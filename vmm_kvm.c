@@ -194,6 +194,25 @@ void vmm_vcpu_set_reg(vmm_vcpu_t* vcpu, vmm_reg_t reg, uint64_t value) {
 #endif
 }
 
+// Read the guest program counter. Used only by the VMM_DEBUG trace, so the
+// cost of this register-read ioctl never touches the normal path.
+static uint64_t vcpu_pc(vmm_vcpu_t* vcpu) {
+#if defined(__x86_64__)
+    struct kvm_regs regs;
+    if (ioctl(vcpu->vcpu_fd, KVM_GET_REGS, &regs) < 0)
+        return 0;
+    return regs.rip;
+#elif defined(__aarch64__)
+    uint64_t pc = 0;
+    struct kvm_one_reg one = {
+        .id = ARM64_CORE_REG(regs.pc),
+        .addr = (uint64_t)(uintptr_t)&pc,
+    };
+    ioctl(vcpu->vcpu_fd, KVM_GET_ONE_REG, &one);
+    return pc;
+#endif
+}
+
 void vmm_vcpu_run(vmm_vcpu_t* vcpu, vmm_exit_info_t* exit_info) {
     struct kvm_run *run = vcpu->run;
 
@@ -208,23 +227,26 @@ void vmm_vcpu_run(vmm_vcpu_t* vcpu, vmm_exit_info_t* exit_info) {
     if (dbg < 0)
         dbg = getenv("VMM_DEBUG") != NULL;
     if (dbg) {
+        unsigned long long pc = (unsigned long long)vcpu_pc(vcpu);
         switch (run->exit_reason) {
             case KVM_EXIT_IO:
-                fprintf(stderr, "[kvm] exit=IO port=0x%x dir=%s size=%u "
-                        "count=%u\n", run->io.port,
+                fprintf(stderr, "[kvm] pc=0x%llx exit=IO port=0x%x dir=%s "
+                        "size=%u count=%u\n", pc, run->io.port,
                         run->io.direction == KVM_EXIT_IO_OUT ? "out" : "in",
                         run->io.size, run->io.count);
                 break;
             case KVM_EXIT_MMIO:
-                fprintf(stderr, "[kvm] exit=MMIO addr=0x%llx len=%u write=%u\n",
+                fprintf(stderr, "[kvm] pc=0x%llx exit=MMIO addr=0x%llx len=%u "
+                        "write=%u\n", pc,
                         (unsigned long long)run->mmio.phys_addr,
                         run->mmio.len, (unsigned)run->mmio.is_write);
                 break;
             case KVM_EXIT_HLT:
-                fprintf(stderr, "[kvm] exit=HLT\n");
+                fprintf(stderr, "[kvm] pc=0x%llx exit=HLT\n", pc);
                 break;
             default:
-                fprintf(stderr, "[kvm] exit=%u\n", run->exit_reason);
+                fprintf(stderr, "[kvm] pc=0x%llx exit=%u\n", pc,
+                        run->exit_reason);
                 break;
         }
     }
