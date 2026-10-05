@@ -13,6 +13,7 @@
 #elif defined(__APPLE__)
 #include <Hypervisor/hypervisor.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach/mach_error.h>
 #endif
 

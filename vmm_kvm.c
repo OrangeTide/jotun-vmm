@@ -1,9 +1,8 @@
 #ifdef __linux__
 
+#include <linux/kvm.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
-#include <linux/kvm.h>
-#include <unistd.h>
 #include <string.h>
 #include "vmm.h"
 
