@@ -54,10 +54,18 @@ int main(int argc, char **argv) {
     uart_16550 uart;
     uart_init(&uart);
 
-    // Run loop: execute the guest and service each exit until it halts.
+    // Run loop: execute the guest and service each exit until it halts. The
+    // cap keeps a misbehaving guest from spinning here forever.
     vmm_exit_info_t exit_info;
     int rc = 0;
+    unsigned long exits = 0;
+    const unsigned long max_exits = 1000000;
     for (;;) {
+        if (++exits > max_exits) {
+            fprintf(stderr, "[giving up after %lu exits]\n", max_exits);
+            rc = 1;
+            break;
+        }
         vmm_vcpu_run(vcpu, &exit_info);
         if (exit_info.reason == VMM_EXIT_REASON_IO) {
             if (!uart_io(&uart, &exit_info) && !exit_info.io.write) {

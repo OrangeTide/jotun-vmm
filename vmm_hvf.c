@@ -5,6 +5,7 @@
 #include "vmm.h"
 
 #include <Hypervisor/Hypervisor.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
@@ -14,6 +15,11 @@
 #define EC_WFI_WFE      0x01    /* trapped WFI/WFE, treated as guest idle */
 #define EC_DATA_ABORT   0x24    /* stage-2 data abort, i.e. an MMIO access */
 #define EC_BRK_AARCH64  0x3c    /* BRK software breakpoint */
+
+/* Initial PSTATE for the guest: EL1h (so the stack pointer is SP_EL1, the one
+ * set through VMM_REG_SP) with DAIF masked so a stray interrupt cannot vector
+ * into an uninitialised exception table before the guest sets one up. */
+#define PSTATE_EL1H_DAIF 0x3c5
 
 /* On Apple Silicon the VM is a per-process singleton: hv_vm_create() takes no
  * handle and there is only ever one VM. We still hand back an allocated struct
@@ -84,6 +90,7 @@ vmm_vcpu_create(vmm_vm_t *vm)
         free(vcpu);
         return NULL;
     }
+    hv_vcpu_set_reg(vcpu->vcpu, HV_REG_CPSR, PSTATE_EL1H_DAIF);
     vcpu->mmio_pending = false;
     return vcpu;
 }
@@ -136,6 +143,22 @@ vmm_vcpu_run(vmm_vcpu_t *vcpu, vmm_exit_info_t *exit_info)
     if (hv_vcpu_run(vcpu->vcpu) != HV_SUCCESS) {
         exit_info->reason = VMM_EXIT_REASON_ERROR;
         return;
+    }
+
+    /* Opt-in per-exit trace: set VMM_DEBUG in the environment to print one
+     * line per exit (reason, exception class, ISS, PC, faulting address). */
+    static int dbg = -1;
+    if (dbg < 0)
+        dbg = getenv("VMM_DEBUG") != NULL;
+    if (dbg) {
+        uint64_t pc = 0, s = vcpu->exit->exception.syndrome;
+        hv_vcpu_get_reg(vcpu->vcpu, HV_REG_PC, &pc);
+        fprintf(stderr, "[hvf] reason=%u ec=0x%llx iss=0x%llx pc=0x%llx "
+                "pa=0x%llx\n", (unsigned)vcpu->exit->reason,
+                (unsigned long long)ESR_EC(s),
+                (unsigned long long)(s & 0x1ffffff),
+                (unsigned long long)pc,
+                (unsigned long long)vcpu->exit->exception.physical_address);
     }
 
     /* ARM64 has no port I/O, so VMM_EXIT_REASON_IO never arises here. Guest
