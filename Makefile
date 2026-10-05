@@ -24,7 +24,8 @@ ifeq ($(OS), Darwin)
     # Apple's toolchain emits Mach-O; produce an ELF with an LLVM ELF target
     # and lld (install with e.g. `brew install lld`).
     GUEST_CC = clang --target=aarch64-unknown-none-elf -fuse-ld=lld
-    GUEST_TEXT = 0x80000
+    # At or above lld's default image base, so no linker-specific flag is needed.
+    GUEST_TEXT = 0x200000
 else
     CFLAGS += -D__linux__
     SRC = vmm_kvm.c elf.c uart.c main.c
@@ -42,7 +43,7 @@ else
         GUEST = test_guest.elf
         GUEST_SRC = test_guest_arm64.c
         GUEST_CC = $(CC)
-        GUEST_TEXT = 0x80000
+        GUEST_TEXT = 0x200000
     endif
 endif
 
