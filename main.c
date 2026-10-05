@@ -54,14 +54,18 @@ int main(int argc, char **argv) {
     uart_16550 uart;
     uart_init(&uart);
 
-    // Run loop: execute the guest and service each exit until it halts. The
-    // cap keeps a misbehaving guest from spinning here forever.
+    // Run loop: execute the guest and service each exit until it halts.
+    //
+    // VMM_MAX_EXITS=N is an opt-in debugging guard: stop after N exits and
+    // report, to catch a guest that spins here. Unset (or 0) runs without a
+    // cap, as a real VMM must, since a live guest exits indefinitely.
     vmm_exit_info_t exit_info;
     int rc = 0;
     unsigned long exits = 0;
-    const unsigned long max_exits = 1000000;
+    const char *cap_env = getenv("VMM_MAX_EXITS");
+    unsigned long max_exits = cap_env ? strtoul(cap_env, NULL, 0) : 0;
     for (;;) {
-        if (++exits > max_exits) {
+        if (max_exits && ++exits > max_exits) {
             fprintf(stderr, "[giving up after %lu exits]\n", max_exits);
             rc = 1;
             break;
