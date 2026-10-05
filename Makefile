@@ -6,20 +6,43 @@ ifeq ($(OS),)
 endif
 ARCH := $(shell uname -m)
 
+# Common freestanding guest flags; per-host blocks add the compiler, the
+# source, and the text base.
+GUEST_CFLAGS = -ffreestanding -fno-pic -fno-pie -nostdlib \
+    -fno-asynchronous-unwind-tables -Wl,-e_start -Wl,--build-id=none
+
 GUEST =
 
 ifeq ($(OS), Darwin)
+    # macos/arm64: Hypervisor.framework, arm64 guest.
     CFLAGS += -D__APPLE__
     LDFLAGS += -framework Hypervisor
     SRC = vmm_hvf.c elf.c uart.c main.c
     CC = clang
+    GUEST = test_guest.elf
+    GUEST_SRC = test_guest_arm64.c
+    # Apple's toolchain emits Mach-O; produce an ELF with an LLVM ELF target
+    # and lld (install with e.g. `brew install lld`).
+    GUEST_CC = clang --target=aarch64-unknown-none-elf -fuse-ld=lld
+    GUEST_TEXT = 0x80000
 else
     CFLAGS += -D__linux__
     SRC = vmm_kvm.c elf.c uart.c main.c
     CC = gcc
-    # The sample guest is an x86 image, so build it only on an x86-64 host.
+    GUEST_CFLAGS += -no-pie
     ifeq ($(ARCH), x86_64)
+        # linux/x86-64: KVM, 32-bit protected-mode x86 guest at 1 MiB.
         GUEST = test_guest.elf
+        GUEST_SRC = test_guest_x86.c
+        GUEST_CC = $(CC) -m32
+        GUEST_TEXT = 0x100000
+    endif
+    ifeq ($(ARCH), aarch64)
+        # linux/arm64: KVM, arm64 guest.
+        GUEST = test_guest.elf
+        GUEST_SRC = test_guest_arm64.c
+        GUEST_CC = $(CC)
+        GUEST_TEXT = 0x80000
     endif
 endif
 
@@ -33,13 +56,8 @@ ifeq ($(OS), Darwin)
 	codesign --force --entitlements entitlements.plist --sign - $@
 endif
 
-# Freestanding 32-bit guest: no libc, no PIC, text based at 1 MiB, entry _start.
-# Drop the build-id note and unwind tables so no stray segment lands outside
-# the guest's RAM window.
-test_guest.elf: test_guest.c
-	$(CC) -m32 -ffreestanding -fno-pic -fno-pie -no-pie -nostdlib \
-	    -fno-asynchronous-unwind-tables \
-	    -Wl,-e_start -Wl,-Ttext=0x100000 -Wl,--build-id=none -o $@ $<
+test_guest.elf: $(GUEST_SRC)
+	$(GUEST_CC) $(GUEST_CFLAGS) -Wl,-Ttext=$(GUEST_TEXT) -o $@ $<
 
 clean:
 	rm -f $(TARGET) test_guest.elf

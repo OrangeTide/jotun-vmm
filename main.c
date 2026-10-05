@@ -69,10 +69,18 @@ int main(int argc, char **argv) {
             printf("\n[guest halted]\n");
             break;
         } else if (exit_info.reason == VMM_EXIT_REASON_MMIO) {
-            fprintf(stderr, "[unhandled MMIO at 0x%" PRIx64 "]\n",
-                    exit_info.mmio.address);
-            rc = 1;
-            break;
+            if (uart_mmio(&exit_info)) {
+                // serviced by the console
+            } else if (exit_info.mmio.write &&
+                       exit_info.mmio.address == MMIO_POWEROFF) {
+                printf("\n[guest powered off]\n");
+                break;
+            } else {
+                fprintf(stderr, "[unhandled MMIO at 0x%" PRIx64 "]\n",
+                        exit_info.mmio.address);
+                rc = 1;
+                break;
+            }
         } else {
             fprintf(stderr, "[guest error or unknown exit]\n");
             rc = 1;

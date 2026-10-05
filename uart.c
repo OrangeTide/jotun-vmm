@@ -3,6 +3,7 @@
 #include "uart.h"
 
 #include <stdio.h>
+#include <string.h>
 
 /* Register offsets from UART_BASE. */
 #define UART_THR_RBR 0      /* THR (write) / RBR (read) / DLL when DLAB set */
@@ -76,6 +77,42 @@ uart_io(uart_16550 *u, vmm_exit_info_t *exit)
         default: break;
         }
         d[0] = v;
+    }
+    return true;
+}
+
+/* PL011 register offsets (the subset a polling transmit driver touches). */
+#define PL011_DR 0x00       /* data register */
+#define PL011_FR 0x18       /* flag register */
+#define FR_TXFF  (1u << 5)  /* transmit FIFO full */
+
+bool
+uart_mmio(vmm_exit_info_t *exit)
+{
+    uint64_t addr = exit->mmio.address;
+    if (addr < MMIO_UART_BASE || addr >= MMIO_UART_BASE + MMIO_UART_SIZE)
+        return false;
+
+    uint32_t off = (uint32_t)(addr - MMIO_UART_BASE);
+    uint8_t *d = exit->mmio.data;
+    size_t n = exit->mmio.size;
+    if (n > 4)
+        n = 4;
+
+    if (exit->mmio.write) {
+        uint32_t v = 0;
+        memcpy(&v, d, n);
+        if (off == PL011_DR) {
+            putchar((int)(v & 0xff));
+            fflush(stdout);
+        }
+    } else {
+        /* FR with TXFF clear means the transmitter is always ready; every
+         * other register reads back as zero. */
+        uint32_t v = 0;
+        (void)off;
+        memset(d, 0, exit->mmio.size);
+        memcpy(d, &v, n);
     }
     return true;
 }
