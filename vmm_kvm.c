@@ -4,6 +4,7 @@
 
 #include <fcntl.h>
 #include <linux/kvm.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -199,6 +200,33 @@ void vmm_vcpu_run(vmm_vcpu_t* vcpu, vmm_exit_info_t* exit_info) {
     if (ioctl(vcpu->vcpu_fd, KVM_RUN, 0) < 0) {
         exit_info->reason = VMM_EXIT_REASON_ERROR;
         return;
+    }
+
+    // Opt-in per-exit trace: set VMM_DEBUG in the environment to print one
+    // line per exit. PC is left out to avoid a register-read ioctl per exit.
+    static int dbg = -1;
+    if (dbg < 0)
+        dbg = getenv("VMM_DEBUG") != NULL;
+    if (dbg) {
+        switch (run->exit_reason) {
+            case KVM_EXIT_IO:
+                fprintf(stderr, "[kvm] exit=IO port=0x%x dir=%s size=%u "
+                        "count=%u\n", run->io.port,
+                        run->io.direction == KVM_EXIT_IO_OUT ? "out" : "in",
+                        run->io.size, run->io.count);
+                break;
+            case KVM_EXIT_MMIO:
+                fprintf(stderr, "[kvm] exit=MMIO addr=0x%llx len=%u write=%u\n",
+                        (unsigned long long)run->mmio.phys_addr,
+                        run->mmio.len, (unsigned)run->mmio.is_write);
+                break;
+            case KVM_EXIT_HLT:
+                fprintf(stderr, "[kvm] exit=HLT\n");
+                break;
+            default:
+                fprintf(stderr, "[kvm] exit=%u\n", run->exit_reason);
+                break;
+        }
     }
 
     switch (run->exit_reason) {
