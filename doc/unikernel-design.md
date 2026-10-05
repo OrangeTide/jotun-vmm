@@ -1,0 +1,299 @@
+# Jotun: a hypervisor-hosted unikernel sandbox
+
+Status: design. Nothing here is implemented yet. The current repository is the
+small hypervisor abstraction (KVM and Hypervisor.framework) that this design
+builds on.
+
+## 1. Goal
+
+Run a single application, linked against a small library OS, as a sandboxed
+guest on the native hypervisor (KVM on Linux, Hypervisor.framework on macOS).
+The guest gets substantial isolation from the host because the virtual machine
+boundary is the security boundary. The application can spawn a few
+subprocesses like a Unix shell and can run threads across one or more
+processors with preemptive scheduling. The host provides filesystem access
+over 9P, limited networking controlled like a container, and a display channel
+that reaches the user through a browser or a standalone client.
+
+The target workloads are non-realtime: data visualizations, interactive
+diagrams, and schematics, the sort of thing that works well over a remote
+connection. That shapes the display design toward a vector-first protocol, with
+pixels used only where raster content is unavoidable, rather than a
+high-framerate GPU pipeline.
+
+This is closer to "a tiny Plan 9 style Unix running as one VM" than to a
+classic single-task unikernel. The multi-process model is wanted, not avoided.
+
+## 2. Naming
+
+The project is named **Jotun**. The two roles are referred to plainly:
+
+- the **host**: the trusted monitor. It owns the hypervisor, the service
+  backends, and the display front end.
+- the **guest**: one sandbox, the library OS plus the linked application.
+
+No further code names for the roles; "host" and "guest" are used throughout.
+
+## 3. Trust and isolation model
+
+- The untrusted thing is the guest. The trusted thing is the host.
+- The VM is the entire security boundary. Everything inside one guest is a
+  single trust domain.
+- The guest runs with no MMU. Processes inside a guest share one flat address
+  space and have identical full access and permissions. Separate processes are
+  a portability and programming convenience, not a security mechanism. A bug in
+  one process can corrupt another, and that is acceptable because they are the
+  same application's trust domain.
+- Because of this, there is no in-guest capability system, no user and
+  supervisor split, and no page tables. All of that machinery would only earn
+  its keep if the guest had to isolate mutually distrusting parties, which it
+  does not.
+- If mutually distrusting tasks are ever needed, the answer is a second guest,
+  not an MMU inside one guest. The arch layer should be written so stage-1
+  paging could be added later, but it is out of scope.
+
+## 4. Host and guest roles
+
+The host is a single trusted process that is, at once:
+
+- the hypervisor driver (the existing `vmm_kvm.c` and `vmm_hvf.c` backends),
+- the 9P filesystem server,
+- the `/net` policy engine,
+- the display front end: it terminates the browser transports, composites the
+  guest's 2D vector scene and any pixel regions, and delivers them to the
+  client.
+
+The guest is the library OS (derived from JOS, see section 6) linked with one
+application image.
+
+## 5. Transport ABI
+
+This is the contract everything else rides on, so it is defined first.
+
+- **Shared-memory rings** in guest RAM carry descriptors. The guest fills a
+  batch and rings a doorbell once, which is a single VM exit per batch, not per
+  access. This is the key difference from the current per-byte MMIO console,
+  which is fine for a log but far too many exits for a data path.
+- **One doorbell**: a single MMIO page the guest writes to signal the host.
+  That write is the VM exit.
+- **Xen style event channels** are the only notification primitive in the other
+  direction. A shared structure holds per-channel pending and mask bits. The
+  host sets a channel pending and injects the guest's event interrupt; the
+  guest reads the pending set, clears bits, and dispatches. One mechanism serves
+  the timer tick, cross-processor wakeups, and every device completion (9P,
+  net, display input).
+- Do not emulate a GIC, an APIC, or virtio-pci. The host owns both ends, so
+  the event-channel model replaces interrupt-controller emulation and collapses
+  a large amount of per-architecture work. The same ABI is used on x86-64 and
+  arm64; only the final interrupt injection differs per backend.
+- **Bulk data** (framebuffer regions, large file reads) moves through separate
+  shared-memory regions passed by reference, not streamed through the ring
+  messages. 9P requests are pipelined with many outstanding tags rather than
+  one in flight.
+
+## 6. Guest library OS (derived from JOS)
+
+JOS (`jon-os`) is a V6 Unix and Plan 9 flavored OS for MMU-less
+machines, with 9P2000 as its native filesystem protocol. Its I/O and namespace
+layer is the reusable core. Its 64-bit and hypervisor ports do not exist yet
+and would be greenfield.
+
+Keep:
+
+- the 9P client, used to talk to the host's 9P server,
+- the per-process namespace with `bind` and `mount`, deep-copied at spawn,
+  and lexical `..` resolution that cannot escape a mount,
+- the device table, the flat first-fit allocator, and the position-independent
+  ELF loader,
+- `spawn`, `exec`, `await`, `reap`, notes as signals, and string exit status,
+- the arch transport seam (`archp9rpc` and friends), where the ring transport
+  slots in.
+
+Add:
+
+- SMP. Each virtual CPU is a host thread looping on `vmm_vcpu_run`. The guest
+  scheduler places tasks on virtual CPUs.
+- Real threads.
+- Preemption driven by a para-virtual timer event, with a cross-processor event
+  for wakeups and reschedule. JOS has neither SMP nor threads today.
+
+Drop:
+
+- the user and supervisor privilege split, including the drop-to-user-mode path
+  and the user-stack-pointer juggling. In one trust domain this is dead weight.
+  Every task runs at the guest's single privilege level, EL1 on arm64 or ring 0
+  on x86-64, with its own stack. The timer still preempts; there is simply no
+  ring to cross.
+
+## 7. Services, namespace, and capability model
+
+The model is "the namespace is the authority," refined with three ideas from
+BRUTAL (`BRUTAL`). BRUTAL is a full capability microkernel; its
+in-kernel capability machinery (per-task handle tables, cross-domain handle
+re-stamping, passable address spaces and tasks, rights delegation to children)
+is dropped, because it only pays off when isolating mutually distrusting
+servers. What is kept is its external service model:
+
+1. **Boot-time service grant.** A per-guest manifest, read by the host at
+   launch, declares which filesystem subtree, which network ports, and whether
+   display access the guest gets. This is the container-style policy surface.
+   It decides which service classes exist at all; the namespace decides which
+   files within them are visible.
+2. **Typed, sequence-matched request and response stubs** over the ring, the
+   small stable contract between guest and host. This can be generated from an
+   IDL later, or hand-written at first.
+3. **Shared memory passed by reference** for bulk and for the display
+   framebuffer. A pixel surface is a shared region plus geometry; file bulk
+   rides the same path.
+
+Net capability model: a fixed, boot-granted set of typed service endpoints plus
+shared-memory regions. No dynamic capabilities, no revocation, the host as
+the sole authority.
+
+Services appear in the guest namespace, Plan 9 style:
+
+- filesystem: the host's 9P server, rooted at the granted subtree,
+- networking: a `/net` tree (section 8),
+- display: a `/dev/draw` endpoint the guest writes a command stream to.
+
+## 8. Networking
+
+A `/net` provider in the host enforces container-style policy from the guest
+manifest: which ports may be bound or dialed, NAT, and rate limits. The guest
+cannot name anything outside what `/net` exposes, so there is no path to the
+real network except through the host's mediation.
+
+## 9. Display subsystem
+
+The target workloads are non-realtime and remote-friendly: visualizations,
+interactive diagrams, and schematics. The design is therefore vector-first.
+Most content is a retained 2D scene the client renders and animates locally;
+pixels cross the wire only for raster content that has no vector form.
+
+It reuses the Quaoar display research
+(`Quaoar`). Quaoar's three-hop pipeline
+already splits where this design needs it: application, then a bridge, then the
+browser. That maps onto guest, then host front end, then client. Quaoar uses
+reliable stream transports (a local socket with netstrings framing, and a
+WebSocket to the browser), not UDP.
+
+### 9.1 Primary path: the 2D vector scene
+
+The guest speaks the Quaoar line protocol over a `/dev/draw` endpoint on the
+ring. This is the literal Plan 9 `/dev/draw` idea: write a drawing command
+stream to a file; only the transport under Quaoar changes, from a local socket
+to the ring. `libquaoar` is the template for the guest emitter.
+
+The content is a retained SVG scene graph. The guest sends the scene once, then
+small mutations. Interaction feedback such as hover, press, and drag is handled
+by the client with declarative animation, so it never crosses the wire. Only
+semantic events return (click, a normalized scroll value, an x-y value,
+debounced text, paste). This fits both the workload and the medium: diagrams
+and schematics are vector-native, the data is bandwidth-light, and most
+interaction never reaches the guest, which matters because every guest-to-host
+crossing is a VM exit.
+
+The command stream is small and textual, so the host validates it cheaply. The
+SVG scene graph tops out around five to ten thousand nodes, which is ample for
+diagrams and UI; denser raster content uses the pixel path below.
+
+### 9.2 Secondary path: raster frames as pixels
+
+For content with no vector form (a rendered 3D view, an image, a dense plot),
+the guest produces pixels itself and the host simply delivers them.
+
+- The guest renders into a framebuffer in its own RAM. A guest app that wants a
+  3D API can link a software rasterizer for this; Triton
+  (`Triton`), a subset of the 3Dfx Glide 3.0 API, is a ready
+  candidate. The rasterizer runs entirely inside the guest.
+- The framebuffer lives in a shared-memory region. The guest marks dirty
+  rectangles and signals the host.
+- The host validates the region geometry (width, height, stride, and bytes per
+  pixel against the region size), composites the pixels as one node in the 2D
+  scene, and encodes them for the client. Because the workload is non-realtime,
+  dirty-rectangle updates and ordinary image compression are enough; there is
+  no video-rate pipeline.
+- The client blits the pixel node under the vector chrome, so it stays a simple
+  display surface.
+
+### 9.3 Why this split, on security grounds
+
+The security boundary is the VM: the guest is attacker-controlled, the host is
+trusted. The decisive question is where an adversarial command stream is parsed
+and executed.
+
+- No rendering command stream crosses into the host. The host never runs a
+  rasterizer on guest-controlled vertices, textures, or framebuffer-write
+  regions, so there is no rasterizer parser to exploit in the trusted process.
+- The only display inputs the host handles are the small textual 2D command
+  stream and a pixel buffer of declared geometry. Both are cheap to validate.
+- Rendering bugs stay where they can do no harm. A software-rasterizer bug is
+  inside the guest, a single trust domain that can already corrupt itself; a
+  client-side rendering bug is inside the browser's own sandbox.
+
+This is why the earlier alternatives are rejected. Running Triton on the host
+over a guest command stream would put an adversarial parser in the trusted
+process. Serializing a WebGL or Glide command stream across the HV adds a large,
+stateful protocol for no security gain, and the buffer and texture upload paths
+are exactly the awkward part. Keeping the rasterizer in the guest and shipping
+only pixels is both simpler and safer.
+
+### 9.4 The host front end
+
+The host terminates the browser-facing transports (WebSocket handshake and
+framing, TLS or a reverse proxy). It multiplexes several guests onto one client
+session using per-guest and per-surface ids. It composites each guest's 2D
+scene and pixel regions and encodes them for the client. All transport
+concerns, ordering, pacing, and any image encoding live here, never in the
+guest, which only ever sees the reliable ring.
+
+### 9.5 Tradeoff
+
+There is no hardware 3D acceleration: raster content is software-rendered in the
+guest. For non-realtime visualization, diagrams, and schematics this is an
+acceptable price for the small, safe host surface. If hardware 3D ever becomes a
+requirement, the right route is a narrowly scoped and separately hardened GPU
+path (for example a virtio-gpu or VirGL style interface), which is its own
+project and is out of scope here.
+
+## 10. Staged roadmap
+
+1. Define and build the transport ABI: rings, doorbell, Xen style event
+   channels, host event injection on both backends.
+2. Retarget the JOS 9P client and namespace onto the ring. The host runs a 9P
+   server exposing a read-only tree plus a console.
+3. Application is the JOS shell doing directory and file reads over the
+   namespace. This exercises spawn when the shell runs a command.
+4. Add the preemptive timer, then a second virtual CPU (SMP) and threads.
+5. Add `/net` with container-style policy.
+6. Add `/dev/draw` speaking the Quaoar 2D vector protocol, with the host as the
+   browser front end. This covers the primary visualization and diagram cases.
+7. Add the pixel path: a shared framebuffer region with dirty-rectangle updates,
+   composited by the host as a scene node. A guest software rasterizer
+   (optionally Triton for a Glide 3D API) is a guest-side library on top of it.
+
+## 11. Open decisions
+
+- Whether the guest-to-host stubs are generated from an IDL or hand-written.
+- The pixel encoding for the host-to-client hop (for example per-tile PNG versus
+  a light codec), which only affects the browser-facing side.
+
+Decisions already made: the project is named Jotun; no MMU and a single trust
+domain, with in-guest processes sharing full access as a convenience; Xen style
+event channels rather than emulated interrupt controllers; no in-guest privilege
+split; the display is vector-first (Quaoar 2D) with raster content rendered in
+the guest and shipped to the host as pixels; no rendering command stream and no
+rasterizer crosses into the host; no hardware 3D acceleration for now.
+
+## 12. Sources
+
+- `jon-os` (JOS): the library OS core, 9P client, namespace,
+  scheduler, and arch seam.
+- `BRUTAL` (BRUTAL): the external service capability model, shared
+  memory by reference, typed RPC.
+- `Triton` (Triton): a subset of the 3Dfx Glide 3.0 API with a
+  software rasterizer, used as an optional guest-side 3D library that renders
+  into a guest framebuffer.
+- `Quaoar` (Quaoar): the retained SVG display
+  protocol, behavior offloading, and the three-hop pipeline, the basis for the
+  primary 2D vector path.
