@@ -47,7 +47,7 @@ else
     endif
 endif
 
-TARGET = vmm_example
+TARGET = jotun
 
 all: $(TARGET) $(GUEST)
 

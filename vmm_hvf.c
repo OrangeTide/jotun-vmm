@@ -145,11 +145,11 @@ vmm_vcpu_run(vmm_vcpu_t *vcpu, vmm_exit_info_t *exit_info)
         return;
     }
 
-    /* Opt-in per-exit trace: set VMM_DEBUG in the environment to print one
+    /* Opt-in per-exit trace: set JOTUN_DEBUG in the environment to print one
      * line per exit (reason, exception class, ISS, PC, faulting address). */
     static int dbg = -1;
     if (dbg < 0)
-        dbg = getenv("VMM_DEBUG") != NULL;
+        dbg = getenv("JOTUN_DEBUG") != NULL;
     if (dbg) {
         uint64_t pc = 0, s = vcpu->exit->exception.syndrome;
         hv_vcpu_get_reg(vcpu->vcpu, HV_REG_PC, &pc);

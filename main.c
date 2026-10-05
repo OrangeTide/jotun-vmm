@@ -56,13 +56,13 @@ int main(int argc, char **argv) {
 
     // Run loop: execute the guest and service each exit until it halts.
     //
-    // VMM_MAX_EXITS=N is an opt-in debugging guard: stop after N exits and
+    // JOTUN_MAX_EXITS=N is an opt-in debugging guard: stop after N exits and
     // report, to catch a guest that spins here. Unset (or 0) runs without a
     // cap, as a real VMM must, since a live guest exits indefinitely.
     vmm_exit_info_t exit_info;
     int rc = 0;
     unsigned long exits = 0;
-    const char *cap_env = getenv("VMM_MAX_EXITS");
+    const char *cap_env = getenv("JOTUN_MAX_EXITS");
     unsigned long max_exits = cap_env ? strtoul(cap_env, NULL, 0) : 0;
     for (;;) {
         if (max_exits && ++exits > max_exits) {

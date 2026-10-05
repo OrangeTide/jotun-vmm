@@ -194,7 +194,7 @@ void vmm_vcpu_set_reg(vmm_vcpu_t* vcpu, vmm_reg_t reg, uint64_t value) {
 #endif
 }
 
-// Read the guest program counter. Used only by the VMM_DEBUG trace, so the
+// Read the guest program counter. Used only by the JOTUN_DEBUG trace, so the
 // cost of this register-read ioctl never touches the normal path.
 static uint64_t vcpu_pc(vmm_vcpu_t* vcpu) {
 #if defined(__x86_64__)
@@ -221,11 +221,11 @@ void vmm_vcpu_run(vmm_vcpu_t* vcpu, vmm_exit_info_t* exit_info) {
         return;
     }
 
-    // Opt-in per-exit trace: set VMM_DEBUG in the environment to print one
+    // Opt-in per-exit trace: set JOTUN_DEBUG in the environment to print one
     // line per exit. PC is left out to avoid a register-read ioctl per exit.
     static int dbg = -1;
     if (dbg < 0)
-        dbg = getenv("VMM_DEBUG") != NULL;
+        dbg = getenv("JOTUN_DEBUG") != NULL;
     if (dbg) {
         unsigned long long pc = (unsigned long long)vcpu_pc(vcpu);
         switch (run->exit_reason) {

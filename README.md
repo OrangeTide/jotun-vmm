@@ -1,8 +1,10 @@
-# vmm
+# Jotun
 
-A small hypervisor abstraction over Linux KVM and macOS Hypervisor.framework.
-It creates a VM, maps guest RAM, runs a vcpu, and loads a guest from an ELF
-file, with a minimal UART console device.
+A hypervisor-hosted unikernel sandbox. This repository currently holds the host
+side: a small hypervisor abstraction over Linux KVM and macOS
+Hypervisor.framework. It creates a VM, maps guest RAM, runs a vcpu, and loads a
+guest from an ELF file, with a minimal UART console device. See
+`doc/unikernel-design.md` for where this is going.
 
 ## Supported hosts
 
@@ -32,19 +34,19 @@ Native only, guest architecture equals host architecture:
 - `lld` to link the arm64 guest as ELF, since Apple's `ld` emits Mach-O:
   `brew install lld`
 - an `entitlements.plist` granting `com.apple.security.hypervisor`; the build
-  ad-hoc code-signs `vmm_example` with it (Hypervisor.framework refuses to run
-  an unsigned, unentitled binary)
+  ad-hoc code-signs `jotun` with it (Hypervisor.framework refuses to run an
+  unsigned, unentitled binary)
 
 ## Build and run
 
 ```sh
 make
-./vmm_example [guest.elf]    # defaults to test_guest.elf
+./jotun [guest.elf]    # defaults to test_guest.elf
 ```
 
-`make` builds `vmm_example` and the matching `test_guest.elf` for the host.
-The x86 guest talks to a 16550 UART over port I/O; the arm64 guest uses an
-MMIO console. Both print a line and stop.
+`make` builds `jotun` and the matching `test_guest.elf` for the host. The x86
+guest talks to a 16550 UART over port I/O; the arm64 guest uses an MMIO console.
+Both print a line and stop.
 
 ```sh
 make clean
@@ -52,15 +54,15 @@ make clean
 
 ### Environment variables
 
-- `VMM_DEBUG` - if set, print one line per vcpu exit to stderr (PC, exit
+- `JOTUN_DEBUG` - if set, print one line per vcpu exit to stderr (PC, exit
   reason, and the port/address details). Off by default, with no cost on the
   normal path.
-- `VMM_MAX_EXITS=N` - stop after N exits and report, as a guard against a
+- `JOTUN_MAX_EXITS=N` - stop after N exits and report, as a guard against a
   guest that spins. Unset or `0` runs without a cap.
 
 ```sh
-VMM_DEBUG=1 ./vmm_example
-VMM_MAX_EXITS=1000 ./vmm_example
+JOTUN_DEBUG=1 ./jotun
+JOTUN_MAX_EXITS=1000 ./jotun
 ```
 
 ### KVM permissions (Linux)
@@ -73,9 +75,13 @@ sudo usermod -aG kvm "$USER"    # then log out and back in
 
 ## Layout
 
-- `vmm.h` - the backend-neutral interface
+- `vmm.h` - the backend-neutral hypervisor interface
 - `vmm_kvm.c`, `vmm_hvf.c` - the two backends
 - `elf.c` - ELF32/ELF64 loader into guest RAM
 - `uart.c` - 16550 (port I/O) and PL011-subset (MMIO) consoles
-- `main.c` - the VMM: load, run loop, device dispatch
+- `main.c` - load, run loop, device dispatch
 - `test_guest_x86.c`, `test_guest_arm64.c` - the sample guests
+- `doc/unikernel-design.md` - the design this is built toward
+
+The `vmm.*` files are the internal hypervisor-abstraction module; the built
+host binary is `jotun`.
