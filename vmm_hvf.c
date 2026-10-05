@@ -1,9 +1,8 @@
 #ifdef __APPLE__
 
+#include <stdlib.h>
 #include <Hypervisor/hypervisor.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
-#include <mach/mach_vm_types.h>
 #include <mach/mach_error.h>
 #include <string.h>
 #include "vmm.h"

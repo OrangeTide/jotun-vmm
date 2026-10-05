@@ -7,9 +7,35 @@
 #include <windows.h>
 #endif
 
+#ifdef __linux__
+#include <sys/ioctl.h>
+#include <linux/kvm.h>
+#elif defined(__APPLE__)
+#include <Hypervisor/hypervisor.h>
+#include <mach/mach.h>
+#include <mach/mach_error.h>
+#endif
+
 // Opaque types for VM and VCPU
-typedef struct vmm_vm vmm_vm_t;
-typedef struct vmm_vcpu vmm_vcpu_t;
+typedef struct vmm_vm {
+#ifdef __linux__
+    int kvm_fd;
+    int vm_fd;
+#elif defined(__APPLE__)
+    hv_vm_t vm;
+#endif
+} vmm_vm_t;
+
+typedef struct vmm_vcpu {
+#ifdef __linux__
+    int kvm_fd;
+    int vm_fd;
+    int vcpu_fd;
+#elif defined(__APPLE__)
+    hv_vm_t vm;
+    hv_vcpu_t vcpu;
+#endif
+} vmm_vcpu_t;
 
 // Execution exit reasons
 typedef enum {

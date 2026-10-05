@@ -3,6 +3,9 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c11
 LDFLAGS =
+ifeq ($(OS),)
+	OS := $(shell uname -s)
+endif
 
 ifeq ($(OS), Darwin)
     CFLAGS += -D__APPLE__
