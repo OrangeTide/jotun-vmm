@@ -50,6 +50,19 @@ MMIO console. Both print a line and stop.
 make clean
 ```
 
+### Environment variables
+
+- `VMM_DEBUG` - if set, print one line per vcpu exit to stderr (PC, exit
+  reason, and the port/address details). Off by default, with no cost on the
+  normal path.
+- `VMM_MAX_EXITS=N` - stop after N exits and report, as a guard against a
+  guest that spins. Unset or `0` runs without a cap.
+
+```sh
+VMM_DEBUG=1 ./vmm_example
+VMM_MAX_EXITS=1000 ./vmm_example
+```
+
 ### KVM permissions (Linux)
 
 Running needs read/write on `/dev/kvm`. Add yourself to the `kvm` group once:
