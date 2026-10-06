@@ -23,6 +23,8 @@
 struct vmm_vm {
     int kvm_fd;
     int vm_fd;
+    int next_slot;          /* memory slot allocator (main thread only) */
+    int next_vcpu_id;       /* vcpu id allocator (atomic; threads create vcpus) */
 };
 
 struct vmm_vcpu {
@@ -47,6 +49,8 @@ vmm_vm_t* vmm_init() {
         free(vm);
         return NULL;
     }
+    vm->next_slot = 0;
+    vm->next_vcpu_id = 0;
     return vm;
 }
 
@@ -56,7 +60,7 @@ vmm_vm_t* vmm_vm_create() {
 
 void vmm_vm_map_memory(vmm_vm_t* vm, void* host_addr, uint64_t guest_addr, size_t size) {
     struct kvm_userspace_memory_region region = {
-        .slot = 0,
+        .slot = vm->next_slot++,
         .flags = 0,
         .guest_phys_addr = guest_addr,
         .memory_size = size,
@@ -71,7 +75,8 @@ vmm_vcpu_t* vmm_vcpu_create(vmm_vm_t* vm) {
     vmm_vcpu_t* vcpu = (vmm_vcpu_t*)malloc(sizeof(vmm_vcpu_t));
     vcpu->kvm_fd = vm->kvm_fd;
     vcpu->vm_fd = vm->vm_fd;
-    vcpu->vcpu_fd = ioctl(vm->vm_fd, KVM_CREATE_VCPU, 0);
+    int vcpu_id = __atomic_fetch_add(&vm->next_vcpu_id, 1, __ATOMIC_SEQ_CST);
+    vcpu->vcpu_fd = ioctl(vm->vm_fd, KVM_CREATE_VCPU, (unsigned long)vcpu_id);
     if (vcpu->vcpu_fd < 0) {
         free(vcpu);
         return NULL;
