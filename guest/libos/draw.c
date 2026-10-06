@@ -182,6 +182,31 @@ draw_hover_fill(uint32_t id, uint32_t to)
 }
 
 void
+draw_drag(uint32_t id, int vertical, int track)
+{
+    need();
+    du8(DOP_INTERACT); du32(id); du16(DI_DRAG);
+    du8(vertical ? 'v' : 'h'); du16((uint16_t)track);
+}
+
+void
+draw_xy(uint32_t id)
+{
+    need();
+    du8(DOP_INTERACT); du32(id); du16(DI_XY);
+}
+
+unsigned
+draw_event_norm(const struct draw_event *ev, int idx)
+{
+    int off = idx * 2;
+    if (off < 0 || off + 2 > ev->vlen)
+        return 0;
+    return (unsigned)(uint8_t)ev->value[off]
+         | (unsigned)(uint8_t)ev->value[off + 1] << 8;
+}
+
+void
 draw_flush(void)
 {
     if (dpos == 0)

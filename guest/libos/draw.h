@@ -52,6 +52,19 @@ void draw_listen(uint32_t id, int event);
 void draw_click(uint32_t id);                       /* clickable: DI_CLICK */
 void draw_hover_fill(uint32_t id, uint32_t to);     /* DI_HOVER_FILL */
 
+/* Make a node a drag handle. vertical selects the axis; track is the travel
+ * length in device units. On release the client reports a DEV_SCROLL event
+ * whose value is one norm u16 (0..65535 maps 0.0..1.0). */
+void draw_drag(uint32_t id, int vertical, int track);
+
+/* Make a node a 2D handle. On release the client reports a DEV_XY event whose
+ * value is two norm u16 (x then y). */
+void draw_xy(uint32_t id);
+
+/* Decode the idx-th little-endian norm u16 from an event value (for DEV_SCROLL
+ * and DEV_XY). Returns 0 when the value is shorter than that. */
+unsigned draw_event_norm(const struct draw_event *ev, int idx);
+
 /* Send the accumulated ops. Parks the task if the host's queue is momentarily
  * full, retrying when a draw event rouses it. */
 void draw_flush(void);

@@ -219,7 +219,8 @@ static const char CLIENT_HTML[] =
 "var ws;\n"
 "function stat(on){dot.classList.toggle('on',on);txt.textContent=on?'connected':'disconnected';}\n"
 "function nodeId(el){var m=/^qu-\\d+-(\\d+)$/.exec(el.id||'');return m?+m[1]:0;}\n"
-"function send(node,type){if(ws&&ws.readyState===1)ws.send(node+' '+type);}\n"
+"function send(node,type,value){if(ws&&ws.readyState===1)\n"
+"  ws.send(node+' '+type+(value!==undefined?'\\n'+value:''));}\n"
 "function wire(root){\n"
 "  root.querySelectorAll('[data-qu-listen=\\'click\\']').forEach(function(el){\n"
 "    el.style.cursor='pointer';\n"
@@ -240,6 +241,34 @@ static const char CLIENT_HTML[] =
 "  if(el.getAttribute('viewBox'))display.setAttribute('viewBox',el.getAttribute('viewBox'));\n"
 "  wire(display);\n"
 "}\n"
+/* Drag (data-qu-drag/track -> DEV_SCROLL=3) and xy (data-qu-xy -> DEV_XY=4). */
+"var drag=null,xy=null;\n"
+"display.addEventListener('mousedown',function(e){\n"
+"  var d=e.target.closest('[data-qu-drag]');\n"
+"  if(d){e.preventDefault();var vert=d.getAttribute('data-qu-drag')==='v';\n"
+"    drag={el:d,vert:vert,track:parseInt(d.getAttribute('data-qu-track')||'100'),\n"
+"      start:parseFloat(d.getAttribute(vert?'y':'x'))||0,\n"
+"      mouse:vert?e.clientY:e.clientX};return;}\n"
+"  var x=e.target.closest('[data-qu-xy]');\n"
+"  if(x){e.preventDefault();xy={el:x,area:x.parentNode};}\n"
+"});\n"
+"document.addEventListener('mousemove',function(e){\n"
+"  if(drag){var dv=(drag.vert?e.clientY:e.clientX)-drag.mouse;\n"
+"    var p=Math.max(0,Math.min(drag.track,drag.start+dv));\n"
+"    drag.el.setAttribute(drag.vert?'y':'x',p);}\n"
+"  if(xy){var r=xy.area.getBoundingClientRect();\n"
+"    var fx=Math.max(0,Math.min(1,(e.clientX-r.left)/r.width));\n"
+"    var fy=Math.max(0,Math.min(1,(e.clientY-r.top)/r.height));\n"
+"    xy.el.setAttribute('cx',fx*r.width);xy.el.setAttribute('cy',fy*r.height);}\n"
+"});\n"
+"document.addEventListener('mouseup',function(e){\n"
+"  if(drag){var p=parseFloat(drag.el.getAttribute(drag.vert?'y':'x'))||0;\n"
+"    send(nodeId(drag.el),3,(drag.track>0?p/drag.track:0).toFixed(4));drag=null;}\n"
+"  if(xy){var r=xy.area.getBoundingClientRect();\n"
+"    var fx=(parseFloat(xy.el.getAttribute('cx'))||0)/r.width;\n"
+"    var fy=(parseFloat(xy.el.getAttribute('cy'))||0)/r.height;\n"
+"    send(nodeId(xy.el),4,fx.toFixed(4)+' '+fy.toFixed(4));xy=null;}\n"
+"});\n"
 "function connect(){\n"
 "  ws=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/ws');\n"
 "  ws.onopen=function(){stat(true);};\n"
@@ -387,8 +416,21 @@ accept_conn(struct drawws *w)
     }
 }
 
+/* Clamp a fraction to [0,1] and scale to a norm u16. */
+static uint16_t
+to_norm(double f)
+{
+    if (f < 0.0)
+        f = 0.0;
+    if (f > 1.0)
+        f = 1.0;
+    return (uint16_t)(f * 65535.0 + 0.5);
+}
+
 /* Parse an inbound event frame "node type" with an optional "\n<value>" tail
- * and dispatch it. */
+ * and dispatch it. Scroll and xy values arrive as text fractions and are
+ * re-encoded to the binary norm form the guest ABI defines, so the guest never
+ * parses text. Other events pass their value bytes through unchanged. */
 static void
 dispatch_event(struct drawws *w, uint8_t *payload, int plen)
 {
@@ -408,8 +450,32 @@ dispatch_event(struct drawws *w, uint8_t *payload, int plen)
     int vlen = nl ? plen - (int)(nl + 1 - (char *)payload) : 0;
     if (vlen < 0)
         vlen = 0;
-    if (w->on_event)
+
+    if (!w->on_event)
+        return;
+
+    if (type == 3 /* DEV_SCROLL */ && value) {    /* one fraction -> norm u16 */
+        char vbuf[32];
+        int n = vlen < (int)sizeof vbuf - 1 ? vlen : (int)sizeof vbuf - 1;
+        memcpy(vbuf, value, (size_t)n);
+        vbuf[n] = '\0';
+        uint16_t v = to_norm(atof(vbuf));
+        uint8_t enc[2] = { (uint8_t)v, (uint8_t)(v >> 8) };
+        w->on_event(w->ctx, node, (uint16_t)type, (const char *)enc, 2);
+    } else if (type == 4 /* DEV_XY */ && value) { /* two fractions -> 2x norm */
+        char vbuf[64];
+        int n = vlen < (int)sizeof vbuf - 1 ? vlen : (int)sizeof vbuf - 1;
+        memcpy(vbuf, value, (size_t)n);
+        vbuf[n] = '\0';
+        double fx = 0, fy = 0;
+        sscanf(vbuf, "%lf %lf", &fx, &fy);
+        uint16_t x = to_norm(fx), y = to_norm(fy);
+        uint8_t enc[4] = { (uint8_t)x, (uint8_t)(x >> 8),
+                           (uint8_t)y, (uint8_t)(y >> 8) };
+        w->on_event(w->ctx, node, (uint16_t)type, (const char *)enc, 4);
+    } else {
         w->on_event(w->ctx, node, (uint16_t)type, value, vlen);
+    }
 }
 
 /* Admit an event under the one-second rate window. Returns 1 to proceed, 0 to

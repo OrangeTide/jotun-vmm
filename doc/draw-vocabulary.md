@@ -168,6 +168,31 @@ tops out around five to ten thousand nodes, per the Quaoar research):
 - polyline points and path segments: capped per node
 - op size: bounded by the channel chunk size
 
+## Serving and TLS
+
+The host serves the browser client and the WebSocket on one port, bound to
+`127.0.0.1` only (`JOTUN_DRAW_PORT`, default 9230, `0` disables the front end).
+Nothing listens on a public interface, so the display is reachable only from the
+same machine. The WebSocket link is plain `ws://`, which is correct for a
+loopback connection where there is no network to protect.
+
+To reach the display from another machine, put a TLS-terminating reverse proxy
+in front of it rather than adding TLS to the host. The host stays loopback-only
+and the proxy owns the certificate. For example, with nginx:
+
+    location / {
+        proxy_pass http://127.0.0.1:9230;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;     # forward the WS upgrade
+        proxy_set_header Connection "upgrade";
+    }
+
+The client already selects `wss://` when the page is loaded over HTTPS, so no
+client change is needed. The proxy is also the right place for authentication
+and for any public-facing rate limiting, keeping that policy out of the host.
+The host's own limits (frame size, event rate, a single browser at a time)
+still apply underneath.
+
 ## Deferred
 
 Out of scope for the M6 acceptance test, candidates for M6.5 vocabulary breadth:
@@ -184,5 +209,6 @@ Out of scope for the M6 acceptance test, candidates for M6.5 vocabulary breadth:
   space that the host maps into the surface viewBox for resolution independence.
 - Whether `SET` should coalesce multiple attributes in one op to cut op count
   for animation-like updates.
-- How tightly to bound per-guest op rate, which belongs with the M6.5 flow
-  control and hardening work.
+- Per-guest op rate bounding. The inbound browser event rate is now capped
+  (M6.5). Bounding the guest-to-host op submission rate is still open and
+  belongs with the M6.6 scale and latency work.

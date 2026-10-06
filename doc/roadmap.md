@@ -444,9 +444,23 @@ Steps:
   WebSocket client: the guest draws the scene, the host pushes a 918-byte
   authored SVG, a click on the rect returns DEV_CLICK to the guest, which
   unblocks and finishes. JOTUN_DRAW_PORT selects the port (0 disables).
-- M6.5: hardening. Audit or replace the hand-rolled WebSocket frame parser
-  (it reads browser-supplied bytes in the trusted host), document TLS via a
-  reverse proxy, add size and rate limits, and broaden the vocabulary.
+- M6.5 (done): hardening and interaction breadth. The hand-rolled WebSocket
+  frame reader was replaced with a non-blocking incremental parser that
+  validates every field before touching a payload byte (reserved bits clear,
+  client frames masked, control frames final and <= 125 bytes, length within
+  the cap and fully present), so a malformed or slow-loris browser cannot wedge
+  or corrupt the single server thread. Limits added: a 16 KiB max inbound frame,
+  a 200/sec event rate window, and receive and send timeouts. TLS is documented
+  as a loopback-only host behind a TLS-terminating reverse proxy
+  (`doc/draw-vocabulary.md`). The interaction vocabulary is wired end to end:
+  guest `draw_drag`/`draw_xy` emit DI_DRAG/DI_XY, the client reports drag and xy
+  gestures, and the host re-encodes their fractional values into the binary norm
+  form the guest ABI defines (verified: a 0.5 scroll decodes to norm 32768 in
+  the guest). Remaining vocabulary breadth (the SET mutation op and the POLYLINE
+  and PATH shape types, which need variable per-node storage) is deferred to a
+  later vocabulary pass; text and paste input stay deferred since they need a
+  text-input primitive, which the restricted vocabulary excludes for now
+  (no foreignObject).
 - M6.6: scale and latency characterization (node ceiling, mutation throughput).
 
 ## M7: display, the pixel path

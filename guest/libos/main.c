@@ -334,6 +334,10 @@ draw_demo(void)
     con_putu(ev.node);
     con_puts(" type ");
     con_putu(ev.type);
+    if (ev.vlen >= 2) {
+        con_puts(" norm ");
+        con_putu(draw_event_norm(&ev, 0));
+    }
     con_putc('\n');
     con_puts("draw: done\n");
 }
