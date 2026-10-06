@@ -185,15 +185,27 @@ trust domain.
 
 The host owns parsing the bundle. The guest only issues 9P reads, so no
 image-format code runs in the guest and the host validates every path. The
-bundle is a read-only filesystem image, either EROFS or squashfs. Both are
-purpose-built for immutable images and both expose an inode and directory
-structure that maps directly onto 9P stat and walk, so the choice is made when
-the reader is written rather than now. squashfs has the wider tooling
-(mksquashfs) and, with gzip, reuses a small DEFLATE decompressor (see the
-inflate sources in section 12); EROFS has a more compact on-disk layout and
-uses lz4 or zstd. The first implementation serves uncompressed data, or even a
-plain host directory, so the 9P path comes up before any decompressor is
-needed; compression is added with the format.
+bundle is an EROFS image. EROFS is the forward-looking read-only filesystem:
+actively developed, and now the de-facto choice for Android, ChromeOS, and
+container images. Its fixed-sized-output compression decompresses small
+clusters on demand, which suits serving arbitrary byte ranges over 9P, where
+squashfs would decompress a whole block of up to a megabyte to answer one read.
+Its compact inodes map cleanly onto 9P stat and walk with little reader state.
+Parsing happens in our own host-side reader, so EROFS being in the Linux kernel
+is not itself the point; the longevity and tooling are.
+
+The first implementation serves uncompressed data, or even a plain host
+directory, so the 9P path comes up before any decompressor exists. Compression
+follows with lz4, the EROFS native codec, using the small MIT lz4 decompressor
+in `lz4` (section 12); lz4 decompresses fast and the code is tiny.
+EROFS also supports DEFLATE, should a gzip path ever be preferred.
+
+EROFS build-time data deduplication, a rolling-hash content-defined chunking
+pass, is left off. It pays off on large images with much duplicate data across
+files, such as layered container images, not on a small bundle of a few
+distinct programs and their config, and enabling it makes inodes share physical
+clusters, which complicates the reader. Revisit it only if many guest domains
+later share a common base, where cross-bundle dedup would matter.
 
 Optionally, and in a later stage, the same bundle can also carry the bootable
 unikernel ELF itself. The host lifts that image out of the bundle to boot the
@@ -347,6 +359,8 @@ rasterizer crosses into the host; no hardware 3D acceleration for now.
 - `Quaoar` (Quaoar): the retained SVG display
   protocol, behavior offloading, and the three-hop pipeline, the basis for the
   primary 2D vector path.
+- `lz4` (`lz4.c`, `lz4.h`): a small MIT lz4 decompressor, the planned
+  codec for the EROFS bundle reader (section 7.1). lz4 is EROFS's native codec.
 - `inflate.c` and `inflate.c`:
-  small self-contained DEFLATE decompressors, candidates for the host-side
-  squashfs-gzip bundle reader (section 7.1). EROFS instead uses lz4 or zstd.
+  small DEFLATE decompressors, held in reserve only if a gzip or zip import
+  path is ever wanted. Not used by the EROFS bundle.

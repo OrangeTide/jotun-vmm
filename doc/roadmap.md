@@ -148,13 +148,14 @@ device table, held back from M2, land.
 - Guest 9P client on the `archp9rpc` seam, routed to the ring.
 - Host 9P2000.u server. It serves a read-only subtree backed by a filesystem
   bundle, a single read-only image that packages the domain's programs (init, a
-  shell, small helpers) and their config and data. The bundle is an EROFS or
-  squashfs image; the choice is made when the reader is written, since both map
-  cleanly to 9P. The first cut serves uncompressed data, or a plain host
-  directory, so the 9P path comes up before any decompressor is needed. If
-  squashfs with gzip is chosen, the host reuses a small DEFLATE decompressor
-  (see `unikernel-design.md` section 12); EROFS uses lz4 or zstd. The host owns
-  all bundle parsing; the guest only issues 9P reads.
+  shell, small helpers) and their config and data. The bundle is an EROFS
+  image, chosen as the forward-looking read-only format; see
+  `unikernel-design.md` section 7.1. The first cut serves uncompressed data, or
+  a plain host directory, so the 9P path comes up before any decompressor
+  exists; lz4 compression follows, using the small MIT lz4 reader in
+  `lz4`. EROFS data deduplication (the rolling-hash pass) stays off; it
+  helps only large, layered images, not a small bundle. The host owns all
+  bundle parsing; the guest only issues 9P reads.
 - Guest-side ELF loader reading programs from the namespace, so `exec(name)`
   loads the named program out of the bundle. Several bundled programs then run
   together in one guest domain.
