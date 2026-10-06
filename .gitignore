@@ -2,3 +2,4 @@ jotun
 test_guest.elf
 echo.elf
 libos.elf
+bundle-depot

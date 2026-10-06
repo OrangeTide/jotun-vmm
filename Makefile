@@ -1,5 +1,11 @@
 # Makefile
-CFLAGS = -Wall -Wextra -std=c11 -pthread -Iabi
+# smolvfs provides the bundle store the host 9P server reads from. Point this
+# at a checkout of smolvfs; the host compiles the read-path sources directly.
+SMOLVFS_DIR ?= third_party/smolvfs
+SMOLVFS_SRC = $(SMOLVFS_DIR)/cas.c $(SMOLVFS_DIR)/cas-tree.c \
+    $(SMOLVFS_DIR)/cas-pack.c $(SMOLVFS_DIR)/cas-codec.c
+
+CFLAGS = -Wall -Wextra -std=c11 -pthread -Iabi -I$(SMOLVFS_DIR)
 LDFLAGS =
 ifeq ($(OS),)
     OS := $(shell uname -s)
@@ -17,7 +23,8 @@ ifeq ($(OS), Darwin)
     # macos/arm64: Hypervisor.framework, arm64 guest.
     CFLAGS += -D__APPLE__
     LDFLAGS += -framework Hypervisor
-    SRC = host/vmm_hvf.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c host/main.c
+    SRC = host/vmm_hvf.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c \
+        host/p9smolvfs.c host/main.c $(SMOLVFS_SRC)
     CC = clang
     GUEST = test_guest.elf echo.elf libos.elf
     GUEST_SRC = guest/test_guest_arm64.c
@@ -29,7 +36,8 @@ ifeq ($(OS), Darwin)
     GUEST_TEXT = 0x200000
 else
     CFLAGS += -D__linux__
-    SRC = host/vmm_kvm.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c host/main.c
+    SRC = host/vmm_kvm.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c \
+        host/p9smolvfs.c host/main.c $(SMOLVFS_SRC)
     CC = gcc
     GUEST_CFLAGS += -no-pie
     ifeq ($(ARCH), x86_64)
@@ -77,7 +85,18 @@ LIBOS_SRC = guest/libos/main.c guest/libos/mem.c guest/libos/task.c \
 libos.elf: $(LIBOS_SRC)
 	$(GUEST_CC) $(GUEST_CFLAGS) -Iguest/libos -Wl,-Ttext=$(GUEST_TEXT) -o $@ $^
 
+# Build a test bundle depot from example/bundle/ using smolvfs's castool, then
+# run with JOTUN_BUNDLE=bundle-depot ./jotun libos.elf.
+BUNDLE_DEPOT = bundle-depot
+
+bundle:
+	$(MAKE) -C $(SMOLVFS_DIR) castool
+	rm -rf $(BUNDLE_DEPOT)
+	$(SMOLVFS_DIR)/castool -d $(BUNDLE_DEPOT) import root example/bundle/*
+	$(SMOLVFS_DIR)/castool -d $(BUNDLE_DEPOT) pack
+
 clean:
 	rm -f $(TARGET) test_guest.elf echo.elf libos.elf
+	rm -rf $(BUNDLE_DEPOT)
 
-.PHONY: all clean
+.PHONY: all clean bundle

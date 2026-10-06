@@ -135,12 +135,17 @@ build.
 Goal: the guest sees a host filesystem, loads programs from it, and boots with
 host-supplied parameters.
 
-Progress: the boot-info block is done. `abi/jotun_boot.h` defines a parameter
-block at a fixed guest-physical address (one page above the ring); the host
-writes the RAM size and a packed argv blob (the guest argv is whatever follows
-the kernel image on the command line), and the library OS reads and reports it
-at boot. Next: the host 9P server over the ring backed by a smolvfs pack, and
-the guest 9P client.
+Progress: the boot-info block and the 9P path are done. `abi/jotun_boot.h`
+defines a parameter block at a fixed guest-physical address (one page above the
+ring); the host writes the RAM size and a packed argv blob, and the library OS
+reads and reports it at boot. `abi/jotun_9p.h` adds a shared request/response
+buffer and a 9P doorbell, with a byte-wise wire codec shared by host and guest.
+The host 9P2000 server (`host/p9srv.c`) runs behind a small backend vtable;
+`host/p9smolvfs.c` resolves a ref in a smolvfs depot and serves its tree and
+blobs, and `host/p9mem.c` is an in-memory fallback. The guest client
+(`guest/libos/p9.c`) mounts, walks, reads, and lists. `make bundle` builds a
+test depot from `example/bundle/` with smolvfs's castool. Next: the guest ELF
+loader reading programs from the namespace, so exec resolves a name.
 
 Transition from M2: M2's `exec` resolves a function directly and the guest has
 no loader. M3 adds the loader and makes `exec` resolve a program by name, read

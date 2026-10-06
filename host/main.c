@@ -13,6 +13,7 @@
 #include "jotun_9p.h"
 #include "p9srv.h"
 #include "p9mem.h"
+#include "p9smolvfs.h"
 
 /* Guest physical RAM mapped at address 0. 8 MiB is ample for the test guest
  * plus per-vcpu stacks. */
@@ -256,7 +257,25 @@ main(int argc, char **argv)
     setup_bootinfo(gargc, gargv);
 
     uart_init(&uart);
-    p9srv_init(&p9, p9mem_backend(), NULL);
+
+    /* Serve a smolvfs bundle if one is named, else the in-memory tree. */
+    const char *bundle = getenv("JOTUN_BUNDLE");
+    const char *ref = getenv("JOTUN_REF");
+    if (!ref)
+        ref = "root";
+    const struct p9_backend *be = NULL;
+    void *p9ctx = NULL;
+    if (bundle)
+        be = p9smolvfs_open(bundle, ref, &p9ctx);
+    if (be) {
+        p9srv_init(&p9, be, p9ctx);
+        fprintf(stderr, "[9p] serving bundle %s (ref %s)\n", bundle, ref);
+    } else {
+        if (bundle)
+            fprintf(stderr, "[9p] could not open bundle %s, using in-memory tree\n",
+                    bundle);
+        p9srv_init(&p9, p9mem_backend(), NULL);
+    }
 
     pthread_t threads[MAX_VCPUS];
     struct vcpu_ctx ctx[MAX_VCPUS];
