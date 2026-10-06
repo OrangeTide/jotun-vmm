@@ -225,10 +225,41 @@ The node ceiling is 4096 per guest, matching the browser's SVG DOM limit (the
 Quaoar research puts it at five to ten thousand). Ops past the cap are dropped,
 and the ceiling holds: a run that asks for 5000 rects settles at 4096 nodes.
 
-The remaining cost is that every SUBMIT re-renders the whole scene. That is fine
-at these sizes (a 2.6 ms re-render), but a future lever for steady-state
-mutation of a large scene is an incremental update path that ships only the
-changed nodes rather than the whole document.
+The host still authors the full SVG every SUBMIT (cheap at these sizes, a 2.6 ms
+re-render at the ceiling), but it no longer always transmits it. A browser that
+already holds a full-document baseline receives an incremental delta instead,
+which ships only the changed nodes. See "Incremental updates" below.
+
+## Incremental updates (M7.2)
+
+The host tracks per-node change state while it applies an op stream: a node is
+added, modified, or removed. The first paint to a browser is always the full
+document, which establishes a baseline. After that, each SUBMIT produces a delta
+that names only what changed, and the browser applies it against the live DOM by
+element id.
+
+The delta is a line-oriented text message. The first line is a header,
+`!<cw> <ch>`, carrying the canvas width and height. Each later line is one
+record:
+
+- `R <id>` removes the node with that guest id.
+- `N <parent> <fragment>` adds a node: the SVG fragment is appended under the
+  parent node's element (parent id 0 is the scene root).
+- `U <fragment>` replaces a node in place, matched by the fragment's element id.
+
+The browser tells a delta from a full document by the first byte: a full
+document starts with `<`, a delta with `!`. Fragments never contain newlines, so
+the split on newlines is unambiguous.
+
+The host falls back to sending the full document whenever a delta cannot be
+applied in order: the browser has no baseline yet, a previous delta is still
+queued unsent, or the change set for one SUBMIT exceeds the per-submit cap (128
+records). A full document re-establishes the baseline, so the browser never
+drifts out of sync. A DOP_IMAGE node re-encodes its PNG only when its pixels are
+marked dirty, not on every unrelated SUBMIT.
+
+Measured on the 2D demo, toggling one rect's fill with a single SET goes out as
+a 226 byte delta in place of the 1144 byte full document.
 
 On bounding the guest-to-host op rate (the earlier open question): the submit
 path is synchronous. Each SUBMIT occupies the vcpu until the host returns, so
@@ -243,8 +274,10 @@ Out of scope for the M6 acceptance test, candidates for M6.5 vocabulary breadth:
 
 - gradients and patterns (would be a fixed, parameterized set, never raw defs)
 - richer text (spans, alignment, wrapping)
-- richer raster: the framebuffer node ships with real PNG compression (M7.1);
-  still deferred are dirty-rectangle partial updates (changed regions only)
+- richer raster: the framebuffer node ships with real PNG compression (M7.1),
+  and changed-node deltas avoid re-sending it when unrelated nodes change
+  (M7.2); still deferred are dirty-rectangle partial updates that re-encode and
+  re-transmit only changed regions of a framebuffer
 - `font_family` beyond the three-way enum
 - grouping transforms beyond translate (scale, rotate), if a use case needs them
 

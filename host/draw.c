@@ -45,6 +45,7 @@
 #define DRAW_IDHASH    8192     /* id index buckets (power of two, > 2x nodes) */
 #define DRAW_IMG_MAXDIM  2048   /* max image width or height */
 #define DRAW_IMG_MAXBYTES (4u * 1024 * 1024)    /* max framebuffer extent */
+#define DRAW_DELTA_MAX   128    /* changed/removed nodes before a full push */
 
 /* The guest id namespaces browser DOM ids as qu-<guest>-<node>. One guest
  * domain exists today; multi-guest namespacing arrives with multiple domains. */
@@ -119,6 +120,10 @@ struct dnode {
     int      close;             /* a close listener is attached */
     int      hidden;            /* SET VISIBLE 0: emitted as display:none */
 
+    uint8_t  change;            /* this submit: 0 none, 1 added, 2 modified */
+    int      img_dirty;         /* image pixels changed; re-encode on next emit */
+    char    *png_cache;         /* last base64 PNG for an image node */
+
     /* Tree links (slot indices, -1 for none). Children are kept in creation
      * order so serialization is a single O(n) walk, no per-parent scan. */
     int      first_child, last_child;
@@ -158,6 +163,15 @@ struct drawdev {
     /* The surface forest, in creation order (slot indices, -1 for none). */
     int root_first, root_last;
     int inited;                 /* freelist and roots laid out once */
+
+    /* Per-submit change set, for incremental (delta) updates to the browser.
+     * Added and modified nodes carry a flag; removed nodes are listed by id
+     * here, since their slots are freed. Too many removals, or a whole-scene
+     * change, falls back to a full document push. */
+    uint32_t removed_ids[DRAW_DELTA_MAX];
+    int nremoved;
+    int nchanged;               /* added + modified nodes this submit */
+    int delta_overflow;
 };
 
 /****************************************************************
@@ -403,6 +417,8 @@ node_new(struct drawdev *dd, uint32_t id, uint8_t type, uint32_t parent)
     n->seq = dd->seqctr++;
     n->first_child = n->last_child = -1;
     n->prev_sib = n->next_sib = -1;
+    n->change = 1;              /* added this submit */
+    dd->nchanged++;
     dd->nnodes++;
 
     idx_insert(dd, id, slot);
@@ -434,12 +450,35 @@ node_remove(struct drawdev *dd, uint32_t id)
     free(n->text);
     free(n->pts);
     free(n->segs);
+    free(n->png_cache);
     n->text = NULL;
     n->pts = NULL;
     n->segs = NULL;
+    n->png_cache = NULL;
     n->in_use = 0;
     dd->freelist[dd->nfree++] = s;
     dd->nnodes--;
+}
+
+/* Flag a node as modified this submit, unless it is newly added (its full
+ * fragment will carry the change). */
+static void
+mark_modified(struct drawdev *dd, int slot)
+{
+    if (dd->nodes[slot].change == 0) {
+        dd->nodes[slot].change = 2;
+        dd->nchanged++;
+    }
+}
+
+/* Record a top-level removal for the delta, or overflow to a full push. */
+static void
+record_removed(struct drawdev *dd, uint32_t id)
+{
+    if (dd->nremoved < DRAW_DELTA_MAX)
+        dd->removed_ids[dd->nremoved++] = id;
+    else
+        dd->delta_overflow = 1;
 }
 
 /****************************************************************
@@ -794,6 +833,7 @@ apply(struct drawdev *dd, const uint8_t *buf, uint32_t len, uint32_t *click_node
             int slot = find(dd, id);
             if (slot < 0 || set_attr(&dd->nodes[slot], attr, v) != 0)
                 return -1;
+            mark_modified(dd, slot);
             break;
         }
         case DOP_TEXT: {
@@ -840,9 +880,20 @@ apply(struct drawdev *dd, const uint8_t *buf, uint32_t len, uint32_t *click_node
             if (stride < (uint32_t)w * 4
                 || (uint64_t)stride * h > DRAW_IMG_MAXBYTES)
                 return -1;
-            struct dnode *n = node_new(dd, id, DOP_IMAGE, parent);
-            if (!n)
-                return -1;
+            /* Re-submitting an existing image id updates the node and marks it
+             * dirty, so a new frame from the guest flows as one node update. */
+            struct dnode *n;
+            int slot = find(dd, id);
+            if (slot >= 0) {
+                if (dd->nodes[slot].type != DOP_IMAGE)
+                    return -1;
+                n = &dd->nodes[slot];
+                mark_modified(dd, slot);
+            } else {
+                n = node_new(dd, id, DOP_IMAGE, parent);
+                if (!n)
+                    return -1;
+            }
             n->geo.image.x = x;
             n->geo.image.y = y;
             n->geo.image.w = w;
@@ -850,6 +901,7 @@ apply(struct drawdev *dd, const uint8_t *buf, uint32_t len, uint32_t *click_node
             n->geo.image.fmt = fmt;
             n->geo.image.stride = stride;
             n->geo.image.gpa = gpa;
+            n->img_dirty = 1;
             break;
         }
         case DOP_SET_TEXT: {
@@ -866,12 +918,14 @@ apply(struct drawdev *dd, const uint8_t *buf, uint32_t len, uint32_t *click_node
             }
             free(dd->nodes[slot].text);
             dd->nodes[slot].text = s;
+            mark_modified(dd, slot);
             break;
         }
         case DOP_REMOVE: {
             uint32_t id = rd_u32(&r);
             if (r.err || find(dd, id) < 0)
                 return -1;
+            record_removed(dd, id);
             node_remove(dd, id);
             break;
         }
@@ -905,6 +959,7 @@ apply(struct drawdev *dd, const uint8_t *buf, uint32_t len, uint32_t *click_node
             if (r.err || slot < 0)
                 return -1;
             node_interact(&dd->nodes[slot], kind, to, axis, track);
+            mark_modified(dd, slot);
             if (click_node && kind == DI_CLICK)
                 *click_node = id;
             break;
@@ -922,6 +977,7 @@ apply(struct drawdev *dd, const uint8_t *buf, uint32_t len, uint32_t *click_node
             } else if (ev == DEV_CLOSE) {
                 dd->nodes[slot].close = 1;
             }
+            mark_modified(dd, slot);
             break;
         }
         default:
@@ -1089,7 +1145,7 @@ emit_common(struct sbuf *b, const struct dnode *n)
         sb_puts(b, " display=\"none\"");
 }
 
-static void emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n);
+static void emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n);
 
 /* Emit a sibling list in creation order, following the next links. O(children),
  * so the whole scene serializes in one O(n) pass. */
@@ -1101,7 +1157,7 @@ emit_siblings(struct sbuf *b, struct drawdev *dd, int head)
 }
 
 static void
-emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n)
+emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n)
 {
     switch (n->type) {
     case DOP_SURFACE:
@@ -1209,17 +1265,20 @@ emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n)
         sb_puts(b, "</text>");
         break;
     case DOP_IMAGE: {
-        /* Read the framebuffer from guest RAM (bounds-checked here) and encode
-         * it as a PNG data URI. A bad or unavailable region drops the node
-         * rather than emitting a broken reference. */
-        uint64_t extent = (uint64_t)n->geo.image.stride * n->geo.image.h;
-        const uint8_t *px = dd->gpa
-            ? dd->gpa(dd->gpa_ctx, n->geo.image.gpa, extent) : NULL;
-        if (!px)
-            break;
-        char *b64 = png_base64_rgba(px, n->geo.image.w, n->geo.image.h,
-                                    (int)n->geo.image.stride);
-        if (!b64)
+        /* Encode the framebuffer only when its pixels have changed; otherwise
+         * reuse the cached PNG so an unchanged image costs nothing to re-emit.
+         * Reading the pixels is bounds-checked; a bad region drops the node. */
+        if (n->img_dirty || !n->png_cache) {
+            uint64_t extent = (uint64_t)n->geo.image.stride * n->geo.image.h;
+            const uint8_t *px = dd->gpa
+                ? dd->gpa(dd->gpa_ctx, n->geo.image.gpa, extent) : NULL;
+            char *b64 = px ? png_base64_rgba(px, n->geo.image.w, n->geo.image.h,
+                                             (int)n->geo.image.stride) : NULL;
+            free(n->png_cache);
+            n->png_cache = b64;
+            n->img_dirty = 0;
+        }
+        if (!n->png_cache)
             break;
         sb_printf(b, "<image id=\"qu-%d-%u\" x=\"%d\" y=\"%d\""
                   " width=\"%u\" height=\"%u\"",
@@ -1227,13 +1286,30 @@ emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n)
                   n->geo.image.w, n->geo.image.h);
         emit_common(b, n);
         sb_puts(b, " xlink:href=\"data:image/png;base64,");
-        sb_puts(b, b64);
+        sb_puts(b, n->png_cache);
         sb_puts(b, "\"/>");
-        free(b64);
         break;
     }
     default:
         break;
+    }
+}
+
+/* Canvas size: enough to contain every surface. Surfaces are the forest roots,
+ * so walk the root list rather than scanning the whole table. */
+static void
+canvas_size(struct drawdev *dd, int *cw, int *ch)
+{
+    *cw = 1;
+    *ch = 1;
+    for (int s = dd->root_first; s >= 0; s = dd->nodes[s].next_sib) {
+        const struct dnode *n = &dd->nodes[s];
+        int right = n->geo.surface.x + n->geo.surface.w;
+        int bottom = n->geo.surface.y + n->geo.surface.h;
+        if (right > *cw)
+            *cw = right;
+        if (bottom > *ch)
+            *ch = bottom;
     }
 }
 
@@ -1242,18 +1318,8 @@ emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n)
 static char *
 serialize(struct drawdev *dd)
 {
-    /* Canvas size: enough to contain every surface. Surfaces are the forest
-     * roots, so walk the root list rather than scanning the whole table. */
-    int cw = 1, ch = 1;
-    for (int s = dd->root_first; s >= 0; s = dd->nodes[s].next_sib) {
-        const struct dnode *n = &dd->nodes[s];
-        int right = n->geo.surface.x + n->geo.surface.w;
-        int bottom = n->geo.surface.y + n->geo.surface.h;
-        if (right > cw)
-            cw = right;
-        if (bottom > ch)
-            ch = bottom;
-    }
+    int cw, ch;
+    canvas_size(dd, &cw, &ch);
 
     struct sbuf b = { 0 };
     sb_printf(&b, "<svg xmlns=\"http://www.w3.org/2000/svg\""
@@ -1263,6 +1329,55 @@ serialize(struct drawdev *dd)
     emit_siblings(&b, dd, dd->root_first);
     sb_puts(&b, "</svg>");
     return b.p;
+}
+
+/* Walk the forest in document order emitting the changed nodes as delta
+ * records. A changed node's whole fragment (its subtree) is emitted once, so
+ * descendants it already covers are suppressed. */
+static void
+emit_changes(struct sbuf *b, struct drawdev *dd, int head, int suppressed)
+{
+    for (int s = head; s >= 0; s = dd->nodes[s].next_sib) {
+        struct dnode *n = &dd->nodes[s];
+        int emitted = 0;
+        if (!suppressed && n->change) {
+            if (n->change == 1)
+                sb_printf(b, "\nN %u ", n->parent);     /* add under parent */
+            else
+                sb_puts(b, "\nU ");                      /* replace by id */
+            emit_node(b, dd, n);
+            emitted = 1;
+        }
+        emit_changes(b, dd, n->first_child, suppressed || emitted);
+    }
+}
+
+/* Build an incremental update: a canvas record, the removals, then the changed
+ * nodes. Records are newline-separated; fragments contain no newlines. Returns
+ * a malloc'd string the caller frees. */
+static char *
+build_delta(struct drawdev *dd)
+{
+    int cw, ch;
+    canvas_size(dd, &cw, &ch);
+
+    struct sbuf b = { 0 };
+    sb_printf(&b, "!%d %d", cw, ch);
+    for (int i = 0; i < dd->nremoved; i++)
+        sb_printf(&b, "\nR %u", dd->removed_ids[i]);
+    emit_changes(&b, dd, dd->root_first, 0);
+    return b.p;
+}
+
+/* Clear the per-submit change set once the update has been built. */
+static void
+clear_changes(struct drawdev *dd)
+{
+    for (int i = 0; i < DRAW_MAXNODES; i++)
+        dd->nodes[i].change = 0;
+    dd->nremoved = 0;
+    dd->nchanged = 0;
+    dd->delta_overflow = 0;
 }
 
 /****************************************************************
@@ -1377,13 +1492,25 @@ handle_submit(struct drawdev *dd, struct jotun_draw *chan)
         fprintf(stderr, "[draw bench] nodes=%d svg=%zu apply=%ld us serialize=%ld us\n",
                 dd->nnodes, svg ? strlen(svg) : 0, au, su);
     }
+
+    /* Push the authored scene. The full document keeps new browsers correct and
+     * backs the on-disk snapshot; a small change set also produces a delta the
+     * front end sends in place of the whole document. A large change set or an
+     * overflow of tracked removals falls back to the full push. */
     if (svg) {
+        char *delta = NULL;
+        int overflow = dd->delta_overflow
+            || dd->nchanged + dd->nremoved > DRAW_DELTA_MAX;
+        if (!overflow && (dd->nchanged || dd->nremoved))
+            delta = build_delta(dd);
         if (dd->ws)
-            drawws_push(dd->ws, svg);
+            drawws_update(dd->ws, svg, delta);
         if (dd->svg_path)
             dump_svg(dd, svg);
+        free(delta);
         free(svg);
     }
+    clear_changes(dd);
 
     if (rc != 0) {
         chan->status = DRAW_EINVAL;

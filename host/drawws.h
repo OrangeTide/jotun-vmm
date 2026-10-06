@@ -27,10 +27,13 @@ typedef void (*drawws_event_fn)(void *ctx, uint32_t node, uint16_t type,
  * each inbound event. Returns NULL on failure. */
 struct drawws *drawws_start(int port, drawws_event_fn on_event, void *ctx);
 
-/* Replace the current scene and send it to the connected browser, if any.
- * Thread-safe; svg is copied. A browser that connects later receives the most
- * recent scene as its first paint. */
-void drawws_push(struct drawws *w, const char *svg);
+/* Update the browser. full is the whole-document SVG; it is stored (copied) as
+ * the snapshot a later-connecting browser receives as its first paint. delta,
+ * when non-NULL, is an incremental update sent in place of the full document to
+ * a browser that already has a baseline. If deltas cannot be sent in order (a
+ * previous one is still pending, or the browser has no baseline), the full
+ * document is sent instead, so the browser never drifts. Thread-safe. */
+void drawws_update(struct drawws *w, const char *full, const char *delta);
 
 /* Stop the server thread and close all sockets. */
 void drawws_stop(struct drawws *w);

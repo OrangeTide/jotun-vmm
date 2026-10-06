@@ -352,20 +352,32 @@ draw_demo(void)
     draw_flush();
     con_puts("draw: scene submitted, waiting for event\n");
 
-    struct draw_event ev;
-    if (draw_next_event(&ev) != 0) {
-        con_puts("draw: event error\n");
-        return;
+    /* Event loop: each click on the rect toggles its fill and re-submits, which
+     * the host sends to the browser as an incremental delta rather than a full
+     * document. A close event ends the demo. */
+    static const uint32_t fills[] = { 0x3366cc, 0xcc6633 };
+    int which = 0;
+    for (;;) {
+        struct draw_event ev;
+        if (draw_next_event(&ev) != 0) {
+            con_puts("draw: event error\n");
+            return;
+        }
+        con_puts("draw: event node ");
+        con_putu(ev.node);
+        con_puts(" type ");
+        con_putu(ev.type);
+        con_putc('\n');
+
+        if (ev.type == DEV_CLOSE)
+            break;
+        if (ev.type == DEV_CLICK && ev.node == 2) {
+            which ^= 1;
+            draw_set(2, DSA_FILL, fills[which]);
+            draw_flush();
+            con_puts("draw: delta submitted\n");
+        }
     }
-    con_puts("draw: event node ");
-    con_putu(ev.node);
-    con_puts(" type ");
-    con_putu(ev.type);
-    if (ev.vlen >= 2) {
-        con_puts(" norm ");
-        con_putu(draw_event_norm(&ev, 0));
-    }
-    con_putc('\n');
     con_puts("draw: done\n");
 }
 

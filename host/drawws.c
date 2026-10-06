@@ -36,9 +36,12 @@ struct drawws {
     int ws_fd;                 /* connected browser, or -1 */
     int nudge[2];              /* self-pipe: [0] read in poll, [1] written to */
     pthread_t thread;
-    pthread_mutex_t lock;      /* guards latest and dirty */
-    char *latest;              /* most recent scene SVG, malloc'd */
-    int dirty;                 /* latest not yet sent to ws_fd */
+    pthread_mutex_t lock;      /* guards latest, pending, dirty, force_full */
+    char *latest;              /* most recent full scene SVG, for new browsers */
+    char *pending;             /* one delta waiting to be sent, or NULL */
+    int force_full;            /* send the full document rather than a delta */
+    int dirty;                 /* an update is waiting for the server thread */
+    int has_baseline;          /* the browser has received a full document */
     volatile int stop;
     drawws_event_fn on_event;
     void *ctx;
@@ -221,16 +224,23 @@ static const char CLIENT_HTML[] =
 "function nodeId(el){var m=/^qu-\\d+-(\\d+)$/.exec(el.id||'');return m?+m[1]:0;}\n"
 "function send(node,type,value){if(ws&&ws.readyState===1)\n"
 "  ws.send(node+' '+type+(value!==undefined?'\\n'+value:''));}\n"
-"function wire(root){\n"
-"  root.querySelectorAll('[data-qu-listen=\\'click\\']').forEach(function(el){\n"
-"    el.style.cursor='pointer';\n"
-"    el.addEventListener('click',function(e){e.stopPropagation();send(nodeId(el),1);});\n"
-"  });\n"
-"  root.querySelectorAll('[data-qu-listen=\\'close\\']').forEach(function(el){\n"
-"    el.style.cursor='pointer';\n"
+"function wireOne(el){\n"
+"  if(!el.getAttribute||el._w)return;\n"
+"  var l=el.getAttribute('data-qu-listen');\n"
+"  if(l==='click'){el._w=1;el.style.cursor='pointer';\n"
+"    el.addEventListener('click',function(e){e.stopPropagation();send(nodeId(el),1);});}\n"
+"  else if(l==='close'){el._w=1;el.style.cursor='pointer';\n"
 "    el.addEventListener('click',function(e){e.stopPropagation();\n"
-"      var s=el.closest('.qu-surface');send(s?nodeId(s):0,2);});\n"
-"  });\n"
+"      var s=el.closest('.qu-surface');send(s?nodeId(s):0,2);});}\n"
+"}\n"
+"function wireTree(root){wireOne(root);\n"
+"  if(root.querySelectorAll)root.querySelectorAll('[data-qu-listen]').forEach(wireOne);}\n"
+"function parseFrag(frag){\n"
+"  var doc=new DOMParser().parseFromString('<svg xmlns=\\'http://www.w3.org/2000/svg\\'"
+" xmlns:xlink=\\'http://www.w3.org/1999/xlink\\'>'+frag+'</svg>','image/svg+xml');\n"
+"  var r=doc.documentElement;\n"
+"  if(!r||r.getElementsByTagName('parsererror').length)return null;\n"
+"  return r.firstChild?document.importNode(r.firstChild,true):null;\n"
 "}\n"
 "function render(text){\n"
 "  var doc=new DOMParser().parseFromString(text,'image/svg+xml');\n"
@@ -239,8 +249,23 @@ static const char CLIENT_HTML[] =
 "  var el=document.importNode(root,true);\n"
 "  display.replaceChildren.apply(display,[].slice.call(el.childNodes));\n"
 "  if(el.getAttribute('viewBox'))display.setAttribute('viewBox',el.getAttribute('viewBox'));\n"
-"  wire(display);\n"
+"  wireTree(display);\n"
 "}\n"
+"function applyDelta(msg){\n"
+"  var lines=msg.split('\\n');\n"
+"  for(var i=0;i<lines.length;i++){var ln=lines[i];if(!ln)continue;var c=ln[0];\n"
+"    if(c==='!'){var wh=ln.slice(1).split(' ');\n"
+"      display.setAttribute('viewBox','0 0 '+wh[0]+' '+wh[1]);}\n"
+"    else if(c==='R'){var rel=document.getElementById('qu-0-'+ln.slice(2).trim());\n"
+"      if(rel)rel.remove();}\n"
+"    else if(c==='N'){var sp=ln.indexOf(' ',2);var pid=ln.slice(2,sp);var el=parseFrag(ln.slice(sp+1));\n"
+"      if(el){var p=pid==='0'?display:document.getElementById('qu-0-'+pid);\n"
+"        if(p){p.appendChild(el);wireTree(el);}}}\n"
+"    else if(c==='U'){var ue=parseFrag(ln.slice(2));\n"
+"      if(ue){var old=document.getElementById(ue.id);if(old){old.replaceWith(ue);wireTree(ue);}}}\n"
+"  }\n"
+"}\n"
+"function onMessage(data){if(data.charAt(0)==='!')applyDelta(data);else render(data);}\n"
 /* Drag (data-qu-drag/track -> DEV_SCROLL=3) and xy (data-qu-xy -> DEV_XY=4). */
 "var drag=null,xy=null;\n"
 "display.addEventListener('mousedown',function(e){\n"
@@ -272,7 +297,7 @@ static const char CLIENT_HTML[] =
 "function connect(){\n"
 "  ws=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/ws');\n"
 "  ws.onopen=function(){stat(true);};\n"
-"  ws.onmessage=function(e){render(e.data);};\n"
+"  ws.onmessage=function(e){onMessage(e.data);};\n"
 "  ws.onclose=function(){stat(false);setTimeout(connect,1000);};\n"
 "  ws.onerror=function(){ws.close();};\n"
 "}\n"
@@ -358,22 +383,64 @@ ws_close(struct drawws *w)
         w->ws_fd = -1;
     }
     w->rlen = 0;                /* next connection starts with a clean buffer */
+    w->has_baseline = 0;        /* the next browser needs a full document */
 }
 
-/* Send the stored latest scene to the browser, clearing the dirty flag. */
+/* Send the full document to the browser and mark it as the baseline. Used for a
+ * new connection's first paint. */
 static void
-send_latest(struct drawws *w)
+send_full(struct drawws *w)
 {
     pthread_mutex_lock(&w->lock);
     char *svg = w->latest ? strdup(w->latest) : NULL;
-    w->dirty = 0;
+    /* The snapshot reflects the complete current state, so any delta queued
+     * before this browser had a baseline is stale and must be dropped, or it
+     * would force the next update to a full push. */
+    free(w->pending);
+    w->pending = NULL;
+    w->force_full = 0;
     pthread_mutex_unlock(&w->lock);
 
     if (svg) {
         if (w->ws_fd >= 0 && ws_write_text(w->ws_fd, svg, strlen(svg)) < 0)
             ws_close(w);
+        else
+            w->has_baseline = 1;
         free(svg);
     }
+}
+
+/* Send a pending update: a delta when the browser has a baseline and in-order
+ * delivery is possible, else the full document (which re-establishes the
+ * baseline). Runs on the server thread, so it alone touches ws_fd. */
+static void
+send_update(struct drawws *w)
+{
+    pthread_mutex_lock(&w->lock);
+    char *delta = w->pending;
+    w->pending = NULL;
+    int full_only = w->force_full || !w->has_baseline;
+    w->force_full = 0;
+    char *full = (full_only && w->latest) ? strdup(w->latest) : NULL;
+    w->dirty = 0;
+    pthread_mutex_unlock(&w->lock);
+
+    if (w->ws_fd < 0) {
+        free(delta);
+        free(full);
+        return;
+    }
+    if (!full_only && delta) {
+        if (ws_write_text(w->ws_fd, delta, strlen(delta)) < 0)
+            ws_close(w);
+    } else if (full) {
+        if (ws_write_text(w->ws_fd, full, strlen(full)) < 0)
+            ws_close(w);
+        else
+            w->has_baseline = 1;
+    }
+    free(delta);
+    free(full);
 }
 
 static void
@@ -409,7 +476,7 @@ accept_conn(struct drawws *w)
         set_timeo(cfd, SO_SNDTIMEO, 5);     /* but a stuck write must not wedge us */
         ws_close(w);            /* one browser at a time: replace the old */
         w->ws_fd = cfd;
-        send_latest(w);         /* first paint */
+        send_full(w);           /* first paint, establishes the baseline */
     } else {
         serve_html(cfd);
         close(cfd);
@@ -611,7 +678,7 @@ run_server(void *arg)
                 dirty = w->dirty;
                 pthread_mutex_unlock(&w->lock);
                 if (dirty)
-                    send_latest(w);
+                    send_update(w);
             }
         }
         if (i_ws >= 0 && (fds[i_ws].revents & (POLLIN | POLLHUP | POLLERR)))
@@ -681,16 +748,30 @@ fail:
 }
 
 void
-drawws_push(struct drawws *w, const char *svg)
+drawws_update(struct drawws *w, const char *full, const char *delta)
 {
-    if (!w || !svg)
+    if (!w || !full)
         return;
-    char *copy = strdup(svg);
-    if (!copy)
+    char *fcopy = strdup(full);
+    if (!fcopy)
         return;
+    char *dcopy = delta ? strdup(delta) : NULL;
+
     pthread_mutex_lock(&w->lock);
     free(w->latest);
-    w->latest = copy;
+    w->latest = fcopy;
+    if (w->pending) {
+        /* A delta is already queued and unsent; two deltas cannot be coalesced,
+         * so fall back to sending the current full document. */
+        free(w->pending);
+        w->pending = NULL;
+        free(dcopy);
+        w->force_full = 1;
+    } else if (dcopy) {
+        w->pending = dcopy;
+    } else {
+        w->force_full = 1;
+    }
     w->dirty = 1;
     pthread_mutex_unlock(&w->lock);
 
@@ -716,6 +797,7 @@ drawws_stop(struct drawws *w)
     close(w->nudge[0]);
     close(w->nudge[1]);
     free(w->latest);
+    free(w->pending);
     pthread_mutex_destroy(&w->lock);
     free(w);
 }

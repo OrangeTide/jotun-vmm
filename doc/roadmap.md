@@ -503,11 +503,26 @@ Goal: raster content where vector does not fit.
   the security point of §9.2. The `pixel` guest demo software-renders a
   wireframe cube (integer Bresenham, no FP) into the framebuffer and shows it
   under a window; verified by rendering the authored SVG. Acceptance met.
-- Remaining: dirty-rectangle partial updates (re-encode and re-transmit only
-  changed regions rather than the whole frame each flush, which is coupled to
-  the incremental changed-node transmit path the SVG side also wants), and the
-  optional guest-side Triton (Glide subset) rendering into the framebuffer. Real
-  PNG compression is done (fixed-Huffman LZ77 DEFLATE in `host/png.c`).
+- M7.2 (done): incremental changed-node transmit. Instead of re-sending the
+  whole document on every SUBMIT, the host tracks per-node change state while
+  applying the op stream (added, modified, removed) and, after the browser has
+  a full-document baseline, sends a small delta that names only what changed.
+  The delta is a line-oriented text message: a `!<cw> <ch>` header carrying the
+  canvas size, then one record per change, `R <id>` to remove a node,
+  `N <parent> <fragment>` to add one, and `U <fragment>` to replace one in
+  place. The browser applies records against the live DOM by element id. When a
+  delta cannot be delivered in order (the browser has no baseline yet, a prior
+  delta is still queued, or the change set overflows the per-submit cap), the
+  host falls back to the full document, so the browser never drifts. A DOP_IMAGE
+  node re-encodes its PNG only when its pixels are marked dirty. Measured on the
+  2D demo, a single-attribute SET goes out as a 226 byte delta in place of the
+  1144 byte full document. This is the changed-node path M6.6 noted as the lever
+  for large scenes under steady mutation.
+- Remaining: dirty-rectangle partial updates for the pixel path (re-encode and
+  re-transmit only changed regions of a framebuffer rather than the whole frame
+  each flush), and the optional guest-side Triton (Glide subset) rendering into
+  the framebuffer. Real PNG compression is done (fixed-Huffman LZ77 DEFLATE in
+  `host/png.c`).
 
 Acceptance: a guest software-renders a wireframe into a framebuffer node
 composited under the 2D chrome.
