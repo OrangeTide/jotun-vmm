@@ -242,6 +242,15 @@ draw_image(uint32_t id, uint32_t parent, int x, int y, int w, int h,
 }
 
 void
+draw_image_damage(uint32_t id, int x, int y, int w, int h)
+{
+    need();
+    du8(DOP_IMAGE_DAMAGE); du32(id);
+    du16((uint16_t)x); du16((uint16_t)y);
+    du16((uint16_t)w); du16((uint16_t)h);
+}
+
+void
 draw_set(uint32_t id, int attr, long value)
 {
     need();

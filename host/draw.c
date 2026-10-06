@@ -44,6 +44,7 @@
 #define DRAW_MAXSEG    512      /* segments in a path */
 #define DRAW_IDHASH    8192     /* id index buckets (power of two, > 2x nodes) */
 #define DRAW_IMG_MAXDIM  2048   /* max image width or height */
+#define FB_MAXPATCH      16     /* overlay patches before a frame is re-based */
 #define DRAW_IMG_MAXBYTES (4u * 1024 * 1024)    /* max framebuffer extent */
 #define DRAW_DELTA_MAX   128    /* changed/removed nodes before a full push */
 
@@ -121,8 +122,22 @@ struct dnode {
     int      hidden;            /* SET VISIBLE 0: emitted as display:none */
 
     uint8_t  change;            /* this submit: 0 none, 1 added, 2 modified */
-    int      img_dirty;         /* image pixels changed; re-encode on next emit */
-    char    *png_cache;         /* last base64 PNG for an image node */
+
+    /* Pixel path. The framebuffer is shown as a base image plus small overlay
+     * patches for damaged regions, so an unchanged background is not re-encoded
+     * or re-sent each frame. Patches accumulate until a cap, then the frame is
+     * re-based (one full re-encode) to bound the DOM and the total bytes. */
+    int      img_dirty;         /* re-encode the whole frame (new or re-based) */
+    char    *png_cache;         /* base64 PNG of the base frame */
+    struct fbpatch {
+        uint16_t x, y, w, h;    /* region in image pixels */
+        char    *b64;           /* base64 PNG of the cropped region */
+    } fb_patch[FB_MAXPATCH];
+    int      fb_npatch;         /* overlay patches since the last re-base */
+    uint32_t fb_patch_area;     /* total patched pixels since the last re-base */
+    uint16_t dmg_x0, dmg_y0, dmg_x1, dmg_y1; /* union damage rect this submit */
+    int      ndmg;              /* damage rects accumulated this submit */
+    int      fb_delta_new;      /* patch index to send as an N delta, or -1 */
 
     /* Tree links (slot indices, -1 for none). Children are kept in creation
      * order so serialization is a single O(n) walk, no per-parent scan. */
@@ -417,6 +432,7 @@ node_new(struct drawdev *dd, uint32_t id, uint8_t type, uint32_t parent)
     n->seq = dd->seqctr++;
     n->first_child = n->last_child = -1;
     n->prev_sib = n->next_sib = -1;
+    n->fb_delta_new = -1;
     n->change = 1;              /* added this submit */
     dd->nchanged++;
     dd->nnodes++;
@@ -451,10 +467,16 @@ node_remove(struct drawdev *dd, uint32_t id)
     free(n->pts);
     free(n->segs);
     free(n->png_cache);
+    for (int i = 0; i < n->fb_npatch; i++)
+        free(n->fb_patch[i].b64);
     n->text = NULL;
     n->pts = NULL;
     n->segs = NULL;
     n->png_cache = NULL;
+    n->fb_npatch = 0;
+    n->fb_patch_area = 0;
+    n->ndmg = 0;
+    n->fb_delta_new = -1;
     n->in_use = 0;
     dd->freelist[dd->nfree++] = s;
     dd->nnodes--;
@@ -901,7 +923,38 @@ apply(struct drawdev *dd, const uint8_t *buf, uint32_t len, uint32_t *click_node
             n->geo.image.fmt = fmt;
             n->geo.image.stride = stride;
             n->geo.image.gpa = gpa;
-            n->img_dirty = 1;
+            n->img_dirty = 1;   /* re-base the whole frame */
+            n->ndmg = 0;        /* a full submit supersedes pending damage */
+            break;
+        }
+        case DOP_IMAGE_DAMAGE: {
+            uint32_t id = rd_u32(&r);
+            uint16_t x = rd_u16(&r), y = rd_u16(&r);
+            uint16_t w = rd_u16(&r), h = rd_u16(&r);
+            if (r.err)
+                return -1;
+            int slot = find(dd, id);
+            if (slot < 0 || dd->nodes[slot].type != DOP_IMAGE)
+                return -1;
+            struct dnode *n = &dd->nodes[slot];
+            /* Clamp the region to the image; an empty region is a no-op. */
+            uint16_t iw = n->geo.image.w, ih = n->geo.image.h;
+            if (x >= iw || y >= ih || w == 0 || h == 0)
+                break;
+            uint32_t x1 = (uint32_t)x + w, y1 = (uint32_t)y + h;
+            if (x1 > iw) x1 = iw;
+            if (y1 > ih) y1 = ih;
+            if (n->ndmg == 0) {
+                n->dmg_x0 = x; n->dmg_y0 = y;
+                n->dmg_x1 = (uint16_t)x1; n->dmg_y1 = (uint16_t)y1;
+            } else {
+                if (x < n->dmg_x0) n->dmg_x0 = x;
+                if (y < n->dmg_y0) n->dmg_y0 = y;
+                if (x1 > n->dmg_x1) n->dmg_x1 = (uint16_t)x1;
+                if (y1 > n->dmg_y1) n->dmg_y1 = (uint16_t)y1;
+            }
+            n->ndmg++;
+            mark_modified(dd, slot);
             break;
         }
         case DOP_SET_TEXT: {
@@ -1145,6 +1198,18 @@ emit_common(struct sbuf *b, const struct dnode *n)
         sb_puts(b, " display=\"none\"");
 }
 
+/* Emit one framebuffer overlay patch: a cropped image positioned within the
+ * image node's translated group, at the region's pixel offset. */
+static void
+emit_fb_patch(struct sbuf *b, const struct fbpatch *p)
+{
+    sb_printf(b, "<image x=\"%u\" y=\"%u\" width=\"%u\" height=\"%u\""
+              " xlink:href=\"data:image/png;base64,",
+              p->x, p->y, p->w, p->h);
+    sb_puts(b, p->b64);
+    sb_puts(b, "\"/>");
+}
+
 static void emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n);
 
 /* Emit a sibling list in creation order, following the next links. O(children),
@@ -1265,33 +1330,118 @@ emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n)
         sb_puts(b, "</text>");
         break;
     case DOP_IMAGE: {
-        /* Encode the framebuffer only when its pixels have changed; otherwise
-         * reuse the cached PNG so an unchanged image costs nothing to re-emit.
-         * Reading the pixels is bounds-checked; a bad region drops the node. */
-        if (n->img_dirty || !n->png_cache) {
-            uint64_t extent = (uint64_t)n->geo.image.stride * n->geo.image.h;
-            const uint8_t *px = dd->gpa
-                ? dd->gpa(dd->gpa_ctx, n->geo.image.gpa, extent) : NULL;
-            char *b64 = px ? png_base64_rgba(px, n->geo.image.w, n->geo.image.h,
-                                             (int)n->geo.image.stride) : NULL;
-            free(n->png_cache);
-            n->png_cache = b64;
-            n->img_dirty = 0;
-        }
+        /* The pixels were resolved before serialization (fb_resolve). Emit the
+         * node as a group holding the base image and any overlay patches, so a
+         * later submit can append a patch under this same group. A node with no
+         * base (an out-of-range buffer) is dropped. */
         if (!n->png_cache)
             break;
-        sb_printf(b, "<image id=\"qu-%d-%u\" x=\"%d\" y=\"%d\""
-                  " width=\"%u\" height=\"%u\"",
-                  DRAW_GUEST, n->id, n->geo.image.x, n->geo.image.y,
-                  n->geo.image.w, n->geo.image.h);
+        sb_printf(b, "<g id=\"qu-%d-%u\" transform=\"translate(%d,%d)\"",
+                  DRAW_GUEST, n->id, n->geo.image.x, n->geo.image.y);
         emit_common(b, n);
-        sb_puts(b, " xlink:href=\"data:image/png;base64,");
+        sb_printf(b, "><image x=\"0\" y=\"0\" width=\"%u\" height=\"%u\""
+                  " xlink:href=\"data:image/png;base64,",
+                  n->geo.image.w, n->geo.image.h);
         sb_puts(b, n->png_cache);
         sb_puts(b, "\"/>");
+        for (int i = 0; i < n->fb_npatch; i++)
+            emit_fb_patch(b, &n->fb_patch[i]);
+        sb_puts(b, "</g>");
         break;
     }
     default:
         break;
+    }
+}
+
+/****************************************************************
+ * Pixel path: resolve framebuffers into base images and patches
+ ****************************************************************/
+
+/* Read an image node's pixels from guest RAM, bounds-checked through the
+ * address translator. Returns NULL if the declared buffer is out of range. */
+static const uint8_t *
+fb_pixels(struct drawdev *dd, struct dnode *n)
+{
+    uint64_t extent = (uint64_t)n->geo.image.stride * n->geo.image.h;
+    return dd->gpa ? dd->gpa(dd->gpa_ctx, n->geo.image.gpa, extent) : NULL;
+}
+
+/* Re-encode the whole frame as the base image and drop every overlay patch. */
+static void
+fb_rebase(struct drawdev *dd, struct dnode *n)
+{
+    const uint8_t *px = fb_pixels(dd, n);
+    char *b64 = px ? png_base64_rgba(px, n->geo.image.w, n->geo.image.h,
+                                     (int)n->geo.image.stride) : NULL;
+    free(n->png_cache);
+    n->png_cache = b64;
+    for (int i = 0; i < n->fb_npatch; i++) {
+        free(n->fb_patch[i].b64);
+        n->fb_patch[i].b64 = NULL;
+    }
+    n->fb_npatch = 0;
+    n->fb_patch_area = 0;
+}
+
+/* Resolve one image node's pixels for this submit into a base image and overlay
+ * patches, and record how the delta should carry the change:
+ *   fb_delta_new >= 0   one appended patch, sent as an N under the node
+ *   fb_delta_new == -1  the whole node (re-based or newly added), sent in full
+ * Runs once per submit, before the scene is serialized. */
+static void
+fb_resolve(struct drawdev *dd, struct dnode *n)
+{
+    n->fb_delta_new = -1;
+    if (n->img_dirty || !n->png_cache) {
+        fb_rebase(dd, n);
+        n->img_dirty = 0;
+        n->ndmg = 0;
+        return;
+    }
+    if (n->ndmg == 0)
+        return;
+    uint16_t rx = n->dmg_x0, ry = n->dmg_y0;
+    uint16_t rw = (uint16_t)(n->dmg_x1 - n->dmg_x0);
+    uint16_t rh = (uint16_t)(n->dmg_y1 - n->dmg_y0);
+    n->ndmg = 0;
+    uint32_t area = (uint32_t)rw * rh;
+    uint32_t frame = (uint32_t)n->geo.image.w * n->geo.image.h;
+    /* Past the patch cap, or once the accumulated patch area would reach a full
+     * frame, re-base: one full re-encode is cheaper than more overlays and it
+     * keeps the DOM bounded. A read failure falls back to a re-base too. */
+    const uint8_t *px;
+    if (n->fb_npatch >= FB_MAXPATCH || n->fb_patch_area + area >= frame
+        || !(px = fb_pixels(dd, n))) {
+        fb_rebase(dd, n);
+        return;
+    }
+    uint32_t stride = n->geo.image.stride;
+    const uint8_t *crop = px + (size_t)ry * stride + (size_t)rx * 4;
+    char *b64 = png_base64_rgba(crop, rw, rh, (int)stride);
+    if (!b64) {
+        fb_rebase(dd, n);
+        return;
+    }
+    int i = n->fb_npatch++;
+    n->fb_patch[i].x = rx;
+    n->fb_patch[i].y = ry;
+    n->fb_patch[i].w = rw;
+    n->fb_patch[i].h = rh;
+    n->fb_patch[i].b64 = b64;
+    n->fb_patch_area += area;
+    n->fb_delta_new = i;
+}
+
+/* Resolve every image node that needs it before the scene is serialized. */
+static void
+fb_resolve_all(struct drawdev *dd)
+{
+    for (int i = 0; i < DRAW_MAXNODES; i++) {
+        struct dnode *n = &dd->nodes[i];
+        if (n->in_use && n->type == DOP_IMAGE
+            && (n->img_dirty || n->ndmg || !n->png_cache))
+            fb_resolve(dd, n);
     }
 }
 
@@ -1341,11 +1491,18 @@ emit_changes(struct sbuf *b, struct drawdev *dd, int head, int suppressed)
         struct dnode *n = &dd->nodes[s];
         int emitted = 0;
         if (!suppressed && n->change) {
-            if (n->change == 1)
+            if (n->type == DOP_IMAGE && n->change == 2 && n->fb_delta_new >= 0) {
+                /* Only a region changed: append the patch under the image group
+                 * rather than re-sending the whole frame. */
+                sb_printf(b, "\nN %u ", n->id);
+                emit_fb_patch(b, &n->fb_patch[n->fb_delta_new]);
+            } else if (n->change == 1) {
                 sb_printf(b, "\nN %u ", n->parent);     /* add under parent */
-            else
+                emit_node(b, dd, n);
+            } else {
                 sb_puts(b, "\nU ");                      /* replace by id */
-            emit_node(b, dd, n);
+                emit_node(b, dd, n);
+            }
             emitted = 1;
         }
         emit_changes(b, dd, n->first_child, suppressed || emitted);
@@ -1373,8 +1530,10 @@ build_delta(struct drawdev *dd)
 static void
 clear_changes(struct drawdev *dd)
 {
-    for (int i = 0; i < DRAW_MAXNODES; i++)
+    for (int i = 0; i < DRAW_MAXNODES; i++) {
         dd->nodes[i].change = 0;
+        dd->nodes[i].fb_delta_new = -1;
+    }
     dd->nremoved = 0;
     dd->nchanged = 0;
     dd->delta_overflow = 0;
@@ -1479,6 +1638,10 @@ handle_submit(struct drawdev *dd, struct jotun_draw *chan)
 
     if (dd->bench)
         clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    /* Resolve framebuffers into base images and overlay patches before the
+     * scene is authored, so a region-only change re-encodes just that region. */
+    fb_resolve_all(dd);
 
     /* Author the scene once: push it to the browser and, when requested, drop a
      * snapshot to disk. A partial scene from a rejected stream is still shown,

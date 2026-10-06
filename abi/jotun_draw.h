@@ -55,6 +55,7 @@ enum {
     DOP_PATH     = 0x15,    /* id parent n:u16 seg[n] style */
     DOP_TEXT     = 0x16,    /* id parent x:i16 y:i16 size:u16 s:str style */
     DOP_IMAGE    = 0x17,    /* id parent x:i16 y:i16 w:u16 h:u16 fmt:u8 stride:u32 gpa:u64 */
+    DOP_IMAGE_DAMAGE = 0x18,/* id:u32 x:u16 y:u16 w:u16 h:u16 (region in image pixels) */
     DOP_SET      = 0x20,    /* id:u32 attr:u16 value (typed by attr) */
     DOP_SET_TEXT = 0x21,    /* id:u32 s:str */
     DOP_REMOVE   = 0x22,    /* id:u32 */
@@ -107,6 +108,12 @@ enum {
 enum {
     DIMG_RGBA8888 = 0,
 };
+
+/* DOP_IMAGE_DAMAGE marks a sub-rectangle of an existing image node changed since
+ * its last submit, so the host re-encodes and re-sends only that region instead
+ * of the whole frame. Coordinates are in image pixels, (0,0) at the top-left of
+ * the image. The region is clamped to the image bounds. Re-submitting DOP_IMAGE
+ * for the same id instead re-bases the whole frame. */
 
 /* Interaction kinds for DOP_INTERACT. */
 enum {

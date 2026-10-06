@@ -108,6 +108,10 @@ Shapes (each ends with a style block):
   The host validates the geometry, reads the pixels from guest memory through a
   bounds-checked translation, encodes them as a PNG, and emits an `<image>` data
   URI. No pixel command stream crosses into the host, only a declared buffer.
+- `0x18 IMAGE_DAMAGE {id:u32, x:u16, y:u16, w:u16, h:u16}`
+  Mark a sub-region of an existing image changed since its last submit, so the
+  host re-encodes and re-sends only that region. Coordinates are image pixels,
+  `(0,0)` at the top-left, clamped to the image. See "Incremental updates".
 
 Mutation:
 
@@ -261,6 +265,25 @@ marked dirty, not on every unrelated SUBMIT.
 Measured on the 2D demo, toggling one rect's fill with a single SET goes out as
 a 226 byte delta in place of the 1144 byte full document.
 
+### Pixel path: dirty rectangles (M7.3)
+
+The same delta path carries partial updates to a framebuffer. An image node is
+authored as a group holding a base `<image>` (the last full frame) plus zero or
+more small overlay `<image>` patches, one per changed region. When the guest
+reports a damaged region with `IMAGE_DAMAGE`, the host crops that region, encodes
+only it, and appends it as a patch under the group with an `N` record. The crop
+needs no copy: the encoder is pointed at the region's byte offset and reads it
+with the framebuffer's own row stride.
+
+Patches accumulate until a cap, 16 per image, or until the patched area would
+reach a full frame. At that point the host re-bases, one full re-encode replaces
+the whole group and clears the overlays, which bounds the DOM and the total
+bytes. Re-submitting `IMAGE` for the same id also re-bases. Measured on the pixel
+demo, stamping a 32x32 square into a 256x192 frame goes out as a 242 byte patch
+in place of the 3911 byte full frame; five stamps cost 1211 bytes against about
+19.5 KB of full frames. The pixels still never cross the channel, only the
+declared buffer and the declared damage rect.
+
 On bounding the guest-to-host op rate (the earlier open question): the submit
 path is synchronous. Each SUBMIT occupies the vcpu until the host returns, so
 the guest is naturally backpressured and cannot outrun the host. An explicit
@@ -275,9 +298,9 @@ Out of scope for the M6 acceptance test, candidates for M6.5 vocabulary breadth:
 - gradients and patterns (would be a fixed, parameterized set, never raw defs)
 - richer text (spans, alignment, wrapping)
 - richer raster: the framebuffer node ships with real PNG compression (M7.1),
-  and changed-node deltas avoid re-sending it when unrelated nodes change
-  (M7.2); still deferred are dirty-rectangle partial updates that re-encode and
-  re-transmit only changed regions of a framebuffer
+  changed-node deltas avoid re-sending it when unrelated nodes change (M7.2),
+  and dirty-rectangle partial updates re-encode and re-transmit only changed
+  regions (M7.3)
 - `font_family` beyond the three-way enum
 - grouping transforms beyond translate (scale, rotate), if a use case needs them
 

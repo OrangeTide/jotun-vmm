@@ -442,6 +442,15 @@ render_cube(void)
     }
 }
 
+/* Fill a solid rectangle into the framebuffer, clamped to its bounds. */
+static void
+fb_fill(int x0, int y0, int w, int h, uint8_t r, uint8_t g, uint8_t b)
+{
+    for (int y = y0; y < y0 + h; y++)
+        for (int x = x0; x < x0 + w; x++)
+            fb_put(x, y, r, g, b);
+}
+
 static void
 drawpixel(void)
 {
@@ -450,21 +459,45 @@ drawpixel(void)
 
     draw_surface(1, 0, 0, FBW + 20, FBH + 20, "framebuffer");
     draw_image(2, 1, 10, 10, FBW, FBH, framebuffer, 0);
-    draw_click(2);              /* so the self-test source can end the demo */
+    draw_click(2);              /* click to stamp a patch; close ends the demo */
 
     draw_flush();
     con_puts("pixel: submitted image node, waiting for event\n");
 
-    struct draw_event ev;
-    if (draw_next_event(&ev) != 0) {
-        con_puts("pixel: event error\n");
-        return;
+    /* Each click paints a small square into a cycling spot and reports just
+     * that region as damaged, so the host re-encodes and re-sends only the
+     * square rather than the whole frame. */
+    static const int spots[][2] = {
+        { 24, 24 }, { 200, 24 }, { 24, 140 }, { 200, 140 }, { 112, 82 },
+    };
+    static const uint8_t cols[][3] = {
+        { 0xff, 0x60, 0x60 }, { 0x60, 0xff, 0x60 }, { 0x60, 0x60, 0xff },
+        { 0xff, 0xff, 0x60 }, { 0xff, 0x60, 0xff },
+    };
+    int n = 0;
+    for (;;) {
+        struct draw_event ev;
+        if (draw_next_event(&ev) != 0) {
+            con_puts("pixel: event error\n");
+            return;
+        }
+        con_puts("pixel: event node ");
+        con_putu(ev.node);
+        con_puts(" type ");
+        con_putu(ev.type);
+        con_putc('\n');
+
+        if (ev.type == DEV_CLOSE)
+            break;
+        if (ev.type == DEV_CLICK && ev.node == 2) {
+            int i = n++ % 5;
+            int sx = spots[i][0], sy = spots[i][1];
+            fb_fill(sx, sy, 32, 32, cols[i][0], cols[i][1], cols[i][2]);
+            draw_image_damage(2, sx, sy, 32, 32);
+            draw_flush();
+            con_puts("pixel: damage submitted\n");
+        }
     }
-    con_puts("pixel: event node ");
-    con_putu(ev.node);
-    con_puts(" type ");
-    con_putu(ev.type);
-    con_putc('\n');
     con_puts("pixel: done\n");
 }
 

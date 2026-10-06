@@ -69,6 +69,11 @@ void draw_text(uint32_t id, uint32_t parent, int x, int y, int size,
  * same buffer and flushing again updates the node. */
 void draw_image(uint32_t id, uint32_t parent, int x, int y, int w, int h,
                 const void *pixels, int stride);
+/* Mark a region of an image node changed since its last flush, so the host
+ * re-encodes and re-sends only that region. x and y are image pixels from the
+ * top-left; the region is clamped to the image. Call after re-rendering into the
+ * framebuffer, before flushing. Re-submitting draw_image re-bases the frame. */
+void draw_image_damage(uint32_t id, int x, int y, int w, int h);
 void draw_set_text(uint32_t id, const char *s);
 /* Set one attribute of an existing node. attr is a DSA_* code; value is read at
  * the width that attribute implies (see jotun_draw.h). */

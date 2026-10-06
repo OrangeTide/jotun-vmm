@@ -518,10 +518,23 @@ Goal: raster content where vector does not fit.
   2D demo, a single-attribute SET goes out as a 226 byte delta in place of the
   1144 byte full document. This is the changed-node path M6.6 noted as the lever
   for large scenes under steady mutation.
-- Remaining: dirty-rectangle partial updates for the pixel path (re-encode and
-  re-transmit only changed regions of a framebuffer rather than the whole frame
-  each flush), and the optional guest-side Triton (Glide subset) rendering into
-  the framebuffer. Real PNG compression is done (fixed-Huffman LZ77 DEFLATE in
+- M7.3 (done): dirty-rectangle partial updates for the pixel path. The guest
+  reports a changed sub-region of an image with a new op (DOP_IMAGE_DAMAGE)
+  after re-rendering into the framebuffer. The host crops that region, encodes
+  only it as a small PNG, and sends it as an overlay `<image>` patch positioned
+  over the base through the M7.2 delta path (an `N` record appending the patch
+  under the image's group). Patches accumulate until a cap (16 per image) or
+  until the patched area would reach a full frame, at which point the host
+  re-bases: one full re-encode replaces the group and clears the overlays, so
+  the DOM stays bounded. Re-submitting DOP_IMAGE for the same id also re-bases.
+  The host crops without copying by pointing the encoder at the region's offset
+  with the framebuffer's own stride. Measured on the pixel demo, stamping a
+  32x32 square into a 256x192 frame goes out as a 242 byte patch delta rather
+  than the 3911 byte full frame, and five stamps cost 1211 bytes against about
+  19.5 KB of full frames. The pixels still never cross the channel, only the
+  declared buffer and a declared damage rect, so the §9.2 boundary is unchanged.
+- Remaining: the optional guest-side Triton (Glide subset) rendering into the
+  framebuffer. Real PNG compression is done (fixed-Huffman LZ77 DEFLATE in
   `host/png.c`).
 
 Acceptance: a guest software-renders a wireframe into a framebuffer node
