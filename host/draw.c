@@ -38,6 +38,7 @@
 
 #define DRAW_MAXNODES  4096     /* nodes per guest (browser SVG DOM ceiling) */
 #define DRAW_MAXSURF   16       /* surfaces (windows) per guest */
+#define DRAW_MAXGUEST  8        /* sinks one front end composites (== MAX_GUESTS) */
 #define DRAW_STRCAP    4096     /* bytes kept from a title or text string */
 #define DRAW_MAXINTER  4        /* interaction annotations per node */
 #define DRAW_MAXPTS    1024     /* points in a polyline */
@@ -145,6 +146,8 @@ struct dnode {
     int      prev_sib, next_sib;
 };
 
+struct drawfe;                  /* the shared front end; defined after drawdev */
+
 struct drawdev {
     struct jotun_draw *chan;
     int gid;                    /* owning guest id, namespaces DOM ids */
@@ -153,7 +156,7 @@ struct drawdev {
     int test;
     int bench;                  /* JOTUN_DRAW_BENCH: time apply and serialize */
     const char *svg_path;       /* JOTUN_DRAW_SVG, or NULL */
-    struct drawws *ws;          /* the browser front end, or NULL */
+    struct drawfe *fe;          /* the shared front end this sink feeds, or NULL */
 
     /* Translate a guest-physical range to a host pointer for reading image
      * pixels, or NULL if the range is out of bounds. Supplied by the host. */
@@ -189,6 +192,15 @@ struct drawdev {
     int nremoved;
     int nchanged;               /* added + modified nodes this submit */
     int delta_overflow;
+};
+
+/* The session front end: one WebSocket transport (drawws) shared by every
+ * guest, and the set of sinks registered by guest id so an inbound event can be
+ * routed to the guest it names. One guest feeds it today; compositing several
+ * guests' scenes into one document arrives with M10.1c. */
+struct drawfe {
+    struct drawws *ws;                      /* the one transport, or NULL */
+    struct drawdev *sinks[DRAW_MAXGUEST];   /* registered sinks, by gid */
 };
 
 /****************************************************************
@@ -1567,12 +1579,12 @@ enqueue(struct drawdev *dd, uint32_t node, uint16_t type,
     pthread_mutex_unlock(&dd->qlock);
 }
 
-/* Inbound event from the browser (on the WS server thread): queue it and rouse
- * the guest, the same evt-plus-wake path the self-test source uses. */
+/* Deliver one inbound event to a sink: queue it and rouse that guest, the same
+ * evt-plus-wake path the self-test source uses. */
 static void
-on_ws_event(void *ctx, uint32_t node, uint16_t type, const char *value, int vlen)
+deliver_event(struct drawdev *dd, uint32_t node, uint16_t type,
+              const char *value, int vlen)
 {
-    struct drawdev *dd = ctx;
     if (vlen < 0)
         vlen = 0;
     enqueue(dd, node, type, value, (uint16_t)vlen);
@@ -1581,19 +1593,77 @@ on_ws_event(void *ctx, uint32_t node, uint16_t type, const char *value, int vlen
         dd->wake(dd->wake_ctx);
 }
 
+/* Inbound event from the browser (on the WS server thread), routed by the front
+ * end to the guest it targets. The browser does not yet tag the event with its
+ * guest, so it is delivered to the first registered sink; per-guest routing by
+ * the DOM id's guest field is M10.2. */
+static void
+fe_on_event(void *ctx, uint32_t node, uint16_t type, const char *value, int vlen)
+{
+    struct drawfe *fe = ctx;
+
+    for (int i = 0; i < DRAW_MAXGUEST; i++) {
+        if (fe->sinks[i]) {
+            deliver_event(fe->sinks[i], node, type, value, vlen);
+            return;
+        }
+    }
+}
+
 /****************************************************************
  * Channel handling
  ****************************************************************/
 
+/* Start the shared session front end bound to 127.0.0.1:port, or return NULL
+ * when port is 0 (headless). One of these backs the whole process; guests
+ * attach their sinks to it in draw_init. */
+struct drawfe *
+drawfe_start(int port)
+{
+    if (port <= 0)
+        return NULL;
+
+    struct drawfe *fe = calloc(1, sizeof(*fe));
+    if (!fe)
+        return NULL;
+    fe->ws = drawws_start(port, fe_on_event, fe);
+    if (!fe->ws) {
+        free(fe);
+        return NULL;
+    }
+    return fe;
+}
+
+void
+drawfe_stop(struct drawfe *fe)
+{
+    if (!fe)
+        return;
+    drawws_stop(fe->ws);
+    free(fe);
+}
+
+/* Push a guest's authored scene to the browser through the front end. Today a
+ * single guest's full document and delta are forwarded unchanged; compositing
+ * several guests' scenes into one document arrives with M10.1c. */
+static void
+drawfe_publish(struct drawfe *fe, const char *full, const char *delta)
+{
+    if (fe && fe->ws)
+        drawws_update(fe->ws, full, delta);
+}
+
 struct drawdev *
-draw_init(struct jotun_draw *chan, int gid, void (*wake)(void *ctx),
-          void *wake_ctx, int test, draw_gpa_fn gpa, void *gpa_ctx)
+draw_init(struct jotun_draw *chan, int gid, struct drawfe *fe,
+          void (*wake)(void *ctx), void *wake_ctx, int test,
+          draw_gpa_fn gpa, void *gpa_ctx)
 {
     struct drawdev *dd = calloc(1, sizeof(*dd));
     if (!dd)
         return NULL;
     dd->chan = chan;
     dd->gid = gid;
+    dd->fe = fe;
     dd->wake = wake;
     dd->wake_ctx = wake_ctx;
     dd->test = test;
@@ -1604,12 +1674,10 @@ draw_init(struct jotun_draw *chan, int gid, void (*wake)(void *ctx),
     pthread_mutex_init(&dd->qlock, NULL);
     tree_init(dd);              /* so an empty forest has root_first == -1 */
 
-    /* The browser front end is opt-out: start it unless JOTUN_DRAW_PORT is 0.
-     * The default port is localhost-only. */
-    const char *pe = getenv("JOTUN_DRAW_PORT");
-    int port = pe ? (int)strtol(pe, NULL, 0) : 9230;
-    if (port > 0)
-        dd->ws = drawws_start(port, on_ws_event, dd);
+    /* Register as the front end's sink for this guest, so inbound events reach
+     * it. The front end's lifecycle is owned by the session, not the sink. */
+    if (fe && gid >= 0 && gid < DRAW_MAXGUEST)
+        fe->sinks[gid] = dd;
     return dd;
 }
 
@@ -1670,8 +1738,7 @@ handle_submit(struct drawdev *dd, struct jotun_draw *chan)
             || dd->nchanged + dd->nremoved > DRAW_DELTA_MAX;
         if (!overflow && (dd->nchanged || dd->nremoved))
             delta = build_delta(dd);
-        if (dd->ws)
-            drawws_update(dd->ws, svg, delta);
+        drawfe_publish(dd->fe, svg, delta);
         if (dd->svg_path)
             dump_svg(dd, svg);
         free(delta);
@@ -1748,7 +1815,10 @@ draw_shutdown(struct drawdev *dd)
 {
     if (!dd)
         return;
-    drawws_stop(dd->ws);
+    /* The front end (dd->fe) is owned and stopped by the session, not here. */
+    if (dd->fe && dd->gid >= 0 && dd->gid < DRAW_MAXGUEST
+        && dd->fe->sinks[dd->gid] == dd)
+        dd->fe->sinks[dd->gid] = NULL;
     for (int i = 0; i < DRAW_MAXNODES; i++) {
         free(dd->nodes[i].text);
         free(dd->nodes[i].pts);

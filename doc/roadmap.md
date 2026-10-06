@@ -769,16 +769,22 @@ Sub-milestones:
     draw_init from the owning guest), and every `qu-<guest>-<node>` emit site
     uses it in place of the old constant 0. No behavior change yet, since only
     guest 0 has a sink; it removes the hardcoded id and threads the real one.
-  - M10.1b: one shared front end, many sinks. Today draw_init starts its own
-    WebSocket server, so each guest would collide on the port. Decouple the
-    drawws front end from the per-guest drawdev: start one front end for the
-    session and give every guest a drawdev that registers with it, rather than
-    guest 0 only.
-  - M10.1c: compositing. The shared front end combines each guest's scene under
-    its `<g id="qu-<guest>" transform="translate(ox,oy)">` group at a host-
-    assigned origin, with per-guest baselines and deltas merged into one
-    document. The `<`/`!` full-vs-delta protocol and the `R`/`N`/`U` records
-    extend unchanged; the per-guest prefix already keeps node ids distinct.
+  - M10.1b (done): invert the draw / front-end ownership. draw_init used to
+    start its own WebSocket server, so each guest would collide on the port. A
+    new session object, struct drawfe, owns the one drawws transport and a sink
+    registry; drawfe_start/stop are called by main, draw_init attaches a sink to
+    it instead of starting a server, and a guest's scene is pushed through
+    drawfe_publish. Still guest 0 only, so the forwarded document is byte-
+    identical to before; the drawws transport stays a dumb one-scene buffer
+    (compositing is SVG authoring, which belongs in draw.c). Inbound events go
+    to the first registered sink for now; per-guest routing is M10.2.
+  - M10.1c: compositing. Every guest attaches a sink, and serialize emits a
+    per-guest `<g id="qu-<guest>" transform="translate(ox,oy)">` fragment that
+    drawfe wraps, combining all present guests' scenes under host-assigned
+    origins into one document. The `<`/`!` full-vs-delta protocol and the
+    `R`/`N`/`U` records extend unchanged (the per-guest prefix already keeps node
+    ids distinct); a multi-guest update recomposites in full until per-guest
+    deltas are added.
 - M10.2: the session layer for inbound events. Stop discarding the guest field
   in the client `nodeId()`, carry it through the event dispatch and the
   `drawws` event callback, and route each event to the targeted guest's queue.

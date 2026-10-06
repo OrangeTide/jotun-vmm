@@ -510,7 +510,7 @@ guest_vm_free(struct guest *gp)
 static int
 guest_bringup(struct guest *gp, int gid, const char *kernel,
               const char *manifest_path, int nvcpus, int draw_test,
-              int targc, char **targv)
+              struct drawfe *fe, int targc, char **targv)
 {
     gp->gid = gid;
 
@@ -575,8 +575,8 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
         struct jotun_draw *drawchan =
             gpa_to_host(gp, JOTUN_DRAW_BASE, sizeof(*drawchan));
         if (drawchan)
-            gp->drawdev = draw_init(drawchan, gid, rouse_vcpus, gp, draw_test,
-                                    draw_gpa, gp);
+            gp->drawdev = draw_init(drawchan, gid, fe, rouse_vcpus, gp,
+                                    draw_test, draw_gpa, gp);
     }
 
     /* If a signed origin is named, pull the bundle into a local cache depot and
@@ -694,6 +694,12 @@ main(int argc, char **argv)
 
     int draw_test = getenv("JOTUN_DRAW_TEST") != NULL;
 
+    /* One browser front end backs the whole session; guest 0 attaches its sink.
+     * Opt out with JOTUN_DRAW_PORT=0; the default port is localhost-only. */
+    const char *pe = getenv("JOTUN_DRAW_PORT");
+    int draw_port = pe ? (int)strtol(pe, NULL, 0) : 9230;
+    struct drawfe *fe = drawfe_start(draw_port);
+
     /* A preemption timer is opt-in: JOTUN_HZ ticks per second, across all. */
     unsigned hz = 0;
     const char *hz_env = getenv("JOTUN_HZ");
@@ -715,7 +721,7 @@ main(int argc, char **argv)
         const char *mpath = nmanifests > 0 ? manifests[gi]
                                            : getenv("JOTUN_MANIFEST");
         if (guest_bringup(&guests[gi], gi, kernel, mpath, nvcpus, draw_test,
-                          targc, targv) != 0) {
+                          fe, targc, targv) != 0) {
             fprintf(stderr, "guest %d: bring-up failed\n", gi);
             return 1;
         }
@@ -741,6 +747,9 @@ main(int argc, char **argv)
         pthread_join(timer_thread, NULL);
     }
 
+    /* Stop the front end first, so its server thread delivers no more events
+     * to a sink before draw_shutdown frees it. */
+    drawfe_stop(fe);
     for (int gi = 0; gi < nguests; gi++) {
         net_shutdown(guests[gi].netdev);
         draw_shutdown(guests[gi].drawdev);
