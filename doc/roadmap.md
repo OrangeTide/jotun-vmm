@@ -496,15 +496,18 @@ Goal: raster content where vector does not fit.
   guest-physical address, geometry, format (RGBA8888), and stride; the host
   validates the geometry, reads the pixels from guest RAM through a bounds-
   checked address translator, encodes them as a PNG (a small dependency-free
-  encoder, `host/png.c`), and emits an `<image>` data URI under the chrome. No
+  encoder, `host/png.c`, with real fixed-Huffman LZ77 DEFLATE: the wireframe
+  frame compresses about 68x, 263 KB to 3.9 KB), and emits an `<image>` data URI
+  under the chrome. No
   pixel command stream crosses into the host, only a declared buffer, which is
   the security point of §9.2. The `pixel` guest demo software-renders a
   wireframe cube (integer Bresenham, no FP) into the framebuffer and shows it
   under a window; verified by rendering the authored SVG. Acceptance met.
-- Remaining: dirty-rectangle partial updates (re-encode only changed regions
-  rather than the whole frame each flush), real image compression in the PNG
-  encoder (it emits stored DEFLATE blocks now), and the optional guest-side
-  Triton (Glide subset) rendering into the framebuffer.
+- Remaining: dirty-rectangle partial updates (re-encode and re-transmit only
+  changed regions rather than the whole frame each flush, which is coupled to
+  the incremental changed-node transmit path the SVG side also wants), and the
+  optional guest-side Triton (Glide subset) rendering into the framebuffer. Real
+  PNG compression is done (fixed-Huffman LZ77 DEFLATE in `host/png.c`).
 
 Acceptance: a guest software-renders a wireframe into a framebuffer node
 composited under the 2D chrome.

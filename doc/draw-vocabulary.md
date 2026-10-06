@@ -243,8 +243,8 @@ Out of scope for the M6 acceptance test, candidates for M6.5 vocabulary breadth:
 
 - gradients and patterns (would be a fixed, parameterized set, never raw defs)
 - richer text (spans, alignment, wrapping)
-- richer raster: the framebuffer node ships (M7.1); still deferred are
-  dirty-rectangle partial updates and real PNG compression
+- richer raster: the framebuffer node ships with real PNG compression (M7.1);
+  still deferred are dirty-rectangle partial updates (changed regions only)
 - `font_family` beyond the three-way enum
 - grouping transforms beyond translate (scale, rotate), if a use case needs them
 
