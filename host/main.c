@@ -20,6 +20,7 @@
 #include "p9mem.h"
 #include "p9smolvfs.h"
 #include "p9overlay.h"
+#include "p9graft.h"
 #include "manifest.h"
 #include "bundlepull.h"
 #include "net.h"
@@ -666,6 +667,32 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
     gp->drawdev = drawchan
         ? draw_init(drawchan, gid, fe, rouse_vcpus, gp, draw_test, draw_gpa, gp)
         : NULL;
+
+    /* An optional graft mount makes a shared read-only tree appear at a
+     * top-level name in this guest's root, alongside its own tree. It wraps the
+     * base backend before the /net overlay wraps the result. */
+    if (have_manifest && gp->manifest.mount_name[0]) {
+        void *gctx = NULL;
+        const struct p9_backend *gbe =
+            p9smolvfs_open(gp->manifest.mount_bundle, gp->manifest.mount_ref,
+                           gp->manifest.mount_subtree, JOTUN_ARCH, &gctx);
+        if (!gbe) {
+            fprintf(stderr, "[9p] guest %d: could not open mount bundle %s\n",
+                    gid, gp->manifest.mount_bundle);
+        } else {
+            struct p9graft *g =
+                p9graft_new(be, p9ctx, gbe, gctx, gp->manifest.mount_name);
+            if (g) {
+                be = p9graft_backend();
+                p9ctx = g;
+                fprintf(stderr, "[9p] guest %d: grafted %s (ref %s) at /%s\n",
+                        gid, gp->manifest.mount_bundle, gp->manifest.mount_ref,
+                        gp->manifest.mount_name);
+            } else {
+                p9smolvfs_close(gctx);
+            }
+        }
+    }
 
     struct p9overlay *ov = p9overlay_new(be, p9ctx, &gp->policy, gp->netdev);
     if (ov)

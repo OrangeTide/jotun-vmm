@@ -28,6 +28,14 @@ struct manifest {
     char argv[MANIFEST_MAXARG][64];     /* init program and arguments */
     int  nnet;
     struct manifest_net net[MANIFEST_MAXNET];   /* network-allow rules */
+
+    /* An optional read-only graft mount: a shared tree that appears as the
+     * top-level directory mount_name in the guest root. mount_name is "" when
+     * no mount is declared. */
+    char mount_name[64];
+    char mount_bundle[256];
+    char mount_ref[64];
+    char mount_subtree[256];
 };
 
 /* Parse the manifest file at path. Returns 0 on success, -1 on error. */

@@ -79,6 +79,31 @@ manifest_load(const char *path, struct manifest *m)
                 copy_field(r->ports, sizeof r->ports, tok[2]);
                 copy_field(r->proto, sizeof r->proto, nt >= 4 ? tok[3] : "");
             }
+        } else if (strcmp(key, "mount") == 0) {
+            /* "mount <name> <bundle> <ref> [subtree]": graft a shared tree at
+             * the top-level name in the guest root. */
+            char *tok[4];
+            int nt = 0;
+            char *p = val;
+            while (*p && nt < 4) {
+                while (*p == ' ' || *p == '\t')
+                    p++;
+                if (!*p)
+                    break;
+                tok[nt++] = p;
+                while (*p && *p != ' ' && *p != '\t')
+                    p++;
+                if (*p)
+                    *p++ = '\0';
+            }
+            if (nt >= 2) {
+                copy_field(m->mount_name, sizeof m->mount_name, tok[0]);
+                copy_field(m->mount_bundle, sizeof m->mount_bundle, tok[1]);
+                copy_field(m->mount_ref, sizeof m->mount_ref,
+                           nt >= 3 ? tok[2] : "root");
+                copy_field(m->mount_subtree, sizeof m->mount_subtree,
+                           nt >= 4 ? tok[3] : "");
+            }
         } else if (strcmp(key, "bundle") == 0) {
             copy_field(m->bundle, sizeof m->bundle, val);
         } else if (strcmp(key, "origin") == 0) {
