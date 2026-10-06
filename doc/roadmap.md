@@ -778,13 +778,17 @@ Sub-milestones:
     identical to before; the drawws transport stays a dumb one-scene buffer
     (compositing is SVG authoring, which belongs in draw.c). Inbound events go
     to the first registered sink for now; per-guest routing is M10.2.
-  - M10.1c: compositing. Every guest attaches a sink, and serialize emits a
-    per-guest `<g id="qu-<guest>" transform="translate(ox,oy)">` fragment that
-    drawfe wraps, combining all present guests' scenes under host-assigned
-    origins into one document. The `<`/`!` full-vs-delta protocol and the
-    `R`/`N`/`U` records extend unchanged (the per-guest prefix already keeps node
-    ids distinct); a multi-guest update recomposites in full until per-guest
-    deltas are added.
+  - M10.1c (done): compositing. Every guest attaches a sink to the shared front
+    end. A lone guest keeps the pass-through fast path (plain `<svg>` plus
+    deltas, byte-identical to before). With more than one guest, drawfe
+    composites: each guest's content is serialized as a bare fragment
+    (serialize_inner), wrapped in a `<g id="qu-<guest>" transform="translate(x,0)">`
+    group at a host-assigned origin (guests laid left to right, each as wide as
+    its own canvas), and the groups are combined into one `<svg>` sized to hold
+    them all. A multi-guest change restates the whole document (sent full, no
+    delta yet); per-guest deltas are a later optimization. The per-guest id
+    prefix keeps node ids distinct across guests. Inbound events still reach the
+    first registered sink; per-guest routing is M10.2.
 - M10.2: the session layer for inbound events. Stop discarding the guest field
   in the client `nodeId()`, carry it through the event dispatch and the
   `drawws` event callback, and route each event to the targeted guest's queue.

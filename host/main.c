@@ -567,17 +567,14 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
     struct jotun_net *netchan = gpa_to_host(gp, JOTUN_NET_BASE, sizeof(*netchan));
     gp->netdev = netchan ? net_init(netchan, rouse_vcpus, gp, &gp->policy) : NULL;
 
-    /* Only guest 0 drives the browser front end (one host, one session). The
-     * rest run headless: a draw op from them is accepted and dropped, since
-     * draw_service finds no sink. */
-    gp->drawdev = NULL;
-    if (gid == 0) {
-        struct jotun_draw *drawchan =
-            gpa_to_host(gp, JOTUN_DRAW_BASE, sizeof(*drawchan));
-        if (drawchan)
-            gp->drawdev = draw_init(drawchan, gid, fe, rouse_vcpus, gp,
-                                    draw_test, draw_gpa, gp);
-    }
+    /* Every guest gets a draw sink attached to the one shared front end, which
+     * composites their scenes into a single browser session. With no front end
+     * (JOTUN_DRAW_PORT=0, fe NULL) the sink still exists but draws nowhere. */
+    struct jotun_draw *drawchan =
+        gpa_to_host(gp, JOTUN_DRAW_BASE, sizeof(*drawchan));
+    gp->drawdev = drawchan
+        ? draw_init(drawchan, gid, fe, rouse_vcpus, gp, draw_test, draw_gpa, gp)
+        : NULL;
 
     /* If a signed origin is named, pull the bundle into a local cache depot and
      * serve that, exactly as a local depot. A pull failure refuses the boot:

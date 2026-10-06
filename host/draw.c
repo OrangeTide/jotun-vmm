@@ -201,6 +201,15 @@ struct drawdev {
 struct drawfe {
     struct drawws *ws;                      /* the one transport, or NULL */
     struct drawdev *sinks[DRAW_MAXGUEST];   /* registered sinks, by gid */
+
+    /* Per-guest scene fragments composited into one document. frag[gid] is the
+     * guest's authored content (its node tree, no <svg> or group wrapper), or
+     * NULL until it has drawn; cw/ch are that guest's canvas extent, used to
+     * lay the guests out side by side. Only used when more than one guest is
+     * attached; a single guest takes the pass-through fast path. */
+    char *frag[DRAW_MAXGUEST];
+    int cw[DRAW_MAXGUEST];
+    int ch[DRAW_MAXGUEST];
 };
 
 /****************************************************************
@@ -1495,6 +1504,18 @@ serialize(struct drawdev *dd)
     return b.p;
 }
 
+/* Serialize just this guest's scene content: its node fragments, with no <svg>
+ * envelope and no group wrapper. The front end places this inside a per-guest
+ * group in the composite document. Never returns NULL (an empty scene gives an
+ * empty string), so the caller can store it as a "has drawn" marker. */
+static char *
+serialize_inner(struct drawdev *dd)
+{
+    struct sbuf b = { 0 };
+    emit_siblings(&b, dd, dd->root_first);
+    return b.p ? b.p : calloc(1, 1);
+}
+
 /* Walk the forest in document order emitting the changed nodes as delta
  * records. A changed node's whole fragment (its subtree) is emitted once, so
  * descendants it already covers are suppressed. */
@@ -1639,18 +1660,87 @@ drawfe_stop(struct drawfe *fe)
 {
     if (!fe)
         return;
-    drawws_stop(fe->ws);
+    drawws_stop(fe->ws);        /* joins the server thread: no more events */
+    for (int i = 0; i < DRAW_MAXGUEST; i++)
+        free(fe->frag[i]);
     free(fe);
 }
 
-/* Push a guest's authored scene to the browser through the front end. Today a
- * single guest's full document and delta are forwarded unchanged; compositing
- * several guests' scenes into one document arrives with M10.1c. */
-static void
-drawfe_publish(struct drawfe *fe, const char *full, const char *delta)
+static int
+fe_nsinks(const struct drawfe *fe)
 {
-    if (fe && fe->ws)
+    int n = 0;
+    for (int i = 0; i < DRAW_MAXGUEST; i++)
+        if (fe->sinks[i])
+            n++;
+    return n;
+}
+
+/* Author the composite document: every guest that has drawn becomes a group
+ * placed at its own horizontal origin (guests are laid out left to right in id
+ * order, each as wide as its own canvas), and the whole is one <svg> sized to
+ * hold them all. Sent as a full document, since a change in one guest restates
+ * the shared canvas. */
+static void
+rebuild_composite(struct drawfe *fe)
+{
+    int sum_w = 0, max_h = 0;
+    for (int i = 0; i < DRAW_MAXGUEST; i++) {
+        if (!fe->frag[i])
+            continue;
+        sum_w += fe->cw[i];
+        if (fe->ch[i] > max_h)
+            max_h = fe->ch[i];
+    }
+    if (sum_w <= 0)
+        sum_w = 1;
+    if (max_h <= 0)
+        max_h = 1;
+
+    struct sbuf b = { 0 };
+    sb_printf(&b, "<svg xmlns=\"http://www.w3.org/2000/svg\""
+              " xmlns:xlink=\"http://www.w3.org/1999/xlink\""
+              " width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\">",
+              sum_w, max_h, sum_w, max_h);
+    int x = 0;
+    for (int i = 0; i < DRAW_MAXGUEST; i++) {
+        if (!fe->frag[i])
+            continue;
+        sb_printf(&b, "<g id=\"qu-%d\" transform=\"translate(%d,0)\">", i, x);
+        sb_puts(&b, fe->frag[i]);
+        sb_puts(&b, "</g>");
+        x += fe->cw[i];
+    }
+    sb_puts(&b, "</svg>");
+    if (b.p)
+        drawws_update(fe->ws, b.p, NULL);
+    free(b.p);
+}
+
+/* Push a guest's authored scene to the browser through the front end. A lone
+ * guest takes the fast path: its full document and delta are forwarded
+ * unchanged, byte-identical to the single-guest front end. With more than one
+ * guest attached, the host composites: this guest's fragment is refreshed and
+ * the whole document is rebuilt and sent full (deltas are not yet composited
+ * across guests). */
+static void
+drawfe_publish(struct drawfe *fe, struct drawdev *dd, const char *full,
+               const char *delta)
+{
+    if (!fe || !fe->ws)
+        return;
+    if (fe_nsinks(fe) <= 1) {
         drawws_update(fe->ws, full, delta);
+        return;
+    }
+
+    int gid = dd->gid;
+    if (gid < 0 || gid >= DRAW_MAXGUEST)
+        return;
+    canvas_size(dd, &fe->cw[gid], &fe->ch[gid]);
+    free(fe->frag[gid]);
+    fe->frag[gid] = serialize_inner(dd);
+    rebuild_composite(fe);
 }
 
 struct drawdev *
@@ -1738,7 +1828,7 @@ handle_submit(struct drawdev *dd, struct jotun_draw *chan)
             || dd->nchanged + dd->nremoved > DRAW_DELTA_MAX;
         if (!overflow && (dd->nchanged || dd->nremoved))
             delta = build_delta(dd);
-        drawfe_publish(dd->fe, svg, delta);
+        drawfe_publish(dd->fe, dd, svg, delta);
         if (dd->svg_path)
             dump_svg(dd, svg);
         free(delta);
@@ -1815,10 +1905,8 @@ draw_shutdown(struct drawdev *dd)
 {
     if (!dd)
         return;
-    /* The front end (dd->fe) is owned and stopped by the session, not here. */
-    if (dd->fe && dd->gid >= 0 && dd->gid < DRAW_MAXGUEST
-        && dd->fe->sinks[dd->gid] == dd)
-        dd->fe->sinks[dd->gid] = NULL;
+    /* The front end (dd->fe) is owned by the session and already torn down by
+     * drawfe_stop before this runs, so it is not touched here. */
     for (int i = 0; i < DRAW_MAXNODES; i++) {
         free(dd->nodes[i].text);
         free(dd->nodes[i].pts);
