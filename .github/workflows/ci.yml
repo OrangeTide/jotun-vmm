@@ -16,6 +16,12 @@ jobs:
       # GitHub-hosted runners do not provide.
       - name: Syntax-check the macOS net path
         run: make macsyntax
+      # Build a multi-arch guest image. This exercises jbundle and the clang +
+      # lld cross-build of the non-native arch (aarch64 here); it only compiles
+      # and assembles objects, so it needs no /dev/kvm. clang and lld are
+      # preinstalled on the runner image.
+      - name: Build a multi-arch guest image
+        run: make bundle
 
   macos:
     runs-on: macos-14
