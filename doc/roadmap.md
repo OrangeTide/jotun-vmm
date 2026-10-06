@@ -272,7 +272,7 @@ Risk: interrupt injection without an emulated controller differs per backend
 (KVM x86 without an in-kernel irqchip, KVM arm64 without a vGIC, and HVF IRQ
 injection). It is the least certain mechanism in the design.
 
-## M5: networking (in progress)
+## M5: networking (done)
 
 Goal: container-style limited networking.
 
@@ -347,9 +347,15 @@ Steps:
   refused acceptance test passes on x86 KVM: a permitted loopback port connects
   and exchanges data, a port outside the rules is refused (NET_EPERM), and the
   proto field distinguishes a TCP rule from a UDP one on the same port.
-- M5.5: the `/net` information tree over 9P (`/net/policy`, `/net/conn`), via a
-  read-only overlay backend that serves `/net` synthetically and delegates the
-  rest to the bundle backend. Observability only; split out from M5.4.
+- M5.5 (done): the `/net` information tree over 9P. A read-only overlay backend
+  (`host/p9overlay.c`) serves `/net` synthetically, delegating every other path
+  to the bundle backend. `/net/policy` renders the active rules (or "allow
+  all"), `/net/conn` lists live connections, and `/net/conn/<handle>` shows a
+  connection's protocol and peer. Synthetic nodes are tagged by a low byte in
+  the backend handle, which real backends never produce, and carry qids in a
+  reserved high range. Verified on x86 KVM: `ls /net`, `cat /net/policy` with
+  and without rules, and `cat /net/conn/0` against a live connection, with
+  bundle delegation and policy enforcement intact.
 
 ## M6: display, the 2D vector path
 

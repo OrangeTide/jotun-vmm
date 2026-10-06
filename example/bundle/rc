@@ -9,4 +9,7 @@ hello
 echo --- bind motd onto greeting, then cat it ---
 bind motd greeting
 cat greeting
+echo --- the /net information tree ---
+ls /net
+cat /net/policy
 echo rc complete

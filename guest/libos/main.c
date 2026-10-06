@@ -164,6 +164,30 @@ block_demo(void)
     con_puts("'\n");
 }
 
+/* Print a file from the 9P namespace, byte for byte. Used to show the /net
+ * information tree from inside the net demo. */
+static void
+cat_path(const char *path)
+{
+    if (ns_walk(path, 6) != 0) {
+        con_puts("  (missing ");
+        con_puts(path);
+        con_puts(")\n");
+        return;
+    }
+    if (p9_open(6) == 0) {
+        char b[256];
+        uint64_t off = 0;
+        long n;
+        while ((n = p9_read(6, off, b, sizeof b)) > 0) {
+            for (long i = 0; i < n; i++)
+                con_putc(b[i]);
+            off += (uint64_t)n;
+        }
+    }
+    p9_clunk(6);
+}
+
 /* Networking demo: dial a target ("host!port", from the second boot argument),
  * send a line, print the reply, and close. The read blocks the task until the
  * host reports data, without stalling the rest of the system. */
@@ -192,6 +216,10 @@ net_demo(void)
     con_puts("net: wrote ");
     con_putu((uint64_t)w);
     con_puts(" bytes\n");
+
+    /* The connection is live, so it appears in the /net tree as handle 0. */
+    con_puts("net: /net/conn/0 = ");
+    cat_path("/net/conn/0");
 
     char buf[256];
     long r = net_read(h, buf, sizeof buf - 1);

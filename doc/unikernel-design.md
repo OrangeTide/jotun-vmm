@@ -247,6 +247,17 @@ manifest: which ports may be bound or dialed, NAT, and rate limits. The guest
 cannot name anything outside what `/net` exposes, so there is no path to the
 real network except through the host's mediation.
 
+As built (M5), the data path is a socket-like client over a dedicated net
+channel (`net_dial`/`net_read`/`net_write`/`net_close`, plus UDP
+`net_sendto`/`net_recvfrom`); the host opens the real sockets, which is the
+NAT. A would-block parks the calling task, not the vcpu, and an event-driven
+epoll poll thread wakes it when the socket is ready. Policy is manifest
+`net allow <cidr> <ports> [proto]` rules matched against the resolved address,
+default-allow with no rules and default-deny with any. `/net` itself is a
+read-only 9P tree (`/net/policy`, `/net/conn`) overlaid on the bundle, for
+naming and observability rather than byte transfer. Rate limits and TCP
+listen/accept are not yet implemented.
+
 ## 9. Display subsystem
 
 The target workloads are non-realtime and remote-friendly: visualizations,

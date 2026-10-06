@@ -18,6 +18,7 @@
 #include "p9srv.h"
 #include "p9mem.h"
 #include "p9smolvfs.h"
+#include "p9overlay.h"
 #include "manifest.h"
 #include "net.h"
 
@@ -477,21 +478,44 @@ main(int argc, char **argv)
 
     uart_init(&uart);
 
-    /* Serve a smolvfs bundle if one is named, else the in-memory tree. */
+    /* Build the net policy from the manifest rules. With no rules the provider
+     * allows every target; with rules it denies by default. */
+    static struct net_policy policy;
+    policy.n = 0;
+    if (have_manifest) {
+        for (int i = 0; i < m.nnet && policy.n < NET_MAXRULES; i++)
+            if (build_net_rule(&m.net[i], &policy.rules[policy.n]) == 0)
+                policy.n++;
+    }
+
+    /* The net provider shares the guest net channel and rouses vcpus when a
+     * socket becomes ready. It is created before the 9P server so the /net
+     * overlay can read its live connections. */
+    struct jotun_net *netchan = gpa_to_host(JOTUN_NET_BASE, sizeof(*netchan));
+    netdev = netchan ? net_init(netchan, net_wake_vcpus, &policy) : NULL;
+
+    /* Serve a smolvfs bundle if one is named, else the in-memory tree, with the
+     * read-only /net overlay wrapping whichever backend is chosen. */
     const struct p9_backend *be = NULL;
     void *p9ctx = NULL;
     if (bundle && bundle[0])
         be = p9smolvfs_open(bundle, ref, subtree, &p9ctx);
     if (be) {
-        p9srv_init(&p9, be, p9ctx);
         fprintf(stderr, "[9p] serving bundle %s (ref %s, subtree %s)\n",
                 bundle, ref, subtree[0] ? subtree : "/");
     } else {
         if (bundle && bundle[0])
             fprintf(stderr, "[9p] could not open bundle %s, using in-memory tree\n",
                     bundle);
-        p9srv_init(&p9, p9mem_backend(), NULL);
+        be = p9mem_backend();
+        p9ctx = NULL;
     }
+
+    struct p9overlay *ov = p9overlay_new(be, p9ctx, &policy, netdev);
+    if (ov)
+        p9srv_init(&p9, p9overlay_backend(), ov);
+    else
+        p9srv_init(&p9, be, p9ctx);     /* fallback: no /net overlay */
 
     /* SIGUSR1 breaks a running vcpu out of its run (no SA_RESTART, so KVM_RUN
      * returns EINTR). Both the preemption timer and the net poll thread use it,
@@ -511,21 +535,6 @@ main(int argc, char **argv)
     all_ctx = ctx;
     all_threads = threads;
     all_n = nvcpus;
-
-    /* Build the net policy from the manifest rules. With no rules the provider
-     * allows every target; with rules it denies by default. */
-    static struct net_policy policy;
-    policy.n = 0;
-    if (have_manifest) {
-        for (int i = 0; i < m.nnet && policy.n < NET_MAXRULES; i++)
-            if (build_net_rule(&m.net[i], &policy.rules[policy.n]) == 0)
-                policy.n++;
-    }
-
-    /* The net provider shares the guest net channel and rouses vcpus when a
-     * socket becomes ready. */
-    struct jotun_net *netchan = gpa_to_host(JOTUN_NET_BASE, sizeof(*netchan));
-    netdev = netchan ? net_init(netchan, net_wake_vcpus, &policy) : NULL;
 
     for (int i = 0; i < nvcpus; i++) {
         ctx[i].index = i;

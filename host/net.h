@@ -45,6 +45,16 @@ struct netdev *net_init(struct jotun_net *chan, void (*wake)(void),
  * into it. Called from the net doorbell. */
 void net_handle(struct netdev *nd, struct jotun_net *chan);
 
+/* A snapshot of one live connection, for the /net information tree. */
+struct net_conninfo {
+    int  handle;
+    int  proto;             /* NET_PROTO_* */
+    char peer[64];          /* "host!port" for a TCP dial, "-" for UDP */
+};
+
+/* Copy up to max live connections into out. Returns the number copied. */
+int net_conn_snapshot(struct netdev *nd, struct net_conninfo *out, int max);
+
 /* Stop the poll thread and close every connection. */
 void net_shutdown(struct netdev *nd);
 

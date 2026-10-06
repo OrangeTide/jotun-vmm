@@ -24,6 +24,7 @@ struct net_conn {
     int fd;                 /* host socket, -1 if the slot is free */
     int proto;
     int in_epoll;           /* fd has been added to the epoll set */
+    char peer[64];          /* "host!port" for a dial, "-" for a UDP socket */
 };
 
 struct netdev {
@@ -187,6 +188,8 @@ do_dial(struct netdev *nd, struct jotun_net *chan)
     nd->conns[handle].fd = fd;
     nd->conns[handle].proto = NET_PROTO_TCP;
     nd->conns[handle].in_epoll = 0;
+    snprintf(nd->conns[handle].peer, sizeof nd->conns[handle].peer,
+             "%.40s!%.16s", host, port);
     pthread_mutex_unlock(&nd->lock);
 
     reply(chan, handle, 0);
@@ -287,6 +290,7 @@ do_udp(struct netdev *nd, struct jotun_net *chan)
     nd->conns[handle].fd = fd;
     nd->conns[handle].proto = NET_PROTO_UDP;
     nd->conns[handle].in_epoll = 0;
+    snprintf(nd->conns[handle].peer, sizeof nd->conns[handle].peer, "-");
     pthread_mutex_unlock(&nd->lock);
 
     reply(chan, handle, 0);
@@ -500,6 +504,23 @@ net_init(struct jotun_net *chan, void (*wake)(void),
         return NULL;
     }
     return nd;
+}
+
+int
+net_conn_snapshot(struct netdev *nd, struct net_conninfo *out, int max)
+{
+    int n = 0;
+    pthread_mutex_lock(&nd->lock);
+    for (int i = 0; i < NET_MAXCONN && n < max; i++) {
+        if (nd->conns[i].fd < 0)
+            continue;
+        out[n].handle = i;
+        out[n].proto = nd->conns[i].proto;
+        snprintf(out[n].peer, sizeof out[n].peer, "%s", nd->conns[i].peer);
+        n++;
+    }
+    pthread_mutex_unlock(&nd->lock);
+    return n;
 }
 
 void
