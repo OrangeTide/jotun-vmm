@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # gcc, clang, and make are preinstalled on the runner image.
+      - name: Build host, guests, and programs
+        run: make all
+      # The guest demos are not run here: they need /dev/kvm, which the
+      # GitHub-hosted runners do not provide.
+      - name: Syntax-check the macOS net path
+        run: make macsyntax
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      # Host only (make jotun): it builds the HVF backend and the real kqueue
+      # net path against Apple's own headers, which is what macsyntax only
+      # approximates on Linux. The freestanding guest ELFs need lld and the
+      # bare-metal cross target, so they are left to a local macOS build.
+      - name: Build host (Hypervisor.framework backend)
+        run: make jotun
+      # The host is not run here: Hypervisor.framework needs nested
+      # virtualization, which the GitHub-hosted macOS runners do not provide.
