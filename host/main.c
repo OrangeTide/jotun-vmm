@@ -40,8 +40,11 @@ static uart_16550 uart;
 static pthread_mutex_t dev_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long max_exits;     /* 0 means no cap */
 
+struct guest;                       /* defined below; vcpu_ctx points back to it */
+
 struct vcpu_ctx {
     int index;
+    struct guest *owner;        /* the guest this vcpu belongs to */
     vmm_vm_t *vm;
     uint64_t entry;
     uint64_t sp;
@@ -128,37 +131,36 @@ rouse_vcpus(void)
  * fit entirely within guest RAM. Every guest-supplied address is checked here
  * before the host dereferences it. */
 static void *
-gpa_to_host(uint64_t gpa, uint64_t len)
+gpa_to_host(struct guest *gp, uint64_t gpa, uint64_t len)
 {
-    if (gpa > g.gm.size || len > g.gm.size - gpa)
+    if (gpa > gp->gm.size || len > gp->gm.size - gpa)
         return NULL;
-    return g.gm.base + gpa;
+    return gp->gm.base + gpa;
 }
 
 /* The draw sink's address translator: same bounds check, with the callback
- * signature the sink expects (the context is unused, since guest RAM is reached
- * through the single guest g here). */
+ * signature the sink expects. The context is the owning guest, passed to
+ * draw_init. */
 static void *
 draw_gpa(void *ctx, uint64_t gpa, uint64_t len)
 {
-    (void)ctx;
-    return gpa_to_host(gpa, len);
+    return gpa_to_host((struct guest *)ctx, gpa, len);
 }
 
 /* Write the boot parameter block into guest RAM before the vcpu starts. The
  * guest argv is whatever follows the kernel image on the command line, with
  * argv[0] the init program. */
 static void
-setup_bootinfo(int gargc, char **gargv)
+setup_bootinfo(struct guest *gp, int gargc, char **gargv)
 {
-    struct jotun_bootinfo *b = gpa_to_host(JOTUN_BOOT_BASE, sizeof(*b));
+    struct jotun_bootinfo *b = gpa_to_host(gp, JOTUN_BOOT_BASE, sizeof(*b));
     if (!b)
         return;
 
     memset(b, 0, sizeof(*b));
     b->magic = JOTUN_BOOT_MAGIC;
     b->version = JOTUN_BOOT_VERSION;
-    b->ram_size = g.gm.size;
+    b->ram_size = gp->gm.size;
 
     uint32_t off = 0;
     int n = 0;
@@ -177,9 +179,9 @@ setup_bootinfo(int gargc, char **gargv)
 /* Doorbell handler: drain the request ring, echo each message into the
  * response ring, and raise the response event. Called with dev_lock held. */
 static void
-ring_service(void)
+ring_service(struct guest *gp)
 {
-    struct jotun_ring *r = gpa_to_host(JOTUN_RING_BASE, sizeof(*r));
+    struct jotun_ring *r = gpa_to_host(gp, JOTUN_RING_BASE, sizeof(*r));
     if (!r)
         return;
 
@@ -204,36 +206,37 @@ ring_service(void)
 /* 9P doorbell handler: process the T-message in the shared channel and write
  * the reply back into it. Called with dev_lock held. */
 static void
-p9_service(void)
+p9_service(struct guest *gp)
 {
-    struct jotun_p9 *c = gpa_to_host(JOTUN_P9_BASE, sizeof(*c));
+    struct jotun_p9 *c = gpa_to_host(gp, JOTUN_P9_BASE, sizeof(*c));
     if (!c)
         return;
-    c->rsp_len = p9srv_handle(&g.p9, c->req, c->req_len, c->rsp, JOTUN_P9_MSIZE);
+    c->rsp_len = p9srv_handle(&gp->p9, c->req, c->req_len, c->rsp,
+                              JOTUN_P9_MSIZE);
 }
 
 /* Net doorbell handler: process the request in the net channel and write the
  * result back. Called without dev_lock, since the provider has its own lock
  * and a dial may resolve a name, which should not block the console. */
 static void
-net_service(void)
+net_service(struct guest *gp)
 {
-    struct jotun_net *c = gpa_to_host(JOTUN_NET_BASE, sizeof(*c));
-    if (!c || !g.netdev)
+    struct jotun_net *c = gpa_to_host(gp, JOTUN_NET_BASE, sizeof(*c));
+    if (!c || !gp->netdev)
         return;
-    net_handle(g.netdev, c);
+    net_handle(gp->netdev, c);
 }
 
 /* Draw doorbell handler: process the request in the draw channel and write the
  * result back. Called without dev_lock, like the net doorbell, since the sink
  * has no shared console state. */
 static void
-draw_service(void)
+draw_service(struct guest *gp)
 {
-    struct jotun_draw *c = gpa_to_host(JOTUN_DRAW_BASE, sizeof(*c));
-    if (!c || !g.drawdev)
+    struct jotun_draw *c = gpa_to_host(gp, JOTUN_DRAW_BASE, sizeof(*c));
+    if (!c || !gp->drawdev)
         return;
-    draw_handle(g.drawdev, c);
+    draw_handle(gp->drawdev, c);
 }
 
 /* Turn one manifest rule (strings) into a numeric net_rule. Returns 0, or -1
@@ -285,6 +288,7 @@ static void *
 run_vcpu(void *arg)
 {
     struct vcpu_ctx *c = arg;
+    struct guest *gp = c->owner;
 
     vmm_vcpu_t *vcpu = vmm_vcpu_create(c->vm);
     if (!vcpu) {
@@ -342,19 +346,19 @@ run_vcpu(void *arg)
             uint32_t target = 0;
             memcpy(&target, e.mmio.data, e.mmio.size < 4 ? e.mmio.size : 4);
             if (target == JOTUN_WAKE_ALL) {
-                for (int j = 0; j < g.nvcpus; j++)
-                    vcpu_wake(&g.ctx[j]);
-            } else if ((int)target < g.nvcpus) {
-                vcpu_wake(&g.ctx[target]);
+                for (int j = 0; j < gp->nvcpus; j++)
+                    vcpu_wake(&gp->ctx[j]);
+            } else if ((int)target < gp->nvcpus) {
+                vcpu_wake(&gp->ctx[target]);
             }
             continue;
         } else if (e.reason == VMM_EXIT_REASON_MMIO
                    && e.mmio.write && e.mmio.address == JOTUN_NET_DOORBELL) {
-            net_service();
+            net_service(gp);
             continue;
         } else if (e.reason == VMM_EXIT_REASON_MMIO
                    && e.mmio.write && e.mmio.address == JOTUN_DRAW_DOORBELL) {
-            draw_service();
+            draw_service(gp);
             continue;
         } else if (e.reason == VMM_EXIT_REASON_MMIO) {
             int stop = 0;
@@ -362,9 +366,9 @@ run_vcpu(void *arg)
             if (uart_mmio(&e)) {
                 /* serviced by the console */
             } else if (e.mmio.write && e.mmio.address == JOTUN_DOORBELL) {
-                ring_service();
+                ring_service(gp);
             } else if (e.mmio.write && e.mmio.address == JOTUN_P9_DOORBELL) {
-                p9_service();
+                p9_service(gp);
             } else if (e.mmio.write && e.mmio.address == MMIO_POWEROFF) {
                 printf("\n[vcpu %d powered off]\n", c->index);
                 fflush(stdout);
@@ -516,7 +520,7 @@ main(int argc, char **argv)
     }
 
     /* Hand the guest its parameters before it starts. */
-    setup_bootinfo(gargc, gargv);
+    setup_bootinfo(&g, gargc, gargv);
 
     uart_init(&uart);
 
@@ -532,16 +536,16 @@ main(int argc, char **argv)
     /* The net provider shares the guest net channel and rouses vcpus when a
      * socket becomes ready. It is created before the 9P server so the /net
      * overlay can read its live connections. */
-    struct jotun_net *netchan = gpa_to_host(JOTUN_NET_BASE, sizeof(*netchan));
+    struct jotun_net *netchan = gpa_to_host(&g, JOTUN_NET_BASE, sizeof(*netchan));
     g.netdev = netchan ? net_init(netchan, rouse_vcpus, &g.policy) : NULL;
 
     /* The draw sink shares the guest draw channel and rouses vcpus when an
      * input event is queued. JOTUN_DRAW_TEST turns on the self-test event
      * source so the submit/poll path can run with no front end attached. */
     int draw_test = getenv("JOTUN_DRAW_TEST") != NULL;
-    struct jotun_draw *drawchan = gpa_to_host(JOTUN_DRAW_BASE, sizeof(*drawchan));
+    struct jotun_draw *drawchan = gpa_to_host(&g, JOTUN_DRAW_BASE, sizeof(*drawchan));
     g.drawdev = drawchan
-        ? draw_init(drawchan, rouse_vcpus, draw_test, draw_gpa, NULL) : NULL;
+        ? draw_init(drawchan, rouse_vcpus, draw_test, draw_gpa, &g) : NULL;
 
     /* If a signed origin is named, pull the bundle into a local cache depot and
      * serve that, exactly as a local depot. A pull failure refuses the boot:
@@ -608,6 +612,7 @@ main(int argc, char **argv)
 
     for (int i = 0; i < nvcpus; i++) {
         g.ctx[i].index = i;
+        g.ctx[i].owner = &g;
         g.ctx[i].vm = g.vm;
         g.ctx[i].entry = g.img.entry;
         g.ctx[i].sp = GUEST_RAM_SIZE - (uint64_t)i * STACK_SLOT - 16;
