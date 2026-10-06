@@ -293,19 +293,28 @@ observability, not for byte transfer. Scope is outbound TCP connect and UDP
 datagrams; listen/accept is deferred.
 
 The host provider opens real host sockets (that is the NAT) and keeps them
-non-blocking. A host poll thread (epoll, modelled on the timer thread) watches
-registered fds; each cycle, while an fd is ready, it injects the event vector
-into running vcpus and wakes any idle vcpus, so readiness is level-triggered
-and re-delivered rather than edge-latched.
+non-blocking. A host poll thread is event-driven, not periodic: it blocks in
+`epoll_wait` with no timeout and wakes only when a socket actually transitions.
+An fd is in the epoll set only while a guest task is waiting on it: the net
+doorbell handler arms it (one-shot) the moment a non-blocking `recv` or
+`connect` returns `EAGAIN`/`EINPROGRESS`, and readiness disarms it until the
+next would-block. On readiness the thread injects the event vector into running
+vcpus and wakes any idle ones. An idle connection has no registered fd, so
+there is nothing to spin on. A single `eventfd` in the set breaks the wait at
+shutdown. (`epoll` is Linux-only; the macOS/HVF path uses the same arm-on-
+`EAGAIN`, one-shot model over `kqueue`, implemented when that backend is
+validated on hardware.)
 
 Blocking is at task granularity, not vcpu granularity, so a task waiting on the
 network does not stall the other tasks on its cpu. A `net_read` that would
-block parks the task (a new `TASK_BLOCKED` scheduler state) and the task is
+block parks the task (the `TASK_BLOCKED` state from M5.1) and the task is
 re-readied on the next net event. The parking reuses the yield invariant that a
 task is never re-queued until its stack pointer is saved: a wake only re-queues
-a task the scheduler has already parked (a `parked` flag set after the switch),
-and because readiness is re-delivered each poll cycle, the rare
-blocked-but-not-yet-parked miss self-heals within one interval.
+a task the scheduler has already parked. A wake that lands in the window after
+the task marks itself blocked but before it finishes parking is not lost: it is
+held as `wake_pending` and honoured by the scheduler's park step. That is what
+lets the host side be strictly edge-triggered and one-shot without a re-delivery
+timer.
 
 Steps:
 
