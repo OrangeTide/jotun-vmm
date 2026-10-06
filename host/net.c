@@ -1,6 +1,11 @@
-/* net.c : the host net provider (Linux epoll). */
+/* net.c : the host net provider. Readiness via epoll on Linux, kqueue on macOS.
+ *
+ * The protocol logic is platform-neutral; the small poller_* layer below hides
+ * the readiness mechanism. One poll thread blocks until a socket is ready (or a
+ * shutdown wakeup), then flags the guest channel and rouses the guest, which
+ * re-readies and retries its parked net tasks. */
 
-#define _GNU_SOURCE     /* getaddrinfo, epoll, eventfd, MSG_NOSIGNAL */
+#define _GNU_SOURCE     /* getaddrinfo, MSG_NOSIGNAL on Linux */
 
 #include "net.h"
 
@@ -10,34 +15,238 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/event.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#else
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#endif
+
+/* macOS has no MSG_NOSIGNAL; it uses the SO_NOSIGPIPE socket option instead
+ * (set on each socket by set_nosigpipe), so the flag can fall back to zero. */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 #define NET_MAXCONN 16
+
+/* What a socket is being armed to wait for. */
+#define NET_WANT_READ  1
+#define NET_WANT_WRITE 2
 
 struct net_conn {
     int fd;                 /* host socket, -1 if the slot is free */
     int proto;
-    int in_epoll;           /* fd has been added to the epoll set */
+    int in_poll;            /* fd is registered with the poller */
     char peer[64];          /* "host!port" for a dial, "-" for a UDP socket */
 };
 
 struct netdev {
     struct net_conn conns[NET_MAXCONN];
+#if defined(__APPLE__)
+    int kqfd;
+    int wake_pipe[2];       /* self-pipe: write to break the poll thread out */
+#else
     int epfd;
     int evtfd;              /* ticked to break the poll thread out at shutdown */
+#endif
     pthread_t poll_thread;
-    pthread_mutex_t lock;   /* guards conns and the epoll set */
+    pthread_mutex_t lock;   /* guards conns and the poller set */
     volatile int stop;
     struct jotun_net *chan; /* guest channel, for the readiness flag */
     void (*wake)(void);
     const struct net_policy *policy;
 };
+
+/* Suppress SIGPIPE on a socket where the platform needs a per-socket option
+ * (macOS). On Linux MSG_NOSIGNAL on the send covers it, so this is a no-op. */
+static void
+set_nosigpipe(int fd)
+{
+#ifdef SO_NOSIGPIPE
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+#else
+    (void)fd;
+#endif
+}
+
+/****************************************************************
+ * Poller: epoll (Linux) or kqueue (macOS)
+ ****************************************************************/
+
+#if defined(__APPLE__)
+
+static int
+poller_create(struct netdev *nd)
+{
+    nd->kqfd = kqueue();
+    if (nd->kqfd < 0)
+        return -1;
+    if (pipe(nd->wake_pipe) != 0) {
+        close(nd->kqfd);
+        return -1;
+    }
+    fcntl(nd->wake_pipe[0], F_SETFL,
+          fcntl(nd->wake_pipe[0], F_GETFL, 0) | O_NONBLOCK);
+    struct kevent kev;
+    EV_SET(&kev, nd->wake_pipe[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
+    kevent(nd->kqfd, &kev, 1, NULL, 0, NULL);
+    return 0;
+}
+
+/* Arm one direction, one-shot: it fires once and stays quiet until re-armed. */
+static void
+poller_arm(struct netdev *nd, struct net_conn *c, int want)
+{
+    int16_t filt = (want & NET_WANT_WRITE) ? EVFILT_WRITE : EVFILT_READ;
+    struct kevent kev;
+    EV_SET(&kev, c->fd, filt, EV_ADD | EV_ONESHOT, 0, 0, NULL);
+    kevent(nd->kqfd, &kev, 1, NULL, 0, NULL);
+    c->in_poll = 1;
+}
+
+static void
+poller_del(struct netdev *nd, struct net_conn *c)
+{
+    struct kevent kev[2];
+    EV_SET(&kev[0], c->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    EV_SET(&kev[1], c->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+    kevent(nd->kqfd, kev, 2, NULL, 0, NULL);        /* ENOENT is harmless */
+    c->in_poll = 0;
+}
+
+/* Block until a socket is ready or the wakeup fires. Returns 1 if a real socket
+ * is ready, 0 for only a wakeup, -1 on a fatal error. */
+static int
+poller_wait(struct netdev *nd)
+{
+    struct kevent evs[NET_MAXCONN + 1];
+    int n = kevent(nd->kqfd, NULL, 0, evs, NET_MAXCONN + 1, NULL);
+    if (n < 0)
+        return errno == EINTR ? 0 : -1;
+    int woke = 0;
+    for (int i = 0; i < n; i++) {
+        if ((int)evs[i].ident == nd->wake_pipe[0]) {
+            char buf[64];
+            while (read(nd->wake_pipe[0], buf, sizeof buf) > 0)
+                ;
+            continue;                               /* shutdown tick */
+        }
+        woke = 1;
+    }
+    return woke;
+}
+
+static void
+poller_wake(struct netdev *nd)
+{
+    char one = 1;
+    if (write(nd->wake_pipe[1], &one, 1) < 0) {
+        /* pipe full: a wakeup is already pending, nothing to do */
+    }
+}
+
+static void
+poller_destroy(struct netdev *nd)
+{
+    close(nd->kqfd);
+    close(nd->wake_pipe[0]);
+    close(nd->wake_pipe[1]);
+}
+
+#else /* Linux: epoll + eventfd */
+
+static int
+poller_create(struct netdev *nd)
+{
+    nd->epfd = epoll_create1(0);
+    nd->evtfd = eventfd(0, EFD_NONBLOCK);
+    if (nd->epfd < 0 || nd->evtfd < 0) {
+        if (nd->epfd >= 0)
+            close(nd->epfd);
+        if (nd->evtfd >= 0)
+            close(nd->evtfd);
+        return -1;
+    }
+    struct epoll_event ev = { .events = EPOLLIN, .data.fd = nd->evtfd };
+    epoll_ctl(nd->epfd, EPOLL_CTL_ADD, nd->evtfd, &ev);
+    return 0;
+}
+
+/* Arm (or re-arm) the socket one-shot, so it fires once and then stays quiet
+ * until the next would-block re-arms it. */
+static void
+poller_arm(struct netdev *nd, struct net_conn *c, int want)
+{
+    uint32_t events = ((want & NET_WANT_READ) ? EPOLLIN : 0)
+                    | ((want & NET_WANT_WRITE) ? EPOLLOUT : 0);
+    struct epoll_event ev = { .events = events | EPOLLONESHOT, .data.fd = c->fd };
+    if (c->in_poll) {
+        epoll_ctl(nd->epfd, EPOLL_CTL_MOD, c->fd, &ev);
+    } else if (epoll_ctl(nd->epfd, EPOLL_CTL_ADD, c->fd, &ev) == 0) {
+        c->in_poll = 1;
+    }
+}
+
+static void
+poller_del(struct netdev *nd, struct net_conn *c)
+{
+    if (c->in_poll)
+        epoll_ctl(nd->epfd, EPOLL_CTL_DEL, c->fd, NULL);
+    c->in_poll = 0;
+}
+
+static int
+poller_wait(struct netdev *nd)
+{
+    struct epoll_event evs[NET_MAXCONN + 1];
+    int n = epoll_wait(nd->epfd, evs, NET_MAXCONN + 1, -1);
+    if (n < 0)
+        return errno == EINTR ? 0 : -1;
+    int woke = 0;
+    for (int i = 0; i < n; i++) {
+        if (evs[i].data.fd == nd->evtfd) {
+            uint64_t v;
+            if (read(nd->evtfd, &v, sizeof v) < 0) {
+                /* spurious; the stop flag is checked by the caller */
+            }
+            continue;                               /* shutdown tick */
+        }
+        woke = 1;
+    }
+    return woke;
+}
+
+static void
+poller_wake(struct netdev *nd)
+{
+    uint64_t one = 1;
+    if (write(nd->evtfd, &one, sizeof one) < 0) {
+        /* counter at max: a wakeup is already pending */
+    }
+}
+
+static void
+poller_destroy(struct netdev *nd)
+{
+    close(nd->epfd);
+    close(nd->evtfd);
+}
+
+#endif
+
+/****************************************************************
+ * Protocol logic (platform-neutral)
+ ****************************************************************/
 
 /* Set a result code and clear the payload length. */
 static void
@@ -45,19 +254,6 @@ reply(struct jotun_net *chan, int32_t status, uint32_t len)
 {
     chan->status = status;
     chan->len = len;
-}
-
-/* Arm (or re-arm) a connection's socket for the given epoll events, one-shot so
- * it fires once and then stays quiet until the next would-block re-arms it. */
-static void
-arm(struct netdev *nd, struct net_conn *c, uint32_t events)
-{
-    struct epoll_event ev = { .events = events | EPOLLONESHOT, .data.fd = c->fd };
-    if (c->in_epoll) {
-        epoll_ctl(nd->epfd, EPOLL_CTL_MOD, c->fd, &ev);
-    } else if (epoll_ctl(nd->epfd, EPOLL_CTL_ADD, c->fd, &ev) == 0) {
-        c->in_epoll = 1;
-    }
 }
 
 /* Extract the IPv4 address (host byte order) and port from a sockaddr. Returns
@@ -169,6 +365,7 @@ do_dial(struct netdev *nd, struct jotun_net *chan)
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0)
             continue;
+        set_nosigpipe(fd);
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
 
         int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
@@ -187,7 +384,7 @@ do_dial(struct netdev *nd, struct jotun_net *chan)
 
     nd->conns[handle].fd = fd;
     nd->conns[handle].proto = NET_PROTO_TCP;
-    nd->conns[handle].in_epoll = 0;
+    nd->conns[handle].in_poll = 0;
     snprintf(nd->conns[handle].peer, sizeof nd->conns[handle].peer,
              "%.40s!%.16s", host, port);
     pthread_mutex_unlock(&nd->lock);
@@ -216,7 +413,7 @@ do_send(struct netdev *nd, struct jotun_net *chan)
         return;
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTCONN) {
-        arm(nd, c, EPOLLOUT);        /* writable also signals connect done */
+        poller_arm(nd, c, NET_WANT_WRITE);  /* writable also signals connect */
         pthread_mutex_unlock(&nd->lock);
         reply(chan, NET_EAGAIN, 0);
         return;
@@ -251,7 +448,7 @@ do_recv(struct netdev *nd, struct jotun_net *chan)
         return;
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTCONN) {
-        arm(nd, c, EPOLLIN);
+        poller_arm(nd, c, NET_WANT_READ);
         pthread_mutex_unlock(&nd->lock);
         reply(chan, NET_EAGAIN, 0);
         return;
@@ -285,11 +482,12 @@ do_udp(struct netdev *nd, struct jotun_net *chan)
         reply(chan, NET_ECONN, 0);
         return;
     }
+    set_nosigpipe(fd);
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
 
     nd->conns[handle].fd = fd;
     nd->conns[handle].proto = NET_PROTO_UDP;
-    nd->conns[handle].in_epoll = 0;
+    nd->conns[handle].in_poll = 0;
     snprintf(nd->conns[handle].peer, sizeof nd->conns[handle].peer, "-");
     pthread_mutex_unlock(&nd->lock);
 
@@ -353,7 +551,7 @@ do_sendto(struct netdev *nd, struct jotun_net *chan)
         return;
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        arm(nd, c, EPOLLOUT);
+        poller_arm(nd, c, NET_WANT_WRITE);
         pthread_mutex_unlock(&nd->lock);
         reply(chan, NET_EAGAIN, 0);
         return;
@@ -398,7 +596,7 @@ do_recvfrom(struct netdev *nd, struct jotun_net *chan)
         return;
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        arm(nd, c, EPOLLIN);
+        poller_arm(nd, c, NET_WANT_READ);
         pthread_mutex_unlock(&nd->lock);
         reply(chan, NET_EAGAIN, 0);
         return;
@@ -413,11 +611,9 @@ do_close(struct netdev *nd, struct jotun_net *chan)
     pthread_mutex_lock(&nd->lock);
     struct net_conn *c = conn_of(nd, chan->handle);
     if (c) {
-        if (c->in_epoll)
-            epoll_ctl(nd->epfd, EPOLL_CTL_DEL, c->fd, NULL);
+        poller_del(nd, c);
         close(c->fd);
         c->fd = -1;
-        c->in_epoll = 0;
     }
     pthread_mutex_unlock(&nd->lock);
     reply(chan, 0, 0);
@@ -442,24 +638,11 @@ static void *
 poll_loop(void *arg)
 {
     struct netdev *nd = arg;
-    struct epoll_event evs[NET_MAXCONN + 1];
 
     while (!__atomic_load_n(&nd->stop, __ATOMIC_SEQ_CST)) {
-        int n = epoll_wait(nd->epfd, evs, NET_MAXCONN + 1, -1);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
+        int woke = poller_wait(nd);
+        if (woke < 0)
             break;
-        }
-        int woke = 0;
-        for (int i = 0; i < n; i++) {
-            if (evs[i].data.fd == nd->evtfd) {
-                uint64_t v;
-                (void)read(nd->evtfd, &v, sizeof v);
-                continue;       /* shutdown tick, loop checks the stop flag */
-            }
-            woke = 1;           /* a real socket is ready */
-        }
         if (woke) {
             /* Readiness is delivered generically: flag the channel and rouse
              * the guest, which re-readies and retries its parked net tasks. */
@@ -485,21 +668,13 @@ net_init(struct jotun_net *chan, void (*wake)(void),
     nd->policy = policy;
     pthread_mutex_init(&nd->lock, NULL);
 
-    nd->epfd = epoll_create1(0);
-    nd->evtfd = eventfd(0, EFD_NONBLOCK);
-    if (nd->epfd < 0 || nd->evtfd < 0) {
-        if (nd->epfd >= 0) close(nd->epfd);
-        if (nd->evtfd >= 0) close(nd->evtfd);
+    if (poller_create(nd) != 0) {
         free(nd);
         return NULL;
     }
 
-    struct epoll_event ev = { .events = EPOLLIN, .data.fd = nd->evtfd };
-    epoll_ctl(nd->epfd, EPOLL_CTL_ADD, nd->evtfd, &ev);
-
     if (pthread_create(&nd->poll_thread, NULL, poll_loop, nd) != 0) {
-        close(nd->epfd);
-        close(nd->evtfd);
+        poller_destroy(nd);
         free(nd);
         return NULL;
     }
@@ -530,14 +705,12 @@ net_shutdown(struct netdev *nd)
         return;
 
     __atomic_store_n(&nd->stop, 1, __ATOMIC_SEQ_CST);
-    uint64_t one = 1;
-    (void)write(nd->evtfd, &one, sizeof one);
+    poller_wake(nd);
     pthread_join(nd->poll_thread, NULL);
 
     for (int i = 0; i < NET_MAXCONN; i++)
         if (nd->conns[i].fd >= 0)
             close(nd->conns[i].fd);
-    close(nd->epfd);
-    close(nd->evtfd);
+    poller_destroy(nd);
     free(nd);
 }

@@ -15,7 +15,14 @@ SMOLVFS_SRC = $(SMOLVFS_READ) $(SMOLVFS_SIGN) $(SMOLVFS_CODEC)
 # The vendored crypto and codec select their backends at compile time.
 SMOLVFS_DEFS = -DCAS_WITH_MONOCYPHER -DCAS_WITH_MINIZ -DMINIZ_NO_STDIO
 
-CFLAGS = -Wall -Wextra -std=c11 -pthread -Iabi -I$(SMOLVFS_DIR) $(SMOLVFS_DEFS)
+# Expose the BSD names (flock, LOCK_EX in <sys/file.h>) the smolvfs sources use;
+# a strict -std hides them otherwise. _DARWIN_C_SOURCE unhides them on macOS,
+# _DEFAULT_SOURCE on glibc/musl. Both are harmless on the other platform.
+# _DEFAULT_SOURCE is defined empty to match cas.c's own definition (no warning).
+HOST_DEFS = -D_DARWIN_C_SOURCE -D_DEFAULT_SOURCE=
+
+CFLAGS = -Wall -Wextra -std=c11 -pthread -Iabi -I$(SMOLVFS_DIR) \
+    $(SMOLVFS_DEFS) $(HOST_DEFS)
 LDFLAGS =
 ifeq ($(OS),)
     OS := $(shell uname -s)
