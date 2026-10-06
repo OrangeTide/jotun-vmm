@@ -1,7 +1,8 @@
 # Makefile
-# smolvfs provides the bundle store the host 9P server reads from. Point this
-# at a checkout of smolvfs; the host compiles the read-path sources directly.
-SMOLVFS_DIR ?= third_party/smolvfs
+# smolvfs provides the bundle store the host 9P server reads from. Its sources
+# are vendored in-tree under third_party/smolvfs (no external checkout); the
+# host compiles the read-path sources directly.
+SMOLVFS_DIR = third_party/smolvfs
 SMOLVFS_SRC = $(SMOLVFS_DIR)/cas.c $(SMOLVFS_DIR)/cas-tree.c \
     $(SMOLVFS_DIR)/cas-pack.c $(SMOLVFS_DIR)/cas-codec.c
 
@@ -128,21 +129,28 @@ libos.elf: $(LIBOS_SRC) $(LIBOS_FP_OBJ)
 hello.elf: guest/prog/hello.c
 	$(GUEST_CC) $(GUEST_CFLAGS) -Iguest/prog -Wl,-Ttext=$(PROG_TEXT) -o $@ $<
 
-# Build a test bundle depot from example/bundle/ using smolvfs's castool, then
-# run with JOTUN_BUNDLE=bundle-depot ./jotun libos.elf.
+# Build a test bundle depot from example/bundle/ using castool, then run with
+# JOTUN_BUNDLE=bundle-depot ./jotun libos.elf. castool is built from the
+# vendored smolvfs sources (no external checkout). Signing is not enabled here;
+# the ref-signing path arrives with M8.
+CASTOOL_SRC = $(SMOLVFS_DIR)/castool.c $(SMOLVFS_DIR)/cas-topic.c \
+    $(SMOLVFS_DIR)/cas-sign.c $(SMOLVFS_DIR)/cas-tree.c $(SMOLVFS_DIR)/cas-gc.c \
+    $(SMOLVFS_DIR)/cas-pack.c $(SMOLVFS_DIR)/cas.c $(SMOLVFS_DIR)/cas-codec.c
 BUNDLE_DEPOT = bundle-depot
 
-bundle: $(PROGS)
-	$(MAKE) -C $(SMOLVFS_DIR) castool
+castool: $(CASTOOL_SRC)
+	$(CC) $(CFLAGS) -o $@ $^
+
+bundle: $(PROGS) castool
 	rm -rf $(BUNDLE_DEPOT) bundle-staging
 	mkdir bundle-staging
 	cp example/bundle/* bundle-staging/
 	cp hello.elf bundle-staging/hello
-	$(SMOLVFS_DIR)/castool -d $(BUNDLE_DEPOT) import root bundle-staging/*
-	$(SMOLVFS_DIR)/castool -d $(BUNDLE_DEPOT) pack
+	./castool -d $(BUNDLE_DEPOT) import root bundle-staging/*
+	./castool -d $(BUNDLE_DEPOT) pack
 
 clean:
-	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS)
+	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool
 	rm -rf $(BUNDLE_DEPOT) bundle-staging build
 
 .PHONY: all clean bundle

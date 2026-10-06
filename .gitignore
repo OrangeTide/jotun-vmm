@@ -3,5 +3,7 @@ test_guest.elf
 echo.elf
 libos.elf
 hello.elf
+castool
 bundle-depot
 bundle-staging
+build/
