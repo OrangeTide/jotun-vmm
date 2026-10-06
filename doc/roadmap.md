@@ -587,6 +587,42 @@ Acceptance: `jotun` pulls a bundle from a URL, fetching only the missing
 objects, verifies the signed ref against a trusted key, and boots a guest from
 it; a bundle whose ref signature is missing or wrong is refused.
 
+Status (done):
+
+- M8.1: the remaining smolvfs sources are vendored in-tree and built into the
+  host: the sign path (`cas-sign`, `cas-topic`) with the bundled monocypher
+  EdDSA-BLAKE2b backend, and the miniz DEFLATE codec, under
+  `-DCAS_WITH_MONOCYPHER -DCAS_WITH_MINIZ`. castool builds with the same
+  backends, so it can sign refs and write compressed objects.
+- M8.2: `host/http.c`, a minimal HTTP/1.1 GET client over plain sockets (no
+  libcurl): parse an `http://` origin, connect with a bounded time, GET a static
+  path, and return the body (Content-Length, chunked, or read-to-close). The
+  transport is plain http; authenticity rests on the signature, not the
+  transport.
+- M8.3: `host/bundlepull.c`, the pull client. It resolves the publisher's topic
+  ref from the trusted public key, fetches the signed version record, and
+  verifies it with `cas_vrec_decode` (format, key binding, and EdDSA signature)
+  plus a pin check that the record's key is the trusted one. It then walks the
+  object set reachable from the published root, fetching only what `cas_exists`
+  reports missing, verifying every object against its content hash
+  (`cas_fsck_object`, escalating to `cas_tree_verify` for htrees), and writing
+  each atomically. The verified root is committed under a local ref, so a rerun
+  resumes by skipping present objects and the host serves the cache depot
+  through the existing `p9smolvfs_open` path unchanged. Compressed (v2) objects
+  are decoded and verified through the miniz codec.
+- M8.4: config. A manifest may name `origin`, `key` (trusted publisher key,
+  hex), and `label`; the env fallbacks are `JOTUN_ORIGIN`, `JOTUN_KEY`,
+  `JOTUN_LABEL`, and `JOTUN_CACHE`. When an origin is set the host pulls before
+  serving, and any failure refuses the boot rather than falling back. See
+  `example/manifest-pull`.
+
+Verified end to end on linux/x86-64: a cold pull fetches and verifies the
+objects and boots the guest; a warm run fetches only the ref and reuses the
+cache; a wrong trusted key, a corrupt object, a corrupt record, and a record
+signed by an untrusted key are each refused; and a compressed depot pulls,
+decodes, verifies, and boots. The pull transport is loose objects only; the
+pack byte-range transport and key rotation stay out of scope.
+
 ## M9: guest libc-lite
 
 Goal: a small freestanding library for the guest, so the libOS stops

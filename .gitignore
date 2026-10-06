@@ -6,4 +6,5 @@ hello.elf
 castool
 bundle-depot
 bundle-staging
+bundle-cache
 build/

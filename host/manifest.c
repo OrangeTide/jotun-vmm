@@ -81,6 +81,12 @@ manifest_load(const char *path, struct manifest *m)
             }
         } else if (strcmp(key, "bundle") == 0) {
             copy_field(m->bundle, sizeof m->bundle, val);
+        } else if (strcmp(key, "origin") == 0) {
+            copy_field(m->origin, sizeof m->origin, val);
+        } else if (strcmp(key, "key") == 0) {
+            copy_field(m->key, sizeof m->key, val);
+        } else if (strcmp(key, "label") == 0) {
+            copy_field(m->label, sizeof m->label, val);
         } else if (strcmp(key, "ref") == 0) {
             copy_field(m->ref, sizeof m->ref, val);
         } else if (strcmp(key, "subtree") == 0) {
@@ -105,5 +111,5 @@ manifest_load(const char *path, struct manifest *m)
     }
 
     fclose(f);
-    return m->bundle[0] ? 0 : -1;
+    return (m->bundle[0] || m->origin[0]) ? 0 : -1;
 }

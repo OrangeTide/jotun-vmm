@@ -21,6 +21,7 @@
 #include "p9smolvfs.h"
 #include "p9overlay.h"
 #include "manifest.h"
+#include "bundlepull.h"
 #include "net.h"
 #include "draw.h"
 
@@ -532,6 +533,31 @@ main(int argc, char **argv)
     struct jotun_draw *drawchan = gpa_to_host(JOTUN_DRAW_BASE, sizeof(*drawchan));
     drawdev = drawchan
         ? draw_init(drawchan, rouse_vcpus, draw_test, draw_gpa, NULL) : NULL;
+
+    /* If a signed origin is named, pull the bundle into a local cache depot and
+     * serve that, exactly as a local depot. A pull failure refuses the boot:
+     * the bundle's authenticity could not be established. */
+    const char *origin = have_manifest ? m.origin : getenv("JOTUN_ORIGIN");
+    const char *trust_key = have_manifest ? m.key : getenv("JOTUN_KEY");
+    const char *label = have_manifest ? m.label : getenv("JOTUN_LABEL");
+    if (label && !label[0])
+        label = NULL;
+    if (origin && origin[0]) {
+        const char *cache = getenv("JOTUN_CACHE");
+        if (!cache || !cache[0])
+            cache = "bundle-cache";
+        if (!trust_key || !trust_key[0]) {
+            fprintf(stderr, "[pull] origin set but no trusted key"
+                    " (set JOTUN_KEY or manifest 'key')\n");
+            return 1;
+        }
+        fprintf(stderr, "[pull] fetching %s into %s\n", origin, cache);
+        if (bundle_pull(origin, trust_key, label, cache, ref) != 0) {
+            fprintf(stderr, "[pull] refusing to boot: bundle not pulled/verified\n");
+            return 1;
+        }
+        bundle = cache;                 /* serve the verified cache depot */
+    }
 
     /* Serve a smolvfs bundle if one is named, else the in-memory tree, with the
      * read-only /net overlay wrapping whichever backend is chosen. */

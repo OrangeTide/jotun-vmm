@@ -19,6 +19,9 @@ struct manifest_net {
 
 struct manifest {
     char bundle[256];                   /* depot path */
+    char origin[256];                   /* http origin to pull from, or "" */
+    char key[128];                      /* trusted publisher key (hex), or "" */
+    char label[64];                     /* topic label, or "" for the bare topic */
     char ref[64];                       /* ref name, default "root" */
     char subtree[256];                  /* guest root within the bundle */
     int  argc;

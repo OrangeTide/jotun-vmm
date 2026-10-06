@@ -1,0 +1,29 @@
+# jotun guest manifest: pull a signed bundle from an http origin.
+#
+# Instead of a local "bundle" path, name a remote "origin" to pull from. The
+# host fetches the bundle into a local cache depot (JOTUN_CACHE, default
+# bundle-cache), verifies the published root against the trusted key below, and
+# then serves it exactly as a local bundle. A missing or wrong signature, or a
+# corrupt object, refuses the boot.
+
+# The static http origin serving the depot (refs/ and loose objects).
+origin http://127.0.0.1:8099
+
+# The trusted publisher public key, 64 hex characters. Obtain it out of band
+# (castool keyid <keyfile> prints it). The root is trusted only if the signed
+# record is signed by this key.
+key 0000000000000000000000000000000000000000000000000000000000000000
+
+# Optional topic label, matching the publisher's "publish -l <label>". Omit for
+# the bare topic.
+# label stable
+
+ref root
+subtree /
+init rc
+
+# Publishing side (with the in-tree castool):
+#   castool keygen key.sk                      # prints public-key and ref name
+#   root=$(castool -d depot import root files...)
+#   castool -d depot publish key.sk $root      # sign and publish the ref
+#   serve the depot directory as static files at the origin url above
