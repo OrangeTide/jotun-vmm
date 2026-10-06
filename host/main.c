@@ -41,7 +41,38 @@ struct vcpu_ctx {
     int rc;
     vmm_vcpu_t *vcpu;           /* published by the thread for the timer */
     volatile int live;          /* 1 while the vcpu is running */
+
+    /* Idle/wake rendezvous: a guest cpu with no work stores to the idle
+     * doorbell and this thread blocks here until another cpu's wake doorbell
+     * store signals it. */
+    pthread_mutex_t idle_m;
+    pthread_cond_t idle_c;
+    int woken;
 };
+
+/* The vcpu table, published so a wake doorbell on one vcpu's thread can reach
+ * another's idle rendezvous. */
+static struct vcpu_ctx *all_ctx;
+static int all_n;
+
+static void
+vcpu_wake(struct vcpu_ctx *c)
+{
+    pthread_mutex_lock(&c->idle_m);
+    c->woken = 1;
+    pthread_cond_signal(&c->idle_c);
+    pthread_mutex_unlock(&c->idle_m);
+}
+
+static void
+vcpu_idle_wait(struct vcpu_ctx *c)
+{
+    pthread_mutex_lock(&c->idle_m);
+    while (!c->woken)
+        pthread_cond_wait(&c->idle_c, &c->idle_m);
+    c->woken = 0;
+    pthread_mutex_unlock(&c->idle_m);
+}
 
 /* Guest physical memory as the host sees it, identity-mapped for now (guest
  * physical address N is host byte N of this buffer). */
@@ -146,6 +177,7 @@ run_vcpu(void *arg)
     }
     vmm_vcpu_set_reg(vcpu, VMM_REG_PC, c->entry);
     vmm_vcpu_set_reg(vcpu, VMM_REG_SP, c->sp);
+    vmm_vcpu_set_reg(vcpu, VMM_REG_ARG, (uint64_t)c->index);    /* vcpu id */
 
     /* Publish the vcpu so the timer can interrupt it, and mark it running. */
     c->vcpu = vcpu;
@@ -180,6 +212,23 @@ run_vcpu(void *arg)
             fflush(stdout);
             pthread_mutex_unlock(&dev_lock);
             break;
+        } else if (e.reason == VMM_EXIT_REASON_MMIO
+                   && e.mmio.write && e.mmio.address == JOTUN_IDLE_DOORBELL) {
+            /* The guest cpu has no work: park this thread until woken. Done
+             * without dev_lock so an idle cpu never blocks the others. */
+            vcpu_idle_wait(c);
+            continue;
+        } else if (e.reason == VMM_EXIT_REASON_MMIO
+                   && e.mmio.write && e.mmio.address == JOTUN_WAKE_DOORBELL) {
+            uint32_t target = 0;
+            memcpy(&target, e.mmio.data, e.mmio.size < 4 ? e.mmio.size : 4);
+            if (target == JOTUN_WAKE_ALL) {
+                for (int j = 0; j < all_n; j++)
+                    vcpu_wake(&all_ctx[j]);
+            } else if ((int)target < all_n) {
+                vcpu_wake(&all_ctx[target]);
+            }
+            continue;
         } else if (e.reason == VMM_EXIT_REASON_MMIO) {
             int stop = 0;
             pthread_mutex_lock(&dev_lock);
@@ -375,6 +424,8 @@ main(int argc, char **argv)
 
     pthread_t threads[MAX_VCPUS];
     struct vcpu_ctx ctx[MAX_VCPUS];
+    all_ctx = ctx;
+    all_n = nvcpus;
     for (int i = 0; i < nvcpus; i++) {
         ctx[i].index = i;
         ctx[i].vm = vm;
@@ -383,6 +434,9 @@ main(int argc, char **argv)
         ctx[i].rc = 0;
         ctx[i].vcpu = NULL;
         ctx[i].live = 0;
+        pthread_mutex_init(&ctx[i].idle_m, NULL);
+        pthread_cond_init(&ctx[i].idle_c, NULL);
+        ctx[i].woken = 0;
         if (pthread_create(&threads[i], NULL, run_vcpu, &ctx[i]) != 0) {
             fprintf(stderr, "Failed to start vcpu %d thread\n", i);
             ctx[i].rc = 1;

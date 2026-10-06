@@ -28,7 +28,11 @@ ifeq ($(OS), Darwin)
     CC = clang
     GUEST = test_guest.elf echo.elf libos.elf
     GUEST_SRC = guest/test_guest_arm64.c
-    LIBOS_ARCH = guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S
+    LIBOS_ARCH = guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
+        guest/libos/arch/arm64_boot.S
+    # Keep atomic builtins inline (LL/SC or LSE) rather than calling the libgcc
+    # outline-atomic helpers, which are absent under -nostdlib.
+    GUEST_CFLAGS += -mno-outline-atomics
     # Apple's toolchain emits Mach-O; produce an ELF with an LLVM ELF target
     # and lld (install with e.g. `brew install lld`).
     GUEST_CC = clang --target=aarch64-unknown-none-elf -fuse-ld=lld
@@ -45,7 +49,7 @@ else
         GUEST = test_guest.elf echo.elf libos.elf
         GUEST_SRC = guest/test_guest_x86.c
         LIBOS_ARCH = guest/libos/arch/x86_64.c guest/libos/arch/x86_64_ctx.S \
-            guest/libos/arch/x86_64_isr.S
+            guest/libos/arch/x86_64_isr.S guest/libos/arch/x86_64_boot.S
         GUEST_CC = $(CC)
         GUEST_TEXT = 0x100000
     endif
@@ -53,7 +57,10 @@ else
         # linux/arm64: KVM, arm64 guest.
         GUEST = test_guest.elf echo.elf libos.elf
         GUEST_SRC = guest/test_guest_arm64.c
-        LIBOS_ARCH = guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S
+        LIBOS_ARCH = guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
+            guest/libos/arch/arm64_boot.S
+        # Inline atomics, not the libgcc outline helpers (absent, -nostdlib).
+        GUEST_CFLAGS += -mno-outline-atomics
         GUEST_CC = $(CC)
         GUEST_TEXT = 0x200000
     endif

@@ -1,23 +1,38 @@
-/* task.c : cooperative scheduler with spawn, exec, await, and notes.
+/* task.c : per-cpu preemptive scheduler with spawn, exec, await, and notes.
  *
- * Two contexts ping-pong: the scheduler (on the boot stack) and whichever task
- * it switched into. A task hands control back by switching to the saved
- * scheduler context, so the scheduler loop resumes right after the switch that
- * entered the task. When no task is ready the loop ends and sched_start
- * returns to the boot code, which halts.
+ * Every vcpu runs its own copy of the scheduler loop (sched_start) on its boot
+ * stack, finding its private state through arch_get_percpu. A single run queue
+ * and the task table are shared across cpus and guarded by one spinlock, so a
+ * ready task runs on whichever cpu reaches it first. That is the whole of the
+ * load balancing: push ready tasks onto the shared queue, let idle cpus pull.
+ *
+ * A task hands control back by switching to its cpu's saved scheduler context.
+ * The crucial SMP rule is that a task is never placed on the run queue until
+ * its stack pointer is saved: task_yield and task_exec only mark the outgoing
+ * task READY and switch away, and the scheduler enqueues it afterwards, once
+ * the switch has stored its sp. Otherwise another cpu could dequeue and resume
+ * a task whose context was still being written.
+ *
+ * When a cpu finds the queue empty it blocks in the host (smp_idle) until some
+ * cpu with new work wakes it (smp_wake_all). When the queue is empty and no cpu
+ * is running a task, the system has quiesced: the discovering cpu sets the
+ * shutdown flag and wakes the others so every scheduler loop returns.
  *
  * A task that exits becomes a zombie holding its exit status until a parent
  * awaits it; the stack is freed as soon as the task is gone, the slot when the
- * status is collected. A task with no awaiting parent simply lingers as a
- * zombie, which is fine at shutdown.
+ * status is collected.
  */
 #include "task.h"
 
+#include <stdint.h>
+
 #include "arch.h"
+#include "jotun_abi.h"
 #include "mem.h"
 #include "print.h"
 
 #define MAX_TASKS   8
+#define MAX_CPUS    8
 #define TASK_STACK  8192
 #define NO_PARENT   (-1)
 
@@ -43,13 +58,65 @@ struct task {
     int                 note_tail;
 };
 
+/* Per-cpu state, reached through arch_get_percpu. self lets a caller that
+ * holds a struct percpu * recover the pointer the arch register hands back. */
+struct percpu {
+    struct percpu       *self;
+    int                 id;
+    struct task         *cur;       /* running task on this cpu, or NULL */
+    void                *sched_sp;  /* this cpu's scheduler context */
+    unsigned char       *reap;      /* an exec'd task's old stack, freed by
+                                       this cpu's scheduler after the switch */
+};
+
+static struct percpu cpus[MAX_CPUS];
+
 static struct task tasks[MAX_TASKS];
 static struct task *runq_head;
 static struct task *runq_tail;
-static struct task *cur;            /* the running task, or NULL in scheduler */
-static void *sched_sp;              /* scheduler context, saved across switches */
-static unsigned char *reap_stack;   /* an exec'd task's old stack, freed by the
-                                       scheduler once it is no longer in use */
+static volatile int runq_lock;      /* guards runq + tasks table + counters */
+static int running_count;           /* tasks currently executing on some cpu */
+static volatile int shutdown;       /* set once the system has quiesced */
+
+static struct percpu *
+this_cpu(void)
+{
+    return arch_get_percpu();
+}
+
+/* Acquire the scheduler lock with interrupts masked. Masking on this cpu is
+ * what keeps a tick from re-entering the scheduler and spinning on a lock this
+ * same cpu already holds. */
+static unsigned long
+lock_irq(void)
+{
+    unsigned long f = arch_irq_save();
+    while (__atomic_exchange_n(&runq_lock, 1, __ATOMIC_ACQUIRE))
+        arch_cpu_relax();
+    return f;
+}
+
+static void
+unlock_irq(unsigned long f)
+{
+    __atomic_store_n(&runq_lock, 0, __ATOMIC_RELEASE);
+    arch_irq_restore(f);
+}
+
+/* Block this cpu in the host until another cpu wakes it. A store to the idle
+ * doorbell is an MMIO exit the host parks the vcpu thread on. */
+static void
+smp_idle(void)
+{
+    *(volatile uint32_t *)JOTUN_IDLE_DOORBELL = 0;
+}
+
+/* Wake every idle cpu so each rechecks the run queue (new work, or shutdown). */
+static void
+smp_wake_all(void)
+{
+    *(volatile uint32_t *)JOTUN_WAKE_DOORBELL = JOTUN_WAKE_ALL;
+}
 
 /* Bounded string copy, always terminated. No libc in a freestanding guest. */
 static void
@@ -64,6 +131,7 @@ scopy(char *dst, const char *src, int max)
     dst[i] = '\0';
 }
 
+/* Run-queue helpers. The caller holds runq_lock. */
 static void
 enqueue(struct task *t)
 {
@@ -89,33 +157,46 @@ dequeue(void)
     return t;
 }
 
+void
+cpu_init(unsigned long id)
+{
+    struct percpu *pc = &cpus[id];
+
+    pc->self = pc;
+    pc->id = (int)id;
+    pc->cur = NULL;
+    pc->sched_sp = NULL;
+    pc->reap = NULL;
+    arch_set_percpu(pc);
+}
+
 /* First code to run on a new task's stack. The scheduler sets cur before
  * switching in, so cur->fn is this task's function. If the function returns,
  * the task exits with success. */
 static void
 task_trampoline(void)
 {
-    cur->fn();
+    this_cpu()->cur->fn();
     task_exits(NULL);
 }
 
 int
 task_spawn(const char *name, task_fn fn)
 {
-    unsigned long f = arch_irq_save();
+    int id = -1;
+    unsigned long f = lock_irq();
+
     for (int i = 0; i < MAX_TASKS; i++) {
         struct task *t = &tasks[i];
         if (t->state != TASK_FREE)
             continue;
 
         unsigned char *stack = kmalloc(TASK_STACK);
-        if (!stack) {
-            arch_irq_restore(f);
-            return -1;
-        }
+        if (!stack)
+            break;          /* table had room but the heap did not */
 
         t->id = i;
-        t->parent = cur ? cur->id : NO_PARENT;
+        t->parent = this_cpu()->cur ? this_cpu()->cur->id : NO_PARENT;
         t->name = name;
         t->fn = fn;
         t->stack = stack;
@@ -124,36 +205,39 @@ task_spawn(const char *name, task_fn fn)
         t->note_head = t->note_tail = 0;
         t->state = TASK_READY;
         enqueue(t);
-        arch_irq_restore(f);
-        return i;
+        id = i;
+        break;
     }
-    arch_irq_restore(f);
-    return -1;
+    unlock_irq(f);
+
+    if (id >= 0)
+        smp_wake_all();     /* new work: rouse any cpu sitting idle */
+    return id;
 }
 
 int
 task_exec(task_fn fn)
 {
-    struct task *t = cur;
-
-    /* We are running on t's current stack, so we cannot lay the fresh program
-     * down on it without clobbering our own live frame. Allocate a new stack,
-     * point the task at it, and hand the old one to the scheduler to free once
-     * we have switched off it. This context is discarded on the switch out, so
-     * its frames are never resumed. */
+    /* Allocate the fresh stack before touching scheduler state: we are running
+     * on the current stack and cannot lay the new program over our own live
+     * frame. kmalloc may block on the heap lock, so do it outside the switch. */
     unsigned char *stack = kmalloc(TASK_STACK);
     if (!stack)
         return -1;
 
-    arch_irq_disable();             /* does not return, so no restore */
-    reap_stack = t->stack;
+    arch_irq_disable();             /* same-cpu guard; does not return */
+    struct percpu *pc = this_cpu();
+    struct task *t = pc->cur;
+
+    pc->reap = t->stack;            /* scheduler frees the old stack after we go */
     t->fn = fn;
     t->stack = stack;
     t->sp = stack_init(stack, TASK_STACK, task_trampoline);
     t->status[0] = '\0';
     t->state = TASK_READY;
-    enqueue(t);
-    ctx_switch(NULL, sched_sp);     /* discard this context, run fresh */
+    /* Discard this context. The scheduler re-enqueues t (now READY with a
+     * fresh sp) and frees pc->reap once the switch has left this stack. */
+    ctx_switch(NULL, pc->sched_sp);
     for (;;)
         ;       /* not reached */
 }
@@ -161,26 +245,67 @@ task_exec(task_fn fn)
 void
 sched_start(void)
 {
-    struct task *t;
+    struct percpu *pc = this_cpu();
 
-    while ((t = dequeue()) != NULL) {
-        cur = t;
+    for (;;) {
+        unsigned long f = lock_irq();
+        if (shutdown) {
+            unlock_irq(f);
+            return;
+        }
+
+        struct task *t = dequeue();
+        if (!t) {
+            if (running_count == 0) {
+                /* Queue empty and nothing running: the system has quiesced.
+                 * Signal every cpu to leave its scheduler. */
+                shutdown = 1;
+                unlock_irq(f);
+                smp_wake_all();
+                return;
+            }
+            unlock_irq(f);
+            smp_idle();         /* wait for another cpu to queue work */
+            continue;
+        }
+
         t->state = TASK_RUNNING;
-        /* Save the scheduler context and run the task. Control returns here
-         * when the task yields, exits, or exec's. */
-        ctx_switch(&sched_sp, t->sp);
-        /* Now off the task's stack: reap an exec'd task's old stack, and free
-         * a zombie's stack (its status and slot linger until a parent awaits
-         * it). */
-        if (reap_stack) {
-            kfree(reap_stack);
-            reap_stack = NULL;
+        running_count++;
+        pc->cur = t;
+        unlock_irq(f);
+
+        /* Save this cpu's scheduler context and run the task. Control returns
+         * here, on the same cpu, when the task yields, exec's, or exits. */
+        ctx_switch(&pc->sched_sp, t->sp);
+
+        struct task *done = pc->cur;
+        pc->cur = NULL;
+        unsigned char *free1 = NULL, *free2 = NULL;
+
+        f = lock_irq();
+        running_count--;
+        if (done->state == TASK_READY) {
+            /* Yielded or exec'd. Its sp is saved now, so it is safe to let
+             * another cpu pick it up. */
+            enqueue(done);
+        } else if (done->state == TASK_ZOMBIE && done->stack) {
+            /* Exited: free the stack, leave status and slot for a reaper. */
+            free1 = done->stack;
+            done->stack = NULL;
         }
-        if (cur->state == TASK_ZOMBIE && cur->stack) {
-            kfree(cur->stack);
-            cur->stack = NULL;
+        if (pc->reap) {
+            free2 = pc->reap;
+            pc->reap = NULL;
         }
-        cur = NULL;
+        unlock_irq(f);
+
+        /* Free outside the lock: kfree takes the heap lock, and the ordering
+         * is always scheduler-lock-then-heap-lock elsewhere, never the
+         * reverse. Releasing first keeps that invariant simple. */
+        if (free1)
+            kfree(free1);
+        if (free2)
+            kfree(free2);
     }
 }
 
@@ -188,11 +313,13 @@ void
 task_yield(void)
 {
     unsigned long f = arch_irq_save();
-    struct task *t = cur;
+    struct percpu *pc = this_cpu();
 
-    t->state = TASK_READY;
-    enqueue(t);
-    ctx_switch(&t->sp, sched_sp);
+    pc->cur->state = TASK_READY;
+    /* Do not enqueue here: another cpu could dequeue and resume this task
+     * before ctx_switch finishes saving its sp. The scheduler enqueues it on
+     * the way back, when the sp is safely stored. */
+    ctx_switch(&pc->cur->sp, pc->sched_sp);
     arch_irq_restore(f);
 }
 
@@ -201,7 +328,7 @@ task_yield(void)
 void
 irq_event(void)
 {
-    if (cur)
+    if (this_cpu()->cur)
         task_yield();
 }
 
@@ -209,10 +336,12 @@ void
 task_exits(const char *status)
 {
     arch_irq_disable();             /* does not return, so no restore */
-    scopy(cur->status, status, STATUS_MAX);
-    cur->state = TASK_ZOMBIE;
+    struct percpu *pc = this_cpu();
+
+    scopy(pc->cur->status, status, STATUS_MAX);
+    pc->cur->state = TASK_ZOMBIE;
     /* Nothing to save: this context is finished, so pass NULL as oldsp. */
-    ctx_switch(NULL, sched_sp);
+    ctx_switch(NULL, pc->sched_sp);
     for (;;)
         ;       /* not reached */
 }
@@ -220,25 +349,27 @@ task_exits(const char *status)
 int
 task_await(char *buf, int nbuf)
 {
+    int myid = this_cpu()->cur->id;
+
     for (;;) {
         int live = 0;
-        unsigned long f = arch_irq_save();
+        unsigned long f = lock_irq();
 
         for (int i = 0; i < MAX_TASKS; i++) {
             struct task *t = &tasks[i];
-            if (t->state == TASK_FREE || t->parent != cur->id)
+            if (t->state == TASK_FREE || t->parent != myid)
                 continue;
             if (t->state == TASK_ZOMBIE) {
                 int id = t->id;
                 if (buf && nbuf > 0)
                     scopy(buf, t->status, nbuf);
                 t->state = TASK_FREE;
-                arch_irq_restore(f);
+                unlock_irq(f);
                 return id;
             }
             live = 1;
         }
-        arch_irq_restore(f);
+        unlock_irq(f);
         if (!live)
             return -1;
         task_yield();       /* let the children make progress */
@@ -248,30 +379,34 @@ task_await(char *buf, int nbuf)
 int
 task_note(int id, const char *note)
 {
-    struct task *t;
-
     if (id < 0 || id >= MAX_TASKS)
         return -1;
-    t = &tasks[id];
-    if (t->state == TASK_FREE)
-        return -1;
-    if (t->note_tail - t->note_head >= NNOTES)
-        return -1;      /* queue full */
+
+    unsigned long f = lock_irq();
+    struct task *t = &tasks[id];
+    if (t->state == TASK_FREE || t->note_tail - t->note_head >= NNOTES) {
+        unlock_irq(f);
+        return -1;          /* gone, or queue full */
+    }
     scopy(t->notes[t->note_tail % NNOTES], note, NOTE_MAX);
     t->note_tail++;
+    unlock_irq(f);
     return 0;
 }
 
 int
 task_recv_note(char *buf, int nbuf)
 {
-    struct task *t = cur;
-
-    if (t->note_head == t->note_tail)
+    unsigned long f = lock_irq();
+    struct task *t = this_cpu()->cur;
+    if (t->note_head == t->note_tail) {
+        unlock_irq(f);
         return 0;
+    }
     if (buf && nbuf > 0)
         scopy(buf, t->notes[t->note_head % NNOTES], nbuf);
     t->note_head++;
+    unlock_irq(f);
     return 1;
 }
 

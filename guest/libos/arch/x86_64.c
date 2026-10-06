@@ -139,3 +139,28 @@ arch_irq_restore(unsigned long flags)
 {
     __asm__ volatile ("push %0; popfq" : : "r"(flags) : "memory", "cc");
 }
+
+#define MSR_GS_BASE 0xc0000101u
+
+void
+arch_set_percpu(void *p)
+{
+    uint64_t v = (uint64_t)(uintptr_t)p;
+    __asm__ volatile ("wrmsr"
+                      : : "c"(MSR_GS_BASE), "a"((uint32_t)v),
+                          "d"((uint32_t)(v >> 32)));
+}
+
+void *
+arch_get_percpu(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(MSR_GS_BASE));
+    return (void *)(uintptr_t)(((uint64_t)hi << 32) | lo);
+}
+
+void
+arch_cpu_relax(void)
+{
+    __asm__ volatile ("pause" ::: "memory");
+}

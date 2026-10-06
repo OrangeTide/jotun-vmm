@@ -1,12 +1,11 @@
 /* main.c : library OS entry and boot.
  *
- * The host loads this ELF, sets the vcpu PC to _start and SP to the top of a
- * per-vcpu stack, then runs. This is the greenfield 64-bit boot path: no
- * privilege split and no asm boot stub, since the host already hands us a
- * usable stack. We bring up the console, exercise the allocator, and halt.
- *
- * Later M2 steps add the scheduler and context switch; for now _start is the
- * whole of the init task. */
+ * The host loads this ELF and starts every vcpu at the same entry: the asm
+ * _start (arch/<arch>_boot.S) sets up the call and jumps to kmain with the
+ * vcpu id in the first argument. cpu 0 brings up the console, heap, 9P, and
+ * namespace, then spawns init; the other cpus wait for that boot to finish and
+ * join the scheduler. All cpus share one run queue, so tasks spread across
+ * them. When the system quiesces every scheduler returns and each cpu halts. */
 #include "arch.h"
 #include "boot.h"
 #include "jsh.h"
@@ -59,9 +58,10 @@ spinner(char letter)
 static void spin_a(void) { spinner('A'); task_exits("a"); }
 static void spin_b(void) { spinner('B'); task_exits("b"); }
 
-/* Preemption demo: two CPU-bound tasks that never yield. With the host timer
- * (JOTUN_HZ) their letters interleave; without it, one runs to completion
- * before the other. */
+/* Preemption demo: two CPU-bound tasks that never yield. With one vcpu and the
+ * host timer (JOTUN_HZ) their letters interleave through preemption; with two
+ * vcpus they run at the same time, one per cpu. Without either, one runs to
+ * completion before the other. */
 static void
 spin_demo(void)
 {
@@ -75,6 +75,58 @@ spin_demo(void)
     con_puts("\nspin: done\n");
 }
 
+/* Shared counter guarded by a spinlock, hammered by several worker tasks. On
+ * two vcpus the increments genuinely race, so a correct final total is
+ * evidence the lock (and the memory the cpus share) behaves. */
+#define SMP_WORKERS 4
+#define SMP_ROUNDS  50000
+
+static volatile int count_lock;
+static volatile unsigned long counter;
+
+static void
+count_lock_acquire(void)
+{
+    while (__atomic_exchange_n(&count_lock, 1, __ATOMIC_ACQUIRE))
+        arch_cpu_relax();
+}
+
+static void
+count_lock_release(void)
+{
+    __atomic_store_n(&count_lock, 0, __ATOMIC_RELEASE);
+}
+
+static void
+count_worker(void)
+{
+    for (int i = 0; i < SMP_ROUNDS; i++) {
+        count_lock_acquire();
+        counter++;
+        count_lock_release();
+    }
+    task_exits(NULL);
+}
+
+/* Spawn SMP_WORKERS counting tasks and check the total once they finish. */
+static void
+smp_demo(void)
+{
+    con_puts("smp: locked-counter test\n");
+    counter = 0;
+    for (int i = 0; i < SMP_WORKERS; i++)
+        task_spawn("count", count_worker);
+
+    char status[STATUS_MAX];
+    while (task_await(status, sizeof status) >= 0)
+        ;
+
+    con_puts("smp: counter ");
+    con_putu(counter);
+    con_puts(counter == (unsigned long)SMP_WORKERS * SMP_ROUNDS
+             ? " ok\n" : " WRONG\n");
+}
+
 /* The init task: either the preemption demo or the startup script, selected by
  * the first boot argument (default "rc"). */
 static void
@@ -84,6 +136,9 @@ init_task(void)
 
     if (script[0] == 's' && script[1] == 'p') {         /* "spin" */
         spin_demo();
+    } else if (script[0] == 's' && script[1] == 'm') {  /* "smp" */
+        spin_demo();
+        smp_demo();
     } else {
         con_puts("init: running script /");
         con_puts(script);
@@ -116,28 +171,43 @@ show_boot_params(void)
     }
 }
 
+/* Set once cpu 0 has finished shared bring-up and spawned init. Secondary cpus
+ * spin on it so they never enter the scheduler against an empty queue and
+ * mistake the not-yet-booted system for a quiesced one. */
+static volatile int boot_ready;
+
 void
-_start(void)
+kmain(unsigned long id)
 {
-    con_puts("libos up\n");
-    heap_selftest();
-    show_boot_params();
-    arch_traps_init();          /* trap tables ready before any task runs */
-    svc_publish();
+    cpu_init(id);
+    arch_traps_init();          /* each cpu loads its own trap tables */
 
-    if (p9_mount() != 0)
-        con_puts("9p: mount failed\n");
-    else
-        con_puts("9p: mounted\n");
-    ns_init();
+    if (id == 0) {
+        con_puts("libos up\n");
+        heap_selftest();
+        show_boot_params();
+        svc_publish();
 
-    task_spawn("init", init_task);
-    sched_start();
+        if (p9_mount() != 0)
+            con_puts("9p: mount failed\n");
+        else
+            con_puts("9p: mounted\n");
+        ns_init();
 
-    con_puts("final table:\n");
-    task_dump();
+        task_spawn("init", init_task);
+        __atomic_store_n(&boot_ready, 1, __ATOMIC_RELEASE);
+    } else {
+        while (!__atomic_load_n(&boot_ready, __ATOMIC_ACQUIRE))
+            arch_cpu_relax();
+    }
 
-    con_puts("libos halting\n");
+    sched_start();              /* runs until the system quiesces */
+
+    if (id == 0) {
+        con_puts("final table:\n");
+        task_dump();
+        con_puts("libos halting\n");
+    }
     arch_halt();
     for (;;)
         ;

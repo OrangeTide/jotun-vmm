@@ -82,3 +82,23 @@ arch_irq_restore(unsigned long flags)
 {
     __asm__ volatile ("msr daif, %0" : : "r"(flags) : "memory");
 }
+
+void
+arch_set_percpu(void *p)
+{
+    __asm__ volatile ("msr tpidr_el1, %0" : : "r"(p) : "memory");
+}
+
+void *
+arch_get_percpu(void)
+{
+    void *p;
+    __asm__ volatile ("mrs %0, tpidr_el1" : "=r"(p));
+    return p;
+}
+
+void
+arch_cpu_relax(void)
+{
+    __asm__ volatile ("yield" ::: "memory");
+}

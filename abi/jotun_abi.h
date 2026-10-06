@@ -16,6 +16,15 @@
 #define JOTUN_RING_BASE     0x4000u
 #define JOTUN_DOORBELL      0x0a000000ull
 
+/* SMP coordination doorbells (MMIO, so a store faults out to the host). A
+ * store to IDLE blocks the calling vcpu in the host until another vcpu stores
+ * to WAKE; a WAKE store carries the target vcpu id, or JOTUN_WAKE_ALL to wake
+ * every vcpu. This is how an idle cpu halts and a cpu with new work rouses it,
+ * without injecting an interrupt into a halted guest. */
+#define JOTUN_IDLE_DOORBELL 0x0a000010ull
+#define JOTUN_WAKE_DOORBELL 0x0a000018ull
+#define JOTUN_WAKE_ALL      0xffffffffu
+
 #define JOTUN_RING_SLOTS    8u
 #define JOTUN_SLOT_SIZE     256u                    /* bytes, header included */
 #define JOTUN_MSG_MAX       (JOTUN_SLOT_SIZE - 2u)  /* payload per slot */

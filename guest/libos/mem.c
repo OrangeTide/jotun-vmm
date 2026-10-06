@@ -20,6 +20,28 @@ struct block {
 
 static struct block *freelist;
 
+/* The free list is shared by every task on every cpu. A spinlock serialises
+ * cross-cpu access; masking interrupts as well keeps a tick on the same cpu
+ * from re-entering the allocator while the lock is held (which would spin
+ * forever against itself). */
+static volatile int heap_lock;
+
+static unsigned long
+heap_acquire(void)
+{
+    unsigned long f = arch_irq_save();
+    while (__atomic_exchange_n(&heap_lock, 1, __ATOMIC_ACQUIRE))
+        arch_cpu_relax();
+    return f;
+}
+
+static void
+heap_release(unsigned long f)
+{
+    __atomic_store_n(&heap_lock, 0, __ATOMIC_RELEASE);
+    arch_irq_restore(f);
+}
+
 void
 meminit(void *base, size_t size)
 {
@@ -38,8 +60,7 @@ kmalloc(size_t size)
 
     total = (size + sizeof(struct block) + ALIGN - 1) & ~((size_t)ALIGN - 1);
 
-    /* The free list is shared with any task that preempts this one. */
-    unsigned long irq = arch_irq_save();
+    unsigned long irq = heap_acquire();
     for (prev = &freelist; (b = *prev) != NULL; prev = &b->next) {
         if (b->size < total)
             continue;
@@ -53,10 +74,10 @@ kmalloc(size_t size)
         } else {
             *prev = b->next;
         }
-        arch_irq_restore(irq);
+        heap_release(irq);
         return (char *)b + sizeof(struct block);
     }
-    arch_irq_restore(irq);
+    heap_release(irq);
     return NULL;
 }
 
@@ -79,7 +100,7 @@ kfree(void *ptr)
     if (ptr == NULL)
         return;
 
-    unsigned long irq = arch_irq_save();
+    unsigned long irq = heap_acquire();
     b = (struct block *)((char *)ptr - sizeof(struct block));
 
     /* insert in address order */
@@ -105,5 +126,5 @@ kfree(void *ptr)
             p->next = b->next;
         }
     }
-    arch_irq_restore(irq);
+    heap_release(irq);
 }

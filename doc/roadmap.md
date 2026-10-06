@@ -205,7 +205,7 @@ host passes init parameters through the boot-info block; `jsh` does directory
 and file reads over the mounted bundle and spawns one of the bundled programs
 by name.
 
-## M4: preemption and SMP (in progress)
+## M4: preemption and SMP (done)
 
 Goal: multiple cores, preemptive scheduling, and threads.
 
@@ -233,15 +233,40 @@ share one path.
 
 Progress (M4.1, x86): single-vcpu preemption works and is verified. With
 `JOTUN_HZ=100`, two CPU-bound tasks that never yield interleave; without the
-timer one runs to completion before the other. Remaining: SMP (a second vcpu,
-a guest-visible vcpu id, cross-vcpu scheduling with a shared run queue, a
-cross-vcpu wakeup event, and a thread test).
+timer one runs to completion before the other.
 
-Scope: injection is implemented and tested on x86 KVM only. KVM arm64 (no
-vGIC) and HVF IRQ injection need hardware to validate, so the arm64 guest keeps
-the cooperative path (it runs at EL1 with IRQs masked); the HVF backend sets
-the pending IRQ by analogy with KVM but is unverified. The arm64 trap vector
-(`VBAR_EL1`) is installed when that work lands.
+SMP (M4.2, x86, done): every vcpu starts at the same entry and the asm `_start`
+(`arch/<arch>_boot.S`) passes the vcpu id to `kmain` in the first argument
+register (`VMM_REG_ARG`: RDI on x86, X0 on arm64). Each cpu finds its private
+state through a per-cpu base register (GS base on x86, `TPIDR_EL1` on arm64)
+and runs its own scheduler loop over one shared run queue guarded by a
+spinlock, so ready tasks spread across whichever cpus are idle. cpu 0 does the
+one-time bring-up (console, heap, 9P, namespace) and spawns init; the others
+wait on a boot flag, then join. The heap allocator takes a spinlock too, since
+it is now shared across cpus. The SMP-critical rule is that a yielding or
+exec'ing task is not re-queued until its stack pointer is saved: the task only
+marks itself ready and switches away, and the scheduler enqueues it after the
+switch, so no other cpu can resume a half-saved context.
+
+An idle cpu blocks in the host with a store to `JOTUN_IDLE_DOORBELL` (an MMIO
+exit the host parks the vcpu thread on, holding no device lock); a cpu that
+queues work stores `JOTUN_WAKE_ALL` to `JOTUN_WAKE_DOORBELL` to rouse the
+idlers. When the run queue is empty and no cpu is running a task, the system
+has quiesced: the discovering cpu sets a shutdown flag and wakes the rest so
+every scheduler returns and each cpu halts.
+
+Acceptance met on x86 KVM: with `JOTUN_VCPUS=2`, two CPU-bound tasks run at the
+same time (one per cpu) and a locked-counter test (four tasks racing on a
+shared counter) produces the exact total, with clean shutdown. The same binary
+still runs correctly on one vcpu, cooperatively or preempted.
+
+Scope: injection and SMP are implemented and tested on x86 KVM only. KVM arm64
+(no vGIC) and HVF IRQ injection need hardware to validate, so the arm64 guest
+keeps the cooperative path (it runs at EL1 with IRQs masked); the HVF backend
+sets the pending IRQ by analogy with KVM but is unverified. The per-cpu base,
+boot path, and idle/wake doorbells are arch-neutral and build clean for arm64
+on both the gcc and clang toolchains, but are not yet run on arm64 hardware.
+The arm64 trap vector (`VBAR_EL1`) is installed when that work lands.
 
 Risk: interrupt injection without an emulated controller differs per backend
 (KVM x86 without an in-kernel irqchip, KVM arm64 without a vGIC, and HVF IRQ

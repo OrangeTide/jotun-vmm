@@ -18,6 +18,7 @@ typedef struct vmm_vcpu vmm_vcpu_t;
 typedef enum {
     VMM_REG_PC,
     VMM_REG_SP,
+    VMM_REG_ARG,    /* first integer argument register: RDI (x86), X0 (arm64) */
 } vmm_reg_t;
 
 /* Execution exit reasons */

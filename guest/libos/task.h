@@ -1,15 +1,18 @@
-/* task.h : cooperative tasks with spawn, exec, await, and notes.
+/* task.h : preemptive tasks with spawn, exec, await, and notes.
  *
- * A task is a function on its own stack. Tasks run until they yield, exit, or
- * return; there is no preemption yet (that arrives with the timer in a later
- * milestone). One shared trust domain, no privilege split, so these are the
- * process-model primitives applied to tasks rather than isolated address
- * spaces. A loader turns a name into a function at M3; for now callers pass a
- * function directly. */
+ * A task is a function on its own stack. A timer preempts running tasks, and
+ * tasks also yield, exit, or return voluntarily. The scheduler is per-cpu over
+ * a shared run queue, so ready tasks spread across whatever vcpus are idle.
+ * One shared trust domain, no privilege split, so these are the process-model
+ * primitives applied to tasks rather than isolated address spaces. */
 #ifndef LIBOS_TASK_H
 #define LIBOS_TASK_H
 
 typedef void (*task_fn)(void);
+
+/* Bind this vcpu's per-cpu state and make arch_get_percpu return it. Each vcpu
+ * calls this once, with its vcpu id, before touching any task primitive. */
+void cpu_init(unsigned long id);
 
 /* Longest exit-status string, including the terminator. Like a Plan 9 exit
  * status: empty means success, non-empty names the failure. */
@@ -30,8 +33,10 @@ int task_spawn(const char *name, task_fn fn);
  * only if the stack cannot be reset. */
 int task_exec(task_fn fn);
 
-/* Run the scheduler until no task is ready, then return to the caller. Called
- * once from the boot context; the boot stack becomes the scheduler's stack. */
+/* Run this cpu's scheduler until the system quiesces (no task running and the
+ * run queue empty), then return to the caller. Every vcpu calls it; the boot
+ * stack becomes that cpu's scheduler stack. An idle cpu blocks in the host
+ * until another cpu queues work. */
 void sched_start(void);
 
 /* Yield the CPU to the next ready task. Returns when scheduled again. */

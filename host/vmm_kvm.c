@@ -206,6 +206,9 @@ void vmm_vcpu_set_reg(vmm_vcpu_t* vcpu, vmm_reg_t reg, uint64_t value) {
         case VMM_REG_SP:
             regs.rsp = value;
             break;
+        case VMM_REG_ARG:
+            regs.rdi = value;
+            break;
     }
     if (ioctl(vcpu->vcpu_fd, KVM_SET_REGS, &regs) < 0) {
         // Handle error
@@ -220,6 +223,9 @@ void vmm_vcpu_set_reg(vmm_vcpu_t* vcpu, vmm_reg_t reg, uint64_t value) {
             break;
         case VMM_REG_SP:
             id = ARM64_CORE_REG(sp_el1);
+            break;
+        case VMM_REG_ARG:
+            id = ARM64_CORE_REG(regs.regs[0]);  /* x0 */
             break;
         default:
             return;

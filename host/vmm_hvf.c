@@ -108,6 +108,9 @@ vmm_vcpu_set_reg(vmm_vcpu_t *vcpu, vmm_reg_t reg, uint64_t value)
         /* The guest runs at EL1, so its stack pointer is SP_EL1. */
         hv_vcpu_set_sys_reg(vcpu->vcpu, HV_SYS_REG_SP_EL1, value);
         break;
+    case VMM_REG_ARG:
+        hv_vcpu_set_reg(vcpu->vcpu, HV_REG_X0, value);
+        break;
     }
 }
 

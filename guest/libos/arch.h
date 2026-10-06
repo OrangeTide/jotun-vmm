@@ -40,4 +40,13 @@ void arch_irq_disable(void);
 unsigned long arch_irq_save(void);
 void arch_irq_restore(unsigned long flags);
 
+/* Per-cpu base pointer: set it once per vcpu at boot, then read it to find
+ * this cpu's private data. Backed by the GS base on x86 and TPIDR_EL1 on
+ * arm64. */
+void arch_set_percpu(void *p);
+void *arch_get_percpu(void);
+
+/* Spin-wait hint for a contended lock (pause / yield). */
+void arch_cpu_relax(void);
+
 #endif /* LIBOS_ARCH_H */
