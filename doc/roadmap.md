@@ -181,7 +181,7 @@ device table, held back from M2, land.
   parameter channel; see `unikernel-design.md` section 7.1.
 - Guest 9P client on the `archp9rpc` seam, routed to the ring.
 - Host 9P2000.u server, reading from the guest's bundle. The bundle is a
-  smolvfs store (`smolvfs`): a content-addressable store, a Merkle tree
+  smolvfs store: a content-addressable store, a Merkle tree
   layer with refs and snapshots, and a packfile that is the distributable
   artifact; see `unikernel-design.md` section 7.1. The server resolves a ref to
   a root tree, maps Twalk onto `cas_tree_lookup`, Tstat onto a tree entry, and
@@ -365,7 +365,7 @@ Acceptance: a guest app draws an interactive diagram in a browser window and
 receives a click or other semantic event back.
 
 Investigation (done): the design reuses the Quaoar research
-(`Quaoar`): a guest line protocol, a C
+(Quaoar): a guest line protocol, a C
 bridge that multiplexes apps onto one WebSocket, and a browser client that
 renders SVG. The bridge is a single-threaded `poll` relay with inline
 SHA-1/base64 WebSocket handshake and framing, no dependencies; its protocol
@@ -564,7 +564,7 @@ podman style.
 
 Depends only on M3, not on M4 through M7, so it can slot in whenever it is
 wanted. It adds the client side of the smolvfs REEF protocol and its HTTP
-profile (`smolvfs`, REEF.md and DOWNLOAD.md): a client fetches a snapshot
+profile (smolvfs REEF.md and DOWNLOAD.md): a client fetches a snapshot
 from a static origin over plain HTTP, downloads only the objects it lacks,
 verifies each against its hash, and resumes after interruption. Signing is part
 of this stage, not a later add-on, since this is where a bundle first arrives
@@ -574,7 +574,7 @@ bundle exactly as a local one.
 - Client-side fetch against static hosting (no server logic), resolving a ref
   and walking the object set it is missing.
 - A local object cache so repeated pulls and shared bases transfer once.
-- Ref signing and verification (`cas-sign`, `smolvfs`). Content
+- Ref signing and verification (smolvfs `cas-sign`). Content
   addressing already verifies each object's bytes against its hash; signing
   covers the missing half, which root ref is authentic. The publisher signs the
   ref; the client verifies the signature against a public key it trusts
@@ -600,7 +600,7 @@ whose output goes through the service vector, never a syscall; `strtol`/`atoi`.
 Deliberately excluded: `malloc` (the libOS already has `kmalloc`; programs get
 a bump allocator if needed later), any file or stdio-stream model, and anything
 syscall-shaped. These are written jotun-native; the formatter may be based on
-the nyctos `printf.c` format engine (`nyctos`, 0BSD) with
+the nyctos `printf.c` format engine (0BSD) with
 its header preserved if copied. nyctos's `sys`, `console`, `file`, and `compose`
 layers do not transfer, because they are bound to its syscall and fs model and
 it has no x86_64 port.

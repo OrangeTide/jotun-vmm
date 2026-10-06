@@ -96,7 +96,7 @@ This is the contract everything else rides on, so it is defined first.
 
 ## 6. Guest library OS (derived from JOS)
 
-JOS (`jon-os`) is a V6 Unix and Plan 9 flavored OS for MMU-less
+JOS (jon-os) is a V6 Unix and Plan 9 flavored OS for MMU-less
 machines, with 9P2000 as its native filesystem protocol. Its I/O and namespace
 layer is the reusable core. Its 64-bit and hypervisor ports do not exist yet
 and would be greenfield.
@@ -131,7 +131,7 @@ Drop:
 ## 7. Services, namespace, and capability model
 
 The model is "the namespace is the authority," refined with three ideas from
-BRUTAL (`BRUTAL`). BRUTAL is a full capability microkernel; its
+BRUTAL. BRUTAL is a full capability microkernel; its
 in-kernel capability machinery (per-task handle tables, cross-domain handle
 re-stamping, passable address spaces and tasks, rights delegation to children)
 is dropped, because it only pays off when isolating mutually distrusting
@@ -186,7 +186,7 @@ trust domain.
 
 The host owns the bundle; the guest only issues 9P reads, so no image-format
 code runs in the guest and the host validates every path. The bundle is a
-smolvfs store (`smolvfs`), a dependency-free content-addressable store
+smolvfs store, a dependency-free content-addressable store
 with a tree layer and a packfile:
 
 - **CAS.** Objects are addressed by their BLAKE2b-256 hash, written atomically,
@@ -266,7 +266,7 @@ Most content is a retained 2D scene the client renders and animates locally;
 pixels cross the wire only for raster content that has no vector form.
 
 It reuses the Quaoar display research
-(`Quaoar`). Quaoar's three-hop pipeline
+(Quaoar). Quaoar's three-hop pipeline
 already splits where this design needs it: application, then a bridge, then the
 browser. That maps onto guest, then host front end, then client. Quaoar uses
 reliable stream transports (a local socket with netstrings framing, and a
@@ -299,7 +299,7 @@ the guest produces pixels itself and the host simply delivers them.
 
 - The guest renders into a framebuffer in its own RAM. A guest app that wants a
   3D API can link a software rasterizer for this; Triton
-  (`Triton`), a subset of the 3Dfx Glide 3.0 API, is a ready
+  (Triton), a subset of the 3Dfx Glide 3.0 API, is a ready
   candidate. The rasterizer runs entirely inside the guest.
 - The framebuffer lives in a shared-memory region. The guest marks dirty
   rectangles and signals the host.
@@ -382,18 +382,19 @@ rasterizer crosses into the host; no hardware 3D acceleration for now.
 
 ## 12. Sources
 
-- `jon-os` (JOS): the library OS core, 9P client, namespace,
-  scheduler, and arch seam.
-- `BRUTAL` (BRUTAL): the external service capability model, shared
-  memory by reference, typed RPC.
-- `Triton` (Triton): a subset of the 3Dfx Glide 3.0 API with a
-  software rasterizer, used as an optional guest-side 3D library that renders
-  into a guest framebuffer.
-- `Quaoar` (Quaoar): the retained SVG display
-  protocol, behavior offloading, and the three-hop pipeline, the basis for the
-  primary 2D vector path.
-- `smolvfs` (smolvfs): the bundle format and store (section 7.1). A
-  dependency-free content-addressable store (CAS, BLAKE2b-256, mmap reads),
-  a Merkle tree layer with refs and snapshots (cas-tree), a packfile (cas-pack),
-  optional ref signing (cas-sign), and a git-style HTTP pull protocol (REEF and
-  its DOWNLOAD profile). Dual licensed MIT / BSD-2-Clause-Patent.
+- JOS (jon-os): the library OS core, 9P client, namespace, scheduler, and arch
+  seam.
+- BRUTAL: the external service capability model, shared memory by reference,
+  typed RPC.
+- Triton (triton-gpu): a subset of the 3Dfx Glide 3.0 API with a software
+  rasterizer, used as an optional guest-side 3D library that renders into a
+  guest framebuffer.
+- Quaoar (programmable-display-protocols): the retained SVG display protocol,
+  behavior offloading, and the three-hop pipeline, the basis for the primary 2D
+  vector path.
+- smolvfs: the bundle format and store (section 7.1). A dependency-free
+  content-addressable store (CAS, BLAKE2b-256, mmap reads), a Merkle tree layer
+  with refs and snapshots (cas-tree), a packfile (cas-pack), optional ref
+  signing (cas-sign), and a git-style HTTP pull protocol (REEF and its DOWNLOAD
+  profile). Dual licensed MIT / BSD-2-Clause-Patent. Its sources are vendored
+  in-tree under `third_party/smolvfs`.
