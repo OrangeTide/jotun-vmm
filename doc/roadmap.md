@@ -84,34 +84,39 @@ Decision: start with guest-polled event channels. The guest checks the pending
 bitmap at safe points, which avoids interrupt injection entirely. Real
 asynchronous injection is deferred to M4, where preemption needs it.
 
-## M2: guest library OS bring-up (in progress)
+## M2: guest library OS bring-up (done)
 
-Goal: boot the JOS-derived library OS as a guest. This is the longest
+Goal: boot the JOS-derived library OS as a guest. This was the longest
 milestone.
 
-Progress: the x86-64 64-bit long-mode switch is done. The KVM backend builds an
-identity-mapped page table in guest RAM and enters the vcpu in long mode, the
-guests build 64-bit, and the `-m32` path is retired. The libOS skeleton is up:
-`guest/libos/` boots to C with no asm stub (the host hands the vcpu a stack),
-has an arch seam (`arch.h` with a console byte sink and halt, implemented per
-arch under `arch/`), and carries the JOS-derived first-fit allocator. `make`
-builds `libos.elf`; it boots, runs a heap self-test, prints `libos up` /
-`heap ok`, and halts. The cooperative round-robin scheduler is up too: a task
-is a function on a `kmalloc`'d stack, with greenfield 64-bit context switches
-(`arch/<arch>_ctx.S` plus a `stack_init` per arch) and a scheduler that
-ping-pongs with the boot context. `task_spawn`, `task_yield`, `task_exit`, and
-a `task_dump` for observability are in `task.c`. The demo spawns two tasks that
-interleave and exit, dumps the table before and after, then halts. Next:
-spawn/exec/await and notes as signals (preemption waits for M4).
+- Import the JOS core: the first-fit allocator is in. The ELF loader, vfs, 9p,
+  and device table move with the filesystem work and land in M3.
+- Write the greenfield x86-64 and arm64 arch ports: boot to C and the context
+  switch are done; exception entry is deferred to M4, where preemption needs
+  it. No privilege split, as planned.
+- Round-robin scheduler on a single vcpu: done, cooperative.
+- `spawn`, `exec`, `await`, notes as signals, string exit status: done.
 
-- Import the JOS core: allocator, ELF loader, proc, vfs, 9p, device table.
-- Write the greenfield x86-64 and arm64 arch ports: boot to C, context switch,
-  exception entry, console. No privilege split.
-- Round-robin scheduler on a single vcpu.
-- `spawn`, `exec`, `await`, notes as signals, string exit status.
+Acceptance (met): `./jotun libos.elf` boots the library OS, runs an init task
+that prints to the console, and halts.
 
-Acceptance: the library OS boots, runs an init task that prints to the console,
-and halts.
+As built: `guest/libos/` boots straight to C with no asm stub, since the host
+hands the vcpu a usable stack. The arch seam is `arch.h`: a console byte sink,
+a halt, `stack_init`, and `ctx_switch`, implemented per arch under `arch/`
+(port I/O and HLT on x86-64, PL011 MMIO and a poweroff store on arm64, and a
+greenfield 64-bit context switch in `arch/<arch>_ctx.S`). The core is the
+JOS-derived allocator (`mem.c`) and the task layer (`task.c`): a cooperative
+round-robin scheduler that ping-pongs with the boot context, with `task_spawn`
+(records a parent), `task_exec` (replaces the program on a fresh stack),
+`task_await` (reaps a child and returns its string exit status), `task_exits`,
+`task_yield`, notes as a small per-task message queue, and `task_dump` for
+observability. `exec` resolves a function directly; name-to-program resolution
+arrives with the loader at M3.
+
+Scope: scheduling is cooperative. A task runs until it yields, exits, or
+exec's; there is no timer and no preemption yet, which is why exception entry
+and async note delivery are held for M4. Notes are drained by the receiving
+task rather than delivered asynchronously for the same reason.
 
 Decided: x86-64 guests run in 64-bit long mode with a trivial identity map.
 32-bit guests are not wanted, so the `-m32` path is interim only, used by the
