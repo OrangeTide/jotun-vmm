@@ -816,8 +816,8 @@ Sub-milestones:
   so the host validates it loads as a real tree and fails the mount cleanly
   otherwise, rather than serving an empty root. Demonstrated by the two-guest
   run in M10.0e, which already shares one depot. Grafting a shared mount at a
-  path inside a guest's own tree (rather than as the whole root) is deferred to
-  M13; it needs per-fid backend routing, which does not exist yet. The
+  path inside a guest's own tree (rather than as the whole root) landed later in
+  M13. The
   inter-guest network link (an in-host virtual switch) is also deferred: it needs
   a net listen/accept or rendezvous primitive that does not exist yet (design
   section 8), so it is tracked under opportunistic work, not M10.
@@ -894,15 +894,29 @@ relitigated later):
   resume. A snapshot therefore captures a guest's own state, not its external
   I/O, which suits the cooperative model.
 
-## M13: graft a shared read-only mount at a path
+## M13: graft a shared read-only mount at a path (done)
 
-Goal: mount another guest's (or a shared depot's) read-only subtree at a path
+Goal: mount another guest's (or a shared depot's) read-only tree at a path
 inside a guest's own filesystem, rather than serving it as the whole root as
-M10.4 does. The 9P server would route per fid to one of two backends by the
-subtree the fid walked into, and offset the grafted backend's qid range so the
-two trees' qid paths cannot collide. Declared in the manifest as a second mount.
-Deferred until a guest needs both its own tree and a shared tree at once; M10.4
-covers the whole-root case, which is enough for the current two-guest sharing.
+M10.4 does, so a guest sees both its own tree and a shared tree at once.
+
+What landed: `host/p9graft.c`, a backend that wraps a base backend and makes a
+second backend appear as one top-level directory in the base root. It models on
+the `/net` overlay, but the injected subtree is a real backend rather than
+synthetic files, and it composes under the overlay (a guest root shows its own
+entries, the grafted name, and `net`). Each operation routes to the backend that
+owns the node, tagged by the top bit of the qid path; the same bit keeps the two
+trees' qids disjoint, so the 9P client never confuses a base file with a graft
+file. The manifest gains `mount <name> <bundle> <ref> [subtree]`, and the shared
+bundle resolves a ref, a pinned hash, or a jimage exactly as the guest's own
+bundle does, so a snapshot can be pinned for a stable shared tree. Serving a
+second smolvfs bundle in one guest needed the per-open context fix (each
+`p9smolvfs_open` now owns its context rather than a single file-scope one).
+
+Scope of the first cut: one graft, at a top-level name in the root. The name
+must not already exist in the base root, or the graft shadows it. Grafting at a
+deeper path, or more than one graft per guest, is a mechanical extension (chain
+the wrapper) left until a need appears.
 
 ## Opportunistic and deferred work
 

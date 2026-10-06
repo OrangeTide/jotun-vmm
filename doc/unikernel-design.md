@@ -226,9 +226,12 @@ reads the live tree. A root hash instead pins an immutable snapshot: a consumer
 serving `ref <hash>` sees exactly that tree forever, even as the owner commits
 new roots behind the same name. A pinned hash is caller-supplied rather than
 resolved from a signed ref, so the host checks that it loads as a real tree and
-refuses the mount otherwise. This shares a whole tree as a guest's root; grafting
-a shared subtree at a path inside a guest's own tree is a later step (roadmap
-M13).
+refuses the mount otherwise. This shares a whole tree as a guest's root. A guest
+can instead graft a shared tree at a top-level name inside its own tree, so it
+sees both at once: the manifest line `mount <name> <bundle> <ref> [subtree]`
+wraps the guest's backend so the shared tree appears as `/<name>`, with the two
+trees' qids kept disjoint (roadmap M13). The shared `ref` resolves the same way,
+so a pinned hash gives a stable shared tree.
 
 Per-object compression is available (smolvfs ships a DEFLATE codec); the first
 cut can leave objects uncompressed. Compression is per object, so a very large

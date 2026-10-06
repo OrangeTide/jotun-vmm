@@ -11,3 +11,9 @@ init rc
 # net allow 127.0.0.1/32 18080 tcp
 # net allow 10.0.0.0/8 1-1024
 # net allow * 53 udp
+
+# Graft a shared read-only tree at a top-level name in the guest root, in
+# addition to the guest's own tree: "mount <name> <bundle> <ref> [subtree]".
+# The ref may be a ref name, a pinned root hash, or a jimage, like bundle/ref
+# above. The name must not already exist in the guest's own root.
+# mount shared shared-depot root
