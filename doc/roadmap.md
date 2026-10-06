@@ -153,9 +153,10 @@ device table, held back from M2, land.
   a root tree, maps Twalk onto `cas_tree_lookup`, Tstat onto a tree entry, and
   Tread onto `cas_open` (mmap). Content addressing dedups across files and
   bundles and verifies every object against its hash. The first cut reads a
-  local packfile with objects uncompressed; the per-object DEFLATE codec and
-  ref signing (`cas-sign`) are deferred, and multi-arch is out of the proof of
-  concept. The host owns all bundle access; the guest only issues 9P reads.
+  local packfile with objects uncompressed; the per-object DEFLATE codec is
+  deferred, and ref signing (`cas-sign`) lands with the pull stage (M8), where
+  bundles first arrive from an untrusted origin. Multi-arch is out of the proof
+  of concept. The host owns all bundle access; the guest only issues 9P reads.
 - Guest-side ELF loader reading programs from the namespace, so `exec(name)`
   loads the named program out of the bundle. Several bundled programs then run
   together in one guest domain.
@@ -224,26 +225,35 @@ Goal: raster content where vector does not fit.
 Acceptance: a guest software-renders a wireframe into a framebuffer node
 composited under the 2D chrome.
 
-## M8: image distribution, pull from a URL
+## M8: image distribution, signed pull from a URL
 
-Goal: fetch a guest bundle from a remote origin, docker or podman style.
+Goal: fetch and authenticate a guest bundle from a remote origin, docker or
+podman style.
 
 Depends only on M3, not on M4 through M7, so it can slot in whenever it is
 wanted. It adds the client side of the smolvfs REEF protocol and its HTTP
 profile (`smolvfs`, REEF.md and DOWNLOAD.md): a client fetches a snapshot
 from a static origin over plain HTTP, downloads only the objects it lacks,
-verifies each against its hash, and resumes after interruption. The host then
-boots the pulled bundle exactly as a local one.
+verifies each against its hash, and resumes after interruption. Signing is part
+of this stage, not a later add-on, since this is where a bundle first arrives
+from an origin that is not already trusted. The host then boots the pulled
+bundle exactly as a local one.
 
 - Client-side fetch against static hosting (no server logic), resolving a ref
   and walking the object set it is missing.
 - A local object cache so repeated pulls and shared bases transfer once.
-- Ref signing (`cas-sign`) added here, since this is where a bundle arrives
-  from an origin that is not already trusted. Until then, pulls are limited to
-  origins trusted out of band.
+- Ref signing and verification (`cas-sign`, `smolvfs`). Content
+  addressing already verifies each object's bytes against its hash; signing
+  covers the missing half, which root ref is authentic. The publisher signs the
+  ref; the client verifies the signature against a public key it trusts
+  (pinned, or the origin's key obtained out of band) before the pulled root is
+  used, and refuses an unsigned or badly signed ref. Key distribution and
+  rotation are kept minimal for the proof of concept; multi-arch stays out of
+  scope.
 
-Acceptance: `jotun` pulls a bundle from a URL, fetching only missing objects,
-and boots a guest from it.
+Acceptance: `jotun` pulls a bundle from a URL, fetching only the missing
+objects, verifies the signed ref against a trusted key, and boots a guest from
+it; a bundle whose ref signature is missing or wrong is refused.
 
 ## Cross-cutting concerns
 

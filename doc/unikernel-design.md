@@ -209,10 +209,12 @@ system, while still sharing the single trust domain.
 Content addressing gives integrity for free: every object verifies against its
 own hash, so neither the transport nor the host's cache need be trusted for the
 object bytes. What it does not establish is which root hash is authentic; that
-is the ref, and ref authenticity is the trust anchor. smolvfs can sign refs
-(`cas-sign`), but ref signing and multi-arch are out of the proof of concept.
-Ref signing is the piece to add back before a guest domain is pulled from an
-origin that is not already trusted.
+is the ref, and ref authenticity is the trust anchor. smolvfs signs refs with
+`cas-sign`: the publisher signs a ref, and the client verifies the signature
+against a trusted public key before using the root. Signing lands with the
+pull-from-URL stage (roadmap M8), where a bundle first arrives from an origin
+that is not already trusted; a local bundle until then carries a ref trusted
+directly. Multi-arch stays out of scope.
 
 Per-object compression is available (smolvfs ships a DEFLATE codec); the first
 cut can leave objects uncompressed. Compression is per object, so a very large
