@@ -7,39 +7,60 @@ build toward.
 
 ## Where we start
 
-The repository today is a working smoke-test VMM: one vcpu, one memory region,
-a UART, an ELF loader, and a run loop, on KVM (x86-64 verified) and
-Hypervisor.framework (arm64, verified by inspection only). The milestones below
-turn that into Jotun.
+After M0, the repository is a small host runtime under `host/`: it creates a
+VM, maps guest RAM in multiple slots, runs N vcpus on their own threads with
+mutex-guarded devices (a UART), loads an ELF guest, and services IO, MMIO, and
+HLT exits. It runs on KVM (x86-64 verified) and Hypervisor.framework (arm64,
+verified by inspection only). The sample guests live under `guest/`. The
+milestones below continue turning that into Jotun.
 
 The critical path is M1 (the transport ABI) then M2 (the guest library OS).
 Everything after rides the ABI. The x86-64 guest execution mode is decided:
 64-bit long mode with a trivial identity map. See M2.
 
-## M0: host core refactor
+## M0: host core refactor (done)
 
 Goal: turn the smoke test into a reusable host runtime.
 
 - Split the tree into `host/` and `guest/`.
-- Separate the generic VMM core (vcpu and memory lifecycle) from device and
-  service code.
+- Keep the generic VMM core (`vmm.*`, vcpu and memory lifecycle) separate from
+  the device code (`uart.*`) and the loader (`elf.*`). The split is by file
+  within `host/`, not subdirectories.
 - Support multiple memory slots and N vcpus, each on its own host thread.
 
-Acceptance: a test guest runs on two vcpus, both report exits cleanly, and
-multiple mapped regions work.
+Acceptance (met): a test guest runs on two vcpus, both halt cleanly, and guest
+RAM mapped as two slots works.
 
-Decision: do the directory reorganization now, before more code lands on the
-current flat layout.
+As built, beyond the plan: each vcpu runs on its own thread and is created on
+that thread, which Hypervisor.framework requires; `JOTUN_VCPUS=N` selects the
+count; each vcpu gets its own stack carved from the top of guest RAM; KVM
+assigns a distinct memory slot per mapping and a unique vcpu id per core
+(atomic, since threads create vcpus); device state and stdout are mutex-guarded;
+the build links `-pthread`.
 
 ## M1: transport ABI
 
 Goal: the single contract everything else rides on.
 
+Transition from M0: the rings and event bitmaps live in guest RAM, but after M0
+the guest-RAM base is a local in `main` and the vcpu threads only see the
+backend-provided `exit_info` buffers. So the first task is a guest-memory handle
+(host base, size, and guest base, identity-mapped for now) passed into the vcpu
+dispatch, with a `gpa_to_host` accessor. The doorbell itself needs no new
+backend work: it is an MMIO address recognized in the existing exit dispatch,
+the same hook point where `MMIO_POWEROFF` is handled today.
+
+- Add the guest-memory handle and `gpa_to_host` accessor.
 - Define `abi/jotun_abi.h` with the ring descriptors, the doorbell MMIO layout,
   and the event-channel pending and mask bitmaps. It is shared verbatim by host
-  and guest.
-- Host: the doorbell MMIO handler, ring draining, and event-channel writes.
-- Guest: a small ring library.
+  and guest, so it uses only fixed-width integer types and no libc, since the
+  guest builds freestanding. Both host and guest compiles add `-Iabi`.
+- Host: recognize the doorbell MMIO address, drain the ring, and write
+  event-channel bits into guest RAM. Serialize ring access across vcpu threads
+  with the existing device lock.
+- Guest: a small ring library in a throwaway bare-metal echo guest, in the
+  style of the current test guests. This milestone does not need the M2 library
+  OS.
 
 Acceptance: an echo service over the ring (the guest sends bytes, the host
 replies), driven by one doorbell exit per batch.
