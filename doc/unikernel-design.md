@@ -59,7 +59,8 @@ No further code names for the roles; "host" and "guest" are used throughout.
 The host is a single trusted process that is, at once:
 
 - the hypervisor driver (the existing `vmm_kvm.c` and `vmm_hvf.c` backends),
-- the 9P filesystem server,
+- the 9P filesystem server, reading from the guest's bundle (a smolvfs
+  content-addressed store, section 7.1),
 - the `/net` policy engine,
 - the display front end: it terminates the browser transports, composites the
   guest's 2D vector scene and any pixel regions, and delivers them to the
@@ -183,35 +184,54 @@ from the 9P namespace and loads it, so several programs cooperate inside one
 guest the way processes do on a normal system, while still sharing the single
 trust domain.
 
-The host owns parsing the bundle. The guest only issues 9P reads, so no
-image-format code runs in the guest and the host validates every path. The
-bundle is an EROFS image. EROFS is the forward-looking read-only filesystem:
-actively developed, and now the de-facto choice for Android, ChromeOS, and
-container images. Its fixed-sized-output compression decompresses small
-clusters on demand, which suits serving arbitrary byte ranges over 9P, where
-squashfs would decompress a whole block of up to a megabyte to answer one read.
-Its compact inodes map cleanly onto 9P stat and walk with little reader state.
-Parsing happens in our own host-side reader, so EROFS being in the Linux kernel
-is not itself the point; the longevity and tooling are.
+The host owns the bundle; the guest only issues 9P reads, so no image-format
+code runs in the guest and the host validates every path. The bundle is a
+smolvfs store (`smolvfs`), a dependency-free content-addressable store
+with a tree layer and a packfile:
 
-The first implementation serves uncompressed data, or even a plain host
-directory, so the 9P path comes up before any decompressor exists. Compression
-follows with lz4, the EROFS native codec, using the small MIT lz4 decompressor
-in `lz4` (section 12); lz4 decompresses fast and the code is tiny.
-EROFS also supports DEFLATE, should a gzip path ever be preferred.
+- **CAS.** Objects are addressed by their BLAKE2b-256 hash, written atomically,
+  and read by mmap. Identical content deduplicates automatically, across files
+  and across bundles, with no separate dedup pass.
+- **cas-tree.** Directories form a Merkle tree of tree objects with named refs
+  and an append-only snapshot log. Structural sharing makes a one-file change
+  cost O(depth) new objects, so snapshots and branches are cheap.
+- **cas-pack.** Many objects roll into a single packfile with a
+  binary-searchable index. That packfile is the distributable bundle.
 
-EROFS build-time data deduplication, a rolling-hash content-defined chunking
-pass, is left off. It pays off on large images with much duplicate data across
-files, such as layered container images, not on a small bundle of a few
-distinct programs and their config, and enabling it makes inodes share physical
-clusters, which complicates the reader. Revisit it only if many guest domains
-later share a common base, where cross-bundle dedup would matter.
+This maps onto 9P almost directly. The host resolves a ref to a root tree hash;
+a Twalk is then a chain of `cas_tree_lookup` calls, a Tstat is a tree entry,
+and a Tread opens the blob with `cas_open` and serves the mmap'd bytes, which
+also feed the shared-memory bulk path of the ABI. Because exec resolves a
+program by name (section 6), the loader reads that program's blob the same way,
+so several programs cooperate inside one guest the way processes do on a normal
+system, while still sharing the single trust domain.
+
+Content addressing gives integrity for free: every object verifies against its
+own hash, so neither the transport nor the host's cache need be trusted for the
+object bytes. What it does not establish is which root hash is authentic; that
+is the ref, and ref authenticity is the trust anchor. smolvfs can sign refs
+(`cas-sign`), but ref signing and multi-arch are out of the proof of concept.
+Ref signing is the piece to add back before a guest domain is pulled from an
+origin that is not already trusted.
+
+Per-object compression is available (smolvfs ships a DEFLATE codec); the first
+cut can leave objects uncompressed. Compression is per object, so a very large
+file decompresses whole rather than by cluster, which does not matter for a
+bundle of small programs and config. A large file can be chunked into a blob
+list if it ever does.
+
+The content-addressed design also gives a natural distribution path: a published
+depot is a set of static files, and a client fetches a snapshot over plain HTTP,
+downloading only the objects it lacks and verifying each against its hash
+(smolvfs REEF and its HTTP profile). This is the docker or podman style pull
+from a URL, and it is deferred to its own later milestone; the first cut uses a
+local packfile.
 
 Optionally, and in a later stage, the same bundle can also carry the bootable
-unikernel ELF itself. The host lifts that image out of the bundle to boot the
-guest, then serves the rest as the filesystem. One file then packages the
-kernel and its filesystem together, a convenient single-file distribution form.
-This is not needed for the first cut.
+unikernel ELF as one more object in the tree, resolved by a well-known path.
+The host lifts that image out to boot the guest, then serves the rest as the
+filesystem, so one file packages the kernel and its filesystem together. This
+is not needed for the first cut.
 
 The manifest ties these together. One manifest, read by the host at launch,
 names the bundle, the subtree within it the guest may see, the init program and
@@ -359,8 +379,8 @@ rasterizer crosses into the host; no hardware 3D acceleration for now.
 - `Quaoar` (Quaoar): the retained SVG display
   protocol, behavior offloading, and the three-hop pipeline, the basis for the
   primary 2D vector path.
-- `lz4` (`lz4.c`, `lz4.h`): a small MIT lz4 decompressor, the planned
-  codec for the EROFS bundle reader (section 7.1). lz4 is EROFS's native codec.
-- `inflate.c` and `inflate.c`:
-  small DEFLATE decompressors, held in reserve only if a gzip or zip import
-  path is ever wanted. Not used by the EROFS bundle.
+- `smolvfs` (smolvfs): the bundle format and store (section 7.1). A
+  dependency-free content-addressable store (CAS, BLAKE2b-256, mmap reads),
+  a Merkle tree layer with refs and snapshots (cas-tree), a packfile (cas-pack),
+  optional ref signing (cas-sign), and a git-style HTTP pull protocol (REEF and
+  its DOWNLOAD profile). Dual licensed MIT / BSD-2-Clause-Patent.

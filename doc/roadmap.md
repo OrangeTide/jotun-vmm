@@ -146,16 +146,16 @@ device table, held back from M2, land.
   runs the named init with those parameters. This is the general host-to-guest
   parameter channel; see `unikernel-design.md` section 7.1.
 - Guest 9P client on the `archp9rpc` seam, routed to the ring.
-- Host 9P2000.u server. It serves a read-only subtree backed by a filesystem
-  bundle, a single read-only image that packages the domain's programs (init, a
-  shell, small helpers) and their config and data. The bundle is an EROFS
-  image, chosen as the forward-looking read-only format; see
-  `unikernel-design.md` section 7.1. The first cut serves uncompressed data, or
-  a plain host directory, so the 9P path comes up before any decompressor
-  exists; lz4 compression follows, using the small MIT lz4 reader in
-  `lz4`. EROFS data deduplication (the rolling-hash pass) stays off; it
-  helps only large, layered images, not a small bundle. The host owns all
-  bundle parsing; the guest only issues 9P reads.
+- Host 9P2000.u server, reading from the guest's bundle. The bundle is a
+  smolvfs store (`smolvfs`): a content-addressable store, a Merkle tree
+  layer with refs and snapshots, and a packfile that is the distributable
+  artifact; see `unikernel-design.md` section 7.1. The server resolves a ref to
+  a root tree, maps Twalk onto `cas_tree_lookup`, Tstat onto a tree entry, and
+  Tread onto `cas_open` (mmap). Content addressing dedups across files and
+  bundles and verifies every object against its hash. The first cut reads a
+  local packfile with objects uncompressed; the per-object DEFLATE codec and
+  ref signing (`cas-sign`) are deferred, and multi-arch is out of the proof of
+  concept. The host owns all bundle access; the guest only issues 9P reads.
 - Guest-side ELF loader reading programs from the namespace, so `exec(name)`
   loads the named program out of the bundle. Several bundled programs then run
   together in one guest domain.
@@ -223,6 +223,27 @@ Goal: raster content where vector does not fit.
 
 Acceptance: a guest software-renders a wireframe into a framebuffer node
 composited under the 2D chrome.
+
+## M8: image distribution, pull from a URL
+
+Goal: fetch a guest bundle from a remote origin, docker or podman style.
+
+Depends only on M3, not on M4 through M7, so it can slot in whenever it is
+wanted. It adds the client side of the smolvfs REEF protocol and its HTTP
+profile (`smolvfs`, REEF.md and DOWNLOAD.md): a client fetches a snapshot
+from a static origin over plain HTTP, downloads only the objects it lacks,
+verifies each against its hash, and resumes after interruption. The host then
+boots the pulled bundle exactly as a local one.
+
+- Client-side fetch against static hosting (no server logic), resolving a ref
+  and walking the object set it is missing.
+- A local object cache so repeated pulls and shared bases transfer once.
+- Ref signing (`cas-sign`) added here, since this is where a bundle arrives
+  from an origin that is not already trusted. Until then, pulls are limited to
+  origins trusted out of band.
+
+Acceptance: `jotun` pulls a bundle from a URL, fetching only missing objects,
+and boots a guest from it.
 
 ## Cross-cutting concerns
 
