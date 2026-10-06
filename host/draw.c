@@ -38,6 +38,8 @@
 #define DRAW_MAXSURF   16       /* surfaces (windows) per guest */
 #define DRAW_STRCAP    4096     /* bytes kept from a title or text string */
 #define DRAW_MAXINTER  4        /* interaction annotations per node */
+#define DRAW_MAXPTS    1024     /* points in a polyline */
+#define DRAW_MAXSEG    512      /* segments in a path */
 
 /* The guest id namespaces browser DOM ids as qu-<guest>-<node>. One guest
  * domain exists today; multi-guest namespacing arrives with multiple domains. */
@@ -71,6 +73,13 @@ struct dinter {
     uint16_t track;             /* DRAG: track length */
 };
 
+/* One validated path segment: the command and its fixed count of arguments. */
+struct dseg {
+    uint8_t cmd;                /* DPATH_* */
+    uint8_t nargs;
+    int16_t a[6];
+};
+
 /* A retained scene node. Geometry is stored by type; text holds a surface
  * title or a text element's content. */
 struct dnode {
@@ -90,10 +99,18 @@ struct dnode {
     } geo;
     struct draw_style style;
     char    *text;              /* malloc'd, NUL-terminated, or NULL */
+
+    int16_t *pts;               /* POLYLINE: 2*npts coordinates, malloc'd */
+    int      npts;
+    int      closed;            /* POLYLINE: polygon rather than open */
+    struct dseg *segs;          /* PATH: nsegs segments, malloc'd */
+    int      nsegs;
+
     struct dinter inter[DRAW_MAXINTER];
     int      ninter;
     int      click;             /* a click listener is attached */
     int      close;             /* a close listener is attached */
+    int      hidden;            /* SET VISIBLE 0: emitted as display:none */
 };
 
 struct drawdev {
@@ -275,7 +292,11 @@ node_remove(struct drawdev *dd, uint32_t id)
     if (n->type == DOP_SURFACE)
         dd->nsurf--;
     free(n->text);
+    free(n->pts);
+    free(n->segs);
     n->text = NULL;
+    n->pts = NULL;
+    n->segs = NULL;
     n->in_use = 0;
     dd->nnodes--;
 }
@@ -298,6 +319,137 @@ node_interact(struct dnode *n, uint16_t kind, uint32_t to,
         it->to = to;
         it->axis = axis;
         it->track = track;
+    }
+}
+
+/* Fixed i16 argument count for a path command, or -1 if the command is unknown. */
+static int
+seg_args(uint8_t cmd)
+{
+    switch (cmd) {
+    case DPATH_M: case DPATH_L: return 2;
+    case DPATH_H: case DPATH_V: return 1;
+    case DPATH_C: return 6;
+    case DPATH_Q: return 4;
+    case DPATH_Z: return 0;
+    default: return -1;
+    }
+}
+
+/* Apply a single-attribute SET to a node. Geometry attributes apply only to the
+ * node kinds that have the field; style attributes and VISIBLE apply to any
+ * node. Returns 0, or -1 if the attribute does not apply to this node. */
+static int
+set_attr(struct dnode *n, uint16_t attr, long v)
+{
+    switch (attr) {
+    case DSA_FILL:
+        n->style.mask |= DST_FILL;
+        n->style.fill = (uint32_t)v == DRAW_COLOR_NONE ? DRAW_COLOR_NONE
+                                                       : (uint32_t)v & 0xffffffu;
+        return 0;
+    case DSA_STROKE:
+        n->style.mask |= DST_STROKE;
+        n->style.stroke = (uint32_t)v == DRAW_COLOR_NONE ? DRAW_COLOR_NONE
+                                                        : (uint32_t)v & 0xffffffu;
+        return 0;
+    case DSA_STROKE_WIDTH:
+        n->style.mask |= DST_STROKE_WIDTH;
+        n->style.stroke_width = (uint16_t)(v > 1024 ? 1024 : v);
+        return 0;
+    case DSA_OPACITY:
+        n->style.mask |= DST_OPACITY;
+        n->style.opacity = (uint8_t)v;
+        return 0;
+    case DSA_FONT:
+        n->style.mask |= DST_FONT;
+        n->style.font = (uint8_t)(v > 2 ? 0 : v);
+        return 0;
+    case DSA_VISIBLE:
+        n->hidden = !v;
+        return 0;
+    default:
+        break;                      /* geometry: handled per node kind below */
+    }
+
+    switch (n->type) {
+    case DOP_SURFACE:
+        switch (attr) {
+        case DSA_X: n->geo.surface.x = (int16_t)v; return 0;
+        case DSA_Y: n->geo.surface.y = (int16_t)v; return 0;
+        case DSA_W: n->geo.surface.w = (uint16_t)v; return 0;
+        case DSA_H: n->geo.surface.h = (uint16_t)v; return 0;
+        }
+        break;
+    case DOP_GROUP:
+        switch (attr) {
+        case DSA_X: n->geo.group.tx = (int16_t)v; return 0;
+        case DSA_Y: n->geo.group.ty = (int16_t)v; return 0;
+        }
+        break;
+    case DOP_RECT:
+        switch (attr) {
+        case DSA_X: n->geo.rect.x = (int16_t)v; return 0;
+        case DSA_Y: n->geo.rect.y = (int16_t)v; return 0;
+        case DSA_W: n->geo.rect.w = (uint16_t)v; return 0;
+        case DSA_H: n->geo.rect.h = (uint16_t)v; return 0;
+        }
+        break;
+    case DOP_CIRCLE:
+        switch (attr) {
+        case DSA_CX: n->geo.circle.cx = (int16_t)v; return 0;
+        case DSA_CY: n->geo.circle.cy = (int16_t)v; return 0;
+        case DSA_R:  n->geo.circle.r = (uint16_t)v; return 0;
+        }
+        break;
+    case DOP_ELLIPSE:
+        switch (attr) {
+        case DSA_CX: n->geo.ellipse.cx = (int16_t)v; return 0;
+        case DSA_CY: n->geo.ellipse.cy = (int16_t)v; return 0;
+        case DSA_RX: n->geo.ellipse.rx = (uint16_t)v; return 0;
+        case DSA_RY: n->geo.ellipse.ry = (uint16_t)v; return 0;
+        }
+        break;
+    case DOP_LINE:
+        switch (attr) {
+        case DSA_X1: n->geo.line.x1 = (int16_t)v; return 0;
+        case DSA_Y1: n->geo.line.y1 = (int16_t)v; return 0;
+        case DSA_X2: n->geo.line.x2 = (int16_t)v; return 0;
+        case DSA_Y2: n->geo.line.y2 = (int16_t)v; return 0;
+        }
+        break;
+    case DOP_TEXT:
+        switch (attr) {
+        case DSA_X: n->geo.text.x = (int16_t)v; return 0;
+        case DSA_Y: n->geo.text.y = (int16_t)v; return 0;
+        }
+        break;
+    }
+    return -1;                      /* attribute does not apply to this node */
+}
+
+/* Read a SET value at the width its attribute implies, into *out. Returns 0, or
+ * -1 for an unknown attribute. */
+static int
+read_set_value(struct rd *r, uint16_t attr, long *out)
+{
+    switch (attr) {
+    case DSA_X: case DSA_Y: case DSA_CX: case DSA_CY:
+    case DSA_X1: case DSA_Y1: case DSA_X2: case DSA_Y2:
+        *out = rd_i16(r);
+        return 0;
+    case DSA_W: case DSA_H: case DSA_R: case DSA_RX: case DSA_RY:
+    case DSA_STROKE_WIDTH:
+        *out = rd_u16(r);
+        return 0;
+    case DSA_FILL: case DSA_STROKE:
+        *out = (long)rd_u32(r);
+        return 0;
+    case DSA_OPACITY: case DSA_VISIBLE: case DSA_FONT:
+        *out = rd_u8(r);
+        return 0;
+    default:
+        return -1;
     }
 }
 
@@ -426,6 +578,83 @@ apply(struct drawdev *dd, const uint8_t *buf, uint32_t len, uint32_t *click_node
             n->style = st;
             break;
         }
+        case DOP_POLYLINE: {
+            uint32_t id = rd_u32(&r);
+            uint32_t parent = rd_u32(&r);
+            uint8_t closed = rd_u8(&r);
+            uint16_t npts = rd_u16(&r);
+            if (r.err || npts < 2 || npts > DRAW_MAXPTS)
+                return -1;
+            int16_t *pts = malloc((size_t)npts * 2 * sizeof *pts);
+            if (!pts)
+                return -1;
+            for (int i = 0; i < npts * 2; i++)
+                pts[i] = rd_i16(&r);
+            struct draw_style st;
+            rd_style(&r, &st);
+            if (r.err || !parent_ok(dd, parent)) {
+                free(pts);
+                return -1;
+            }
+            struct dnode *n = node_new(dd, id, DOP_POLYLINE, parent);
+            if (!n) {
+                free(pts);
+                return -1;
+            }
+            n->pts = pts;
+            n->npts = npts;
+            n->closed = closed ? 1 : 0;
+            n->style = st;
+            break;
+        }
+        case DOP_PATH: {
+            uint32_t id = rd_u32(&r);
+            uint32_t parent = rd_u32(&r);
+            uint16_t nseg = rd_u16(&r);
+            if (r.err || nseg == 0 || nseg > DRAW_MAXSEG)
+                return -1;
+            struct dseg *segs = malloc((size_t)nseg * sizeof *segs);
+            if (!segs)
+                return -1;
+            for (int i = 0; i < nseg; i++) {
+                uint8_t cmd = rd_u8(&r);
+                int na = seg_args(cmd);
+                if (r.err || na < 0) {
+                    free(segs);
+                    return -1;
+                }
+                segs[i].cmd = cmd;
+                segs[i].nargs = (uint8_t)na;
+                for (int k = 0; k < na; k++)
+                    segs[i].a[k] = rd_i16(&r);
+            }
+            struct draw_style st;
+            rd_style(&r, &st);
+            if (r.err || !parent_ok(dd, parent)) {
+                free(segs);
+                return -1;
+            }
+            struct dnode *n = node_new(dd, id, DOP_PATH, parent);
+            if (!n) {
+                free(segs);
+                return -1;
+            }
+            n->segs = segs;
+            n->nsegs = nseg;
+            n->style = st;
+            break;
+        }
+        case DOP_SET: {
+            uint32_t id = rd_u32(&r);
+            uint16_t attr = rd_u16(&r);
+            long v = 0;
+            if (read_set_value(&r, attr, &v) != 0 || r.err)
+                return -1;
+            int slot = find(dd, id);
+            if (slot < 0 || set_attr(&dd->nodes[slot], attr, v) != 0)
+                return -1;
+            break;
+        }
         case DOP_TEXT: {
             uint32_t id = rd_u32(&r);
             uint32_t parent = rd_u32(&r);
@@ -523,10 +752,7 @@ apply(struct drawdev *dd, const uint8_t *buf, uint32_t len, uint32_t *click_node
             break;
         }
         default:
-            /* SET, POLYLINE and PATH are in the vocabulary but have no guest
-             * emitter yet; their host apply and SVG land with those wrappers.
-             * Any other opcode is a protocol error. */
-            return -1;
+            return -1;              /* unknown opcode: a protocol error */
         }
         if (r.err)
             return -1;
@@ -679,6 +905,17 @@ emit_inter_smil(struct sbuf *b, const struct dnode *n)
     }
 }
 
+/* The attributes a shape's open tag ends with: style, interaction, and the
+ * hidden flag. */
+static void
+emit_common(struct sbuf *b, const struct dnode *n)
+{
+    emit_style(b, &n->style);
+    emit_inter_attrs(b, n);
+    if (n->hidden)
+        sb_puts(b, " display=\"none\"");
+}
+
 static void emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n);
 
 /* Emit every child of parent id in creation order: repeatedly pick the child
@@ -714,8 +951,9 @@ emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n)
     switch (n->type) {
     case DOP_SURFACE:
         sb_printf(b, "<g id=\"qu-%d-%u\" class=\"qu-surface\""
-                  " transform=\"translate(%d,%d)\">",
-                  DRAW_GUEST, n->id, n->geo.surface.x, n->geo.surface.y);
+                  " transform=\"translate(%d,%d)\"%s>",
+                  DRAW_GUEST, n->id, n->geo.surface.x, n->geo.surface.y,
+                  n->hidden ? " display=\"none\"" : "");
         sb_printf(b, "<rect class=\"qu-frame\" x=\"0\" y=\"0\""
                   " width=\"%u\" height=\"%u\" fill=\"#ffffff\""
                   " stroke=\"#888888\"/>",
@@ -735,8 +973,9 @@ emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n)
         sb_puts(b, "</g>");
         break;
     case DOP_GROUP:
-        sb_printf(b, "<g id=\"qu-%d-%u\" transform=\"translate(%d,%d)\">",
-                  DRAW_GUEST, n->id, n->geo.group.tx, n->geo.group.ty);
+        sb_printf(b, "<g id=\"qu-%d-%u\" transform=\"translate(%d,%d)\"%s>",
+                  DRAW_GUEST, n->id, n->geo.group.tx, n->geo.group.ty,
+                  n->hidden ? " display=\"none\"" : "");
         emit_children_ordered(b, dd, n->id);
         sb_puts(b, "</g>");
         break;
@@ -745,8 +984,7 @@ emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n)
                   " width=\"%u\" height=\"%u\" rx=\"%u\"",
                   DRAW_GUEST, n->id, n->geo.rect.x, n->geo.rect.y,
                   n->geo.rect.w, n->geo.rect.h, n->geo.rect.rx);
-        emit_style(b, &n->style);
-        emit_inter_attrs(b, n);
+        emit_common(b, n);
         sb_puts(b, ">");
         emit_inter_smil(b, n);
         sb_puts(b, "</rect>");
@@ -755,8 +993,7 @@ emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n)
         sb_printf(b, "<circle id=\"qu-%d-%u\" cx=\"%d\" cy=\"%d\" r=\"%u\"",
                   DRAW_GUEST, n->id, n->geo.circle.cx, n->geo.circle.cy,
                   n->geo.circle.r);
-        emit_style(b, &n->style);
-        emit_inter_attrs(b, n);
+        emit_common(b, n);
         sb_puts(b, ">");
         emit_inter_smil(b, n);
         sb_puts(b, "</circle>");
@@ -766,8 +1003,7 @@ emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n)
                   " rx=\"%u\" ry=\"%u\"",
                   DRAW_GUEST, n->id, n->geo.ellipse.cx, n->geo.ellipse.cy,
                   n->geo.ellipse.rx, n->geo.ellipse.ry);
-        emit_style(b, &n->style);
-        emit_inter_attrs(b, n);
+        emit_common(b, n);
         sb_puts(b, ">");
         emit_inter_smil(b, n);
         sb_puts(b, "</ellipse>");
@@ -777,18 +1013,42 @@ emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n)
                   " x2=\"%d\" y2=\"%d\"",
                   DRAW_GUEST, n->id, n->geo.line.x1, n->geo.line.y1,
                   n->geo.line.x2, n->geo.line.y2);
-        emit_style(b, &n->style);
-        emit_inter_attrs(b, n);
+        emit_common(b, n);
         sb_puts(b, ">");
         emit_inter_smil(b, n);
         sb_puts(b, "</line>");
+        break;
+    case DOP_POLYLINE: {
+        const char *tag = n->closed ? "polygon" : "polyline";
+        sb_printf(b, "<%s id=\"qu-%d-%u\" points=\"", tag, DRAW_GUEST, n->id);
+        for (int i = 0; i < n->npts; i++)
+            sb_printf(b, "%s%d,%d", i ? " " : "", n->pts[2 * i], n->pts[2 * i + 1]);
+        sb_puts(b, "\"");
+        emit_common(b, n);
+        sb_puts(b, ">");
+        emit_inter_smil(b, n);
+        sb_printf(b, "</%s>", tag);
+        break;
+    }
+    case DOP_PATH:
+        sb_printf(b, "<path id=\"qu-%d-%u\" d=\"", DRAW_GUEST, n->id);
+        for (int i = 0; i < n->nsegs; i++) {
+            const struct dseg *s = &n->segs[i];
+            sb_printf(b, "%s%c", i ? " " : "", s->cmd);
+            for (int k = 0; k < s->nargs; k++)
+                sb_printf(b, " %d", s->a[k]);
+        }
+        sb_puts(b, "\"");
+        emit_common(b, n);
+        sb_puts(b, ">");
+        emit_inter_smil(b, n);
+        sb_puts(b, "</path>");
         break;
     case DOP_TEXT:
         sb_printf(b, "<text id=\"qu-%d-%u\" x=\"%d\" y=\"%d\" font-size=\"%u\"",
                   DRAW_GUEST, n->id, n->geo.text.x, n->geo.text.y,
                   n->geo.text.size);
-        emit_style(b, &n->style);
-        emit_inter_attrs(b, n);
+        emit_common(b, n);
         sb_puts(b, ">");
         sb_escape(b, n->text);
         sb_puts(b, "</text>");
@@ -996,8 +1256,11 @@ draw_shutdown(struct drawdev *dd)
     if (!dd)
         return;
     drawws_stop(dd->ws);
-    for (int i = 0; i < DRAW_MAXNODES; i++)
+    for (int i = 0; i < DRAW_MAXNODES; i++) {
         free(dd->nodes[i].text);
+        free(dd->nodes[i].pts);
+        free(dd->nodes[i].segs);
+    }
     pthread_mutex_destroy(&dd->qlock);
     free(dd);
 }

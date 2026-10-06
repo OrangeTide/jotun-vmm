@@ -14,8 +14,13 @@ ARCH := $(shell uname -m)
 
 # Common freestanding guest flags; per-host blocks add the compiler, the
 # source, and the text base.
+# -mgeneral-regs-only keeps the compiler from emitting FP/SIMD (SSE on x86, NEON
+# on arm64) for things like struct copies. The guest never enables those units,
+# so such an instruction would fault; the guest is integer-only, so forbidding
+# them costs nothing. Works the same under gcc and clang, on both arches.
 GUEST_CFLAGS = -ffreestanding -fno-pic -fno-pie -nostdlib -fno-builtin -Iabi \
-    -fno-asynchronous-unwind-tables -Wl,-e_start -Wl,--build-id=none
+    -fno-asynchronous-unwind-tables -mgeneral-regs-only \
+    -Wl,-e_start -Wl,--build-id=none
 
 GUEST =
 

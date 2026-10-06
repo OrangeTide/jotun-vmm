@@ -61,6 +61,33 @@ enum {
     DOP_LISTEN   = 0x24,    /* id:u32 event:u16 */
 };
 
+/* Attributes for DOP_SET. The value that follows the attribute is typed by it:
+ *   i16   coordinates: X Y CX CY X1 Y1 X2 Y2
+ *   u16   dimensions:  W H R RX RY STROKE_WIDTH
+ *   color FILL STROKE  (u32: 0xRRGGBB or DRAW_COLOR_NONE)
+ *   u8    OPACITY (0..255), VISIBLE (0 or 1), FONT (0 sans, 1 serif, 2 mono)
+ * Geometry attributes apply only to the node kinds that have that field; a
+ * mismatch is a protocol error. Style attributes and VISIBLE apply to any node. */
+enum {
+    DSA_X = 1, DSA_Y, DSA_W, DSA_H,
+    DSA_CX, DSA_CY, DSA_R, DSA_RX, DSA_RY,
+    DSA_X1, DSA_Y1, DSA_X2, DSA_Y2,
+    DSA_FILL, DSA_STROKE, DSA_STROKE_WIDTH,
+    DSA_OPACITY, DSA_VISIBLE, DSA_FONT,
+};
+
+/* DOP_PATH segment commands (the cmd:u8), each followed by its fixed count of
+ * i16 arguments. The set is closed; the host re-emits the path string itself. */
+enum {
+    DPATH_M = 'M',      /* moveto: 2 args (x y) */
+    DPATH_L = 'L',      /* lineto: 2 args (x y) */
+    DPATH_H = 'H',      /* horizontal lineto: 1 arg (x) */
+    DPATH_V = 'V',      /* vertical lineto: 1 arg (y) */
+    DPATH_C = 'C',      /* cubic bezier: 6 args */
+    DPATH_Q = 'Q',      /* quadratic bezier: 4 args */
+    DPATH_Z = 'Z',      /* closepath: 0 args */
+};
+
 /* Style presence-mask bits; present fields follow the u16 mask in bit order. */
 enum {
     DST_FILL         = 1u << 0,     /* color */

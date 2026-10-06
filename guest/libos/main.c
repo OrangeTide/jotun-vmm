@@ -322,6 +322,28 @@ draw_demo(void)
     draw_group(4, 1, 20, 130);
     draw_circle(5, 4, 30, 30, 20, &dot);
 
+    /* A polyline (triangle) and a path, to exercise the new shape ops. */
+    static const int16_t tri[] = { 110, 0, 150, 60, 70, 60 };
+    struct draw_style edge = {
+        .mask = DST_FILL | DST_STROKE | DST_STROKE_WIDTH,
+        .fill = DRAW_COLOR_NONE,
+        .stroke = 0xaa3344,
+        .stroke_width = 2,
+    };
+    draw_polyline(6, 4, 1, tri, 3, &edge);
+
+    struct draw_seg path[] = {
+        { DPATH_M, { 170, 0 } },
+        { DPATH_L, { 210, 0 } },
+        { DPATH_Q, { 230, 30, 210, 60 } },
+        { DPATH_Z, { 0 } },
+    };
+    struct draw_style pstyle = { .mask = DST_FILL, .fill = 0x6688cc };
+    draw_path(7, 4, path, 4, &pstyle);
+
+    /* Move the circle with SET, a post-create mutation. */
+    draw_set(5, DSA_CX, 40);
+
     draw_flush();
     con_puts("draw: scene submitted, waiting for event\n");
 

@@ -31,6 +31,13 @@ struct draw_event {
     char     value[64];     /* event-specific, NUL-terminated */
 };
 
+/* One path segment: a command (DPATH_*) and up to six i16 arguments, of which
+ * the command's fixed count are used. */
+struct draw_seg {
+    uint8_t cmd;
+    int16_t a[6];
+};
+
 /* Register the draw event hook with the scheduler. Call once at boot. */
 void draw_init(void);
 
@@ -42,11 +49,24 @@ void draw_rect(uint32_t id, uint32_t parent, int x, int y, int w, int h,
                int rx, const struct draw_style *st);
 void draw_circle(uint32_t id, uint32_t parent, int cx, int cy, int r,
                  const struct draw_style *st);
+void draw_ellipse(uint32_t id, uint32_t parent, int cx, int cy, int rx, int ry,
+                  const struct draw_style *st);
 void draw_line(uint32_t id, uint32_t parent, int x1, int y1, int x2, int y2,
+               const struct draw_style *st);
+/* A connected set of n points (x,y pairs in pts[0..2n)); closed selects a
+ * filled polygon over an open polyline. n is capped by the host. */
+void draw_polyline(uint32_t id, uint32_t parent, int closed,
+                   const int16_t *pts, int n, const struct draw_style *st);
+/* A path of n segments. The host re-emits the path string from the validated
+ * commands and arguments; no path text crosses from the guest. */
+void draw_path(uint32_t id, uint32_t parent, const struct draw_seg *segs, int n,
                const struct draw_style *st);
 void draw_text(uint32_t id, uint32_t parent, int x, int y, int size,
                const char *s, const struct draw_style *st);
 void draw_set_text(uint32_t id, const char *s);
+/* Set one attribute of an existing node. attr is a DSA_* code; value is read at
+ * the width that attribute implies (see jotun_draw.h). */
+void draw_set(uint32_t id, int attr, long value);
 void draw_remove(uint32_t id);
 void draw_listen(uint32_t id, int event);
 void draw_click(uint32_t id);                       /* clickable: DI_CLICK */

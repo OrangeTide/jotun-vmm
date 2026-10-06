@@ -456,11 +456,21 @@ Steps:
   guest `draw_drag`/`draw_xy` emit DI_DRAG/DI_XY, the client reports drag and xy
   gestures, and the host re-encodes their fractional values into the binary norm
   form the guest ABI defines (verified: a 0.5 scroll decodes to norm 32768 in
-  the guest). Remaining vocabulary breadth (the SET mutation op and the POLYLINE
-  and PATH shape types, which need variable per-node storage) is deferred to a
-  later vocabulary pass; text and paste input stay deferred since they need a
-  text-input primitive, which the restricted vocabulary excludes for now
-  (no foreignObject).
+  the guest).
+- M6.5 vocabulary breadth (done): the specified-but-stubbed ops now have guest
+  wrappers, host validation and apply, and SVG emission. SET mutates one
+  attribute of an existing node (geometry attributes apply only to the node
+  kinds that have the field, style attributes and VISIBLE to any node); POLYLINE
+  emits a polyline or, when closed, a polygon; PATH re-emits a path string from
+  a closed command set (M L H V C Q Z) with host-checked argument counts, so no
+  path text crosses from the guest. Points and segments are capped per node and
+  freed with the node. Verified end to end via the draw demo (a SET moves a
+  circle, a closed polyline renders as a polygon, a path renders) and the SVG is
+  well-formed and renders. A build fix came with this: the guest is now compiled
+  -mgeneral-regs-only, since a larger aggregate initializer made the compiler
+  emit SSE the guest never enabled, which faulted the vcpu. Text and paste input
+  stay deferred since they need a text-input primitive the restricted vocabulary
+  excludes (no foreignObject).
 - M6.6: scale and latency characterization (node ceiling, mutation throughput).
 
 ## M7: display, the pixel path
