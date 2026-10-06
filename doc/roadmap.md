@@ -301,9 +301,11 @@ doorbell handler arms it (one-shot) the moment a non-blocking `recv` or
 next would-block. On readiness the thread injects the event vector into running
 vcpus and wakes any idle ones. An idle connection has no registered fd, so
 there is nothing to spin on. A single `eventfd` in the set breaks the wait at
-shutdown. (`epoll` is Linux-only; the macOS/HVF path uses the same arm-on-
-`EAGAIN`, one-shot model over `kqueue`, implemented when that backend is
-validated on hardware.)
+shutdown. (`epoll` is Linux-only. The net provider now carries a `kqueue`
+backend behind the same `poller_*` interface for macOS, with a self-pipe in
+place of the `eventfd` wakeup; it is arm-on-`EAGAIN` and one-shot like the
+Linux path. The macOS backend is compile-reviewed only, since this tree is
+built and run on Linux; it needs a macOS build to confirm.)
 
 Blocking is at task granularity, not vcpu granularity, so a task waiting on the
 network does not stall the other tasks on its cpu. A `net_read` that would
@@ -727,6 +729,14 @@ Independent of the milestones above, tracked so they are not lost:
   networking, M6 for display, and M8 for the pull origin and trusted key.
 - Validation of every guest-to-host message is a standing requirement, not a
   phase.
+- Host portability to macos/arm64 is a standing concern. As of the M8 work the
+  host builds on macOS: the Makefile sets `_DARWIN_C_SOURCE`/`_DEFAULT_SOURCE`
+  so the vendored smolvfs sources see the BSD names they use, and the net
+  provider has a `kqueue` backend (self-pipe wakeup, `SO_NOSIGPIPE` per socket)
+  beside the Linux `epoll` one. This is compile-reviewed only; the tree is built
+  and run on Linux here, so a real macOS build plus the HVF backend on hardware
+  is still needed to confirm. See the net event loop under M5 and the HVF notes
+  under M4.
 - Multi-guest multiplexing and session authentication, snapshot and restore, and
   single-file packaging were earlier cross-cutting notes; they are now the
   forward milestones M10, M12, and M11 above.
