@@ -650,8 +650,12 @@ Steps:
   never names it; the guest referenced none of them and was one such construct
   away from a link failure. `guest/libos/string.c` provides those four plus
   strlen, strcmp, strncmp, and strlcpy, compiled into the libOS.
-- M9.2: de-duplicate the open-coded helpers onto this header (ns.c `sstrlen`,
-  net.c `ncopy`, task.c `scopy`, and the ad-hoc loops in p9.c and jsh.c).
+- M9.2 (done): de-duplicate the open-coded helpers onto this header. ns.c
+  `sstrlen`/`sstrcpy` became `strlen`/`strlcpy`, net.c `ncopy` became `memcpy`,
+  task.c `scopy` and ns.c's copies became `strlcpy`, and jsh.c `streq` became
+  `strcmp() == 0`; each file now includes `string.h`. p9.c was left as is: its
+  loops are 9P wire marshalling and stream decoding through the bounds-checked
+  codec in `abi/jotun_9p.h`, which host and guest share, not string helpers.
 - M9.3: the bounded formatter, output via the service vector.
 - M9.4: expose the library to bundle programs. Decide between extending the
   service vector with these entries and linking a small `libc.a` into each

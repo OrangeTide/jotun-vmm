@@ -6,6 +6,7 @@
 #include "ns.h"
 
 #include "p9.h"
+#include "string.h"
 
 #define NS_MAX      16
 #define NS_NAMELEN  64
@@ -18,28 +19,10 @@ struct ns_ent {
 static struct ns_ent ents[NS_MAX];
 static int nents;
 
-static void
-sstrcpy(char *dst, const char *src, int cap)
-{
-    int i = 0;
-    for (; src[i] && i < cap - 1; i++)
-        dst[i] = src[i];
-    dst[i] = '\0';
-}
-
-static int
-sstrlen(const char *s)
-{
-    int n = 0;
-    while (s[n])
-        n++;
-    return n;
-}
-
 void
 ns_init(void)
 {
-    sstrcpy(ents[0].at, "/", NS_NAMELEN);
+    strlcpy(ents[0].at, "/", NS_NAMELEN);
     ents[0].src[0] = '\0';
     nents = 1;
 }
@@ -49,8 +32,8 @@ ns_mount(const char *at, const char *src)
 {
     if (nents >= NS_MAX)
         return -1;
-    sstrcpy(ents[nents].at, at, NS_NAMELEN);
-    sstrcpy(ents[nents].src, src, NS_NAMELEN);
+    strlcpy(ents[nents].at, at, NS_NAMELEN);
+    strlcpy(ents[nents].src, src, NS_NAMELEN);
     nents++;
     return 0;
 }
@@ -65,7 +48,7 @@ ns_bind(const char *src, const char *at)
 static int
 is_prefix(const char *at, const char *path)
 {
-    int la = sstrlen(at);
+    int la = strlen(at);
 
     if (la == 1 && at[0] == '/')
         return 1;
@@ -83,7 +66,7 @@ ns_resolve(const char *path, char *out, int cap)
 
     for (int i = 0; i < nents; i++) {
         if (is_prefix(ents[i].at, path)) {
-            int l = sstrlen(ents[i].at);
+            int l = strlen(ents[i].at);
             if (l > bestlen) {
                 bestlen = l;
                 best = i;
@@ -91,7 +74,7 @@ ns_resolve(const char *path, char *out, int cap)
         }
     }
     if (best < 0) {
-        sstrcpy(out, path, cap);
+        strlcpy(out, path, cap);
         return;
     }
 

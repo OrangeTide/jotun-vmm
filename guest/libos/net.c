@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include "arch.h"
+#include "string.h"
 #include "task.h"
 
 /* One waiter flag per task id. Set before an RPC that may arm host readiness,
@@ -53,15 +54,6 @@ doorbell(void)
     *(volatile uint32_t *)(uintptr_t)JOTUN_NET_DOORBELL = 1;
 }
 
-static void
-ncopy(void *dst, const void *src, unsigned long n)
-{
-    unsigned char *d = dst;
-    const unsigned char *s = src;
-    for (unsigned long i = 0; i < n; i++)
-        d[i] = s[i];
-}
-
 /* Re-ready every parked net task. Registered as the scheduler event hook, so
  * it runs on the event interrupt and when an idle cpu is woken. It returns
  * fast unless the host actually flagged a net event. */
@@ -95,7 +87,7 @@ net_dial(int proto, const char *target)
     c->op = NET_OP_DIAL;
     c->proto = (uint32_t)proto;
     c->len = (uint32_t)len;
-    ncopy(c->data, target, len);
+    memcpy(c->data, target, len);
     doorbell();
     int st = c->status;
     unlock_chan(f);
@@ -114,7 +106,7 @@ send_once(int handle, const void *buf, unsigned long n)
     c->op = NET_OP_SEND;
     c->handle = handle;
     c->len = (uint32_t)n;
-    ncopy(c->data, buf, n);
+    memcpy(c->data, buf, n);
     doorbell();
     long st = c->status;
     unlock_chan(f);
@@ -161,7 +153,7 @@ recv_once(int handle, void *buf, unsigned long max)
     doorbell();
     long st = c->status;
     if (st > 0)
-        ncopy(buf, c->data, c->len);
+        memcpy(buf, c->data, c->len);
     unlock_chan(f);
     return st;
 }
@@ -216,9 +208,9 @@ sendto_once(int handle, const char *dst, const void *buf, unsigned long n)
     c->op = NET_OP_SENDTO;
     c->handle = handle;
     c->addrlen = (uint32_t)alen;
-    ncopy(c->addr, dst, alen);
+    memcpy(c->addr, dst, alen);
     c->len = (uint32_t)n;
-    ncopy(c->data, buf, n);
+    memcpy(c->data, buf, n);
     doorbell();
     long st = c->status;
     unlock_chan(f);
@@ -259,12 +251,12 @@ recvfrom_once(int handle, char *src, unsigned long srccap,
     doorbell();
     long st = c->status;
     if (st >= 0) {
-        ncopy(buf, c->data, c->len);
+        memcpy(buf, c->data, c->len);
         unsigned long a = c->addrlen;
         if (src && srccap > 0) {
             if (a > srccap - 1)
                 a = srccap - 1;
-            ncopy(src, c->addr, a);
+            memcpy(src, c->addr, a);
             src[a] = '\0';
         }
     }

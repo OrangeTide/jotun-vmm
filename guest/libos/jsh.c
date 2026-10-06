@@ -10,19 +10,10 @@
 #include "p9.h"
 #include "print.h"
 #include "prog.h"
+#include "string.h"
 
 #define JSH_FID     5u
 #define SCRIPT_MAX  2048
-
-static int
-streq(const char *a, const char *b)
-{
-    while (*a && *a == *b) {
-        a++;
-        b++;
-    }
-    return *a == *b;
-}
 
 static void
 cmd_ls(const char *path)
@@ -111,7 +102,7 @@ exec_line(char *line)
     char *rest = s;             /* remainder of the line, untruncated */
 
     /* echo prints the whole remainder, so handle it before truncating. */
-    if (streq(cmd, "echo")) {
+    if (strcmp(cmd, "echo") == 0) {
         con_puts(rest);
         con_putc('\n');
         return;
@@ -133,19 +124,19 @@ exec_line(char *line)
         *e = '\0';
     }
 
-    if (streq(cmd, "ls")) {
+    if (strcmp(cmd, "ls") == 0) {
         cmd_ls(a1[0] ? a1 : "/");
-    } else if (streq(cmd, "cat")) {
+    } else if (strcmp(cmd, "cat") == 0) {
         if (a1[0])
             cmd_cat(a1);
         else
             con_puts("cat: missing path\n");
-    } else if (streq(cmd, "bind")) {
+    } else if (strcmp(cmd, "bind") == 0) {
         if (a1[0] && a2[0])
             ns_bind(a1, a2);        /* bind src onto mountpoint */
         else
             con_puts("bind: usage: bind SRC DIR\n");
-    } else if (streq(cmd, "mount")) {
+    } else if (strcmp(cmd, "mount") == 0) {
         if (a1[0] && a2[0])
             ns_mount(a2, a1);       /* mount SRC at DIR */
         else

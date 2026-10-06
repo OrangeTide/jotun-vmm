@@ -30,6 +30,7 @@
 #include "jotun_abi.h"
 #include "mem.h"
 #include "print.h"
+#include "string.h"
 
 #define MAX_TASKS   TASK_MAX
 #define MAX_CPUS    8
@@ -133,19 +134,6 @@ static void
 smp_wake_all(void)
 {
     *(volatile uint32_t *)JOTUN_WAKE_DOORBELL = JOTUN_WAKE_ALL;
-}
-
-/* Bounded string copy, always terminated. No libc in a freestanding guest. */
-static void
-scopy(char *dst, const char *src, int max)
-{
-    int i = 0;
-
-    if (src == NULL)
-        src = "";
-    for (i = 0; i < max - 1 && src[i] != '\0'; i++)
-        dst[i] = src[i];
-    dst[i] = '\0';
 }
 
 /* Run-queue helpers. The caller holds runq_lock. */
@@ -438,7 +426,7 @@ task_exits(const char *status)
     arch_irq_disable();             /* does not return, so no restore */
     struct percpu *pc = this_cpu();
 
-    scopy(pc->cur->status, status, STATUS_MAX);
+    strlcpy(pc->cur->status, status, STATUS_MAX);
     pc->cur->state = TASK_ZOMBIE;
     /* Nothing to save: this context is finished, so pass NULL as oldsp. */
     ctx_switch(NULL, pc->sched_sp);
@@ -462,7 +450,7 @@ task_await(char *buf, int nbuf)
             if (t->state == TASK_ZOMBIE) {
                 int id = t->id;
                 if (buf && nbuf > 0)
-                    scopy(buf, t->status, nbuf);
+                    strlcpy(buf, t->status, nbuf);
                 t->state = TASK_FREE;
                 unlock_irq(f);
                 return id;
@@ -488,7 +476,7 @@ task_note(int id, const char *note)
         unlock_irq(f);
         return -1;          /* gone, or queue full */
     }
-    scopy(t->notes[t->note_tail % NNOTES], note, NOTE_MAX);
+    strlcpy(t->notes[t->note_tail % NNOTES], note, NOTE_MAX);
     t->note_tail++;
     unlock_irq(f);
     return 0;
@@ -504,7 +492,7 @@ task_recv_note(char *buf, int nbuf)
         return 0;
     }
     if (buf && nbuf > 0)
-        scopy(buf, t->notes[t->note_head % NNOTES], nbuf);
+        strlcpy(buf, t->notes[t->note_head % NNOTES], nbuf);
     t->note_head++;
     unlock_irq(f);
     return 1;
