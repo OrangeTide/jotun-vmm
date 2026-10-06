@@ -91,8 +91,13 @@ milestone.
 
 Progress: the x86-64 64-bit long-mode switch is done. The KVM backend builds an
 identity-mapped page table in guest RAM and enters the vcpu in long mode, the
-guests build 64-bit, and the `-m32` path is retired. Next: import the JOS core
-and write the arch ports.
+guests build 64-bit, and the `-m32` path is retired. The libOS skeleton is up:
+`guest/libos/` boots to C with no asm stub (the host hands the vcpu a stack),
+has an arch seam (`arch.h` with a console byte sink and halt, implemented per
+arch under `arch/`), and carries the JOS-derived first-fit allocator. `make`
+builds `libos.elf`; it boots, runs a heap self-test, prints `libos up` /
+`heap ok`, and halts. Next: the scheduler and context switch, then
+spawn/exec/await.
 
 - Import the JOS core: allocator, ELF loader, proc, vfs, 9p, device table.
 - Write the greenfield x86-64 and arm64 arch ports: boot to C, context switch,

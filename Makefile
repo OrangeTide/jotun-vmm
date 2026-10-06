@@ -19,8 +19,9 @@ ifeq ($(OS), Darwin)
     LDFLAGS += -framework Hypervisor
     SRC = host/vmm_hvf.c host/elf.c host/uart.c host/main.c
     CC = clang
-    GUEST = test_guest.elf echo.elf
+    GUEST = test_guest.elf echo.elf libos.elf
     GUEST_SRC = guest/test_guest_arm64.c
+    LIBOS_ARCH = guest/libos/arch/arm64.c
     # Apple's toolchain emits Mach-O; produce an ELF with an LLVM ELF target
     # and lld (install with e.g. `brew install lld`).
     GUEST_CC = clang --target=aarch64-unknown-none-elf -fuse-ld=lld
@@ -33,15 +34,17 @@ else
     GUEST_CFLAGS += -no-pie
     ifeq ($(ARCH), x86_64)
         # linux/x86-64: KVM, 64-bit long-mode x86 guest at 1 MiB.
-        GUEST = test_guest.elf echo.elf
+        GUEST = test_guest.elf echo.elf libos.elf
         GUEST_SRC = guest/test_guest_x86.c
+        LIBOS_ARCH = guest/libos/arch/x86_64.c
         GUEST_CC = $(CC)
         GUEST_TEXT = 0x100000
     endif
     ifeq ($(ARCH), aarch64)
         # linux/arm64: KVM, arm64 guest.
-        GUEST = test_guest.elf echo.elf
+        GUEST = test_guest.elf echo.elf libos.elf
         GUEST_SRC = guest/test_guest_arm64.c
+        LIBOS_ARCH = guest/libos/arch/arm64.c
         GUEST_CC = $(CC)
         GUEST_TEXT = 0x200000
     endif
@@ -66,7 +69,14 @@ test_guest.elf: $(GUEST_SRC)
 echo.elf: guest/echo.c
 	$(GUEST_LINK)
 
+# The library OS is multiple translation units: the portable core plus the
+# selected arch file. It needs its own include path and links all objects.
+LIBOS_SRC = guest/libos/main.c guest/libos/mem.c $(LIBOS_ARCH)
+
+libos.elf: $(LIBOS_SRC)
+	$(GUEST_CC) $(GUEST_CFLAGS) -Iguest/libos -Wl,-Ttext=$(GUEST_TEXT) -o $@ $^
+
 clean:
-	rm -f $(TARGET) test_guest.elf echo.elf
+	rm -f $(TARGET) test_guest.elf echo.elf libos.elf
 
 .PHONY: all clean
