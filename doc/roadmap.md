@@ -864,11 +864,35 @@ and a multi-arch image, only transfers the objects that are missing.
   `BUNDLE_ARCHS` selects which arches go in; set it to this host's arch for a
   single-arch image that needs no cross toolchain.
 
-## M12: snapshot and restore
+## M12: snapshot and restore (deferred)
 
 Goal: capture a running guest's memory and device state and resume it later.
 Optional, and the heaviest of the forward items; it interacts with SMP (M4) and
-with the channel state on each device. Shape it when a concrete need appears.
+with the channel state on each device. Deferred: there is no concrete need yet,
+so it stays unbuilt until one appears.
+
+Intended shape, when it is built (decided 2026-10-06, so the groundwork is not
+relitigated later):
+
+- Cooperative checkpoint, not host-forced capture. The guest reaches a
+  quiescent point and writes a new snapshot doorbell (the same MMIO doorbell
+  mechanism the ring, 9P, net, and draw channels already use). The guest handles
+  its own register context, which its task switcher already saves and restores
+  (`guest/libos/task.c` and `arch/*_ctx.S`). The host captures guest RAM plus a
+  small resume vector, and on restore reloads RAM and re-enters a guest resume
+  trampoline; the guest re-initialises its devices (reconnect sockets, redraw,
+  remount 9P). This was chosen because two facts make a host-forced capture
+  costly and low-value here: the VMM abstraction cannot read back a vcpu's full
+  architectural register state today (it only sets PC/SP/ARG at creation, so a
+  forced capture needs a large new get/set-all-registers surface in both
+  `vmm_kvm.c` and `vmm_hvf.c`), and the net device holds live host sockets that
+  have no serialisable form. The cooperative model sidesteps both.
+- A snapshot is a flat file for the first cut, not CAS objects. Simpler, with no
+  dedup against the bundle; revisit CAS storage (chunked, content-addressed,
+  signable and pullable like a jimage) only if snapshots are distributed.
+- Live sockets are not preserved: the guest re-establishes connections on
+  resume. A snapshot therefore captures a guest's own state, not its external
+  I/O, which suits the cooperative model.
 
 ## M13: graft a shared read-only mount at a path
 
