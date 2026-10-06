@@ -45,9 +45,11 @@ No further code names for the roles; "host" and "guest" are used throughout.
   one process can corrupt another, and that is acceptable because they are the
   same application's trust domain.
 - Because of this, there is no in-guest capability system, no user and
-  supervisor split, and no page tables. All of that machinery would only earn
-  its keep if the guest had to isolate mutually distrusting parties, which it
-  does not.
+  supervisor split, and no page tables used for isolation. All of that
+  machinery would only earn its keep if the guest had to isolate mutually
+  distrusting parties, which it does not. (x86-64 long mode requires a trivial
+  identity-mapped page table, which performs no translation; arm64 runs with
+  the MMU off. Guests are 64-bit; 32-bit guests are not supported.)
 - If mutually distrusting tasks are ever needed, the answer is a second guest,
   not an MMU inside one guest. The arch layer should be written so stage-1
   paging could be added later, but it is out of scope.
