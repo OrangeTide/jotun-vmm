@@ -78,7 +78,7 @@ net_wake_waiters(void)
 void
 net_init(void)
 {
-    task_set_event_hook(net_wake_waiters);
+    task_add_event_hook(net_wake_waiters);
 }
 
 int

@@ -400,11 +400,20 @@ Decisions (made):
 
 Steps:
 
-- M6.1: the `/dev/draw` channel ABI and the guest draw client. A structured-op
-  emitter (no markup, no libc formatting dependency) and backpressure: when the
-  host's outbound queue is full the guest task parks through the M5.1 block/wake
-  primitive rather than stalling the vcpu. A single draw message can be large,
-  so the channel chunks rather than assuming one slot per scene.
+- M6.1 (done): the `/dev/draw` channel ABI (`abi/jotun_draw.h`) and the guest
+  draw client (`guest/libos/draw.{c,h}`). A structured-op emitter encodes ops
+  little-endian into the channel buffer with no markup and no libc formatting,
+  auto-flushing between whole ops when a chunk fills, so a scene larger than one
+  slot chunks rather than assuming one message. Backpressure reuses the M5.1
+  block/wake primitive: a full outbound queue returns DRAW_EAGAIN and the task
+  parks instead of stalling the vcpu. Input events return through a POLL op and
+  a scheduler event hook (the net hook became an array so net and draw can both
+  register). The host sink (`host/draw.{c,h}`) is mechanism only for now: it
+  walks and bounds-checks the op stream, rejecting a malformed stream whole, and
+  discards the payload since no SVG is authored yet. A self-test event source
+  (JOTUN_DRAW_TEST) feeds a synthetic click back on a clickable node, so the
+  submit/park/poll loop runs end to end with no front end. The `draw` demo in
+  the libos exercises it; verified on x86-64 KVM and cross-linked for arm64.
 - M6.2: the host draw subsystem. A validator for the op vocabulary and a
   canonical SVG emitter, with per-guest scene and id tracking. The host is a
   translator, not a relay.

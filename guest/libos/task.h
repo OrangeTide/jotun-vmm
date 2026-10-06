@@ -59,9 +59,9 @@ void task_wake(int id);
 int task_self(void);
 
 /* Register a hook the scheduler calls on an event interrupt and whenever an
- * idle cpu is woken. A subsystem (for example the net client) uses it to wake
- * its own parked tasks when a device event arrives. One hook; NULL clears it. */
-void task_set_event_hook(void (*fn)(void));
+ * idle cpu is woken. A subsystem (net, draw) uses it to wake its own parked
+ * tasks when a device event arrives. Several may be registered. */
+void task_add_event_hook(void (*fn)(void));
 
 /* End the current task with an exit status (NULL or "" means success). Does
  * not return. A task that returns from its function exits with success. */

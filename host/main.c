@@ -15,12 +15,14 @@
 #include "jotun_boot.h"
 #include "jotun_9p.h"
 #include "jotun_net.h"
+#include "jotun_draw.h"
 #include "p9srv.h"
 #include "p9mem.h"
 #include "p9smolvfs.h"
 #include "p9overlay.h"
 #include "manifest.h"
 #include "net.h"
+#include "draw.h"
 
 /* Guest physical RAM mapped at address 0. 8 MiB is ample for the test guest
  * plus per-vcpu stacks. */
@@ -60,8 +62,10 @@ static struct vcpu_ctx *all_ctx;
 static pthread_t *all_threads;
 static int all_n;
 
-/* The net provider, and its guest channel in host memory. */
+/* The net provider and the draw sink, each sharing its guest channel in host
+ * memory. */
 static struct netdev *netdev;
+static struct drawdev *drawdev;
 
 static void
 vcpu_wake(struct vcpu_ctx *c)
@@ -82,12 +86,13 @@ vcpu_idle_wait(struct vcpu_ctx *c)
     pthread_mutex_unlock(&c->idle_m);
 }
 
-/* Rouse every vcpu for a net event: inject the event interrupt into running
+/* Rouse every vcpu for a device event: inject the event interrupt into running
  * vcpus (breaking their run so the guest ISR fires) and wake any that are idle
  * (so they leave the idle rendezvous and recheck). The net poll thread calls
- * this when a socket a guest task waits on becomes ready. */
+ * this when a socket a guest task waits on becomes ready, and the draw sink
+ * when an input event is queued. */
 static void
-net_wake_vcpus(void)
+rouse_vcpus(void)
 {
     for (int i = 0; i < all_n; i++) {
         if (__atomic_load_n(&all_ctx[i].live, __ATOMIC_SEQ_CST)) {
@@ -195,6 +200,18 @@ net_service(void)
     if (!c || !netdev)
         return;
     net_handle(netdev, c);
+}
+
+/* Draw doorbell handler: process the request in the draw channel and write the
+ * result back. Called without dev_lock, like the net doorbell, since the sink
+ * has no shared console state. */
+static void
+draw_service(void)
+{
+    struct jotun_draw *c = gpa_to_host(JOTUN_DRAW_BASE, sizeof(*c));
+    if (!c || !drawdev)
+        return;
+    draw_handle(drawdev, c);
 }
 
 /* Turn one manifest rule (strings) into a numeric net_rule. Returns 0, or -1
@@ -312,6 +329,10 @@ run_vcpu(void *arg)
         } else if (e.reason == VMM_EXIT_REASON_MMIO
                    && e.mmio.write && e.mmio.address == JOTUN_NET_DOORBELL) {
             net_service();
+            continue;
+        } else if (e.reason == VMM_EXIT_REASON_MMIO
+                   && e.mmio.write && e.mmio.address == JOTUN_DRAW_DOORBELL) {
+            draw_service();
             continue;
         } else if (e.reason == VMM_EXIT_REASON_MMIO) {
             int stop = 0;
@@ -492,7 +513,14 @@ main(int argc, char **argv)
      * socket becomes ready. It is created before the 9P server so the /net
      * overlay can read its live connections. */
     struct jotun_net *netchan = gpa_to_host(JOTUN_NET_BASE, sizeof(*netchan));
-    netdev = netchan ? net_init(netchan, net_wake_vcpus, &policy) : NULL;
+    netdev = netchan ? net_init(netchan, rouse_vcpus, &policy) : NULL;
+
+    /* The draw sink shares the guest draw channel and rouses vcpus when an
+     * input event is queued. JOTUN_DRAW_TEST turns on the self-test event
+     * source so the submit/poll path can run with no front end attached. */
+    int draw_test = getenv("JOTUN_DRAW_TEST") != NULL;
+    struct jotun_draw *drawchan = gpa_to_host(JOTUN_DRAW_BASE, sizeof(*drawchan));
+    drawdev = drawchan ? draw_init(drawchan, rouse_vcpus, draw_test) : NULL;
 
     /* Serve a smolvfs bundle if one is named, else the in-memory tree, with the
      * read-only /net overlay wrapping whichever backend is chosen. */
@@ -572,6 +600,7 @@ main(int argc, char **argv)
     }
 
     net_shutdown(netdev);
+    draw_shutdown(drawdev);
 
     vmm_vm_destroy(vm);
     munmap(ram, GUEST_RAM_SIZE);

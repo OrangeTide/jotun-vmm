@@ -8,6 +8,7 @@
  * them. When the system quiesces every scheduler returns and each cpu halts. */
 #include "arch.h"
 #include "boot.h"
+#include "draw.h"
 #include "jsh.h"
 #include "mem.h"
 #include "net.h"
@@ -291,6 +292,42 @@ udp_demo(void)
     con_puts("udp: done\n");
 }
 
+/* Draw demo: build a tiny scene with one clickable rectangle, submit it, then
+ * block on the first input event. With JOTUN_DRAW_TEST set on the host, the
+ * sink feeds back a synthetic click on that rectangle, so the submit, park, and
+ * poll path runs end to end with no browser attached. */
+static void
+draw_demo(void)
+{
+    con_puts("draw: building scene\n");
+    draw_surface(1, 0, 0, 320, 240, "demo");
+
+    struct draw_style box = {
+        .mask = DST_FILL | DST_STROKE | DST_STROKE_WIDTH,
+        .fill = 0x3366cc,
+        .stroke = 0x102040,
+        .stroke_width = 2,
+    };
+    draw_rect(2, 1, 40, 40, 120, 60, 8, &box);
+    draw_text(3, 1, 52, 78, 16, "click me", 0);
+    draw_click(2);
+
+    draw_flush();
+    con_puts("draw: scene submitted, waiting for event\n");
+
+    struct draw_event ev;
+    if (draw_next_event(&ev) != 0) {
+        con_puts("draw: event error\n");
+        return;
+    }
+    con_puts("draw: event node ");
+    con_putu(ev.node);
+    con_puts(" type ");
+    con_putu(ev.type);
+    con_putc('\n');
+    con_puts("draw: done\n");
+}
+
 /* The init task: either the preemption demo or the startup script, selected by
  * the first boot argument (default "rc"). */
 static void
@@ -309,6 +346,8 @@ init_task(void)
         net_demo();
     } else if (script[0] == 'u' && script[1] == 'd') {  /* "udp" */
         udp_demo();
+    } else if (script[0] == 'd' && script[1] == 'r') {  /* "draw" */
+        draw_demo();
     } else {
         con_puts("init: running script /");
         con_puts(script);
@@ -364,6 +403,7 @@ kmain(unsigned long id)
             con_puts("9p: mounted\n");
         ns_init();
         net_init();
+        draw_init();
 
         task_spawn("init", init_task);
         __atomic_store_n(&boot_ready, 1, __ATOMIC_RELEASE);

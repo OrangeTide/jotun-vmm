@@ -81,7 +81,19 @@ static volatile int runq_lock;      /* guards runq + tasks table + counters */
 static int running_count;           /* tasks currently executing on some cpu */
 static int blocked_count;           /* tasks parked on an event */
 static volatile int shutdown;       /* set once the system has quiesced */
-static void (*event_hook)(void);    /* called on an event / idle-wake */
+
+/* Event hooks, called on an event interrupt and on idle-wake. Each subsystem
+ * (net, draw) registers one to ready its own parked tasks. */
+#define MAX_HOOKS 4
+static void (*event_hooks[MAX_HOOKS])(void);
+static int nhooks;
+
+static void
+run_event_hooks(void)
+{
+    for (int i = 0; i < nhooks; i++)
+        event_hooks[i]();
+}
 
 static struct percpu *
 this_cpu(void)
@@ -278,10 +290,9 @@ sched_start(void)
              * parked and a waker (another task, or a host event) will ready
              * one. Block until a wake doorbell rouses us, then recheck. */
             smp_idle();
-            /* A device event may be what woke us; let the hook ready its
+            /* A device event may be what woke us; let the hooks ready their
              * parked tasks before we look at the queue again. */
-            if (event_hook)
-                event_hook();
+            run_event_hooks();
             continue;
         }
 
@@ -403,19 +414,20 @@ task_self(void)
 }
 
 void
-task_set_event_hook(void (*fn)(void))
+task_add_event_hook(void (*fn)(void))
 {
-    event_hook = fn;
+    if (nhooks < MAX_HOOKS)
+        event_hooks[nhooks++] = fn;
 }
 
-/* Called from the event ISR. Give the event hook a chance to ready its parked
- * tasks (for example net waiters), then reschedule the running task; if the
- * scheduler itself was interrupted (cur is NULL) there is nothing to preempt. */
+/* Called from the event ISR. Give the event hooks a chance to ready their
+ * parked tasks (net and draw waiters), then reschedule the running task; if
+ * the scheduler itself was interrupted (cur is NULL) there is nothing to
+ * preempt. */
 void
 irq_event(void)
 {
-    if (event_hook)
-        event_hook();
+    run_event_hooks();
     if (this_cpu()->cur)
         task_yield();
 }
