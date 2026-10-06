@@ -17,6 +17,7 @@
 #include "print.h"
 #include "prog.h"
 #include "task.h"
+#include "triton.h"
 
 /* The heap lives in .bss. Guest RAM is zero-filled by the host before entry,
  * so no explicit clearing is needed before meminit lays down the first block. */
@@ -558,6 +559,8 @@ init_task(void)
         drawbench();
     } else if (script[0] == 'p' && script[1] == 'i') {  /* "pixel" */
         drawpixel();
+    } else if (script[0] == 't' && script[1] == 'r') {  /* "triton" */
+        triton_demo();
     } else {
         con_puts("init: running script /");
         con_puts(script);
@@ -600,6 +603,7 @@ kmain(unsigned long id)
 {
     cpu_init(id);
     arch_traps_init();          /* each cpu loads its own trap tables */
+    arch_fpu_init();            /* enable FP/SIMD so the rasterizer can run */
 
     if (id == 0) {
         con_puts("libos up\n");

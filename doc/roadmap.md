@@ -533,12 +533,29 @@ Goal: raster content where vector does not fit.
   than the 3911 byte full frame, and five stamps cost 1211 bytes against about
   19.5 KB of full frames. The pixels still never cross the channel, only the
   declared buffer and a declared damage rect, so the §9.2 boundary is unchanged.
-- Remaining: the optional guest-side Triton (Glide subset) rendering into the
-  framebuffer. Real PNG compression is done (fixed-Huffman LZ77 DEFLATE in
-  `host/png.c`).
+- M7.4 (done): the guest software rasterizer, a minimal 3D core. `guest/libos/
+  triton.c` rasterizes gouraud-shaded, z-buffered triangles into an RGBA
+  framebuffer in guest RAM, through a small Glide-flavored immediate-mode API
+  (`tr_clear`, `tr_triangle`). It renders entirely in the guest; the host still
+  only receives pixels through the pixel path, so the section 9.2 boundary holds.
+  The `triton` guest demo spins a shaded cube (incremental rotation with no
+  sin/cos routine, re-based through the pixel path each frame). This is the
+  minimal core named in the design doc, textures, combine units, and blend are
+  not included.
+  Enabling it meant turning on the guest FPU, since the rasterizer uses floating
+  point. The FPU is enabled per cpu at boot (`arch_fpu_init`: CR0/CR4 for SSE on
+  x86-64, CPACR_EL1 for FP/SIMD on arm64). The rest of the guest stays
+  integer-only (`-mgeneral-regs-only`); only `triton.c` is built with the FPU on,
+  as its own object. FP state is preserved across task switches: on x86-64 the
+  interrupt path saves it with FXSAVE/FXRSTOR around the handler (preemption must
+  be transparent to a task mid-computation), and on arm64 the cooperative switch
+  saves the callee-saved vector registers d8-d15 (arm64 has no preemption yet).
+  The earlier M6.5 reason for `-mgeneral-regs-only` stands for the kernel; this
+  only carves out the one FP translation unit.
+- Real PNG compression is done (fixed-Huffman LZ77 DEFLATE in `host/png.c`).
 
 Acceptance: a guest software-renders a wireframe into a framebuffer node
-composited under the 2D chrome.
+composited under the 2D chrome. Met, and extended to a shaded, z-buffered cube.
 
 ## M8: image distribution, signed pull from a URL
 

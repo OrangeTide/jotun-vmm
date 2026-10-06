@@ -31,6 +31,15 @@ void ctx_switch(void **oldsp, void *newsp);
  * and a tick could arrive. On arm64 this is a stub for now. */
 void arch_traps_init(void);
 
+/* Enable the floating-point and SIMD unit on this cpu, so code built with the
+ * FPU on (the guest rasterizer) can run. The rest of the library OS is built
+ * integer-only and never touches these registers; the only place FP state
+ * crosses a context boundary is a task switch, which each arch preserves (the
+ * x86 interrupt path saves it around the handler, and the arm64 cooperative
+ * switch saves the callee-saved vector registers). Must run once per cpu at
+ * boot, before any task starts. */
+void arch_fpu_init(void);
+
 /* Enable and disable asynchronous interrupts on this cpu. */
 void arch_irq_enable(void);
 void arch_irq_disable(void);

@@ -6,7 +6,13 @@
  * point), calls the C handler, restores them, and returns with iretq, which
  * restores the task's RFLAGS (re-enabling interrupts) and RIP. The C handler
  * may reschedule; when this task is resumed the stack is restored exactly, so
- * the iretq returns where the task left off. */
+ * the iretq returns where the task left off.
+ *
+ * It also saves and restores the full FPU/SSE state with FXSAVE/FXRSTOR around
+ * the handler. The handler may switch to another task that uses the FPU, so
+ * without this an interrupt would not be transparent to an interrupted task
+ * that was mid-computation in floating point. The 512-byte save area is carved
+ * from the stack, 16-byte aligned as FXSAVE requires. */
 
     .text
     .global isr_event
@@ -27,11 +33,17 @@ isr_event:
     push %r14
     push %r15
 
-    mov %rsp, %rbp             /* align the stack for the C call */
-    and $-16, %rsp
+    mov %rsp, %rbp             /* rbp: top of the saved GP frame, call-preserved */
+    sub $512, %rsp             /* carve the FXSAVE area */
+    and $-16, %rsp             /* FXSAVE needs 16-byte alignment */
+    fxsave (%rsp)
+    mov %rsp, %r12             /* r12: FXSAVE area, call-preserved */
+
     cld
     call irq_event
-    mov %rbp, %rsp
+
+    fxrstor (%r12)
+    mov %rbp, %rsp             /* drop the FXSAVE area back to the GP frame */
 
     pop %r15
     pop %r14

@@ -114,6 +114,26 @@ arch_traps_init(void)
     __asm__ volatile ("lidt %0" : : "m"(ip));
 }
 
+/* Enable SSE: clear CR0.EM (no x87 emulation), set CR0.MP, and set CR4.OSFXSR
+ * so SSE instructions and FXSAVE/FXRSTOR work. SSE exceptions stay masked in
+ * MXCSR and CR4.OSXMMEXCPT is left clear, so no #XM handler is needed. FNINIT
+ * puts the x87/MMX state in a known state. */
+void
+arch_fpu_init(void)
+{
+    unsigned long cr0, cr4;
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1UL << 2);             /* EM = 0 */
+    cr0 |= (1UL << 1);              /* MP = 1 */
+    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0));
+    __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1UL << 9);              /* OSFXSR = 1 */
+    __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4));
+    __asm__ volatile ("fninit");
+    unsigned int mxcsr = 0x1f80;    /* all SSE exceptions masked */
+    __asm__ volatile ("ldmxcsr %0" : : "m"(mxcsr));
+}
+
 void
 arch_irq_enable(void)
 {

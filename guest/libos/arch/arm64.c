@@ -32,16 +32,18 @@ arch_halt(void)
         ;
 }
 
-/* ctx_switch saves twelve 8-byte slots: x19-x28, then x29 (fp) and x30 (lr).
- * The restore loads them and rets to x30, so put entry in the x30 slot (the
- * twelfth word). The frame is a multiple of 16 bytes, so sp stays aligned. */
+/* ctx_switch saves twenty 8-byte slots: x19-x28, x29 (fp), x30 (lr), then the
+ * eight callee-saved vector registers d8-d15. The restore loads them and rets
+ * to x30, so put entry in the x30 slot (the twelfth word) and zero the rest,
+ * including the vector slots. The frame is a multiple of 16 bytes, so sp stays
+ * aligned. */
 void *
 stack_init(void *stack, size_t size, void (*entry)(void))
 {
     uintptr_t top = ((uintptr_t)stack + size) & ~(uintptr_t)15;
-    uint64_t *sp = (uint64_t *)top - 12;
+    uint64_t *sp = (uint64_t *)top - 20;
 
-    for (int i = 0; i < 12; i++)
+    for (int i = 0; i < 20; i++)
         sp[i] = 0;
     sp[11] = (uint64_t)(uintptr_t)entry;    /* x30: ret lands here */
     return sp;
@@ -55,6 +57,17 @@ stack_init(void *stack, size_t size, void (*entry)(void))
 void
 arch_traps_init(void)
 {
+}
+
+/* Enable FP/SIMD at EL1: set CPACR_EL1.FPEN to 0b11 so FP and Advanced SIMD
+ * instructions do not trap, then synchronize with an ISB. */
+void
+arch_fpu_init(void)
+{
+    uint64_t v;
+    __asm__ volatile ("mrs %0, cpacr_el1" : "=r"(v));
+    v |= (3UL << 20);               /* FPEN = 0b11 */
+    __asm__ volatile ("msr cpacr_el1, %0; isb" : : "r"(v));
 }
 
 void

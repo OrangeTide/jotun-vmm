@@ -15,9 +15,11 @@ ARCH := $(shell uname -m)
 # Common freestanding guest flags; per-host blocks add the compiler, the
 # source, and the text base.
 # -mgeneral-regs-only keeps the compiler from emitting FP/SIMD (SSE on x86, NEON
-# on arm64) for things like struct copies. The guest never enables those units,
-# so such an instruction would fault; the guest is integer-only, so forbidding
-# them costs nothing. Works the same under gcc and clang, on both arches.
+# on arm64) for things like struct copies. The kernel is integer-only, so
+# forbidding them costs nothing and avoids a fault from an unexpected FP
+# instruction. The one exception is the software rasterizer (build/triton.o),
+# built with the FPU on; the guest enables the FPU at boot and preserves FP
+# state across task switches. Works the same under gcc and clang, on both arches.
 GUEST_CFLAGS = -ffreestanding -fno-pic -fno-pie -nostdlib -fno-builtin -Iabi \
     -fno-asynchronous-unwind-tables -mgeneral-regs-only \
     -Wl,-e_start -Wl,--build-id=none
@@ -104,8 +106,23 @@ LIBOS_SRC = guest/libos/main.c guest/libos/mem.c guest/libos/task.c \
     guest/libos/prog.c guest/libos/jsh.c guest/libos/ns.c guest/libos/net.c \
     guest/libos/draw.c guest/libos/string.c $(LIBOS_ARCH)
 
-libos.elf: $(LIBOS_SRC)
-	$(GUEST_CC) $(GUEST_CFLAGS) -Iguest/libos -Wl,-Ttext=$(GUEST_TEXT) -o $@ $^
+# triton.c is the only guest translation unit built with the FPU enabled: it is
+# the software rasterizer and uses floating point. The rest of the guest stays
+# integer-only (-mgeneral-regs-only). Compile it to an object on its own with
+# that flag dropped, then link it with the integer-only sources. The guest
+# enables the FPU at boot and preserves FP state across task switches, so this
+# object's floating point is safe to run.
+GUEST_FP_CFLAGS = $(filter-out -mgeneral-regs-only -Wl%,$(GUEST_CFLAGS))
+LIBOS_FP_OBJ = build/triton.o
+
+build:
+	mkdir -p build
+
+build/triton.o: guest/libos/triton.c guest/libos/triton.h | build
+	$(GUEST_CC) $(GUEST_FP_CFLAGS) -Iguest/libos -c -o $@ $<
+
+libos.elf: $(LIBOS_SRC) $(LIBOS_FP_OBJ)
+	$(GUEST_CC) $(GUEST_CFLAGS) -Iguest/libos -Wl,-Ttext=$(GUEST_TEXT) -o $@ $(LIBOS_SRC) $(LIBOS_FP_OBJ)
 
 # Standalone programs, linked at the program base and loaded from the bundle.
 hello.elf: guest/prog/hello.c
@@ -126,6 +143,6 @@ bundle: $(PROGS)
 
 clean:
 	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS)
-	rm -rf $(BUNDLE_DEPOT) bundle-staging
+	rm -rf $(BUNDLE_DEPOT) bundle-staging build
 
 .PHONY: all clean bundle
