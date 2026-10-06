@@ -703,16 +703,65 @@ land as wanted rather than in a strict sequence. M9 (above) stays opportunistic.
 
 Goal: one browser session fronting several guests at once, which the display
 design (section 9.4) calls for but the current front end does not do (one guest
-to one browser, replace-on-connect).
+to one browser, replace-on-connect). The host runs several isolated guests in
+one process and composites their scenes into a single client document.
 
-- Per-guest and per-surface ids, so the host composites several guests' scenes
-  and pixel regions into a single client session.
-- A session layer over the WebSocket: route each inbound browser event to the
-  guest it targets, and tag each host push with its guest.
-- Session authentication, so the port can be exposed beyond localhost safely.
-  This pairs with the serving and TLS note in `doc/draw-vocabulary.md`: today the
-  link is plain `ws://` on localhost, and a reverse proxy or in-host TLS is
-  needed off-box.
+The current host is strictly one guest: one process is one VM, and the N vcpus
+are SMP cpus of that one guest, sharing one RAM and one set of device channels
+(net, draw, p9) at fixed GPAs resolved against a single backing buffer. The
+display layer already reserved the seam for this work: DOM ids are
+`qu-<guest>-<node>` with the guest field pinned to a constant 0, and the client
+JS already parses then discards it.
+
+Locked decisions (interview, 2026-10-06):
+
+- Process model: several VMs in one host process, each its own guest with
+  private RAM and its own draw/net/p9 devices. Guests are isolated by default
+  (separate VMs and address spaces), so the fixed channel GPAs do not collide.
+  The host is the only thing that can bridge two guests, which keeps the trust
+  model intact. Chosen over a process-per-guest front-end aggregator, since that
+  would need an inter-host IPC bus for the same result.
+- Launch: one guest per manifest, named with repeated `-m <manifest>` arguments
+  (`jotun -m web.manifest -m db.manifest libos.elf`). The existing manifest
+  (bundle, net policy, init params) is unchanged and each guest is specified
+  independently.
+- Compositing layout: each guest is a top-level group `<g id="qu-<guest>">`
+  offset by a per-guest origin the host assigns; guests keep their own internal
+  coordinates. Simplest compositor and minimal client change.
+- Auth: the host stays loopback-only and single-browser; a reverse proxy owns
+  TLS and authentication off-box, per `doc/draw-vocabulary.md`. The host gains no
+  auth code.
+
+Sub-milestones:
+
+- M10.0: run N guests in one host process. Collapse the file-scope singletons
+  (vm, backing RAM, vcpu table, netdev, drawdev, p9srv, manifest) into a
+  per-guest struct, launch one VM per manifest, and carry a `struct guest *` on
+  each vcpu thread so the doorbell demux and the net/draw/p9/ring service calls
+  target that guest's devices. The SMP wake and event-vector injection become
+  per-guest. Independent of the browser and the bulk of the work; it can ship
+  with the front end still showing guest 0 only.
+- M10.1: per-guest id namespacing and host-side compositing. Make the guest id
+  per-drawdev (not the constant 0) through every `qu-<guest>-<node>` emit site,
+  and have the front end combine each guest's scene under its `<g id="qu-<guest>">`
+  group, with per-guest baselines and deltas merged into one document. The
+  `<`/`!` full-vs-delta protocol and the `R`/`N`/`U` records extend unchanged.
+- M10.2: the session layer for inbound events. Stop discarding the guest field
+  in the client `nodeId()`, carry it through the event dispatch and the
+  `drawws` event callback, and route each event to the targeted guest's queue.
+- M10.3: auth is a no-op in the host by the decision above; document the proxy
+  boundary and confirm the single-browser limit still holds under multiplexing.
+- M10.4: shared read-only filesystem mount between guests. Point two guests' 9P
+  subtree at the same bundle depot or snapshot, one side owning ref commits and
+  the other mounting a fixed root read-only. Safe because the store is a
+  content-addressed, immutable CAS, and cheap because the host already serves
+  both 9P trees in one process. Declared in the manifest. The inter-guest
+  network link (an in-host virtual switch) is deferred: it needs a net
+  listen/accept or rendezvous primitive that does not exist yet (design
+  section 8), so it is tracked under opportunistic work, not M10.
+
+Suggested order: M10.0 first (unblocks the rest), then M10.1 and M10.2 together
+(shared id plumbing), then M10.3 and M10.4.
 
 ## M11: single-file packaging
 
@@ -741,6 +790,12 @@ Independent of the milestones above, tracked so they are not lost:
 - libc-lite (M9): a `<threads.h>` shim (`thrd_*`/`mtx_*`/`cnd_*`) over `task.c`,
   deferred until a bundle program needs the standard API so a real consumer
   shapes it. M9.1 through M9.4 are done.
+- Inter-guest network link (follows M10): an in-host virtual switch that splices
+  one guest's connection to another guest's service without touching the real
+  network, so the trusted host stays the only bridge. Deferred because it needs
+  a net listen/accept or rendezvous primitive the net layer does not have yet
+  (design section 8). The shared read-only mount is the sharing feature that
+  does land, in M10.4.
 
 ## Cross-cutting concerns
 
