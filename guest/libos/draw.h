@@ -63,6 +63,12 @@ void draw_path(uint32_t id, uint32_t parent, const struct draw_seg *segs, int n,
                const struct draw_style *st);
 void draw_text(uint32_t id, uint32_t parent, int x, int y, int size,
                const char *s, const struct draw_style *st);
+/* Place an image node showing a framebuffer in guest RAM. pixels is RGBA8888;
+ * stride is the row length in bytes, or 0 for w*4. The host reads the pixels
+ * from guest memory each time the scene is flushed, so re-rendering into the
+ * same buffer and flushing again updates the node. */
+void draw_image(uint32_t id, uint32_t parent, int x, int y, int w, int h,
+                const void *pixels, int stride);
 void draw_set_text(uint32_t id, const char *s);
 /* Set one attribute of an existing node. attr is a DSA_* code; value is read at
  * the width that attribute implies (see jotun_draw.h). */

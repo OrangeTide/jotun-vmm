@@ -369,6 +369,93 @@ draw_demo(void)
     con_puts("draw: done\n");
 }
 
+/* Pixel path demo: software-render a wireframe cube into an RGBA framebuffer in
+ * guest RAM, then show it as an image node under the 2D window chrome. The host
+ * reads the framebuffer from guest memory, encodes it as a PNG, and composites
+ * it into the scene. */
+#define FBW 256
+#define FBH 192
+static uint8_t framebuffer[FBW * FBH * 4];
+
+static void
+fb_put(int x, int y, uint8_t r, uint8_t g, uint8_t b)
+{
+    if ((unsigned)x < FBW && (unsigned)y < FBH) {
+        uint8_t *p = framebuffer + ((unsigned)y * FBW + (unsigned)x) * 4;
+        p[0] = r; p[1] = g; p[2] = b; p[3] = 255;
+    }
+}
+
+/* Integer Bresenham line, no floating point (the guest has no FP unit). */
+static void
+fb_line(int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b)
+{
+    int dx = x1 - x0, dy = y1 - y0;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    dy = -dy;
+    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        fb_put(x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1)
+            break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+static void
+render_cube(void)
+{
+    /* Clear to a dark blue. */
+    for (int i = 0; i < FBW * FBH; i++) {
+        uint8_t *p = framebuffer + i * 4;
+        p[0] = 0x10; p[1] = 0x18; p[2] = 0x30; p[3] = 255;
+    }
+
+    /* Two offset squares (front and back faces) joined by four edges: a cube in
+     * cabinet projection, drawn with integer coordinates. */
+    int s = 90, o = 44;
+    int fx = (FBW - s) / 2 - o / 2, fy = (FBH - s) / 2 + o / 2;   /* front TL */
+    int bx = fx + o, by = fy - o;                                /* back  TL */
+    int fr[4][2] = { {fx, fy}, {fx + s, fy}, {fx + s, fy + s}, {fx, fy + s} };
+    int bk[4][2] = { {bx, by}, {bx + s, by}, {bx + s, by + s}, {bx, by + s} };
+    for (int i = 0; i < 4; i++) {
+        int j = (i + 1) % 4;
+        fb_line(fr[i][0], fr[i][1], fr[j][0], fr[j][1], 0x8c, 0xd0, 0xff);
+        fb_line(bk[i][0], bk[i][1], bk[j][0], bk[j][1], 0x4c, 0x80, 0xc0);
+        fb_line(fr[i][0], fr[i][1], bk[i][0], bk[i][1], 0xa0, 0xa8, 0xc0);
+    }
+}
+
+static void
+drawpixel(void)
+{
+    con_puts("pixel: rendering wireframe into framebuffer\n");
+    render_cube();
+
+    draw_surface(1, 0, 0, FBW + 20, FBH + 20, "framebuffer");
+    draw_image(2, 1, 10, 10, FBW, FBH, framebuffer, 0);
+    draw_click(2);              /* so the self-test source can end the demo */
+
+    draw_flush();
+    con_puts("pixel: submitted image node, waiting for event\n");
+
+    struct draw_event ev;
+    if (draw_next_event(&ev) != 0) {
+        con_puts("pixel: event error\n");
+        return;
+    }
+    con_puts("pixel: event node ");
+    con_putu(ev.node);
+    con_puts(" type ");
+    con_putu(ev.type);
+    con_putc('\n');
+    con_puts("pixel: done\n");
+}
+
 /* Draw scale benchmark: build a grid of many rects in one surface and submit
  * it, so the host (with JOTUN_DRAW_BENCH) can time apply and serialize as the
  * node count grows. The count comes from the second boot argument. */
@@ -424,6 +511,8 @@ init_task(void)
         draw_demo();
     } else if (script[0] == 'b' && script[1] == 'e') {  /* "bench" */
         drawbench();
+    } else if (script[0] == 'p' && script[1] == 'i') {  /* "pixel" */
+        drawpixel();
     } else {
         con_puts("init: running script /");
         con_puts(script);

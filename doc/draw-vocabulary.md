@@ -102,6 +102,12 @@ Shapes (each ends with a style block):
 - `0x16 TEXT     {id, parent, x:i16, y:i16, size:u16, s:str, style}`
   The host XML-escapes `s` and marks the element as the text target for
   `SET_TEXT`.
+- `0x17 IMAGE    {id, parent, x:i16, y:i16, w:u16, h:u16, fmt:u8, stride:u32, gpa:u64}`
+  A framebuffer node (the pixel path, M7). The pixels live in guest RAM at
+  `gpa`, in format `fmt` (`0` RGBA8888), `stride` bytes per row (`0` for `w*4`).
+  The host validates the geometry, reads the pixels from guest memory through a
+  bounds-checked translation, encodes them as a PNG, and emits an `<image>` data
+  URI. No pixel command stream crosses into the host, only a declared buffer.
 
 Mutation:
 
@@ -237,7 +243,8 @@ Out of scope for the M6 acceptance test, candidates for M6.5 vocabulary breadth:
 
 - gradients and patterns (would be a fixed, parameterized set, never raw defs)
 - richer text (spans, alignment, wrapping)
-- images and the pixel surface (that is M7, a separate shared framebuffer node)
+- richer raster: the framebuffer node ships (M7.1); still deferred are
+  dirty-rectangle partial updates and real PNG compression
 - `font_family` beyond the three-way enum
 - grouping transforms beyond translate (scale, rotate), if a use case needs them
 

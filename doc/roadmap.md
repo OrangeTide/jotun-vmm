@@ -489,11 +489,22 @@ Steps:
 
 Goal: raster content where vector does not fit.
 
-- A shared framebuffer region with dirty rectangles.
-- The host validates the region geometry, composites it as a scene node, and
-  encodes it for the browser.
-- Optional guest-side Triton as a Glide library rendering into that
-  framebuffer.
+- M7.1 (done): the framebuffer node. The pixel surface is a framebuffer in
+  guest RAM, surfaced as a `DOP_IMAGE` node in the existing draw scene, so it
+  composites through the same channel, scene tree, SVG, and WebSocket as the 2D
+  path, no new channel. The guest declares the node with the framebuffer's
+  guest-physical address, geometry, format (RGBA8888), and stride; the host
+  validates the geometry, reads the pixels from guest RAM through a bounds-
+  checked address translator, encodes them as a PNG (a small dependency-free
+  encoder, `host/png.c`), and emits an `<image>` data URI under the chrome. No
+  pixel command stream crosses into the host, only a declared buffer, which is
+  the security point of §9.2. The `pixel` guest demo software-renders a
+  wireframe cube (integer Bresenham, no FP) into the framebuffer and shows it
+  under a window; verified by rendering the authored SVG. Acceptance met.
+- Remaining: dirty-rectangle partial updates (re-encode only changed regions
+  rather than the whole frame each flush), real image compression in the PNG
+  encoder (it emits stored DEFLATE blocks now), and the optional guest-side
+  Triton (Glide subset) rendering into the framebuffer.
 
 Acceptance: a guest software-renders a wireframe into a framebuffer node
 composited under the 2D chrome.

@@ -61,6 +61,7 @@ du8(uint8_t v)
 
 static void du16(uint16_t v) { du8((uint8_t)v); du8((uint8_t)(v >> 8)); }
 static void du32(uint32_t v) { du16((uint16_t)v); du16((uint16_t)(v >> 16)); }
+static void du64(uint64_t v) { du32((uint32_t)v); du32((uint32_t)(v >> 32)); }
 static void di16(int v) { du16((uint16_t)(int16_t)v); }
 
 static void
@@ -226,6 +227,18 @@ draw_set_text(uint32_t id, const char *s)
 {
     need();
     du8(DOP_SET_TEXT); du32(id); dstr(s);
+}
+
+void
+draw_image(uint32_t id, uint32_t parent, int x, int y, int w, int h,
+           const void *pixels, int stride)
+{
+    need();
+    du8(DOP_IMAGE); du32(id); du32(parent); di16(x); di16(y);
+    du16((uint16_t)w); du16((uint16_t)h);
+    du8(DIMG_RGBA8888);
+    du32((uint32_t)(stride ? stride : w * 4));
+    du64((uint64_t)(uintptr_t)pixels);
 }
 
 void

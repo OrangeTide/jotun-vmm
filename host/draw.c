@@ -23,6 +23,7 @@
  * node cap for correctness; an index is M6.6 scale work. */
 #include "draw.h"
 #include "drawws.h"
+#include "png.h"
 
 #include <pthread.h>
 #include <stdint.h>
@@ -42,6 +43,8 @@
 #define DRAW_MAXPTS    1024     /* points in a polyline */
 #define DRAW_MAXSEG    512      /* segments in a path */
 #define DRAW_IDHASH    8192     /* id index buckets (power of two, > 2x nodes) */
+#define DRAW_IMG_MAXDIM  2048   /* max image width or height */
+#define DRAW_IMG_MAXBYTES (4u * 1024 * 1024)    /* max framebuffer extent */
 
 /* The guest id namespaces browser DOM ids as qu-<guest>-<node>. One guest
  * domain exists today; multi-guest namespacing arrives with multiple domains. */
@@ -98,6 +101,8 @@ struct dnode {
         struct { int16_t cx, cy; uint16_t rx, ry; } ellipse;
         struct { int16_t x1, y1, x2, y2; } line;
         struct { int16_t x, y; uint16_t size; } text;
+        struct { int16_t x, y; uint16_t w, h; uint8_t fmt;
+                 uint32_t stride; uint64_t gpa; } image;
     } geo;
     struct draw_style style;
     char    *text;              /* malloc'd, NUL-terminated, or NULL */
@@ -127,6 +132,11 @@ struct drawdev {
     int bench;                  /* JOTUN_DRAW_BENCH: time apply and serialize */
     const char *svg_path;       /* JOTUN_DRAW_SVG, or NULL */
     struct drawws *ws;          /* the browser front end, or NULL */
+
+    /* Translate a guest-physical range to a host pointer for reading image
+     * pixels, or NULL if the range is out of bounds. Supplied by the host. */
+    draw_gpa_fn gpa;
+    void *gpa_ctx;
 
     /* Inbound events are queued by the WS server thread and drained by the
      * vcpu thread in POLL, so the queue is guarded. */
@@ -191,6 +201,14 @@ static int16_t
 rd_i16(struct rd *r)
 {
     return (int16_t)rd_u16(r);
+}
+
+static uint64_t
+rd_u64(struct rd *r)
+{
+    uint64_t lo = rd_u32(r);
+    uint64_t hi = rd_u32(r);
+    return lo | hi << 32;
 }
 
 /* Read a length-prefixed string into a fresh capped, NUL-terminated buffer. The
@@ -802,6 +820,38 @@ apply(struct drawdev *dd, const uint8_t *buf, uint32_t len, uint32_t *click_node
             n->style = st;
             break;
         }
+        case DOP_IMAGE: {
+            uint32_t id = rd_u32(&r);
+            uint32_t parent = rd_u32(&r);
+            int16_t x = rd_i16(&r), y = rd_i16(&r);
+            uint16_t w = rd_u16(&r), h = rd_u16(&r);
+            uint8_t fmt = rd_u8(&r);
+            uint32_t stride = rd_u32(&r);
+            uint64_t gpa = rd_u64(&r);
+            if (r.err || !parent_ok(dd, parent))
+                return -1;
+            /* Validate geometry; the pixels themselves are bounds-checked at
+             * read time through the address translator. */
+            if (fmt != DIMG_RGBA8888 || w == 0 || h == 0
+                || w > DRAW_IMG_MAXDIM || h > DRAW_IMG_MAXDIM)
+                return -1;
+            if (stride == 0)
+                stride = (uint32_t)w * 4;
+            if (stride < (uint32_t)w * 4
+                || (uint64_t)stride * h > DRAW_IMG_MAXBYTES)
+                return -1;
+            struct dnode *n = node_new(dd, id, DOP_IMAGE, parent);
+            if (!n)
+                return -1;
+            n->geo.image.x = x;
+            n->geo.image.y = y;
+            n->geo.image.w = w;
+            n->geo.image.h = h;
+            n->geo.image.fmt = fmt;
+            n->geo.image.stride = stride;
+            n->geo.image.gpa = gpa;
+            break;
+        }
         case DOP_SET_TEXT: {
             uint32_t id = rd_u32(&r);
             char *s = rd_str_dup(&r);
@@ -1158,6 +1208,30 @@ emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n)
         sb_escape(b, n->text);
         sb_puts(b, "</text>");
         break;
+    case DOP_IMAGE: {
+        /* Read the framebuffer from guest RAM (bounds-checked here) and encode
+         * it as a PNG data URI. A bad or unavailable region drops the node
+         * rather than emitting a broken reference. */
+        uint64_t extent = (uint64_t)n->geo.image.stride * n->geo.image.h;
+        const uint8_t *px = dd->gpa
+            ? dd->gpa(dd->gpa_ctx, n->geo.image.gpa, extent) : NULL;
+        if (!px)
+            break;
+        char *b64 = png_base64_rgba(px, n->geo.image.w, n->geo.image.h,
+                                    (int)n->geo.image.stride);
+        if (!b64)
+            break;
+        sb_printf(b, "<image id=\"qu-%d-%u\" x=\"%d\" y=\"%d\""
+                  " width=\"%u\" height=\"%u\"",
+                  DRAW_GUEST, n->id, n->geo.image.x, n->geo.image.y,
+                  n->geo.image.w, n->geo.image.h);
+        emit_common(b, n);
+        sb_puts(b, " xlink:href=\"data:image/png;base64,");
+        sb_puts(b, b64);
+        sb_puts(b, "\"/>");
+        free(b64);
+        break;
+    }
     default:
         break;
     }
@@ -1183,6 +1257,7 @@ serialize(struct drawdev *dd)
 
     struct sbuf b = { 0 };
     sb_printf(&b, "<svg xmlns=\"http://www.w3.org/2000/svg\""
+              " xmlns:xlink=\"http://www.w3.org/1999/xlink\""
               " width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\">",
               cw, ch, cw, ch);
     emit_siblings(&b, dd, dd->root_first);
@@ -1235,7 +1310,8 @@ on_ws_event(void *ctx, uint32_t node, uint16_t type, const char *value, int vlen
  ****************************************************************/
 
 struct drawdev *
-draw_init(struct jotun_draw *chan, void (*wake)(void), int test)
+draw_init(struct jotun_draw *chan, void (*wake)(void), int test,
+          draw_gpa_fn gpa, void *gpa_ctx)
 {
     struct drawdev *dd = calloc(1, sizeof(*dd));
     if (!dd)
@@ -1243,6 +1319,8 @@ draw_init(struct jotun_draw *chan, void (*wake)(void), int test)
     dd->chan = chan;
     dd->wake = wake;
     dd->test = test;
+    dd->gpa = gpa;
+    dd->gpa_ctx = gpa_ctx;
     dd->bench = getenv("JOTUN_DRAW_BENCH") != NULL;
     dd->svg_path = getenv("JOTUN_DRAW_SVG");
     pthread_mutex_init(&dd->qlock, NULL);

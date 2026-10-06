@@ -1,25 +1,31 @@
 /* draw.h : the host draw sink.
  *
- * Receives the guest's structured draw ops over the draw channel and is the
- * authority on what they mean. This step is mechanism only: it validates the
- * op stream structurally and discards the payload, since no SVG is authored and
- * no browser is attached yet (that is M6.2 and M6.3). An optional self-test
- * event source lets the guest's POLL/event path be exercised standalone: a
- * submitted scene that marks a node clickable gets a synthetic click queued
- * back, routed through the same wake path the real front end will use. */
+ * Receives the guest's structured draw ops over the draw channel, holds the
+ * authoritative per-guest scene, and authors the SVG that reaches the browser.
+ * Image nodes reference a framebuffer in guest RAM; the host reads those pixels
+ * through the supplied address translator and encodes them as a PNG data URI.
+ * A self-test event source (test != 0) can queue a synthetic click so the
+ * guest's POLL/event path runs with no browser attached. */
 #ifndef DRAW_H
 #define DRAW_H
+
+#include <stdint.h>
 
 #include "jotun_draw.h"
 
 struct drawdev;
 
+/* Translate a guest-physical range [gpa, gpa+len) to a host pointer, or NULL if
+ * it does not lie entirely within guest RAM. */
+typedef void *(*draw_gpa_fn)(void *ctx, uint64_t gpa, uint64_t len);
+
 /* Create the sink. chan is the guest draw channel in host memory. wake rouses
  * the guest when an input event is queued (the net provider's contract). test,
- * when nonzero, enables the self-test event source described above. policy is
- * reserved for later display confinement and may be NULL. Returns NULL on
- * failure. */
-struct drawdev *draw_init(struct jotun_draw *chan, void (*wake)(void), int test);
+ * when nonzero, enables the self-test event source. gpa (with gpa_ctx) reads
+ * image pixels from guest RAM and may be NULL to disable image nodes. Returns
+ * NULL on failure. */
+struct drawdev *draw_init(struct jotun_draw *chan, void (*wake)(void), int test,
+                          draw_gpa_fn gpa, void *gpa_ctx);
 
 /* Handle one request already written into the channel, writing the result
  * back. Called from the draw doorbell. */

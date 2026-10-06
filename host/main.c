@@ -123,6 +123,16 @@ gpa_to_host(uint64_t gpa, uint64_t len)
     return gm.base + gpa;
 }
 
+/* The draw sink's address translator: same bounds check, with the callback
+ * signature the sink expects (the context is unused, since guest RAM is file
+ * scope here). */
+static void *
+draw_gpa(void *ctx, uint64_t gpa, uint64_t len)
+{
+    (void)ctx;
+    return gpa_to_host(gpa, len);
+}
+
 /* Write the boot parameter block into guest RAM before the vcpu starts. The
  * guest argv is whatever follows the kernel image on the command line, with
  * argv[0] the init program. */
@@ -520,7 +530,8 @@ main(int argc, char **argv)
      * source so the submit/poll path can run with no front end attached. */
     int draw_test = getenv("JOTUN_DRAW_TEST") != NULL;
     struct jotun_draw *drawchan = gpa_to_host(JOTUN_DRAW_BASE, sizeof(*drawchan));
-    drawdev = drawchan ? draw_init(drawchan, rouse_vcpus, draw_test) : NULL;
+    drawdev = drawchan
+        ? draw_init(drawchan, rouse_vcpus, draw_test, draw_gpa, NULL) : NULL;
 
     /* Serve a smolvfs bundle if one is named, else the in-memory tree, with the
      * read-only /net overlay wrapping whichever backend is chosen. */

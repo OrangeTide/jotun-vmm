@@ -54,6 +54,7 @@ enum {
     DOP_POLYLINE = 0x14,    /* id parent closed:u8 n:u16 pts:i16[2n] style */
     DOP_PATH     = 0x15,    /* id parent n:u16 seg[n] style */
     DOP_TEXT     = 0x16,    /* id parent x:i16 y:i16 size:u16 s:str style */
+    DOP_IMAGE    = 0x17,    /* id parent x:i16 y:i16 w:u16 h:u16 fmt:u8 stride:u32 gpa:u64 */
     DOP_SET      = 0x20,    /* id:u32 attr:u16 value (typed by attr) */
     DOP_SET_TEXT = 0x21,    /* id:u32 s:str */
     DOP_REMOVE   = 0x22,    /* id:u32 */
@@ -99,6 +100,13 @@ enum {
 
 /* color: low 24 bits are 0xRRGGBB; this sentinel means "none" (no paint). */
 #define DRAW_COLOR_NONE  0x01000000u
+
+/* Pixel formats for DOP_IMAGE. The pixels live in guest RAM at `gpa` (the host
+ * reads them there, never over the channel); `stride` is the row length in
+ * bytes, or 0 for the tight w*bpp. RGBA8888 is four bytes per pixel, R,G,B,A. */
+enum {
+    DIMG_RGBA8888 = 0,
+};
 
 /* Interaction kinds for DOP_INTERACT. */
 enum {
