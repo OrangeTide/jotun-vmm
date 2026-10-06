@@ -414,9 +414,21 @@ Steps:
   (JOTUN_DRAW_TEST) feeds a synthetic click back on a clickable node, so the
   submit/park/poll loop runs end to end with no front end. The `draw` demo in
   the libos exercises it; verified on x86-64 KVM and cross-linked for arm64.
-- M6.2: the host draw subsystem. A validator for the op vocabulary and a
-  canonical SVG emitter, with per-guest scene and id tracking. The host is a
-  translator, not a relay.
+- M6.2 (done): the host draw subsystem (`host/draw.c`). The sink now retains a
+  per-guest scene tree and applies each SUBMIT op as a validated mutation:
+  create under a parent, set text, annotate interaction, listen, remove. It
+  validates id uniqueness (id 0 reserved), that a parent exists and is a surface
+  or group, the color/enum/width ranges, and the node, surface, and string caps.
+  From the tree it authors the canonical SVG, reconstructing every attribute
+  from a validated number or an XML-escaped string, so no guest bytes are
+  forwarded and there is nowhere to inject markup. Hover and press fills become
+  SMIL `<set>` children; drag, xy, click, and close become `data-qu-*`
+  attributes the M6.3 client reads. JOTUN_DRAW_SVG dumps the authored document
+  per SUBMIT for inspection; verified well-formed with the draw demo (surface,
+  rect with hover, text, nested group and circle). Not yet shipped anywhere:
+  that is the WebSocket front end in M6.3. SET, POLYLINE, and PATH apply/emit
+  land with their guest wrappers; full op-stream rollback against a hostile
+  guest and a node index for scale are M6.5/M6.6.
 - M6.3: the host WebSocket front end (SHA-1/base64/handshake/framing lifted
   from `quaoar-server`, bound to localhost) and the browser client, reused from
   `quaoar-client.html` but now consuming host-authored markup. Meets the

@@ -311,6 +311,16 @@ draw_demo(void)
     draw_rect(2, 1, 40, 40, 120, 60, 8, &box);
     draw_text(3, 1, 52, 78, 16, "click me", 0);
     draw_click(2);
+    draw_hover_fill(2, 0x4c8cff);
+
+    /* A nested group with a circle, to exercise container nesting and a second
+     * shape in the serialized scene. */
+    struct draw_style dot = {
+        .mask = DST_FILL,
+        .fill = 0x33aa55,
+    };
+    draw_group(4, 1, 20, 130);
+    draw_circle(5, 4, 30, 30, 20, &dot);
 
     draw_flush();
     con_puts("draw: scene submitted, waiting for event\n");
