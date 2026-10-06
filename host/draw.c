@@ -1615,20 +1615,17 @@ deliver_event(struct drawdev *dd, uint32_t node, uint16_t type,
 }
 
 /* Inbound event from the browser (on the WS server thread), routed by the front
- * end to the guest it targets. The browser does not yet tag the event with its
- * guest, so it is delivered to the first registered sink; per-guest routing by
- * the DOM id's guest field is M10.2. */
+ * end to the guest named by the DOM id's guest field, so a click on one guest's
+ * content reaches that guest and no other. An event for an unknown or
+ * unattached guest is dropped. */
 static void
-fe_on_event(void *ctx, uint32_t node, uint16_t type, const char *value, int vlen)
+fe_on_event(void *ctx, uint32_t guest, uint32_t node, uint16_t type,
+            const char *value, int vlen)
 {
     struct drawfe *fe = ctx;
 
-    for (int i = 0; i < DRAW_MAXGUEST; i++) {
-        if (fe->sinks[i]) {
-            deliver_event(fe->sinks[i], node, type, value, vlen);
-            return;
-        }
-    }
+    if (guest < DRAW_MAXGUEST && fe->sinks[guest])
+        deliver_event(fe->sinks[guest], node, type, value, vlen);
 }
 
 /****************************************************************

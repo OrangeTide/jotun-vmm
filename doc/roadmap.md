@@ -789,9 +789,13 @@ Sub-milestones:
     delta yet); per-guest deltas are a later optimization. The per-guest id
     prefix keeps node ids distinct across guests. Inbound events still reach the
     first registered sink; per-guest routing is M10.2.
-- M10.2: the session layer for inbound events. Stop discarding the guest field
-  in the client `nodeId()`, carry it through the event dispatch and the
-  `drawws` event callback, and route each event to the targeted guest's queue.
+- M10.2 (done): the session layer for inbound events. The client now reads the
+  guest field of the DOM id (guestId) alongside the node and sends it, so the
+  browser-to-host wire is `<guest> <node> <type>` with the optional value line.
+  dispatch_event parses the guest, the drawws event callback carries it, and the
+  front end routes the event to that guest's sink (fe->sinks[guest]); an event
+  for an unattached guest is dropped. A click on one guest's content now reaches
+  that guest and no other.
 - M10.3: auth is a no-op in the host by the decision above; document the proxy
   boundary and confirm the single-browser limit still holds under multiplexing.
 - M10.4: shared read-only filesystem mount between guests. Point two guests' 9P

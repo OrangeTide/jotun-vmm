@@ -16,12 +16,13 @@
 
 struct drawws;
 
-/* Called on the server thread when the browser reports an input event. node is
- * the guest node id, type is a DEV_* code, and value is the optional payload
+/* Called on the server thread when the browser reports an input event. guest is
+ * the owning guest's id (the guest field of the DOM id), node is the node id
+ * within that guest, type is a DEV_* code, and value is the optional payload
  * (vlen bytes, not NUL-terminated). The callback must be quick and thread-aware
  * (it rouses the guest). */
-typedef void (*drawws_event_fn)(void *ctx, uint32_t node, uint16_t type,
-                                const char *value, int vlen);
+typedef void (*drawws_event_fn)(void *ctx, uint32_t guest, uint32_t node,
+                                uint16_t type, const char *value, int vlen);
 
 /* Start the server bound to 127.0.0.1:port. on_event (with ctx) is invoked for
  * each inbound event. Returns NULL on failure. */

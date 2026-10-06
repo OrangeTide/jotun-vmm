@@ -222,16 +222,17 @@ static const char CLIENT_HTML[] =
 "var ws;\n"
 "function stat(on){dot.classList.toggle('on',on);txt.textContent=on?'connected':'disconnected';}\n"
 "function nodeId(el){var m=/^qu-\\d+-(\\d+)$/.exec(el.id||'');return m?+m[1]:0;}\n"
-"function send(node,type,value){if(ws&&ws.readyState===1)\n"
-"  ws.send(node+' '+type+(value!==undefined?'\\n'+value:''));}\n"
+"function guestId(el){var m=/^qu-(\\d+)-\\d+$/.exec(el.id||'');return m?+m[1]:0;}\n"
+"function send(guest,node,type,value){if(ws&&ws.readyState===1)\n"
+"  ws.send(guest+' '+node+' '+type+(value!==undefined?'\\n'+value:''));}\n"
 "function wireOne(el){\n"
 "  if(!el.getAttribute||el._w)return;\n"
 "  var l=el.getAttribute('data-qu-listen');\n"
 "  if(l==='click'){el._w=1;el.style.cursor='pointer';\n"
-"    el.addEventListener('click',function(e){e.stopPropagation();send(nodeId(el),1);});}\n"
+"    el.addEventListener('click',function(e){e.stopPropagation();send(guestId(el),nodeId(el),1);});}\n"
 "  else if(l==='close'){el._w=1;el.style.cursor='pointer';\n"
 "    el.addEventListener('click',function(e){e.stopPropagation();\n"
-"      var s=el.closest('.qu-surface');send(s?nodeId(s):0,2);});}\n"
+"      var s=el.closest('.qu-surface');send(s?guestId(s):0,s?nodeId(s):0,2);});}\n"
 "}\n"
 "function wireTree(root){wireOne(root);\n"
 "  if(root.querySelectorAll)root.querySelectorAll('[data-qu-listen]').forEach(wireOne);}\n"
@@ -288,11 +289,11 @@ static const char CLIENT_HTML[] =
 "});\n"
 "document.addEventListener('mouseup',function(e){\n"
 "  if(drag){var p=parseFloat(drag.el.getAttribute(drag.vert?'y':'x'))||0;\n"
-"    send(nodeId(drag.el),3,(drag.track>0?p/drag.track:0).toFixed(4));drag=null;}\n"
+"    send(guestId(drag.el),nodeId(drag.el),3,(drag.track>0?p/drag.track:0).toFixed(4));drag=null;}\n"
 "  if(xy){var r=xy.area.getBoundingClientRect();\n"
 "    var fx=(parseFloat(xy.el.getAttribute('cx'))||0)/r.width;\n"
 "    var fy=(parseFloat(xy.el.getAttribute('cy'))||0)/r.height;\n"
-"    send(nodeId(xy.el),4,fx.toFixed(4)+' '+fy.toFixed(4));xy=null;}\n"
+"    send(guestId(xy.el),nodeId(xy.el),4,fx.toFixed(4)+' '+fy.toFixed(4));xy=null;}\n"
 "});\n"
 "function connect(){\n"
 "  ws=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/ws');\n"
@@ -509,8 +510,8 @@ dispatch_event(struct drawws *w, uint8_t *payload, int plen)
     memcpy(hdr, payload, (size_t)hlen);
     hdr[hlen] = '\0';
 
-    unsigned node = 0, type = 0;
-    if (sscanf(hdr, "%u %u", &node, &type) != 2)
+    unsigned guest = 0, node = 0, type = 0;
+    if (sscanf(hdr, "%u %u %u", &guest, &node, &type) != 3)
         return;
 
     const char *value = nl ? nl + 1 : NULL;
@@ -528,7 +529,7 @@ dispatch_event(struct drawws *w, uint8_t *payload, int plen)
         vbuf[n] = '\0';
         uint16_t v = to_norm(atof(vbuf));
         uint8_t enc[2] = { (uint8_t)v, (uint8_t)(v >> 8) };
-        w->on_event(w->ctx, node, (uint16_t)type, (const char *)enc, 2);
+        w->on_event(w->ctx, guest, node, (uint16_t)type, (const char *)enc, 2);
     } else if (type == 4 /* DEV_XY */ && value) { /* two fractions -> 2x norm */
         char vbuf[64];
         int n = vlen < (int)sizeof vbuf - 1 ? vlen : (int)sizeof vbuf - 1;
@@ -539,9 +540,9 @@ dispatch_event(struct drawws *w, uint8_t *payload, int plen)
         uint16_t x = to_norm(fx), y = to_norm(fy);
         uint8_t enc[4] = { (uint8_t)x, (uint8_t)(x >> 8),
                            (uint8_t)y, (uint8_t)(y >> 8) };
-        w->on_event(w->ctx, node, (uint16_t)type, (const char *)enc, 4);
+        w->on_event(w->ctx, guest, node, (uint16_t)type, (const char *)enc, 4);
     } else {
-        w->on_event(w->ctx, node, (uint16_t)type, value, vlen);
+        w->on_event(w->ctx, guest, node, (uint16_t)type, value, vlen);
     }
 }
 
