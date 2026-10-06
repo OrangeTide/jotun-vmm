@@ -203,6 +203,17 @@ and for any public-facing rate limiting, keeping that policy out of the host.
 The host's own limits (frame size, event rate, a single browser at a time)
 still apply underneath.
 
+Multi-guest sessions (M10) do not change this boundary. When the host runs
+several guests, one browser session fronts all of them: the host composites
+each guest's scene into one document (a group per guest) and routes each
+inbound event to the guest its DOM id names. That is still a single browser on
+one loopback port, not one browser per guest, so the "single browser at a time"
+limit and the replace-on-connect behavior are unchanged. The host adds no
+authentication or session identity of its own; a deployment that exposes the
+port to more than one viewer, or wants per-session access control, puts that in
+the reverse proxy in front, exactly as above. Several simultaneous viewers and
+in-host session authentication are deliberately not implemented.
+
 ## Scale and latency (M6.6)
 
 The host keeps the scene in an id-indexed tree: an id-to-slot hash makes lookup

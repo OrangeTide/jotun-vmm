@@ -796,8 +796,14 @@ Sub-milestones:
   front end routes the event to that guest's sink (fe->sinks[guest]); an event
   for an unattached guest is dropped. A click on one guest's content now reaches
   that guest and no other.
-- M10.3: auth is a no-op in the host by the decision above; document the proxy
-  boundary and confirm the single-browser limit still holds under multiplexing.
+- M10.3 (done): auth is a no-op in the host by the decision above. Confirmed the
+  front end is still loopback-only (binds INADDR_LOOPBACK) and single-browser
+  (accept_conn closes the old connection before taking the new one) after
+  multiplexing, demonstrated by a second browser dropping the first live. One
+  session fronts all guests, not one browser per guest. Documented the boundary
+  in `doc/draw-vocabulary.md`: several simultaneous viewers and in-host session
+  authentication are deliberately not implemented; a deployment that needs them
+  puts them in the reverse proxy in front.
 - M10.4: shared read-only filesystem mount between guests. Point two guests' 9P
   subtree at the same bundle depot or snapshot, one side owning ref commits and
   the other mounting a fixed root read-only. Safe because the store is a
