@@ -331,7 +331,13 @@ Steps:
   server: dial, write, blocking read, close, on one and two vcpus and with the
   preemption timer on (10 iterations clean), plus a clean error on a refused
   connection. Policy enforcement and the `/net` tree arrive in M5.4.
-- M5.3: UDP `sendto`/`recvfrom`.
+- M5.3 (done): UDP. `net_udp` opens an unconnected datagram socket, and
+  `net_sendto`/`net_recvfrom` carry a per-datagram "host!port" address through a
+  new `addr` field in the channel, with three ops (`NET_OP_UDP`,
+  `NET_OP_SENDTO`, `NET_OP_RECVFROM`). recvfrom reports the source as a numeric
+  address and blocks the task until a datagram arrives, reusing the same park
+  path as TCP. IPv4 for now. Verified on x86 KVM against a loopback UDP echo
+  server on one and two vcpus with the timer on.
 - M5.4: the `/net` information tree over 9P, the manifest network-policy fields
   and their enforcement, and the allowed/refused acceptance test.
 

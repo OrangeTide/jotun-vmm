@@ -25,13 +25,17 @@
 #define JOTUN_NET_BASE      0x10000u
 #define JOTUN_NET_DOORBELL  0x0a000020ull
 #define JOTUN_NET_MSIZE     8192u
+#define JOTUN_NET_ADDRMAX   128u        /* a "host!port" address string */
 
 /* Operations (guest to host). */
 enum {
-    NET_OP_DIAL  = 1,       /* open a connection to data[] as "host!port" */
-    NET_OP_SEND  = 2,       /* write len bytes of data[] to a connection */
-    NET_OP_RECV  = 3,       /* read up to maxlen bytes from a connection */
-    NET_OP_CLOSE = 4,       /* close a connection */
+    NET_OP_DIAL     = 1,    /* open a connection to data[] as "host!port" */
+    NET_OP_SEND     = 2,    /* write len bytes of data[] to a connection */
+    NET_OP_RECV     = 3,    /* read up to maxlen bytes from a connection */
+    NET_OP_CLOSE    = 4,    /* close a connection */
+    NET_OP_UDP      = 5,    /* open an unconnected UDP socket */
+    NET_OP_SENDTO   = 6,    /* send a datagram (data[]) to addr[] "host!port" */
+    NET_OP_RECVFROM = 7,    /* receive a datagram, addr[] filled with the source */
 };
 
 /* Protocols for NET_OP_DIAL. */
@@ -57,7 +61,8 @@ struct jotun_net {
     uint32_t len;               /* data length: SEND in, RECV out */
     uint32_t maxlen;            /* RECV: max bytes to read (guest to host) */
     volatile uint32_t evt;      /* host sets on a net event; guest clears it */
-    uint32_t _pad;
+    uint32_t addrlen;           /* addr length: SENDTO in, RECVFROM out */
+    uint8_t  addr[JOTUN_NET_ADDRMAX];   /* "host!port" for SENDTO/RECVFROM */
     uint8_t  data[JOTUN_NET_MSIZE];
 };
 

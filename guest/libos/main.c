@@ -212,6 +212,57 @@ net_demo(void)
     con_puts("net: done\n");
 }
 
+/* UDP demo: open a datagram socket, send one datagram to a target, and print
+ * the reply with its source address. The recvfrom blocks the task until a
+ * datagram arrives. */
+static void
+udp_demo(void)
+{
+    const char *target = (boot_argc() > 1) ? boot_argv(1) : "127.0.0.1!7";
+
+    con_puts("udp: socket, sending to ");
+    con_puts(target);
+    con_putc('\n');
+
+    int h = net_udp();
+    if (h < 0) {
+        con_puts("udp: open failed\n");
+        return;
+    }
+
+    const char *msg = "ping\n";
+    long w = net_sendto(h, target, msg, 5);
+    if (w < 0) {
+        con_puts("udp: send failed\n");
+        net_close(h);
+        return;
+    }
+    con_puts("udp: sent ");
+    con_putu((uint64_t)w);
+    con_puts(" bytes\n");
+
+    char src[64];
+    char buf[256];
+    long r = net_recvfrom(h, src, sizeof src, buf, sizeof buf - 1);
+    if (r < 0) {
+        con_puts("udp: recv error\n");
+        net_close(h);
+        return;
+    }
+    buf[r] = '\0';
+    con_puts("udp: got ");
+    con_putu((uint64_t)r);
+    con_puts(" bytes from ");
+    con_puts(src);
+    con_puts(": ");
+    con_puts(buf);
+    if (r == 0 || buf[r - 1] != '\n')
+        con_putc('\n');
+
+    net_close(h);
+    con_puts("udp: done\n");
+}
+
 /* The init task: either the preemption demo or the startup script, selected by
  * the first boot argument (default "rc"). */
 static void
@@ -228,6 +279,8 @@ init_task(void)
         block_demo();
     } else if (script[0] == 'n' && script[1] == 'e') {  /* "net" */
         net_demo();
+    } else if (script[0] == 'u' && script[1] == 'd') {  /* "udp" */
+        udp_demo();
     } else {
         con_puts("init: running script /");
         con_puts(script);

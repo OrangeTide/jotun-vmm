@@ -188,6 +188,109 @@ net_read(int handle, void *buf, unsigned long max)
 }
 
 int
+net_udp(void)
+{
+    unsigned long f = lock_chan();
+    struct jotun_net *c = chan();
+    c->op = NET_OP_UDP;
+    doorbell();
+    int st = c->status;
+    unlock_chan(f);
+    return st;
+}
+
+/* One non-blocking sendto RPC. */
+static long
+sendto_once(int handle, const char *dst, const void *buf, unsigned long n)
+{
+    unsigned long alen = 0;
+    while (dst[alen] != '\0')
+        alen++;
+    if (alen >= JOTUN_NET_ADDRMAX)
+        return NET_EINVAL;
+    if (n > JOTUN_NET_MSIZE)
+        n = JOTUN_NET_MSIZE;
+
+    unsigned long f = lock_chan();
+    struct jotun_net *c = chan();
+    c->op = NET_OP_SENDTO;
+    c->handle = handle;
+    c->addrlen = (uint32_t)alen;
+    ncopy(c->addr, dst, alen);
+    c->len = (uint32_t)n;
+    ncopy(c->data, buf, n);
+    doorbell();
+    long st = c->status;
+    unlock_chan(f);
+    return st;
+}
+
+long
+net_sendto(int handle, const char *dst, const void *buf, unsigned long n)
+{
+    int me = task_self();
+
+    __atomic_store_n(&net_waiting[me], 1, __ATOMIC_SEQ_CST);
+    for (;;) {
+        long st = sendto_once(handle, dst, buf, n);
+        if (st == NET_EAGAIN) {
+            task_block();
+            continue;
+        }
+        __atomic_store_n(&net_waiting[me], 0, __ATOMIC_SEQ_CST);
+        return st;              /* datagram count, or an error */
+    }
+}
+
+/* One non-blocking recvfrom RPC. On success copies the payload and the source
+ * address string out. */
+static long
+recvfrom_once(int handle, char *src, unsigned long srccap,
+              void *buf, unsigned long max)
+{
+    if (max > JOTUN_NET_MSIZE)
+        max = JOTUN_NET_MSIZE;
+
+    unsigned long f = lock_chan();
+    struct jotun_net *c = chan();
+    c->op = NET_OP_RECVFROM;
+    c->handle = handle;
+    c->maxlen = (uint32_t)max;
+    doorbell();
+    long st = c->status;
+    if (st >= 0) {
+        ncopy(buf, c->data, c->len);
+        unsigned long a = c->addrlen;
+        if (src && srccap > 0) {
+            if (a > srccap - 1)
+                a = srccap - 1;
+            ncopy(src, c->addr, a);
+            src[a] = '\0';
+        }
+    }
+    unlock_chan(f);
+    return st;
+}
+
+long
+net_recvfrom(int handle, char *src, unsigned long srccap,
+             void *buf, unsigned long max)
+{
+    int me = task_self();
+
+    __atomic_store_n(&net_waiting[me], 1, __ATOMIC_SEQ_CST);
+    for (;;) {
+        long st = recvfrom_once(handle, src, srccap, buf, max);
+        if (st == NET_EAGAIN) {
+            task_block();
+            continue;
+        }
+        __atomic_store_n(&net_waiting[me], 0, __ATOMIC_SEQ_CST);
+        return st;
+    }
+}
+
+int
 net_close(int handle)
 {
     unsigned long f = lock_chan();

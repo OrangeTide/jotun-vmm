@@ -220,6 +220,151 @@ do_recv(struct netdev *nd, struct jotun_net *chan)
 }
 
 static void
+do_udp(struct netdev *nd, struct jotun_net *chan)
+{
+    pthread_mutex_lock(&nd->lock);
+    int handle = -1;
+    for (int i = 0; i < NET_MAXCONN; i++) {
+        if (nd->conns[i].fd < 0) {
+            handle = i;
+            break;
+        }
+    }
+    if (handle < 0) {
+        pthread_mutex_unlock(&nd->lock);
+        reply(chan, NET_ENORES, 0);
+        return;
+    }
+
+    /* Unconnected datagram socket. IPv4 for this PoC, so sendto resolves its
+     * targets as IPv4 too. */
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        pthread_mutex_unlock(&nd->lock);
+        reply(chan, NET_ECONN, 0);
+        return;
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+
+    nd->conns[handle].fd = fd;
+    nd->conns[handle].proto = NET_PROTO_UDP;
+    nd->conns[handle].in_epoll = 0;
+    pthread_mutex_unlock(&nd->lock);
+
+    reply(chan, handle, 0);
+}
+
+static void
+do_sendto(struct netdev *nd, struct jotun_net *chan)
+{
+    /* Resolve the per-datagram destination before taking the lock. */
+    char target[JOTUN_NET_ADDRMAX];
+    uint32_t an = chan->addrlen;
+    if (an >= sizeof target) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+    memcpy(target, chan->addr, an);
+    target[an] = '\0';
+
+    char *bang = strchr(target, '!');
+    if (!bang) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+    *bang = '\0';
+    const char *host = target;
+    const char *port = bang + 1;
+
+    if (!policy_allow(host, port, NET_PROTO_UDP)) {
+        reply(chan, NET_EPERM, 0);
+        return;
+    }
+
+    struct addrinfo hints = { 0 };
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, port, &hints, &res) != 0 || !res) {
+        reply(chan, NET_ENORES, 0);
+        return;
+    }
+
+    pthread_mutex_lock(&nd->lock);
+    struct net_conn *c = conn_of(nd, chan->handle);
+    if (!c) {
+        pthread_mutex_unlock(&nd->lock);
+        freeaddrinfo(res);
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+
+    uint32_t len = chan->len;
+    if (len > JOTUN_NET_MSIZE)
+        len = JOTUN_NET_MSIZE;
+    ssize_t s = sendto(c->fd, chan->data, len, 0, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+    if (s >= 0) {
+        pthread_mutex_unlock(&nd->lock);
+        reply(chan, (int32_t)s, 0);
+        return;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        arm(nd, c, EPOLLOUT);
+        pthread_mutex_unlock(&nd->lock);
+        reply(chan, NET_EAGAIN, 0);
+        return;
+    }
+    pthread_mutex_unlock(&nd->lock);
+    reply(chan, NET_ECONN, 0);
+}
+
+static void
+do_recvfrom(struct netdev *nd, struct jotun_net *chan)
+{
+    pthread_mutex_lock(&nd->lock);
+    struct net_conn *c = conn_of(nd, chan->handle);
+    if (!c) {
+        pthread_mutex_unlock(&nd->lock);
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+
+    uint32_t max = chan->maxlen;
+    if (max > JOTUN_NET_MSIZE)
+        max = JOTUN_NET_MSIZE;
+    struct sockaddr_storage src;
+    socklen_t srclen = sizeof src;
+    ssize_t r = recvfrom(c->fd, chan->data, max, 0, (struct sockaddr *)&src,
+                         &srclen);
+    if (r >= 0) {
+        /* Report the source as a numeric "host!port" string. */
+        char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
+        chan->addrlen = 0;
+        if (getnameinfo((struct sockaddr *)&src, srclen, hbuf, sizeof hbuf,
+                        sbuf, sizeof sbuf,
+                        NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+            int n = snprintf((char *)chan->addr, JOTUN_NET_ADDRMAX, "%s!%s",
+                             hbuf, sbuf);
+            if (n > 0)
+                chan->addrlen = (uint32_t)(n < (int)JOTUN_NET_ADDRMAX
+                                           ? n : (int)JOTUN_NET_ADDRMAX - 1);
+        }
+        pthread_mutex_unlock(&nd->lock);
+        reply(chan, (int32_t)r, (uint32_t)r);
+        return;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        arm(nd, c, EPOLLIN);
+        pthread_mutex_unlock(&nd->lock);
+        reply(chan, NET_EAGAIN, 0);
+        return;
+    }
+    pthread_mutex_unlock(&nd->lock);
+    reply(chan, NET_ECONN, 0);
+}
+
+static void
 do_close(struct netdev *nd, struct jotun_net *chan)
 {
     pthread_mutex_lock(&nd->lock);
@@ -239,11 +384,14 @@ void
 net_handle(struct netdev *nd, struct jotun_net *chan)
 {
     switch (chan->op) {
-    case NET_OP_DIAL:   do_dial(nd, chan);  break;
-    case NET_OP_SEND:   do_send(nd, chan);  break;
-    case NET_OP_RECV:   do_recv(nd, chan);  break;
-    case NET_OP_CLOSE:  do_close(nd, chan); break;
-    default:            reply(chan, NET_EINVAL, 0); break;
+    case NET_OP_DIAL:     do_dial(nd, chan);     break;
+    case NET_OP_SEND:     do_send(nd, chan);     break;
+    case NET_OP_RECV:     do_recv(nd, chan);     break;
+    case NET_OP_CLOSE:    do_close(nd, chan);    break;
+    case NET_OP_UDP:      do_udp(nd, chan);      break;
+    case NET_OP_SENDTO:   do_sendto(nd, chan);   break;
+    case NET_OP_RECVFROM: do_recvfrom(nd, chan); break;
+    default:              reply(chan, NET_EINVAL, 0); break;
     }
 }
 

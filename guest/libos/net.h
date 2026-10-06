@@ -24,7 +24,21 @@ long net_write(int handle, const void *buf, unsigned long n);
  * count (0 means the peer closed), or a negative NET_* error. */
 long net_read(int handle, void *buf, unsigned long max);
 
-/* Close a connection. Returns 0, or a negative NET_* error. */
+/* Open an unconnected UDP socket. Returns a handle, or a negative NET_* error.
+ * Use net_sendto/net_recvfrom with it; close it with net_close. */
+int net_udp(void);
+
+/* Send one datagram of n bytes to dst ("host!port"), blocking if the socket is
+ * momentarily full. Returns the byte count, or a negative NET_* error. */
+long net_sendto(int handle, const char *dst, const void *buf, unsigned long n);
+
+/* Receive one datagram, up to max bytes, blocking until one arrives. The
+ * source is written to src as "host!port" (truncated to srccap). Returns the
+ * datagram's byte count, or a negative NET_* error. */
+long net_recvfrom(int handle, char *src, unsigned long srccap,
+                  void *buf, unsigned long max);
+
+/* Close a connection or UDP socket. Returns 0, or a negative NET_* error. */
 int net_close(int handle);
 
 #endif /* LIBOS_NET_H */
