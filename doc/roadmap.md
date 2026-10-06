@@ -361,13 +361,61 @@ Steps:
 
 Goal: the primary use case, interactive diagrams and schematics in a browser.
 
-- Guest `/dev/draw` emitting the Quaoar line protocol over the ring.
-- Host front end, ported from `quaoar-server` to the ring, then a WebSocket to
-  the browser.
-- Reuse `quaoar-client.html` as the browser display.
-
 Acceptance: a guest app draws an interactive diagram in a browser window and
 receives a click or other semantic event back.
+
+Investigation (done): the design reuses the Quaoar research
+(`Quaoar`): a guest line protocol, a C
+bridge that multiplexes apps onto one WebSocket, and a browser client that
+renders SVG. The bridge is a single-threaded `poll` relay with inline
+SHA-1/base64 WebSocket handshake and framing, no dependencies; its protocol
+logic (framing, routing, per-app id) is transport-agnostic and its I/O layer
+(~300-500 LOC) is the only socket-coupled part. The guest emitter `libquaoar`
+is built on `snprintf`/`vsnprintf`/`malloc`/sockets, none of which the
+freestanding libOS has. Quaoar is a proof of concept (Approach A, SVG
+streaming) and its author documents the untested parts: a 5-10k SVG-node
+ceiling, localhost-only latency, no auth or session management, and no pixel
+path (that is M7).
+
+The decisive risk is the threat-model inversion. Quaoar is a display server
+for cooperative apps; its client `DOMParser`s application-supplied SVG into one
+shared page with no sanitization. Jotun's guest is attacker-controlled, so
+forwarding guest markup verbatim would let one guest inject script that reaches
+other guests' surfaces and the socket.
+
+Decisions (made):
+
+- Restrict the vocabulary. The guest never emits markup. It emits a small set
+  of structured draw ops (surface, group/transform, rect, circle, line, path
+  with validated commands, text, a style allowlist, and declarative hover/
+  press/drag annotations). The host validates every op and field and is the
+  sole author of the SVG sent to the browser, so no guest bytes are ever
+  DOM-parsed by the client. This makes the host-side validation genuinely cheap
+  (a known vocabulary, not arbitrary SVG) and closes the injection risk by
+  construction rather than by sanitizing a hostile parser's input.
+- Mechanism first, then harden. The restricted vocabulary is light enough that
+  it is part of the mechanism, not a later phase, so there is no insecure
+  intermediate state. What defers to M6.5+ is the WebSocket frame parser audit,
+  transport hardening, vocabulary breadth, and scale/latency work.
+
+Steps:
+
+- M6.1: the `/dev/draw` channel ABI and the guest draw client. A structured-op
+  emitter (no markup, no libc formatting dependency) and backpressure: when the
+  host's outbound queue is full the guest task parks through the M5.1 block/wake
+  primitive rather than stalling the vcpu. A single draw message can be large,
+  so the channel chunks rather than assuming one slot per scene.
+- M6.2: the host draw subsystem. A validator for the op vocabulary and a
+  canonical SVG emitter, with per-guest scene and id tracking. The host is a
+  translator, not a relay.
+- M6.3: the host WebSocket front end (SHA-1/base64/handshake/framing lifted
+  from `quaoar-server`, bound to localhost) and the browser client, reused from
+  `quaoar-client.html` but now consuming host-authored markup. Meets the
+  acceptance test: a guest draws an interactive diagram, a click returns.
+- M6.5: hardening. Audit or replace the hand-rolled WebSocket frame parser
+  (it reads browser-supplied bytes in the trusted host), document TLS via a
+  reverse proxy, add size and rate limits, and broaden the vocabulary.
+- M6.6: scale and latency characterization (node ceiling, mutation throughput).
 
 ## M7: display, the pixel path
 
