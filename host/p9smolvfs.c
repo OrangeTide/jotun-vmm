@@ -55,8 +55,6 @@ struct smolctx {
     char            root[CAS_HASH_HEX + 1];
 };
 
-static struct smolctx ctx;
-
 /* Fold the leading hex of a content hash into a 64-bit qid path. */
 static uint64_t
 qid_of(const char *hash)
@@ -206,17 +204,17 @@ is_root_hash(const char *s)
     return n == CAS_HASH_HEX;
 }
 
-/* If ctx.root names a jimage manifest object, replace it with the root tree
- * for `arch`. Leaves ctx.root untouched when it is an ordinary tree. Returns 0
- * on success, -1 if the object is a jimage this host cannot use (bad format or
- * no row for arch). */
+/* If c->root names a jimage manifest object, replace it with the root tree for
+ * `arch`. Leaves c->root untouched when it is an ordinary tree. Returns 0 on
+ * success, -1 if the object is a jimage this host cannot use (bad format or no
+ * row for arch). */
 static int
-resolve_image(const char *arch)
+resolve_image(struct smolctx *c, const char *arch)
 {
     struct cas_file cf;
     char type[CAS_TYPE_MAX + 1] = "";
 
-    if (cas_open_object(ctx.store, &cf, ctx.root, type, sizeof type) != CAS_OK)
+    if (cas_open_object(c->store, &cf, c->root, type, sizeof type) != CAS_OK)
         return 0;                       /* not readable as a typed object: treat as a tree */
     if (strcmp(type, JIMAGE_TYPE) != 0) {
         cas_close(&cf);
@@ -237,8 +235,8 @@ resolve_image(const char *arch)
                 arch ? arch : "");
         return -1;
     }
-    strncpy(ctx.root, r, sizeof ctx.root - 1);
-    ctx.root[sizeof ctx.root - 1] = '\0';
+    strncpy(c->root, r, sizeof c->root - 1);
+    c->root[sizeof c->root - 1] = '\0';
     return 0;
 }
 
@@ -246,47 +244,64 @@ const struct p9_backend *
 p9smolvfs_open(const char *depot, const char *ref, const char *subtree,
                const char *arch, void **ctx_out)
 {
-    ctx.store = cas_new(depot);
-    if (!ctx.store)
+    struct smolctx *c = calloc(1, sizeof *c);
+    if (!c)
         return NULL;
-    ctx.ct = cas_tree_new(ctx.store);
-    if (!ctx.ct) {
-        cas_free(ctx.store);
-        ctx.store = NULL;
+
+    c->store = cas_new(depot);
+    if (!c->store) {
+        free(c);
+        return NULL;
+    }
+    c->ct = cas_tree_new(c->store);
+    if (!c->ct) {
+        cas_free(c->store);
+        free(c);
         return NULL;
     }
     if (ref && is_root_hash(ref)) {
-        strncpy(ctx.root, ref, sizeof ctx.root - 1);        /* pinned snapshot */
-        ctx.root[sizeof ctx.root - 1] = '\0';
-    } else if (cas_tree_ref_read(ctx.ct, ref, ctx.root) != CAS_OK) {
+        strncpy(c->root, ref, sizeof c->root - 1);          /* pinned snapshot */
+        c->root[sizeof c->root - 1] = '\0';
+    } else if (cas_tree_ref_read(c->ct, ref, c->root) != CAS_OK) {
         goto fail;
     }
 
     /* The resolved object is either a root tree (serve it) or a jimage manifest
      * that points at a root tree per arch (select this host's). */
-    if (resolve_image(arch) != 0)
+    if (resolve_image(c, arch) != 0)
         goto fail;
 
     /* Confirm the root names a real tree. A ref name always resolves to a
      * committed tree, but a pinned or image-selected hash is caller-supplied,
      * so a mistyped one fails here rather than mounting an empty, broken root. */
     struct cas_tree_dir d;
-    if (cas_tree_load(ctx.ct, ctx.root, &d) != CAS_OK)
+    if (cas_tree_load(c->ct, c->root, &d) != CAS_OK)
         goto fail;
     cas_tree_dir_free(&d);
 
     /* Confine the served root to the manifest's subtree. */
-    if (subtree && descend_subtree(ctx.ct, ctx.root, subtree) != 0)
+    if (subtree && descend_subtree(c->ct, c->root, subtree) != 0)
         goto fail;
 
-    *ctx_out = &ctx;
+    *ctx_out = c;
     return &sv_backend;
 
 fail:
-    cas_tree_free(ctx.ct);
-    cas_free(ctx.store);
-    ctx.store = NULL;
+    cas_tree_free(c->ct);
+    cas_free(c->store);
+    free(c);
     return NULL;
+}
+
+void
+p9smolvfs_close(void *vctx)
+{
+    struct smolctx *c = vctx;
+    if (!c)
+        return;
+    cas_tree_free(c->ct);
+    cas_free(c->store);
+    free(c);
 }
 
 int

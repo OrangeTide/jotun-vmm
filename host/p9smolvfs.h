@@ -23,4 +23,7 @@ const struct p9_backend *p9smolvfs_open(const char *depot, const char *ref,
  * directory, or on error. Used to lift the kernel image out of the bundle. */
 int p9smolvfs_readfile(void *ctx, const char *path, void **out, size_t *len);
 
+/* Release a context returned by p9smolvfs_open. */
+void p9smolvfs_close(void *ctx);
+
 #endif /* P9SMOLVFS_H */
