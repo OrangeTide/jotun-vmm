@@ -562,6 +562,17 @@ Steps:
   program (leaning toward the linked archive, to keep the `jotun_svc` ABI
   minimal), then give programs `strtol`/`atoi` and the formatter.
 
+Atomics and threading are deliberately not libc work here. C11 `<stdatomic.h>`
+is a compiler-provided freestanding header, and the word-sized atomics the guest
+uses lower to inline instructions with no out-of-line library calls (verified on
+x86-64 and arm64 under the guest's flags, with `-mno-outline-atomics` on arm64).
+So atomics need no library code; use `<stdatomic.h>` directly in place of raw
+`__atomic_*` builtins. (Only 16-byte atomics would pull in libatomic, and the
+guest uses none.) Threading already has its substrate in `task.c` (spawn,
+block/wake, self, spinlocks). A standard `<threads.h>` shim (`thrd_*`/`mtx_*`/
+`cnd_*`) over `task.c` is deferred until a bundle program actually needs the
+standard API, so the wrapper is shaped by a real consumer rather than guessed.
+
 ## Cross-cutting concerns
 
 - The per-guest manifest is the sandbox's control surface. It appears at M3,
