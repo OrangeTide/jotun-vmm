@@ -184,16 +184,22 @@ guest the way processes do on a normal system, while still sharing the single
 trust domain.
 
 The host owns parsing the bundle. The guest only issues 9P reads, so no
-archive-format code runs in the guest and the host validates every path. The
-bundle format is read-only, random access, and compressed. squashfs is the
-recommended format: it is purpose-built for immutable images (it backs
-AppImage, snaps, and initramfs), it is produced with the standard mksquashfs
-tool, and its inode and directory structure maps directly onto 9P stat and walk
-operations. A zip archive is simpler to parse but models an archive rather than
-a filesystem, so directory, mode, and symlink semantics fit a POSIX-ish tree
-less well. The first implementation may serve a plain host directory, with the
-bundle as the packaged production form, so the 9P server and the bundle reader
-can land in that order.
+image-format code runs in the guest and the host validates every path. The
+bundle is a read-only filesystem image, either EROFS or squashfs. Both are
+purpose-built for immutable images and both expose an inode and directory
+structure that maps directly onto 9P stat and walk, so the choice is made when
+the reader is written rather than now. squashfs has the wider tooling
+(mksquashfs) and, with gzip, reuses a small DEFLATE decompressor (see the
+inflate sources in section 12); EROFS has a more compact on-disk layout and
+uses lz4 or zstd. The first implementation serves uncompressed data, or even a
+plain host directory, so the 9P path comes up before any decompressor is
+needed; compression is added with the format.
+
+Optionally, and in a later stage, the same bundle can also carry the bootable
+unikernel ELF itself. The host lifts that image out of the bundle to boot the
+guest, then serves the rest as the filesystem. One file then packages the
+kernel and its filesystem together, a convenient single-file distribution form.
+This is not needed for the first cut.
 
 The manifest ties these together. One manifest, read by the host at launch,
 names the bundle, the subtree within it the guest may see, the init program and
@@ -341,3 +347,6 @@ rasterizer crosses into the host; no hardware 3D acceleration for now.
 - `Quaoar` (Quaoar): the retained SVG display
   protocol, behavior offloading, and the three-hop pipeline, the basis for the
   primary 2D vector path.
+- `inflate.c` and `inflate.c`:
+  small self-contained DEFLATE decompressors, candidates for the host-side
+  squashfs-gzip bundle reader (section 7.1). EROFS instead uses lz4 or zstd.
