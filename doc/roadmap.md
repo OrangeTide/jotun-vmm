@@ -740,7 +740,23 @@ Sub-milestones:
   each vcpu thread so the doorbell demux and the net/draw/p9/ring service calls
   target that guest's devices. The SMP wake and event-vector injection become
   per-guest. Independent of the browser and the bulk of the work; it can ship
-  with the front end still showing guest 0 only.
+  with the front end still showing guest 0 only. This is the schedule risk in
+  M10, so it is done in small steps that each keep the build and the existing
+  single-guest tests green, with N held at 1 until the last:
+  - M10.0a: introduce `struct guest` and group the file-scope singletons into
+    one instance of it. Pure data-grouping, no behavior change.
+  - M10.0b: thread `struct guest *` through run_vcpu, the doorbell demux, and
+    the net/draw/p9/ring service calls, replacing the global reaches. Still one
+    guest, identical behavior.
+  - M10.0c: make the wake and event path per-guest (rouse_vcpus, the SIGUSR1
+    wake, event-vector injection target one guest's vcpu set, not the global
+    table). Isolated because it is the easy place to introduce a cross-guest
+    wake bug. Identical with one guest.
+  - M10.0d: give each guest its own RAM buffer and VM through the struct (both
+    are global today); still allocate one, to prove the per-guest path.
+  - M10.0e: flip to N guests. Parse repeated `-m` manifests, allocate an array,
+    launch each as its own VM. Keep the front end bound to guest 0 (others run
+    headless), so the browser path is untouched. First step where N > 1 runs.
 - M10.1: per-guest id namespacing and host-side compositing. Make the guest id
   per-drawdev (not the constant 0) through every `qu-<guest>-<node>` emit site,
   and have the front end combine each guest's scene under its `<g id="qu-<guest>">`

@@ -34,11 +34,11 @@
 #define STACK_SLOT     (512u * 1024)
 #define MAX_VCPUS      8
 
-/* Shared host-side state touched by every vcpu thread. */
+/* Process-wide host state touched by every vcpu thread. The console and its
+ * lock are shared across the process; per-guest state lives in struct guest. */
 static uart_16550 uart;
 static pthread_mutex_t dev_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long max_exits;     /* 0 means no cap */
-static struct p9srv p9;             /* the 9P server, guarded by dev_lock */
 
 struct vcpu_ctx {
     int index;
@@ -57,16 +57,35 @@ struct vcpu_ctx {
     int woken;
 };
 
-/* The vcpu table, published so a wake doorbell on one vcpu's thread can reach
- * another's idle rendezvous. */
-static struct vcpu_ctx *all_ctx;
-static pthread_t *all_threads;
-static int all_n;
+/* Guest physical memory as the host sees it, identity-mapped for now (guest
+ * physical address N is host byte N of this buffer). */
+struct guest_mem {
+    uint8_t *base;
+    uint64_t size;
+};
 
-/* The net provider and the draw sink, each sharing its guest channel in host
- * memory. */
-static struct netdev *netdev;
-static struct drawdev *drawdev;
+/* One guest domain: its VM and RAM, its vcpu table, and the devices that share
+ * its channels. There is one instance today (g); M10 grows this to several so
+ * the host can run and composite multiple guests. These fields were file-scope
+ * singletons; for now they are reached through the single g, and a later step
+ * threads a struct guest * through the call graph so each guest is addressed by
+ * pointer rather than by this global. */
+struct guest {
+    vmm_vm_t *vm;
+    struct guest_mem gm;
+    elf_image img;
+
+    struct vcpu_ctx ctx[MAX_VCPUS];
+    pthread_t threads[MAX_VCPUS];
+    int nvcpus;
+
+    struct netdev *netdev;      /* net provider sharing this guest's channel */
+    struct drawdev *drawdev;    /* draw sink sharing this guest's channel */
+    struct p9srv p9;            /* 9P server, guarded by dev_lock */
+    struct net_policy policy;   /* net rules for this guest */
+};
+
+static struct guest g;
 
 static void
 vcpu_wake(struct vcpu_ctx *c)
@@ -95,23 +114,15 @@ vcpu_idle_wait(struct vcpu_ctx *c)
 static void
 rouse_vcpus(void)
 {
-    for (int i = 0; i < all_n; i++) {
-        if (__atomic_load_n(&all_ctx[i].live, __ATOMIC_SEQ_CST)) {
-            vmm_vcpu_interrupt(all_ctx[i].vcpu, JOTUN_EVENT_VECTOR);
-            if (all_threads[i])
-                pthread_kill(all_threads[i], SIGUSR1);
+    for (int i = 0; i < g.nvcpus; i++) {
+        if (__atomic_load_n(&g.ctx[i].live, __ATOMIC_SEQ_CST)) {
+            vmm_vcpu_interrupt(g.ctx[i].vcpu, JOTUN_EVENT_VECTOR);
+            if (g.threads[i])
+                pthread_kill(g.threads[i], SIGUSR1);
         }
-        vcpu_wake(&all_ctx[i]);
+        vcpu_wake(&g.ctx[i]);
     }
 }
-
-/* Guest physical memory as the host sees it, identity-mapped for now (guest
- * physical address N is host byte N of this buffer). */
-struct guest_mem {
-    uint8_t *base;
-    uint64_t size;
-};
-static struct guest_mem gm;
 
 /* Translate a guest-physical range to a host pointer, or NULL if it does not
  * fit entirely within guest RAM. Every guest-supplied address is checked here
@@ -119,14 +130,14 @@ static struct guest_mem gm;
 static void *
 gpa_to_host(uint64_t gpa, uint64_t len)
 {
-    if (gpa > gm.size || len > gm.size - gpa)
+    if (gpa > g.gm.size || len > g.gm.size - gpa)
         return NULL;
-    return gm.base + gpa;
+    return g.gm.base + gpa;
 }
 
 /* The draw sink's address translator: same bounds check, with the callback
- * signature the sink expects (the context is unused, since guest RAM is file
- * scope here). */
+ * signature the sink expects (the context is unused, since guest RAM is reached
+ * through the single guest g here). */
 static void *
 draw_gpa(void *ctx, uint64_t gpa, uint64_t len)
 {
@@ -147,7 +158,7 @@ setup_bootinfo(int gargc, char **gargv)
     memset(b, 0, sizeof(*b));
     b->magic = JOTUN_BOOT_MAGIC;
     b->version = JOTUN_BOOT_VERSION;
-    b->ram_size = gm.size;
+    b->ram_size = g.gm.size;
 
     uint32_t off = 0;
     int n = 0;
@@ -198,7 +209,7 @@ p9_service(void)
     struct jotun_p9 *c = gpa_to_host(JOTUN_P9_BASE, sizeof(*c));
     if (!c)
         return;
-    c->rsp_len = p9srv_handle(&p9, c->req, c->req_len, c->rsp, JOTUN_P9_MSIZE);
+    c->rsp_len = p9srv_handle(&g.p9, c->req, c->req_len, c->rsp, JOTUN_P9_MSIZE);
 }
 
 /* Net doorbell handler: process the request in the net channel and write the
@@ -208,9 +219,9 @@ static void
 net_service(void)
 {
     struct jotun_net *c = gpa_to_host(JOTUN_NET_BASE, sizeof(*c));
-    if (!c || !netdev)
+    if (!c || !g.netdev)
         return;
-    net_handle(netdev, c);
+    net_handle(g.netdev, c);
 }
 
 /* Draw doorbell handler: process the request in the draw channel and write the
@@ -220,9 +231,9 @@ static void
 draw_service(void)
 {
     struct jotun_draw *c = gpa_to_host(JOTUN_DRAW_BASE, sizeof(*c));
-    if (!c || !drawdev)
+    if (!c || !g.drawdev)
         return;
-    draw_handle(drawdev, c);
+    draw_handle(g.drawdev, c);
 }
 
 /* Turn one manifest rule (strings) into a numeric net_rule. Returns 0, or -1
@@ -331,10 +342,10 @@ run_vcpu(void *arg)
             uint32_t target = 0;
             memcpy(&target, e.mmio.data, e.mmio.size < 4 ? e.mmio.size : 4);
             if (target == JOTUN_WAKE_ALL) {
-                for (int j = 0; j < all_n; j++)
-                    vcpu_wake(&all_ctx[j]);
-            } else if ((int)target < all_n) {
-                vcpu_wake(&all_ctx[target]);
+                for (int j = 0; j < g.nvcpus; j++)
+                    vcpu_wake(&g.ctx[j]);
+            } else if ((int)target < g.nvcpus) {
+                vcpu_wake(&g.ctx[target]);
             }
             continue;
         } else if (e.reason == VMM_EXIT_REASON_MMIO
@@ -438,8 +449,8 @@ main(int argc, char **argv)
     const char *cap_env = getenv("JOTUN_MAX_EXITS");
     max_exits = cap_env ? strtoul(cap_env, NULL, 0) : 0;
 
-    vmm_vm_t *vm = vmm_vm_create();
-    if (!vm) {
+    g.vm = vmm_vm_create();
+    if (!g.vm) {
         fprintf(stderr, "Failed to create VM\n");
         return 1;
     }
@@ -450,22 +461,21 @@ main(int argc, char **argv)
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (ram == MAP_FAILED) {
         fprintf(stderr, "Failed to allocate guest memory\n");
-        vmm_vm_destroy(vm);
+        vmm_vm_destroy(g.vm);
         return 1;
     }
     size_t half = GUEST_RAM_SIZE / 2;
-    vmm_vm_map_memory(vm, ram, 0, half);
-    vmm_vm_map_memory(vm, (char *)ram + half, half, GUEST_RAM_SIZE - half);
+    vmm_vm_map_memory(g.vm, ram, 0, half);
+    vmm_vm_map_memory(g.vm, (char *)ram + half, half, GUEST_RAM_SIZE - half);
 
-    gm.base = ram;
-    gm.size = GUEST_RAM_SIZE;
+    g.gm.base = ram;
+    g.gm.size = GUEST_RAM_SIZE;
 
     // Load the guest image once into shared RAM.
-    elf_image img;
-    if (elf_load_file(path, ram, GUEST_RAM_SIZE, &img) != 0) {
+    if (elf_load_file(path, ram, GUEST_RAM_SIZE, &g.img) != 0) {
         fprintf(stderr, "Failed to load guest image '%s'\n", path);
         munmap(ram, GUEST_RAM_SIZE);
-        vmm_vm_destroy(vm);
+        vmm_vm_destroy(g.vm);
         return 1;
     }
 
@@ -512,26 +522,25 @@ main(int argc, char **argv)
 
     /* Build the net policy from the manifest rules. With no rules the provider
      * allows every target; with rules it denies by default. */
-    static struct net_policy policy;
-    policy.n = 0;
+    g.policy.n = 0;
     if (have_manifest) {
-        for (int i = 0; i < m.nnet && policy.n < NET_MAXRULES; i++)
-            if (build_net_rule(&m.net[i], &policy.rules[policy.n]) == 0)
-                policy.n++;
+        for (int i = 0; i < m.nnet && g.policy.n < NET_MAXRULES; i++)
+            if (build_net_rule(&m.net[i], &g.policy.rules[g.policy.n]) == 0)
+                g.policy.n++;
     }
 
     /* The net provider shares the guest net channel and rouses vcpus when a
      * socket becomes ready. It is created before the 9P server so the /net
      * overlay can read its live connections. */
     struct jotun_net *netchan = gpa_to_host(JOTUN_NET_BASE, sizeof(*netchan));
-    netdev = netchan ? net_init(netchan, rouse_vcpus, &policy) : NULL;
+    g.netdev = netchan ? net_init(netchan, rouse_vcpus, &g.policy) : NULL;
 
     /* The draw sink shares the guest draw channel and rouses vcpus when an
      * input event is queued. JOTUN_DRAW_TEST turns on the self-test event
      * source so the submit/poll path can run with no front end attached. */
     int draw_test = getenv("JOTUN_DRAW_TEST") != NULL;
     struct jotun_draw *drawchan = gpa_to_host(JOTUN_DRAW_BASE, sizeof(*drawchan));
-    drawdev = drawchan
+    g.drawdev = drawchan
         ? draw_init(drawchan, rouse_vcpus, draw_test, draw_gpa, NULL) : NULL;
 
     /* If a signed origin is named, pull the bundle into a local cache depot and
@@ -576,11 +585,11 @@ main(int argc, char **argv)
         p9ctx = NULL;
     }
 
-    struct p9overlay *ov = p9overlay_new(be, p9ctx, &policy, netdev);
+    struct p9overlay *ov = p9overlay_new(be, p9ctx, &g.policy, g.netdev);
     if (ov)
-        p9srv_init(&p9, p9overlay_backend(), ov);
+        p9srv_init(&g.p9, p9overlay_backend(), ov);
     else
-        p9srv_init(&p9, be, p9ctx);     /* fallback: no /net overlay */
+        p9srv_init(&g.p9, be, p9ctx);   /* fallback: no /net overlay */
 
     /* SIGUSR1 breaks a running vcpu out of its run (no SA_RESTART, so KVM_RUN
      * returns EINTR). Both the preemption timer and the net poll thread use it,
@@ -595,40 +604,36 @@ main(int argc, char **argv)
     if (hz_env)
         hz = (unsigned)strtoul(hz_env, NULL, 0);
 
-    pthread_t threads[MAX_VCPUS];
-    struct vcpu_ctx ctx[MAX_VCPUS];
-    all_ctx = ctx;
-    all_threads = threads;
-    all_n = nvcpus;
+    g.nvcpus = nvcpus;
 
     for (int i = 0; i < nvcpus; i++) {
-        ctx[i].index = i;
-        ctx[i].vm = vm;
-        ctx[i].entry = img.entry;
-        ctx[i].sp = GUEST_RAM_SIZE - (uint64_t)i * STACK_SLOT - 16;
-        ctx[i].rc = 0;
-        ctx[i].vcpu = NULL;
-        ctx[i].live = 0;
-        pthread_mutex_init(&ctx[i].idle_m, NULL);
-        pthread_cond_init(&ctx[i].idle_c, NULL);
-        ctx[i].woken = 0;
-        if (pthread_create(&threads[i], NULL, run_vcpu, &ctx[i]) != 0) {
+        g.ctx[i].index = i;
+        g.ctx[i].vm = g.vm;
+        g.ctx[i].entry = g.img.entry;
+        g.ctx[i].sp = GUEST_RAM_SIZE - (uint64_t)i * STACK_SLOT - 16;
+        g.ctx[i].rc = 0;
+        g.ctx[i].vcpu = NULL;
+        g.ctx[i].live = 0;
+        pthread_mutex_init(&g.ctx[i].idle_m, NULL);
+        pthread_cond_init(&g.ctx[i].idle_c, NULL);
+        g.ctx[i].woken = 0;
+        if (pthread_create(&g.threads[i], NULL, run_vcpu, &g.ctx[i]) != 0) {
             fprintf(stderr, "Failed to start vcpu %d thread\n", i);
-            ctx[i].rc = 1;
-            threads[i] = 0;
+            g.ctx[i].rc = 1;
+            g.threads[i] = 0;
         }
     }
 
     pthread_t timer_thread = 0;
-    struct timer_ctx tctx = { threads, ctx, nvcpus, hz, 0 };
+    struct timer_ctx tctx = { g.threads, g.ctx, nvcpus, hz, 0 };
     if (hz > 0)
         pthread_create(&timer_thread, NULL, run_timer, &tctx);
 
     int rc = 0;
     for (int i = 0; i < nvcpus; i++) {
-        if (threads[i])
-            pthread_join(threads[i], NULL);
-        rc |= ctx[i].rc;
+        if (g.threads[i])
+            pthread_join(g.threads[i], NULL);
+        rc |= g.ctx[i].rc;
     }
 
     if (timer_thread) {
@@ -636,10 +641,10 @@ main(int argc, char **argv)
         pthread_join(timer_thread, NULL);
     }
 
-    net_shutdown(netdev);
-    draw_shutdown(drawdev);
+    net_shutdown(g.netdev);
+    draw_shutdown(g.drawdev);
 
-    vmm_vm_destroy(vm);
+    vmm_vm_destroy(g.vm);
     munmap(ram, GUEST_RAM_SIZE);
     return rc;
 }
