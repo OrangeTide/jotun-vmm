@@ -32,10 +32,10 @@ else
     CC = gcc
     GUEST_CFLAGS += -no-pie
     ifeq ($(ARCH), x86_64)
-        # linux/x86-64: KVM, 32-bit protected-mode x86 guest at 1 MiB.
+        # linux/x86-64: KVM, 64-bit long-mode x86 guest at 1 MiB.
         GUEST = test_guest.elf echo.elf
         GUEST_SRC = guest/test_guest_x86.c
-        GUEST_CC = $(CC) -m32
+        GUEST_CC = $(CC)
         GUEST_TEXT = 0x100000
     endif
     ifeq ($(ARCH), aarch64)

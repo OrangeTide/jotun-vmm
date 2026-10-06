@@ -84,10 +84,15 @@ Decision: start with guest-polled event channels. The guest checks the pending
 bitmap at safe points, which avoids interrupt injection entirely. Real
 asynchronous injection is deferred to M4, where preemption needs it.
 
-## M2: guest library OS bring-up
+## M2: guest library OS bring-up (in progress)
 
 Goal: boot the JOS-derived library OS as a guest. This is the longest
 milestone.
+
+Progress: the x86-64 64-bit long-mode switch is done. The KVM backend builds an
+identity-mapped page table in guest RAM and enters the vcpu in long mode, the
+guests build 64-bit, and the `-m32` path is retired. Next: import the JOS core
+and write the arch ports.
 
 - Import the JOS core: allocator, ELF loader, proc, vfs, 9p, device table.
 - Write the greenfield x86-64 and arm64 arch ports: boot to C, context switch,

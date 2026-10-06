@@ -19,6 +19,19 @@
      KVM_REG_ARM_CORE_REG(name))
 #endif
 
+#if defined(__x86_64__)
+/* Identity-map page tables for the guest's long mode, placed low in guest RAM
+ * below the ring and the guest image. A single page directory of 512 2 MiB
+ * pages covers the first 1 GiB, which spans all guest RAM and the MMIO
+ * addresses above it (present but unbacked, so they fault out as MMIO). */
+#define PT_PML4   0x1000
+#define PT_PDPT   0x2000
+#define PT_PD     0x3000
+#define PTE_P     0x1       /* present */
+#define PTE_RW    0x2       /* writable */
+#define PTE_PS    0x80      /* 2 MiB page */
+#endif
+
 /* Concrete layout for the opaque handles declared in vmm.h. */
 struct vmm_vm {
     int kvm_fd;
@@ -69,6 +82,21 @@ void vmm_vm_map_memory(vmm_vm_t* vm, void* host_addr, uint64_t guest_addr, size_
     if (ioctl(vm->vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
         // Handle error
     }
+
+#if defined(__x86_64__)
+    // Long mode needs page tables in guest RAM. Build an identity map in the
+    // region covering guest-physical address 0; every vcpu points CR3 here.
+    if (guest_addr == 0) {
+        uint8_t *base = (uint8_t*)host_addr;
+        uint64_t *pml4 = (uint64_t*)(base + PT_PML4);
+        uint64_t *pdpt = (uint64_t*)(base + PT_PDPT);
+        uint64_t *pd = (uint64_t*)(base + PT_PD);
+        pml4[0] = PT_PDPT | PTE_P | PTE_RW;
+        pdpt[0] = PT_PD | PTE_P | PTE_RW;
+        for (int i = 0; i < 512; i++)
+            pd[i] = ((uint64_t)i << 21) | PTE_P | PTE_RW | PTE_PS;
+    }
+#endif
 }
 
 vmm_vcpu_t* vmm_vcpu_create(vmm_vm_t* vm) {
@@ -83,12 +111,11 @@ vmm_vcpu_t* vmm_vcpu_create(vmm_vm_t* vm) {
     }
 
 #if defined(__x86_64__)
-    // A fresh x86 vcpu resets into 16-bit real mode, which cannot run a
-    // toolchain-built 32-bit ELF. Put it straight into 32-bit protected mode
-    // with flat, paging-off segments by programming the segment descriptor
-    // cache directly (no GDT in guest memory is needed as long as the guest
-    // does not reload the segment registers). The entry point and stack are
-    // set later via VMM_REG_PC / VMM_REG_SP.
+    // Put the vcpu directly into 64-bit long mode on the identity map built in
+    // vmm_vm_map_memory. Flat segments are programmed through the descriptor
+    // cache, so no GDT in guest memory is needed as long as the guest does not
+    // reload the segment registers. Entry and stack are set later via
+    // VMM_REG_PC / VMM_REG_SP.
     struct kvm_sregs sregs;
     if (ioctl(vcpu->vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
         close(vcpu->vcpu_fd);
@@ -98,12 +125,17 @@ vmm_vcpu_t* vmm_vcpu_create(vmm_vm_t* vm) {
     struct kvm_segment code = {
         .base = 0, .limit = 0xffffffff, .selector = 0x08,
         .type = 0xb,        /* execute/read, accessed */
+        .present = 1, .dpl = 0, .db = 0, .s = 1, .l = 1, .g = 1,
+    };
+    struct kvm_segment data = {
+        .base = 0, .limit = 0xffffffff, .selector = 0x10,
+        .type = 0x3,        /* read/write, accessed */
         .present = 1, .dpl = 0, .db = 1, .s = 1, .l = 0, .g = 1,
     };
-    struct kvm_segment data = code;
-    data.type = 0x3;        /* read/write, accessed */
-    data.selector = 0x10;
-    sregs.cr0 |= 0x1;       /* CR0.PE: enter protected mode */
+    sregs.cr3 = PT_PML4;
+    sregs.cr4 |= (1u << 5);                 /* CR4.PAE */
+    sregs.cr0 |= (1u << 0) | (1u << 31);    /* CR0.PE | CR0.PG */
+    sregs.efer |= (1u << 8) | (1u << 10);   /* EFER.LME | EFER.LMA */
     sregs.cs = code;
     sregs.ds = sregs.es = sregs.fs = sregs.gs = sregs.ss = data;
     if (ioctl(vcpu->vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
