@@ -762,11 +762,23 @@ Sub-milestones:
     timer and the join and shutdown loops span all guests. Known limitation: all
     guests share the one serial console, so their output interleaves per
     character; per-guest console tagging is a separate concern, not part of M10.
-- M10.1: per-guest id namespacing and host-side compositing. Make the guest id
-  per-drawdev (not the constant 0) through every `qu-<guest>-<node>` emit site,
-  and have the front end combine each guest's scene under its `<g id="qu-<guest>">`
-  group, with per-guest baselines and deltas merged into one document. The
-  `<`/`!` full-vs-delta protocol and the `R`/`N`/`U` records extend unchanged.
+- M10.1: per-guest id namespacing and host-side compositing. Split, since the
+  namespacing is a small threading change but the compositing reworks the
+  draw/front-end boundary:
+  - M10.1a (done): per-drawdev guest id. drawdev carries a gid (passed to
+    draw_init from the owning guest), and every `qu-<guest>-<node>` emit site
+    uses it in place of the old constant 0. No behavior change yet, since only
+    guest 0 has a sink; it removes the hardcoded id and threads the real one.
+  - M10.1b: one shared front end, many sinks. Today draw_init starts its own
+    WebSocket server, so each guest would collide on the port. Decouple the
+    drawws front end from the per-guest drawdev: start one front end for the
+    session and give every guest a drawdev that registers with it, rather than
+    guest 0 only.
+  - M10.1c: compositing. The shared front end combines each guest's scene under
+    its `<g id="qu-<guest>" transform="translate(ox,oy)">` group at a host-
+    assigned origin, with per-guest baselines and deltas merged into one
+    document. The `<`/`!` full-vs-delta protocol and the `R`/`N`/`U` records
+    extend unchanged; the per-guest prefix already keeps node ids distinct.
 - M10.2: the session layer for inbound events. Stop discarding the guest field
   in the client `nodeId()`, carry it through the event dispatch and the
   `drawws` event callback, and route each event to the targeted guest's queue.

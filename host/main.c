@@ -575,7 +575,7 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
         struct jotun_draw *drawchan =
             gpa_to_host(gp, JOTUN_DRAW_BASE, sizeof(*drawchan));
         if (drawchan)
-            gp->drawdev = draw_init(drawchan, rouse_vcpus, gp, draw_test,
+            gp->drawdev = draw_init(drawchan, gid, rouse_vcpus, gp, draw_test,
                                     draw_gpa, gp);
     }
 

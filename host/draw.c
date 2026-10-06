@@ -48,9 +48,9 @@
 #define DRAW_IMG_MAXBYTES (4u * 1024 * 1024)    /* max framebuffer extent */
 #define DRAW_DELTA_MAX   128    /* changed/removed nodes before a full push */
 
-/* The guest id namespaces browser DOM ids as qu-<guest>-<node>. One guest
- * domain exists today; multi-guest namespacing arrives with multiple domains. */
-#define DRAW_GUEST     0
+/* Browser DOM ids are namespaced qu-<guest>-<node>, where the guest field is
+ * the owning guest's id (drawdev.gid). It keeps several guests' node ids
+ * distinct in one client session and lets an inbound event name its guest. */
 
 struct draw_evt {
     uint32_t node;
@@ -147,6 +147,7 @@ struct dnode {
 
 struct drawdev {
     struct jotun_draw *chan;
+    int gid;                    /* owning guest id, namespaces DOM ids */
     void (*wake)(void *ctx);
     void *wake_ctx;
     int test;
@@ -1229,7 +1230,7 @@ emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n)
     case DOP_SURFACE:
         sb_printf(b, "<g id=\"qu-%d-%u\" class=\"qu-surface\""
                   " transform=\"translate(%d,%d)\"%s>",
-                  DRAW_GUEST, n->id, n->geo.surface.x, n->geo.surface.y,
+                  dd->gid, n->id, n->geo.surface.x, n->geo.surface.y,
                   n->hidden ? " display=\"none\"" : "");
         sb_printf(b, "<rect class=\"qu-frame\" x=\"0\" y=\"0\""
                   " width=\"%u\" height=\"%u\" fill=\"#ffffff\""
@@ -1251,7 +1252,7 @@ emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n)
         break;
     case DOP_GROUP:
         sb_printf(b, "<g id=\"qu-%d-%u\" transform=\"translate(%d,%d)\"%s>",
-                  DRAW_GUEST, n->id, n->geo.group.tx, n->geo.group.ty,
+                  dd->gid, n->id, n->geo.group.tx, n->geo.group.ty,
                   n->hidden ? " display=\"none\"" : "");
         emit_siblings(b, dd, n->first_child);
         sb_puts(b, "</g>");
@@ -1259,7 +1260,7 @@ emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n)
     case DOP_RECT:
         sb_printf(b, "<rect id=\"qu-%d-%u\" x=\"%d\" y=\"%d\""
                   " width=\"%u\" height=\"%u\" rx=\"%u\"",
-                  DRAW_GUEST, n->id, n->geo.rect.x, n->geo.rect.y,
+                  dd->gid, n->id, n->geo.rect.x, n->geo.rect.y,
                   n->geo.rect.w, n->geo.rect.h, n->geo.rect.rx);
         emit_common(b, n);
         sb_puts(b, ">");
@@ -1268,7 +1269,7 @@ emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n)
         break;
     case DOP_CIRCLE:
         sb_printf(b, "<circle id=\"qu-%d-%u\" cx=\"%d\" cy=\"%d\" r=\"%u\"",
-                  DRAW_GUEST, n->id, n->geo.circle.cx, n->geo.circle.cy,
+                  dd->gid, n->id, n->geo.circle.cx, n->geo.circle.cy,
                   n->geo.circle.r);
         emit_common(b, n);
         sb_puts(b, ">");
@@ -1278,7 +1279,7 @@ emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n)
     case DOP_ELLIPSE:
         sb_printf(b, "<ellipse id=\"qu-%d-%u\" cx=\"%d\" cy=\"%d\""
                   " rx=\"%u\" ry=\"%u\"",
-                  DRAW_GUEST, n->id, n->geo.ellipse.cx, n->geo.ellipse.cy,
+                  dd->gid, n->id, n->geo.ellipse.cx, n->geo.ellipse.cy,
                   n->geo.ellipse.rx, n->geo.ellipse.ry);
         emit_common(b, n);
         sb_puts(b, ">");
@@ -1288,7 +1289,7 @@ emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n)
     case DOP_LINE:
         sb_printf(b, "<line id=\"qu-%d-%u\" x1=\"%d\" y1=\"%d\""
                   " x2=\"%d\" y2=\"%d\"",
-                  DRAW_GUEST, n->id, n->geo.line.x1, n->geo.line.y1,
+                  dd->gid, n->id, n->geo.line.x1, n->geo.line.y1,
                   n->geo.line.x2, n->geo.line.y2);
         emit_common(b, n);
         sb_puts(b, ">");
@@ -1297,7 +1298,7 @@ emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n)
         break;
     case DOP_POLYLINE: {
         const char *tag = n->closed ? "polygon" : "polyline";
-        sb_printf(b, "<%s id=\"qu-%d-%u\" points=\"", tag, DRAW_GUEST, n->id);
+        sb_printf(b, "<%s id=\"qu-%d-%u\" points=\"", tag, dd->gid, n->id);
         for (int i = 0; i < n->npts; i++)
             sb_printf(b, "%s%d,%d", i ? " " : "", n->pts[2 * i], n->pts[2 * i + 1]);
         sb_puts(b, "\"");
@@ -1308,7 +1309,7 @@ emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n)
         break;
     }
     case DOP_PATH:
-        sb_printf(b, "<path id=\"qu-%d-%u\" d=\"", DRAW_GUEST, n->id);
+        sb_printf(b, "<path id=\"qu-%d-%u\" d=\"", dd->gid, n->id);
         for (int i = 0; i < n->nsegs; i++) {
             const struct dseg *s = &n->segs[i];
             sb_printf(b, "%s%c", i ? " " : "", s->cmd);
@@ -1323,7 +1324,7 @@ emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n)
         break;
     case DOP_TEXT:
         sb_printf(b, "<text id=\"qu-%d-%u\" x=\"%d\" y=\"%d\" font-size=\"%u\"",
-                  DRAW_GUEST, n->id, n->geo.text.x, n->geo.text.y,
+                  dd->gid, n->id, n->geo.text.x, n->geo.text.y,
                   n->geo.text.size);
         emit_common(b, n);
         sb_puts(b, ">");
@@ -1338,7 +1339,7 @@ emit_node(struct sbuf *b, struct drawdev *dd, struct dnode *n)
         if (!n->png_cache)
             break;
         sb_printf(b, "<g id=\"qu-%d-%u\" transform=\"translate(%d,%d)\"",
-                  DRAW_GUEST, n->id, n->geo.image.x, n->geo.image.y);
+                  dd->gid, n->id, n->geo.image.x, n->geo.image.y);
         emit_common(b, n);
         sb_printf(b, "><image x=\"0\" y=\"0\" width=\"%u\" height=\"%u\""
                   " xlink:href=\"data:image/png;base64,",
@@ -1585,13 +1586,14 @@ on_ws_event(void *ctx, uint32_t node, uint16_t type, const char *value, int vlen
  ****************************************************************/
 
 struct drawdev *
-draw_init(struct jotun_draw *chan, void (*wake)(void *ctx), void *wake_ctx,
-          int test, draw_gpa_fn gpa, void *gpa_ctx)
+draw_init(struct jotun_draw *chan, int gid, void (*wake)(void *ctx),
+          void *wake_ctx, int test, draw_gpa_fn gpa, void *gpa_ctx)
 {
     struct drawdev *dd = calloc(1, sizeof(*dd));
     if (!dd)
         return NULL;
     dd->chan = chan;
+    dd->gid = gid;
     dd->wake = wake;
     dd->wake_ctx = wake_ctx;
     dd->test = test;
