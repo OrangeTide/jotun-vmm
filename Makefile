@@ -24,7 +24,7 @@ ifeq ($(OS), Darwin)
     CFLAGS += -D__APPLE__
     LDFLAGS += -framework Hypervisor
     SRC = host/vmm_hvf.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c \
-        host/p9smolvfs.c host/p9overlay.c host/manifest.c host/net.c host/draw.c host/main.c $(SMOLVFS_SRC)
+        host/p9smolvfs.c host/p9overlay.c host/manifest.c host/net.c host/draw.c host/drawws.c host/main.c $(SMOLVFS_SRC)
     CC = clang
     GUEST = test_guest.elf echo.elf libos.elf
     GUEST_SRC = guest/test_guest_arm64.c
@@ -41,7 +41,7 @@ ifeq ($(OS), Darwin)
 else
     CFLAGS += -D__linux__
     SRC = host/vmm_kvm.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c \
-        host/p9smolvfs.c host/p9overlay.c host/manifest.c host/net.c host/draw.c host/main.c $(SMOLVFS_SRC)
+        host/p9smolvfs.c host/p9overlay.c host/manifest.c host/net.c host/draw.c host/drawws.c host/main.c $(SMOLVFS_SRC)
     CC = gcc
     GUEST_CFLAGS += -no-pie
     ifeq ($(ARCH), x86_64)

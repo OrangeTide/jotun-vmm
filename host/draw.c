@@ -22,7 +22,9 @@
  * against a hostile guest is M6.5. Node lookup is a linear scan, fine at the
  * node cap for correctness; an index is M6.6 scale work. */
 #include "draw.h"
+#include "drawws.h"
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,7 +101,11 @@ struct drawdev {
     void (*wake)(void);
     int test;
     const char *svg_path;       /* JOTUN_DRAW_SVG, or NULL */
+    struct drawws *ws;          /* the browser front end, or NULL */
 
+    /* Inbound events are queued by the WS server thread and drained by the
+     * vcpu thread in POLL, so the queue is guarded. */
+    pthread_mutex_t qlock;
     struct draw_evt q[DRAW_MAXEVT];
     int head;
     int count;
@@ -830,6 +836,7 @@ enqueue(struct drawdev *dd, uint32_t node, uint16_t type,
 {
     if (vlen > DRAW_VALMAX)
         vlen = DRAW_VALMAX;
+    pthread_mutex_lock(&dd->qlock);
     if (dd->count == DRAW_MAXEVT) {
         dd->head = (dd->head + 1) % DRAW_MAXEVT;
         dd->count--;
@@ -842,6 +849,21 @@ enqueue(struct drawdev *dd, uint32_t node, uint16_t type,
     if (vlen)
         memcpy(e->value, value, vlen);
     dd->count++;
+    pthread_mutex_unlock(&dd->qlock);
+}
+
+/* Inbound event from the browser (on the WS server thread): queue it and rouse
+ * the guest, the same evt-plus-wake path the self-test source uses. */
+static void
+on_ws_event(void *ctx, uint32_t node, uint16_t type, const char *value, int vlen)
+{
+    struct drawdev *dd = ctx;
+    if (vlen < 0)
+        vlen = 0;
+    enqueue(dd, node, type, value, (uint16_t)vlen);
+    __atomic_store_n(&dd->chan->evt, 1, __ATOMIC_SEQ_CST);
+    if (dd->wake)
+        dd->wake();
 }
 
 /****************************************************************
@@ -858,24 +880,26 @@ draw_init(struct jotun_draw *chan, void (*wake)(void), int test)
     dd->wake = wake;
     dd->test = test;
     dd->svg_path = getenv("JOTUN_DRAW_SVG");
+    pthread_mutex_init(&dd->qlock, NULL);
+
+    /* The browser front end is opt-out: start it unless JOTUN_DRAW_PORT is 0.
+     * The default port is localhost-only. */
+    const char *pe = getenv("JOTUN_DRAW_PORT");
+    int port = pe ? (int)strtol(pe, NULL, 0) : 9230;
+    if (port > 0)
+        dd->ws = drawws_start(port, on_ws_event, dd);
     return dd;
 }
 
 static void
-dump_svg(struct drawdev *dd)
+dump_svg(struct drawdev *dd, const char *svg)
 {
-    if (!dd->svg_path)
-        return;
-    char *svg = serialize(dd);
-    if (!svg)
-        return;
     FILE *f = fopen(dd->svg_path, "w");
     if (f) {
         fputs(svg, f);
         fputc('\n', f);
         fclose(f);
     }
-    free(svg);
 }
 
 static void
@@ -890,9 +914,17 @@ handle_submit(struct drawdev *dd, struct jotun_draw *chan)
     uint32_t click_node = 0;
     int rc = apply(dd, chan->buf, len, dd->test ? &click_node : NULL);
 
-    /* Author the SVG snapshot regardless, so a partial scene from a rejected
-     * stream is still inspectable during bring-up. */
-    dump_svg(dd);
+    /* Author the scene once: push it to the browser and, when requested, drop a
+     * snapshot to disk. A partial scene from a rejected stream is still shown,
+     * so it is inspectable during bring-up. */
+    char *svg = serialize(dd);
+    if (svg) {
+        if (dd->ws)
+            drawws_push(dd->ws, svg);
+        if (dd->svg_path)
+            dump_svg(dd, svg);
+        free(svg);
+    }
 
     if (rc != 0) {
         chan->status = DRAW_EINVAL;
@@ -911,15 +943,20 @@ handle_submit(struct drawdev *dd, struct jotun_draw *chan)
 static void
 handle_poll(struct drawdev *dd, struct jotun_draw *chan)
 {
+    struct draw_evt ev;
+    pthread_mutex_lock(&dd->qlock);
     if (dd->count == 0) {
+        pthread_mutex_unlock(&dd->qlock);
         chan->status = DRAW_OK;
         chan->len = 0;
         return;
     }
-
-    struct draw_evt *e = &dd->q[dd->head];
+    ev = dd->q[dd->head];
     dd->head = (dd->head + 1) % DRAW_MAXEVT;
     dd->count--;
+    pthread_mutex_unlock(&dd->qlock);
+
+    struct draw_evt *e = &ev;
 
     /* node:u32 type:u16 vlen:u16 value[vlen] */
     uint8_t *b = chan->buf;
@@ -958,7 +995,9 @@ draw_shutdown(struct drawdev *dd)
 {
     if (!dd)
         return;
+    drawws_stop(dd->ws);
     for (int i = 0; i < DRAW_MAXNODES; i++)
         free(dd->nodes[i].text);
+    pthread_mutex_destroy(&dd->qlock);
     free(dd);
 }

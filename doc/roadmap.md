@@ -429,10 +429,21 @@ Steps:
   that is the WebSocket front end in M6.3. SET, POLYLINE, and PATH apply/emit
   land with their guest wrappers; full op-stream rollback against a hostile
   guest and a node index for scale are M6.5/M6.6.
-- M6.3: the host WebSocket front end (SHA-1/base64/handshake/framing lifted
-  from `quaoar-server`, bound to localhost) and the browser client, reused from
-  `quaoar-client.html` but now consuming host-authored markup. Meets the
-  acceptance test: a guest draws an interactive diagram, a click returns.
+- M6.3 (done): the host WebSocket front end (`host/drawws.c`) and the embedded
+  browser client. The SHA-1, base64, and WebSocket framing are lifted from
+  `quaoar-server` (the SHA-1 is Jon Mayo's public-domain sha1tiny). A single
+  server thread, bound to localhost, serves the client page over HTTP and
+  upgrades a WebSocket on the same port; all socket work stays on that thread,
+  with a self-pipe nudge for pushes from the vcpu thread, so there are no fd
+  races. On each SUBMIT the draw subsystem serializes the scene and pushes the
+  whole SVG document; the client (a small page, not Quaoar's command protocol,
+  since the host sends authored documents) renders it with DOMParser and wires
+  `data-qu-listen` click and close back as events. An inbound event is queued
+  under a lock and rouses the guest through the same evt-plus-wake path as the
+  self-test source. Meets the acceptance test, verified end to end with a test
+  WebSocket client: the guest draws the scene, the host pushes a 918-byte
+  authored SVG, a click on the rect returns DEV_CLICK to the guest, which
+  unblocks and finishes. JOTUN_DRAW_PORT selects the port (0 disables).
 - M6.5: hardening. Audit or replace the hand-rolled WebSocket frame parser
   (it reads browser-supplied bytes in the trusted host), document TLS via a
   reverse proxy, add size and rate limits, and broaden the vocabulary.
