@@ -6,4 +6,7 @@ echo --- motd ---
 cat motd
 echo --- running the hello program ---
 hello
+echo --- bind motd onto greeting, then cat it ---
+bind motd greeting
+cat greeting
 echo rc complete

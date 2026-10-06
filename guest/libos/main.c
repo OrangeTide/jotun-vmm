@@ -11,6 +11,7 @@
 #include "boot.h"
 #include "jsh.h"
 #include "mem.h"
+#include "ns.h"
 #include "p9.h"
 #include "print.h"
 #include "prog.h"
@@ -90,6 +91,7 @@ _start(void)
         con_puts("9p: mount failed\n");
     else
         con_puts("9p: mounted\n");
+    ns_init();
 
     task_spawn("init", init_task);
     sched_start();

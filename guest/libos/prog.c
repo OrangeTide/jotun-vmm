@@ -9,6 +9,7 @@
 
 #include "arch.h"
 #include "elfload.h"
+#include "ns.h"
 #include "p9.h"
 #include "print.h"
 #include "task.h"
@@ -64,9 +65,8 @@ const char *
 prog_run(const char *name)
 {
     static char status[STATUS_MAX];
-    const char *names[1] = { name };
 
-    if (p9_walk(P9_ROOT_FID, PROG_FID, 1, names) != 1)
+    if (ns_walk(name, PROG_FID) != 0)
         return NULL;
     if (p9_open(PROG_FID) != 0) {
         p9_clunk(PROG_FID);

@@ -6,6 +6,7 @@
 #include "jsh.h"
 
 #include "mem.h"
+#include "ns.h"
 #include "p9.h"
 #include "print.h"
 #include "prog.h"
@@ -23,47 +24,10 @@ streq(const char *a, const char *b)
     return *a == *b;
 }
 
-/* Split a slash-separated path into components. Returns the count. */
-static int
-split_path(const char *path, char comps[][64], int maxc)
-{
-    int n = 0;
-    const char *p = path;
-
-    while (*p && n < maxc) {
-        while (*p == '/')
-            p++;
-        if (!*p)
-            break;
-        int i = 0;
-        while (*p && *p != '/') {
-            if (i < 63)
-                comps[n][i++] = *p;
-            p++;
-        }
-        comps[n][i] = '\0';
-        n++;
-    }
-    return n;
-}
-
-/* Walk from the root to path into fid. Returns 0 on a full walk. */
-static int
-walk_path(const char *path, uint32_t fid)
-{
-    char comps[P9_MAXWELEM][64];
-    const char *names[P9_MAXWELEM];
-    int n = split_path(path, comps, P9_MAXWELEM);
-
-    for (int i = 0; i < n; i++)
-        names[i] = comps[i];
-    return (p9_walk(P9_ROOT_FID, fid, n, names) == n) ? 0 : -1;
-}
-
 static void
 cmd_ls(const char *path)
 {
-    if (walk_path(path, JSH_FID) != 0) {
+    if (ns_walk(path, JSH_FID) != 0) {
         con_puts("ls: not found: ");
         con_puts(path);
         con_putc('\n');
@@ -88,7 +52,7 @@ cmd_ls(const char *path)
 static void
 cmd_cat(const char *path)
 {
-    if (walk_path(path, JSH_FID) != 0) {
+    if (ns_walk(path, JSH_FID) != 0) {
         con_puts("cat: not found: ");
         con_puts(path);
         con_putc('\n');
@@ -153,20 +117,39 @@ exec_line(char *line)
         return;
     }
 
-    /* The other commands take a single path, the first token of the rest. */
-    char *arg = rest;
-    char *e = arg;
+    /* Split the remainder into up to two whitespace-separated arguments. */
+    char *a1 = rest;
+    char *e = a1;
     while (*e && *e != ' ' && *e != '\t')
         e++;
-    *e = '\0';
+    char *a2 = e;
+    if (*e) {
+        *e++ = '\0';
+        while (*e == ' ' || *e == '\t')
+            e++;
+        a2 = e;
+        while (*e && *e != ' ' && *e != '\t')
+            e++;
+        *e = '\0';
+    }
 
     if (streq(cmd, "ls")) {
-        cmd_ls(arg[0] ? arg : "/");
+        cmd_ls(a1[0] ? a1 : "/");
     } else if (streq(cmd, "cat")) {
-        if (arg[0])
-            cmd_cat(arg);
+        if (a1[0])
+            cmd_cat(a1);
         else
             con_puts("cat: missing path\n");
+    } else if (streq(cmd, "bind")) {
+        if (a1[0] && a2[0])
+            ns_bind(a1, a2);        /* bind src onto mountpoint */
+        else
+            con_puts("bind: usage: bind SRC DIR\n");
+    } else if (streq(cmd, "mount")) {
+        if (a1[0] && a2[0])
+            ns_mount(a2, a1);       /* mount SRC at DIR */
+        else
+            con_puts("mount: usage: mount SRC DIR\n");
     } else {
         cmd_run(cmd);
     }
@@ -179,7 +162,7 @@ jsh_run(const char *script_path)
     if (!buf)
         return;
 
-    if (walk_path(script_path, JSH_FID) != 0 || p9_open(JSH_FID) != 0) {
+    if (ns_walk(script_path, JSH_FID) != 0 || p9_open(JSH_FID) != 0) {
         con_puts("jsh: cannot open script ");
         con_puts(script_path);
         con_putc('\n');
