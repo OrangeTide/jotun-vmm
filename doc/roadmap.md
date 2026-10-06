@@ -754,9 +754,14 @@ Sub-milestones:
     wake bug. Identical with one guest.
   - M10.0d: give each guest its own RAM buffer and VM through the struct (both
     are global today); still allocate one, to prove the per-guest path.
-  - M10.0e: flip to N guests. Parse repeated `-m` manifests, allocate an array,
-    launch each as its own VM. Keep the front end bound to guest 0 (others run
-    headless), so the browser path is untouched. First step where N > 1 runs.
+  - M10.0e (done): flip to N guests. `jotun [-m <manifest>]... <kernel> [args]`
+    runs one guest per `-m` (each its own VM, RAM, net/9p devices, and manifest
+    config), with no `-m` keeping the single env/CLI guest exactly as before.
+    guest_bringup resolves config, brings a guest up, and spawns its vcpus; the
+    front end attaches to guest 0 only, so the rest run headless. The preemption
+    timer and the join and shutdown loops span all guests. Known limitation: all
+    guests share the one serial console, so their output interleaves per
+    character; per-guest console tagging is a separate concern, not part of M10.
 - M10.1: per-guest id namespacing and host-side compositing. Make the guest id
   per-drawdev (not the constant 0) through every `qu-<guest>-<node>` emit site,
   and have the front end combine each guest's scene under its `<g id="qu-<guest>">`

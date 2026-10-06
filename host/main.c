@@ -34,6 +34,9 @@
 #define STACK_SLOT     (512u * 1024)
 #define MAX_VCPUS      8
 
+/* The host runs up to this many guests in one process, each its own VM. */
+#define MAX_GUESTS     8
+
 /* Process-wide host state touched by every vcpu thread. The console and its
  * lock are shared across the process; per-guest state lives in struct guest. */
 static uart_16550 uart;
@@ -74,6 +77,7 @@ struct guest_mem {
  * threads a struct guest * through the call graph so each guest is addressed by
  * pointer rather than by this global. */
 struct guest {
+    int gid;                    /* 0..nguests-1; guest 0 owns the front end */
     vmm_vm_t *vm;
     struct guest_mem gm;
     elf_image img;
@@ -86,9 +90,11 @@ struct guest {
     struct drawdev *drawdev;    /* draw sink sharing this guest's channel */
     struct p9srv p9;            /* 9P server, guarded by dev_lock */
     struct net_policy policy;   /* net rules for this guest */
+    struct manifest manifest;   /* this guest's domain config, if from -m */
 };
 
-static struct guest g;
+static struct guest guests[MAX_GUESTS];
+static int nguests;
 
 static void
 vcpu_wake(struct vcpu_ctx *c)
@@ -411,9 +417,8 @@ sig_noop(int sig)
 /* Timer thread: tick at the configured rate and preempt each running vcpu by
  * queuing the event interrupt and signalling the thread out of its run. */
 struct timer_ctx {
-    pthread_t *threads;
-    struct vcpu_ctx *ctx;
-    int n;
+    struct guest *guests;
+    int nguests;
     unsigned hz;
     volatile int stop;
 };
@@ -429,11 +434,14 @@ run_timer(void *arg)
 
     while (!__atomic_load_n(&t->stop, __ATOMIC_SEQ_CST)) {
         nanosleep(&period, NULL);
-        for (int i = 0; i < t->n; i++) {
-            if (!__atomic_load_n(&t->ctx[i].live, __ATOMIC_SEQ_CST))
-                continue;
-            vmm_vcpu_interrupt(t->ctx[i].vcpu, JOTUN_EVENT_VECTOR);
-            pthread_kill(t->threads[i], SIGUSR1);
+        for (int gi = 0; gi < t->nguests; gi++) {
+            struct guest *gp = &t->guests[gi];
+            for (int i = 0; i < gp->nvcpus; i++) {
+                if (!__atomic_load_n(&gp->ctx[i].live, __ATOMIC_SEQ_CST))
+                    continue;
+                vmm_vcpu_interrupt(gp->ctx[i].vcpu, JOTUN_EVENT_VECTOR);
+                pthread_kill(gp->threads[i], SIGUSR1);
+            }
         }
     }
     return NULL;
@@ -492,10 +500,184 @@ guest_vm_free(struct guest *gp)
     }
 }
 
+/* Bring one guest fully up and start its vcpus: resolve its domain config (from
+ * a -m manifest, or from the environment and the trailing CLI args when none is
+ * given), create its VM and RAM, write its boot block, install its net policy
+ * and provider, attach the browser front end for guest 0 only, pull a signed
+ * bundle if an origin is named, open its 9P server, and spawn its vcpu threads.
+ * Returns 0, or -1 on failure (a pull that cannot be verified refuses the
+ * boot). The env/argv fallback applies only to a lone guest with no manifest. */
+static int
+guest_bringup(struct guest *gp, int gid, const char *kernel,
+              const char *manifest_path, int nvcpus, int draw_test,
+              int targc, char **targv)
+{
+    gp->gid = gid;
+
+    if (guest_vm_init(gp, kernel) != 0)
+        return -1;
+
+    /* A manifest, when given, is the full description of the guest domain: the
+     * bundle and ref to serve, the subtree it is confined to, and the init
+     * arguments. It is stored in the guest so its strings outlive this call. */
+    int have_manifest = 0;
+    if (manifest_path) {
+        if (manifest_load(manifest_path, &gp->manifest) == 0)
+            have_manifest = 1;
+        else
+            fprintf(stderr, "[manifest] failed to load %s\n", manifest_path);
+    }
+
+    const char *bundle, *ref, *subtree;
+    int gargc;
+    char *gargv[MANIFEST_MAXARG];
+    if (have_manifest) {
+        bundle = gp->manifest.bundle;
+        ref = gp->manifest.ref;
+        subtree = gp->manifest.subtree;
+        gargc = gp->manifest.argc;
+        for (int i = 0; i < gp->manifest.argc; i++)
+            gargv[i] = gp->manifest.argv[i];
+    } else {
+        bundle = getenv("JOTUN_BUNDLE");
+        ref = getenv("JOTUN_REF");
+        if (!ref)
+            ref = "root";
+        subtree = "";
+        gargc = targc > MANIFEST_MAXARG ? MANIFEST_MAXARG : targc;
+        for (int i = 0; i < gargc; i++)
+            gargv[i] = targv[i];
+    }
+
+    setup_bootinfo(gp, gargc, gargv);
+
+    /* Build the net policy from the manifest rules. With no rules the provider
+     * allows every target; with rules it denies by default. */
+    gp->policy.n = 0;
+    if (have_manifest) {
+        for (int i = 0; i < gp->manifest.nnet && gp->policy.n < NET_MAXRULES; i++)
+            if (build_net_rule(&gp->manifest.net[i],
+                               &gp->policy.rules[gp->policy.n]) == 0)
+                gp->policy.n++;
+    }
+
+    /* The net provider shares this guest's net channel and rouses its vcpus
+     * when a socket becomes ready. Created before the 9P server so the /net
+     * overlay can read its live connections. */
+    struct jotun_net *netchan = gpa_to_host(gp, JOTUN_NET_BASE, sizeof(*netchan));
+    gp->netdev = netchan ? net_init(netchan, rouse_vcpus, gp, &gp->policy) : NULL;
+
+    /* Only guest 0 drives the browser front end (one host, one session). The
+     * rest run headless: a draw op from them is accepted and dropped, since
+     * draw_service finds no sink. */
+    gp->drawdev = NULL;
+    if (gid == 0) {
+        struct jotun_draw *drawchan =
+            gpa_to_host(gp, JOTUN_DRAW_BASE, sizeof(*drawchan));
+        if (drawchan)
+            gp->drawdev = draw_init(drawchan, rouse_vcpus, gp, draw_test,
+                                    draw_gpa, gp);
+    }
+
+    /* If a signed origin is named, pull the bundle into a local cache depot and
+     * serve that, exactly as a local depot. A pull failure refuses the boot:
+     * the bundle's authenticity could not be established. */
+    const char *origin = have_manifest ? gp->manifest.origin : getenv("JOTUN_ORIGIN");
+    const char *trust_key = have_manifest ? gp->manifest.key : getenv("JOTUN_KEY");
+    const char *label = have_manifest ? gp->manifest.label : getenv("JOTUN_LABEL");
+    if (label && !label[0])
+        label = NULL;
+    if (origin && origin[0]) {
+        const char *cache = getenv("JOTUN_CACHE");
+        if (!cache || !cache[0])
+            cache = "bundle-cache";
+        if (!trust_key || !trust_key[0]) {
+            fprintf(stderr, "[pull] guest %d: origin set but no trusted key"
+                    " (set JOTUN_KEY or manifest 'key')\n", gid);
+            return -1;
+        }
+        fprintf(stderr, "[pull] guest %d: fetching %s into %s\n", gid, origin, cache);
+        if (bundle_pull(origin, trust_key, label, cache, ref) != 0) {
+            fprintf(stderr, "[pull] guest %d: refusing to boot:"
+                    " bundle not pulled/verified\n", gid);
+            return -1;
+        }
+        bundle = cache;                 /* serve the verified cache depot */
+    }
+
+    /* Serve a smolvfs bundle if one is named, else the in-memory tree, with the
+     * read-only /net overlay wrapping whichever backend is chosen. */
+    const struct p9_backend *be = NULL;
+    void *p9ctx = NULL;
+    if (bundle && bundle[0])
+        be = p9smolvfs_open(bundle, ref, subtree, &p9ctx);
+    if (be) {
+        fprintf(stderr, "[9p] guest %d: serving bundle %s (ref %s, subtree %s)\n",
+                gid, bundle, ref, subtree[0] ? subtree : "/");
+    } else {
+        if (bundle && bundle[0])
+            fprintf(stderr, "[9p] guest %d: could not open bundle %s,"
+                    " using in-memory tree\n", gid, bundle);
+        be = p9mem_backend();
+        p9ctx = NULL;
+    }
+
+    struct p9overlay *ov = p9overlay_new(be, p9ctx, &gp->policy, gp->netdev);
+    if (ov)
+        p9srv_init(&gp->p9, p9overlay_backend(), ov);
+    else
+        p9srv_init(&gp->p9, be, p9ctx);     /* fallback: no /net overlay */
+
+    gp->nvcpus = nvcpus;
+    for (int i = 0; i < nvcpus; i++) {
+        gp->ctx[i].index = i;
+        gp->ctx[i].owner = gp;
+        gp->ctx[i].vm = gp->vm;
+        gp->ctx[i].entry = gp->img.entry;
+        gp->ctx[i].sp = GUEST_RAM_SIZE - (uint64_t)i * STACK_SLOT - 16;
+        gp->ctx[i].rc = 0;
+        gp->ctx[i].vcpu = NULL;
+        gp->ctx[i].live = 0;
+        pthread_mutex_init(&gp->ctx[i].idle_m, NULL);
+        pthread_cond_init(&gp->ctx[i].idle_c, NULL);
+        gp->ctx[i].woken = 0;
+        if (pthread_create(&gp->threads[i], NULL, run_vcpu, &gp->ctx[i]) != 0) {
+            fprintf(stderr, "guest %d: failed to start vcpu %d thread\n", gid, i);
+            gp->ctx[i].rc = 1;
+            gp->threads[i] = 0;
+        }
+    }
+    return 0;
+}
+
 int
 main(int argc, char **argv)
 {
-    const char *path = (argc > 1) ? argv[1] : "test_guest.elf";
+    /* Each -m names one guest's manifest; the first bare argument is the kernel
+     * image shared by all guests, and any trailing arguments are the init args
+     * for the lone no-manifest guest. With no -m, one guest runs from the
+     * environment (and JOTUN_MANIFEST), exactly as before. */
+    const char *kernel = NULL;
+    const char *manifests[MAX_GUESTS];
+    int nmanifests = 0;
+    int targc = 0;
+    char *targv[MANIFEST_MAXARG];
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            if (nmanifests >= MAX_GUESTS) {
+                fprintf(stderr, "too many -m manifests (max %d)\n", MAX_GUESTS);
+                return 1;
+            }
+            manifests[nmanifests++] = argv[++i];
+        } else if (!kernel) {
+            kernel = argv[i];
+        } else if (targc < MANIFEST_MAXARG) {
+            targv[targc++] = argv[i];
+        }
+    }
+    if (!kernel)
+        kernel = "test_guest.elf";
 
     int nvcpus = 1;
     const char *vcpus_env = getenv("JOTUN_VCPUS");
@@ -510,165 +692,48 @@ main(int argc, char **argv)
     const char *cap_env = getenv("JOTUN_MAX_EXITS");
     max_exits = cap_env ? strtoul(cap_env, NULL, 0) : 0;
 
-    if (guest_vm_init(&g, path) != 0)
-        return 1;
-
-    /* A manifest, when given, is the full description of the guest domain: the
-     * bundle and ref to serve, the subtree the guest is confined to, and the
-     * init arguments. Without one, fall back to environment and command line. */
-    struct manifest m;
-    int have_manifest = 0;
-    const char *manifest_path = getenv("JOTUN_MANIFEST");
-    if (manifest_path) {
-        if (manifest_load(manifest_path, &m) == 0)
-            have_manifest = 1;
-        else
-            fprintf(stderr, "[manifest] failed to load %s\n", manifest_path);
-    }
-
-    const char *bundle, *ref, *subtree;
-    int gargc;
-    char *gargv[MANIFEST_MAXARG];
-    if (have_manifest) {
-        bundle = m.bundle;
-        ref = m.ref;
-        subtree = m.subtree;
-        gargc = m.argc;
-        for (int i = 0; i < m.argc; i++)
-            gargv[i] = m.argv[i];
-    } else {
-        bundle = getenv("JOTUN_BUNDLE");
-        ref = getenv("JOTUN_REF");
-        if (!ref)
-            ref = "root";
-        subtree = "";
-        gargc = (argc > 2) ? argc - 2 : 0;
-        if (gargc > MANIFEST_MAXARG)
-            gargc = MANIFEST_MAXARG;
-        for (int i = 0; i < gargc; i++)
-            gargv[i] = argv[2 + i];
-    }
-
-    /* Hand the guest its parameters before it starts. */
-    setup_bootinfo(&g, gargc, gargv);
-
-    uart_init(&uart);
-
-    /* Build the net policy from the manifest rules. With no rules the provider
-     * allows every target; with rules it denies by default. */
-    g.policy.n = 0;
-    if (have_manifest) {
-        for (int i = 0; i < m.nnet && g.policy.n < NET_MAXRULES; i++)
-            if (build_net_rule(&m.net[i], &g.policy.rules[g.policy.n]) == 0)
-                g.policy.n++;
-    }
-
-    /* The net provider shares the guest net channel and rouses vcpus when a
-     * socket becomes ready. It is created before the 9P server so the /net
-     * overlay can read its live connections. */
-    struct jotun_net *netchan = gpa_to_host(&g, JOTUN_NET_BASE, sizeof(*netchan));
-    g.netdev = netchan ? net_init(netchan, rouse_vcpus, &g, &g.policy) : NULL;
-
-    /* The draw sink shares the guest draw channel and rouses vcpus when an
-     * input event is queued. JOTUN_DRAW_TEST turns on the self-test event
-     * source so the submit/poll path can run with no front end attached. */
     int draw_test = getenv("JOTUN_DRAW_TEST") != NULL;
-    struct jotun_draw *drawchan = gpa_to_host(&g, JOTUN_DRAW_BASE, sizeof(*drawchan));
-    g.drawdev = drawchan
-        ? draw_init(drawchan, rouse_vcpus, &g, draw_test, draw_gpa, &g) : NULL;
 
-    /* If a signed origin is named, pull the bundle into a local cache depot and
-     * serve that, exactly as a local depot. A pull failure refuses the boot:
-     * the bundle's authenticity could not be established. */
-    const char *origin = have_manifest ? m.origin : getenv("JOTUN_ORIGIN");
-    const char *trust_key = have_manifest ? m.key : getenv("JOTUN_KEY");
-    const char *label = have_manifest ? m.label : getenv("JOTUN_LABEL");
-    if (label && !label[0])
-        label = NULL;
-    if (origin && origin[0]) {
-        const char *cache = getenv("JOTUN_CACHE");
-        if (!cache || !cache[0])
-            cache = "bundle-cache";
-        if (!trust_key || !trust_key[0]) {
-            fprintf(stderr, "[pull] origin set but no trusted key"
-                    " (set JOTUN_KEY or manifest 'key')\n");
-            return 1;
-        }
-        fprintf(stderr, "[pull] fetching %s into %s\n", origin, cache);
-        if (bundle_pull(origin, trust_key, label, cache, ref) != 0) {
-            fprintf(stderr, "[pull] refusing to boot: bundle not pulled/verified\n");
-            return 1;
-        }
-        bundle = cache;                 /* serve the verified cache depot */
-    }
-
-    /* Serve a smolvfs bundle if one is named, else the in-memory tree, with the
-     * read-only /net overlay wrapping whichever backend is chosen. */
-    const struct p9_backend *be = NULL;
-    void *p9ctx = NULL;
-    if (bundle && bundle[0])
-        be = p9smolvfs_open(bundle, ref, subtree, &p9ctx);
-    if (be) {
-        fprintf(stderr, "[9p] serving bundle %s (ref %s, subtree %s)\n",
-                bundle, ref, subtree[0] ? subtree : "/");
-    } else {
-        if (bundle && bundle[0])
-            fprintf(stderr, "[9p] could not open bundle %s, using in-memory tree\n",
-                    bundle);
-        be = p9mem_backend();
-        p9ctx = NULL;
-    }
-
-    struct p9overlay *ov = p9overlay_new(be, p9ctx, &g.policy, g.netdev);
-    if (ov)
-        p9srv_init(&g.p9, p9overlay_backend(), ov);
-    else
-        p9srv_init(&g.p9, be, p9ctx);   /* fallback: no /net overlay */
-
-    /* SIGUSR1 breaks a running vcpu out of its run (no SA_RESTART, so KVM_RUN
-     * returns EINTR). Both the preemption timer and the net poll thread use it,
-     * so install it unconditionally. */
-    struct sigaction sa = { 0 };
-    sa.sa_handler = sig_noop;
-    sigaction(SIGUSR1, &sa, NULL);
-
-    /* A preemption timer is opt-in: JOTUN_HZ ticks per second. */
+    /* A preemption timer is opt-in: JOTUN_HZ ticks per second, across all. */
     unsigned hz = 0;
     const char *hz_env = getenv("JOTUN_HZ");
     if (hz_env)
         hz = (unsigned)strtoul(hz_env, NULL, 0);
 
-    g.nvcpus = nvcpus;
+    uart_init(&uart);
 
-    for (int i = 0; i < nvcpus; i++) {
-        g.ctx[i].index = i;
-        g.ctx[i].owner = &g;
-        g.ctx[i].vm = g.vm;
-        g.ctx[i].entry = g.img.entry;
-        g.ctx[i].sp = GUEST_RAM_SIZE - (uint64_t)i * STACK_SLOT - 16;
-        g.ctx[i].rc = 0;
-        g.ctx[i].vcpu = NULL;
-        g.ctx[i].live = 0;
-        pthread_mutex_init(&g.ctx[i].idle_m, NULL);
-        pthread_cond_init(&g.ctx[i].idle_c, NULL);
-        g.ctx[i].woken = 0;
-        if (pthread_create(&g.threads[i], NULL, run_vcpu, &g.ctx[i]) != 0) {
-            fprintf(stderr, "Failed to start vcpu %d thread\n", i);
-            g.ctx[i].rc = 1;
-            g.threads[i] = 0;
+    /* SIGUSR1 breaks a running vcpu out of its run (no SA_RESTART, so KVM_RUN
+     * returns EINTR). The preemption timer and the net poll threads use it, so
+     * install it once for the process. */
+    struct sigaction sa = { 0 };
+    sa.sa_handler = sig_noop;
+    sigaction(SIGUSR1, &sa, NULL);
+
+    nguests = nmanifests > 0 ? nmanifests : 1;
+
+    for (int gi = 0; gi < nguests; gi++) {
+        const char *mpath = nmanifests > 0 ? manifests[gi]
+                                           : getenv("JOTUN_MANIFEST");
+        if (guest_bringup(&guests[gi], gi, kernel, mpath, nvcpus, draw_test,
+                          targc, targv) != 0) {
+            fprintf(stderr, "guest %d: bring-up failed\n", gi);
+            return 1;
         }
     }
 
     pthread_t timer_thread = 0;
-    struct timer_ctx tctx = { g.threads, g.ctx, nvcpus, hz, 0 };
+    struct timer_ctx tctx = { guests, nguests, hz, 0 };
     if (hz > 0)
         pthread_create(&timer_thread, NULL, run_timer, &tctx);
 
     int rc = 0;
-    for (int i = 0; i < nvcpus; i++) {
-        if (g.threads[i])
-            pthread_join(g.threads[i], NULL);
-        rc |= g.ctx[i].rc;
+    for (int gi = 0; gi < nguests; gi++) {
+        struct guest *gp = &guests[gi];
+        for (int i = 0; i < gp->nvcpus; i++) {
+            if (gp->threads[i])
+                pthread_join(gp->threads[i], NULL);
+            rc |= gp->ctx[i].rc;
+        }
     }
 
     if (timer_thread) {
@@ -676,9 +741,10 @@ main(int argc, char **argv)
         pthread_join(timer_thread, NULL);
     }
 
-    net_shutdown(g.netdev);
-    draw_shutdown(g.drawdev);
-
-    guest_vm_free(&g);
+    for (int gi = 0; gi < nguests; gi++) {
+        net_shutdown(guests[gi].netdev);
+        draw_shutdown(guests[gi].drawdev);
+        guest_vm_free(&guests[gi]);
+    }
     return rc;
 }
