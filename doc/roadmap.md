@@ -357,7 +357,7 @@ Steps:
   and without rules, and `cat /net/conn/0` against a live connection, with
   bundle delegation and policy enforcement intact.
 
-## M6: display, the 2D vector path
+## M6: display, the 2D vector path (done)
 
 Goal: the primary use case, interactive diagrams and schematics in a browser.
 
@@ -485,7 +485,7 @@ Steps:
   large scenes under steady mutation is incremental (changed-node) updates
   instead of full re-render, noted for later.
 
-## M7: display, the pixel path
+## M7: display, the pixel path (done)
 
 Goal: raster content where vector does not fit.
 
@@ -557,7 +557,7 @@ Goal: raster content where vector does not fit.
 Acceptance: a guest software-renders a wireframe into a framebuffer node
 composited under the 2D chrome. Met, and extended to a shaded, z-buffered cube.
 
-## M8: image distribution, signed pull from a URL
+## M8: image distribution, signed pull from a URL (done)
 
 Goal: fetch and authenticate a guest bundle from a remote origin, docker or
 podman style.
@@ -668,17 +668,65 @@ block/wake, self, spinlocks). A standard `<threads.h>` shim (`thrd_*`/`mtx_*`/
 `cnd_*`) over `task.c` is deferred until a bundle program actually needs the
 standard API, so the wrapper is shaped by a real consumer rather than guessed.
 
+## After M8: the forward milestones
+
+The seven-step plan in the design doc (section 10) is now implemented end to
+end: the transport ABI, 9P and the bundle, the shell, preemption and SMP,
+networking, the 2D vector display, and the pixel path, with signed distribution
+on top. What remains are the forward milestones below, drawn from the display
+design's multi-guest front end (section 9.4), the cross-cutting concerns, and
+the deferrals accumulated along the way. They are largely independent, so they
+land as wanted rather than in a strict sequence. M9 (above) stays opportunistic.
+
+## M10: multi-guest multiplexing and the browser session
+
+Goal: one browser session fronting several guests at once, which the display
+design (section 9.4) calls for but the current front end does not do (one guest
+to one browser, replace-on-connect).
+
+- Per-guest and per-surface ids, so the host composites several guests' scenes
+  and pixel regions into a single client session.
+- A session layer over the WebSocket: route each inbound browser event to the
+  guest it targets, and tag each host push with its guest.
+- Session authentication, so the port can be exposed beyond localhost safely.
+  This pairs with the serving and TLS note in `doc/draw-vocabulary.md`: today the
+  link is plain `ws://` on localhost, and a reverse proxy or in-host TLS is
+  needed off-box.
+
+## M11: single-file packaging
+
+Goal: one artifact that carries both the bootable unikernel ELF and its
+filesystem, docker-image style. The bundle also holds the kernel ELF; the host
+lifts it out to boot the guest and serves the rest as the 9P filesystem, so a
+pull delivers a complete, signed, bootable image in one object set. Depends on
+M3 and M8.
+
+## M12: snapshot and restore
+
+Goal: capture a running guest's memory and device state and resume it later.
+Optional, and the heaviest of the forward items; it interacts with SMP (M4) and
+with the channel state on each device. Shape it when a concrete need appears.
+
+## Opportunistic and deferred work
+
+Independent of the milestones above, tracked so they are not lost:
+
+- Guest rasterizer (M7.4) beyond the minimal 3D core: point-sampled texturing,
+  the Glide combine units, alpha blend, and the fuller subset.
+- Pull transport (M8): the pack byte-range transport (fetch only the changed
+  extents of a packfile), key rotation, and multi-arch bundles.
+- Display input: text and paste, which need a text-input primitive the
+  restricted SVG vocabulary excludes today.
+- libc-lite (M9): the remaining M9.2 through M9.4, and a `<threads.h>` shim over
+  `task.c` once a bundle program needs the standard API.
+
 ## Cross-cutting concerns
 
 - The per-guest manifest is the sandbox's control surface. It appears at M3,
-  naming the filesystem bundle and the init parameters, and grows through M5
-  for networking and M6 for display.
+  naming the filesystem bundle and the init parameters, and grows through M5 for
+  networking, M6 for display, and M8 for the pull origin and trusted key.
 - Validation of every guest-to-host message is a standing requirement, not a
   phase.
-- Multiplexing several guests onto one browser session, and any session
-  authentication, land with or after M6.
-- Snapshot and restore is optional and comes later.
-- Single-file packaging is optional and comes later: the bundle can also carry
-  the bootable unikernel ELF, which the host lifts out to boot the guest while
-  serving the rest as the filesystem. One file then holds the kernel and its
-  filesystem together. Not needed for the M3 first cut.
+- Multi-guest multiplexing and session authentication, snapshot and restore, and
+  single-file packaging were earlier cross-cutting notes; they are now the
+  forward milestones M10, M12, and M11 above.
