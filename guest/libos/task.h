@@ -57,4 +57,8 @@ int task_recv_note(char *buf, int nbuf);
 /* Print the task table: id, state, name. Observability for bring-up. */
 void task_dump(void);
 
+/* The event-interrupt handler, called from the arch ISR. Preempts the running
+ * task by rescheduling. */
+void irq_event(void);
+
 #endif /* LIBOS_TASK_H */

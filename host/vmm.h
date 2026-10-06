@@ -25,6 +25,8 @@ typedef enum {
     VMM_EXIT_REASON_IO,
     VMM_EXIT_REASON_MMIO,
     VMM_EXIT_REASON_HLT,
+    VMM_EXIT_REASON_INTR,   /* run broken by a signal or interrupt window; no
+                               guest exit, caller should run again */
     VMM_EXIT_REASON_ERROR,
 } vmm_exit_reason_t;
 
@@ -59,6 +61,11 @@ void vmm_vm_map_memory(vmm_vm_t *vm, void *host_addr, uint64_t guest_addr,
 vmm_vcpu_t *vmm_vcpu_create(vmm_vm_t *vm);
 void vmm_vcpu_set_reg(vmm_vcpu_t *vcpu, vmm_reg_t reg, uint64_t value);
 void vmm_vcpu_run(vmm_vcpu_t *vcpu, vmm_exit_info_t *exit_info);
+/* Queue an asynchronous interrupt for delivery to the vcpu (the event vector).
+ * Safe to call from another thread; the next run delivers it when the guest
+ * can accept it. Pair with a signal to the vcpu thread to break a running
+ * guest out of its run. */
+void vmm_vcpu_interrupt(vmm_vcpu_t *vcpu, uint8_t vector);
 void vmm_vcpu_destroy(vmm_vcpu_t *vcpu);
 void vmm_vm_destroy(vmm_vm_t *vm);
 

@@ -22,7 +22,22 @@ void *stack_init(void *stack, size_t size, void (*entry)(void));
 
 /* Save the current callee-saved context to *oldsp (unless oldsp is NULL, as on
  * the first switch away from a context never to be resumed), load newsp, and
- * return into the context stored there. */
+ * return into the context stored there. Preserves the interrupt-enable state
+ * per context, so a resumed context keeps its own masking. */
 void ctx_switch(void **oldsp, void *newsp);
+
+/* Install the trap tables (GDT and IDT on x86) and the event interrupt gate.
+ * Must run before any task starts, since a task runs with interrupts enabled
+ * and a tick could arrive. On arm64 this is a stub for now. */
+void arch_traps_init(void);
+
+/* Enable and disable asynchronous interrupts on this cpu. */
+void arch_irq_enable(void);
+void arch_irq_disable(void);
+
+/* Save-and-disable interrupts, returning the prior state, and restore it.
+ * Used to guard scheduler-critical regions against preemption. */
+unsigned long arch_irq_save(void);
+void arch_irq_restore(unsigned long flags);
 
 #endif /* LIBOS_ARCH_H */

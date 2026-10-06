@@ -102,14 +102,17 @@ task_trampoline(void)
 int
 task_spawn(const char *name, task_fn fn)
 {
+    unsigned long f = arch_irq_save();
     for (int i = 0; i < MAX_TASKS; i++) {
         struct task *t = &tasks[i];
         if (t->state != TASK_FREE)
             continue;
 
         unsigned char *stack = kmalloc(TASK_STACK);
-        if (!stack)
+        if (!stack) {
+            arch_irq_restore(f);
             return -1;
+        }
 
         t->id = i;
         t->parent = cur ? cur->id : NO_PARENT;
@@ -121,8 +124,10 @@ task_spawn(const char *name, task_fn fn)
         t->note_head = t->note_tail = 0;
         t->state = TASK_READY;
         enqueue(t);
+        arch_irq_restore(f);
         return i;
     }
+    arch_irq_restore(f);
     return -1;
 }
 
@@ -140,6 +145,7 @@ task_exec(task_fn fn)
     if (!stack)
         return -1;
 
+    arch_irq_disable();             /* does not return, so no restore */
     reap_stack = t->stack;
     t->fn = fn;
     t->stack = stack;
@@ -181,16 +187,28 @@ sched_start(void)
 void
 task_yield(void)
 {
+    unsigned long f = arch_irq_save();
     struct task *t = cur;
 
     t->state = TASK_READY;
     enqueue(t);
     ctx_switch(&t->sp, sched_sp);
+    arch_irq_restore(f);
+}
+
+/* Called from the event ISR. Reschedule the running task; if the scheduler
+ * itself was interrupted (cur is NULL) there is nothing to preempt. */
+void
+irq_event(void)
+{
+    if (cur)
+        task_yield();
 }
 
 void
 task_exits(const char *status)
 {
+    arch_irq_disable();             /* does not return, so no restore */
     scopy(cur->status, status, STATUS_MAX);
     cur->state = TASK_ZOMBIE;
     /* Nothing to save: this context is finished, so pass NULL as oldsp. */
@@ -204,6 +222,7 @@ task_await(char *buf, int nbuf)
 {
     for (;;) {
         int live = 0;
+        unsigned long f = arch_irq_save();
 
         for (int i = 0; i < MAX_TASKS; i++) {
             struct task *t = &tasks[i];
@@ -214,10 +233,12 @@ task_await(char *buf, int nbuf)
                 if (buf && nbuf > 0)
                     scopy(buf, t->status, nbuf);
                 t->state = TASK_FREE;
+                arch_irq_restore(f);
                 return id;
             }
             live = 1;
         }
+        arch_irq_restore(f);
         if (!live)
             return -1;
         task_yield();       /* let the children make progress */

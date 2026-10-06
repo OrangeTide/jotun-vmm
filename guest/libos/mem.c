@@ -7,6 +7,8 @@
 
 #include <stdint.h>
 
+#include "arch.h"
+
 /* Allocation granularity. Every block is a multiple of this, which keeps
  * headers aligned and bounds the number of free-list fragments. */
 #define ALIGN 64
@@ -36,6 +38,8 @@ kmalloc(size_t size)
 
     total = (size + sizeof(struct block) + ALIGN - 1) & ~((size_t)ALIGN - 1);
 
+    /* The free list is shared with any task that preempts this one. */
+    unsigned long irq = arch_irq_save();
     for (prev = &freelist; (b = *prev) != NULL; prev = &b->next) {
         if (b->size < total)
             continue;
@@ -49,8 +53,10 @@ kmalloc(size_t size)
         } else {
             *prev = b->next;
         }
+        arch_irq_restore(irq);
         return (char *)b + sizeof(struct block);
     }
+    arch_irq_restore(irq);
     return NULL;
 }
 
@@ -73,6 +79,7 @@ kfree(void *ptr)
     if (ptr == NULL)
         return;
 
+    unsigned long irq = arch_irq_save();
     b = (struct block *)((char *)ptr - sizeof(struct block));
 
     /* insert in address order */
@@ -98,4 +105,5 @@ kfree(void *ptr)
             p->next = b->next;
         }
     }
+    arch_irq_restore(irq);
 }

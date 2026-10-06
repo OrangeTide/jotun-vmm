@@ -21,11 +21,13 @@ ctx_switch:
     push %r13
     push %r14
     push %r15
+    pushfq                     /* save RFLAGS, so IF travels with the context */
     test %rdi, %rdi
     jz 1f
     mov %rsp, (%rdi)            /* *oldsp = rsp */
 1:
     mov %rsi, %rsp             /* switch to the new stack */
+    popfq                      /* restore the incoming context's RFLAGS */
     pop %r15
     pop %r14
     pop %r13

@@ -38,19 +38,104 @@ arch_halt(void)
         __asm__ volatile ("hlt");
 }
 
-/* The ctx_switch restore pops six callee-saved registers (r15, r14, r13, r12,
- * rbp, rbx) and then rets. Lay those down with the entry as the return slot.
- * The entry slot is 16-aligned so that after the ret, rsp is 8 mod 16, which
- * is what the SysV ABI promises a function at its entry. */
+/* The ctx_switch restore pops RFLAGS then six callee-saved registers (r15,
+ * r14, r13, r12, rbp, rbx) and rets. Lay those down with the entry as the
+ * return slot. RFLAGS starts with IF set (0x202) so a fresh task runs with
+ * interrupts enabled and is preemptible. The entry slot is 16-aligned so that
+ * after the ret, rsp is 8 mod 16, as the SysV ABI promises at entry. */
 void *
 stack_init(void *stack, size_t size, void (*entry)(void))
 {
     uintptr_t top = ((uintptr_t)stack + size) & ~(uintptr_t)15;
     uint64_t *entry_slot = (uint64_t *)(top - 16);
-    uint64_t *sp = entry_slot - 6;
+    uint64_t *sp = entry_slot - 7;
 
-    for (int i = 0; i < 6; i++)
-        sp[i] = 0;
+    sp[0] = 0x202;                  /* RFLAGS: IF set, reserved bit 1 */
+    for (int i = 1; i < 7; i++)
+        sp[i] = 0;                  /* r15, r14, r13, r12, rbp, rbx */
     *entry_slot = (uint64_t)(uintptr_t)entry;
     return sp;
+}
+
+/****************************************************************
+ * Traps: a GDT the interrupt path can reload CS/SS from, an IDT with the
+ * event gate, and interrupt-mask helpers.
+ ****************************************************************/
+
+/* GDT: null, 64-bit code (0x08), data (0x10). The vcpu already runs with these
+ * cached from KVM; the table must exist in memory so an interrupt or iret can
+ * reload the selectors without faulting. */
+static uint64_t gdt[3] __attribute__((aligned(16))) = {
+    0x0000000000000000ull,          /* null */
+    0x00af9a000000ffffull,          /* code: present, DPL0, L=1 */
+    0x00cf92000000ffffull,          /* data: present, DPL0, DB=1 */
+};
+
+struct idt_gate {
+    uint16_t off_lo;
+    uint16_t sel;
+    uint8_t  ist;
+    uint8_t  attr;
+    uint16_t off_mid;
+    uint32_t off_hi;
+    uint32_t zero;
+} __attribute__((packed));
+
+static struct idt_gate idt[256] __attribute__((aligned(16)));
+
+struct desc_ptr {
+    uint16_t limit;
+    uint64_t base;
+} __attribute__((packed));
+
+extern void isr_event(void);        /* arch/x86_64_isr.S */
+
+static void
+idt_set(int vec, void (*handler)(void))
+{
+    uintptr_t a = (uintptr_t)handler;
+    idt[vec].off_lo = (uint16_t)a;
+    idt[vec].sel = 0x08;            /* kernel code selector */
+    idt[vec].ist = 0;
+    idt[vec].attr = 0x8e;           /* present, DPL0, 64-bit interrupt gate */
+    idt[vec].off_mid = (uint16_t)(a >> 16);
+    idt[vec].off_hi = (uint32_t)(a >> 32);
+    idt[vec].zero = 0;
+}
+
+void
+arch_traps_init(void)
+{
+    struct desc_ptr gp = { sizeof gdt - 1, (uint64_t)(uintptr_t)gdt };
+    __asm__ volatile ("lgdt %0" : : "m"(gp));
+
+    idt_set(0x20, isr_event);       /* JOTUN_EVENT_VECTOR */
+    struct desc_ptr ip = { sizeof idt - 1, (uint64_t)(uintptr_t)idt };
+    __asm__ volatile ("lidt %0" : : "m"(ip));
+}
+
+void
+arch_irq_enable(void)
+{
+    __asm__ volatile ("sti" ::: "memory");
+}
+
+void
+arch_irq_disable(void)
+{
+    __asm__ volatile ("cli" ::: "memory");
+}
+
+unsigned long
+arch_irq_save(void)
+{
+    unsigned long flags;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+void
+arch_irq_restore(unsigned long flags)
+{
+    __asm__ volatile ("push %0; popfq" : : "r"(flags) : "memory", "cc");
 }

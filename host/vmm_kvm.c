@@ -2,6 +2,7 @@
 
 #include "vmm.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <linux/kvm.h>
 #include <stdio.h>
@@ -46,6 +47,8 @@ struct vmm_vcpu {
     int vcpu_fd;
     struct kvm_run *run;    /* shared run structure, mapped for the vcpu's life */
     int mmap_size;
+    volatile int irq_pending;   /* set by another thread, delivered by the run */
+    uint8_t irq_vector;
 };
 
 // Lifecycle management functions
@@ -250,10 +253,39 @@ static uint64_t vcpu_pc(vmm_vcpu_t* vcpu) {
 #endif
 }
 
+void vmm_vcpu_interrupt(vmm_vcpu_t* vcpu, uint8_t vector) {
+    vcpu->irq_vector = vector;
+    __atomic_store_n(&vcpu->irq_pending, 1, __ATOMIC_SEQ_CST);
+}
+
 void vmm_vcpu_run(vmm_vcpu_t* vcpu, vmm_exit_info_t* exit_info) {
     struct kvm_run *run = vcpu->run;
 
+#if defined(__x86_64__)
+    /* Interrupt injection with no in-kernel irqchip. If a vector is queued and
+     * the guest can take it now (per the previous run), inject it. Otherwise
+     * ask KVM to exit when the interrupt window opens, so we can inject then. */
+    if (__atomic_load_n(&vcpu->irq_pending, __ATOMIC_SEQ_CST)) {
+        if (run->ready_for_interrupt_injection) {
+            struct kvm_interrupt intr = { .irq = vcpu->irq_vector };
+            if (ioctl(vcpu->vcpu_fd, KVM_INTERRUPT, &intr) == 0)
+                __atomic_store_n(&vcpu->irq_pending, 0, __ATOMIC_SEQ_CST);
+            run->request_interrupt_window = 0;
+        } else {
+            run->request_interrupt_window = 1;
+        }
+    } else {
+        run->request_interrupt_window = 0;
+    }
+#endif
+
     if (ioctl(vcpu->vcpu_fd, KVM_RUN, 0) < 0) {
+        /* A signal broke the run (used to preempt a spinning guest). Report it
+         * so the caller runs again, which re-attempts injection. */
+        if (errno == EINTR) {
+            exit_info->reason = VMM_EXIT_REASON_INTR;
+            return;
+        }
         exit_info->reason = VMM_EXIT_REASON_ERROR;
         return;
     }
@@ -307,6 +339,10 @@ void vmm_vcpu_run(vmm_vcpu_t* vcpu, vmm_exit_info_t* exit_info) {
             break;
         case KVM_EXIT_HLT:
             exit_info->reason = VMM_EXIT_REASON_HLT;
+            break;
+        case KVM_EXIT_IRQ_WINDOW_OPEN:
+            /* The guest can now take an interrupt; run again to inject it. */
+            exit_info->reason = VMM_EXIT_REASON_INTR;
             break;
         default:
             exit_info->reason = VMM_EXIT_REASON_ERROR;

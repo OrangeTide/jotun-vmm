@@ -26,6 +26,12 @@
  * pending bit is still set so the mechanism is in place for M4. */
 #define JOTUN_EVT_RSP       0x1u
 
+/* The x86 interrupt vector the host injects for guest events (timer tick,
+ * cross-vcpu wakeup). The guest installs an IDT gate for it. Chosen above the
+ * CPU exception range (0..31). On arm64 there is no vector; the IRQ enters
+ * through the guest's exception vector instead. */
+#define JOTUN_EVENT_VECTOR  0x20u
+
 struct jotun_msg {
     uint16_t len;                   /* payload length, <= JOTUN_MSG_MAX */
     uint8_t  data[JOTUN_MSG_MAX];

@@ -46,3 +46,39 @@ stack_init(void *stack, size_t size, void (*entry)(void))
     sp[11] = (uint64_t)(uintptr_t)entry;    /* x30: ret lands here */
     return sp;
 }
+
+/* arm64 preemption is deferred: injecting IRQs without a vGIC (KVM) and the
+ * HVF path both need hardware to validate, and the guest runs at EL1 with DAIF
+ * masked. The trap table (VBAR_EL1 exception vectors) is set up when that work
+ * lands. The mask helpers below still work, so the scheduler's critical-region
+ * guards are correct, they simply never see an asynchronous interrupt yet. */
+void
+arch_traps_init(void)
+{
+}
+
+void
+arch_irq_enable(void)
+{
+    __asm__ volatile ("msr daifclr, #2" ::: "memory");
+}
+
+void
+arch_irq_disable(void)
+{
+    __asm__ volatile ("msr daifset, #2" ::: "memory");
+}
+
+unsigned long
+arch_irq_save(void)
+{
+    unsigned long f;
+    __asm__ volatile ("mrs %0, daif; msr daifset, #2" : "=r"(f) :: "memory");
+    return f;
+}
+
+void
+arch_irq_restore(unsigned long flags)
+{
+    __asm__ volatile ("msr daif, %0" : : "r"(flags) : "memory");
+}

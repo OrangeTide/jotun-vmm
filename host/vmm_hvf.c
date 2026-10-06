@@ -42,6 +42,8 @@ struct vmm_vcpu {
     uint32_t mmio_srt;      /* data register number, 31 == XZR */
     uint8_t mmio_size;      /* access width in bytes */
     uint8_t mmio_data[8];   /* exit_info->mmio.data points here */
+
+    volatile int irq_pending;   /* set by another thread, delivered on run */
 };
 
 vmm_vm_t *
@@ -109,6 +111,18 @@ vmm_vcpu_set_reg(vmm_vcpu_t *vcpu, vmm_reg_t reg, uint64_t value)
     }
 }
 
+/* Queue an asynchronous IRQ for the vcpu. On AArch64 there is no vector
+ * number: the interrupt enters through the guest's exception vector (VBAR_EL1)
+ * when IRQs are unmasked, so the vector argument is ignored. The flag is
+ * applied before the next run. This path is implemented by analogy with the
+ * KVM backend and is not yet validated on Apple Silicon. */
+void
+vmm_vcpu_interrupt(vmm_vcpu_t *vcpu, uint8_t vector)
+{
+    (void)vector;
+    __atomic_store_n(&vcpu->irq_pending, 1, __ATOMIC_SEQ_CST);
+}
+
 /* Finish the MMIO access the previous run faulted on: deliver a load result
  * into its destination register, then step PC past the faulting instruction
  * (all AArch64 instructions are 4 bytes). */
@@ -139,6 +153,12 @@ vmm_vcpu_run(vmm_vcpu_t *vcpu, vmm_exit_info_t *exit_info)
 {
     if (vcpu->mmio_pending)
         complete_mmio(vcpu);
+
+    /* Assert or clear the IRQ line for this run (by analogy with KVM; not yet
+     * validated on hardware). Delivered when the guest unmasks IRQs. */
+    hv_vcpu_set_pending_interrupt(vcpu->vcpu, HV_INTERRUPT_TYPE_IRQ,
+        __atomic_load_n(&vcpu->irq_pending, __ATOMIC_SEQ_CST) != 0);
+    __atomic_store_n(&vcpu->irq_pending, 0, __ATOMIC_SEQ_CST);
 
     if (hv_vcpu_run(vcpu->vcpu) != HV_SUCCESS) {
         exit_info->reason = VMM_EXIT_REASON_ERROR;

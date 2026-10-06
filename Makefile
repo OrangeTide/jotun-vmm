@@ -44,7 +44,8 @@ else
         # linux/x86-64: KVM, 64-bit long-mode x86 guest at 1 MiB.
         GUEST = test_guest.elf echo.elf libos.elf
         GUEST_SRC = guest/test_guest_x86.c
-        LIBOS_ARCH = guest/libos/arch/x86_64.c guest/libos/arch/x86_64_ctx.S
+        LIBOS_ARCH = guest/libos/arch/x86_64.c guest/libos/arch/x86_64_ctx.S \
+            guest/libos/arch/x86_64_isr.S
         GUEST_CC = $(CC)
         GUEST_TEXT = 0x100000
     endif

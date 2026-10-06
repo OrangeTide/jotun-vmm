@@ -1,9 +1,11 @@
 #include <inttypes.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #include "vmm.h"
 #include "elf.h"
@@ -37,6 +39,8 @@ struct vcpu_ctx {
     uint64_t entry;
     uint64_t sp;
     int rc;
+    vmm_vcpu_t *vcpu;           /* published by the thread for the timer */
+    volatile int live;          /* 1 while the vcpu is running */
 };
 
 /* Guest physical memory as the host sees it, identity-mapped for now (guest
@@ -143,6 +147,10 @@ run_vcpu(void *arg)
     vmm_vcpu_set_reg(vcpu, VMM_REG_PC, c->entry);
     vmm_vcpu_set_reg(vcpu, VMM_REG_SP, c->sp);
 
+    /* Publish the vcpu so the timer can interrupt it, and mark it running. */
+    c->vcpu = vcpu;
+    __atomic_store_n(&c->live, 1, __ATOMIC_SEQ_CST);
+
     vmm_exit_info_t e;
     unsigned long exits = 0;
     for (;;) {
@@ -162,6 +170,10 @@ run_vcpu(void *arg)
             if (!uart_io(&uart, &e) && !e.io.write)
                 memset(e.io.data, 0, (size_t)e.io.size * e.io.count);
             pthread_mutex_unlock(&dev_lock);
+        } else if (e.reason == VMM_EXIT_REASON_INTR) {
+            /* The run was broken to inject an interrupt, or an interrupt
+             * window opened. Nothing to service; run again. */
+            continue;
         } else if (e.reason == VMM_EXIT_REASON_HLT) {
             pthread_mutex_lock(&dev_lock);
             printf("\n[vcpu %d halted]\n", c->index);
@@ -199,7 +211,47 @@ run_vcpu(void *arg)
         }
     }
 
+    __atomic_store_n(&c->live, 0, __ATOMIC_SEQ_CST);
     vmm_vcpu_destroy(vcpu);
+    return NULL;
+}
+
+/* An empty handler so a signal breaks a vcpu out of its run with EINTR rather
+ * than terminating the process. */
+static void
+sig_noop(int sig)
+{
+    (void)sig;
+}
+
+/* Timer thread: tick at the configured rate and preempt each running vcpu by
+ * queuing the event interrupt and signalling the thread out of its run. */
+struct timer_ctx {
+    pthread_t *threads;
+    struct vcpu_ctx *ctx;
+    int n;
+    unsigned hz;
+    volatile int stop;
+};
+
+static void *
+run_timer(void *arg)
+{
+    struct timer_ctx *t = arg;
+    struct timespec period = {
+        .tv_sec = 0,
+        .tv_nsec = 1000000000L / (long)t->hz,
+    };
+
+    while (!__atomic_load_n(&t->stop, __ATOMIC_SEQ_CST)) {
+        nanosleep(&period, NULL);
+        for (int i = 0; i < t->n; i++) {
+            if (!__atomic_load_n(&t->ctx[i].live, __ATOMIC_SEQ_CST))
+                continue;
+            vmm_vcpu_interrupt(t->ctx[i].vcpu, JOTUN_EVENT_VECTOR);
+            pthread_kill(t->threads[i], SIGUSR1);
+        }
+    }
     return NULL;
 }
 
@@ -309,6 +361,18 @@ main(int argc, char **argv)
         p9srv_init(&p9, p9mem_backend(), NULL);
     }
 
+    /* A preemption timer is opt-in: JOTUN_HZ ticks per second. The signal
+     * handler lets a tick break a running vcpu out of its run. */
+    unsigned hz = 0;
+    const char *hz_env = getenv("JOTUN_HZ");
+    if (hz_env)
+        hz = (unsigned)strtoul(hz_env, NULL, 0);
+    if (hz > 0) {
+        struct sigaction sa = { 0 };
+        sa.sa_handler = sig_noop;        /* no SA_RESTART: KVM_RUN returns EINTR */
+        sigaction(SIGUSR1, &sa, NULL);
+    }
+
     pthread_t threads[MAX_VCPUS];
     struct vcpu_ctx ctx[MAX_VCPUS];
     for (int i = 0; i < nvcpus; i++) {
@@ -317,6 +381,8 @@ main(int argc, char **argv)
         ctx[i].entry = img.entry;
         ctx[i].sp = GUEST_RAM_SIZE - (uint64_t)i * STACK_SLOT - 16;
         ctx[i].rc = 0;
+        ctx[i].vcpu = NULL;
+        ctx[i].live = 0;
         if (pthread_create(&threads[i], NULL, run_vcpu, &ctx[i]) != 0) {
             fprintf(stderr, "Failed to start vcpu %d thread\n", i);
             ctx[i].rc = 1;
@@ -324,11 +390,21 @@ main(int argc, char **argv)
         }
     }
 
+    pthread_t timer_thread = 0;
+    struct timer_ctx tctx = { threads, ctx, nvcpus, hz, 0 };
+    if (hz > 0)
+        pthread_create(&timer_thread, NULL, run_timer, &tctx);
+
     int rc = 0;
     for (int i = 0; i < nvcpus; i++) {
         if (threads[i])
             pthread_join(threads[i], NULL);
         rc |= ctx[i].rc;
+    }
+
+    if (timer_thread) {
+        __atomic_store_n(&tctx.stop, 1, __ATOMIC_SEQ_CST);
+        pthread_join(timer_thread, NULL);
     }
 
     vmm_vm_destroy(vm);

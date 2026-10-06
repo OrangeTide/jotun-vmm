@@ -205,7 +205,7 @@ host passes init parameters through the boot-info block; `jsh` does directory
 and file reads over the mounted bundle and spawns one of the bundled programs
 by name.
 
-## M4: preemption and SMP
+## M4: preemption and SMP (in progress)
 
 Goal: multiple cores, preemptive scheduling, and threads.
 
@@ -218,10 +218,34 @@ Goal: multiple cores, preemptive scheduling, and threads.
 Acceptance: two CPU-bound tasks are preempted and balanced across two vcpus, and
 a thread test passes.
 
+Spike decision (made): to preempt a running, possibly spinning, guest, a host
+timer thread (opt-in, `JOTUN_HZ`) sets a per-vcpu pending flag and signals the
+vcpu thread (`SIGUSR1`) so `KVM_RUN` returns `EINTR`. On x86 KVM with no
+in-kernel irqchip, the backend then injects with `KVM_INTERRUPT` when
+`ready_for_interrupt_injection`, else sets `request_interrupt_window` and
+retries on `KVM_EXIT_IRQ_WINDOW_OPEN`. The event vector is fixed
+(`JOTUN_EVENT_VECTOR`, 0x20). The guest installs a GDT (so the interrupt path
+can reload CS/SS), an IDT gate, and a full-register ISR; `ctx_switch` now
+saves and restores RFLAGS so the interrupt-enable bit travels with each
+context, and scheduler-critical regions mask interrupts. The ISR reschedules
+through the existing cooperative switch, so preemption and cooperative yield
+share one path.
+
+Progress (M4.1, x86): single-vcpu preemption works and is verified. With
+`JOTUN_HZ=100`, two CPU-bound tasks that never yield interleave; without the
+timer one runs to completion before the other. Remaining: SMP (a second vcpu,
+a guest-visible vcpu id, cross-vcpu scheduling with a shared run queue, a
+cross-vcpu wakeup event, and a thread test).
+
+Scope: injection is implemented and tested on x86 KVM only. KVM arm64 (no
+vGIC) and HVF IRQ injection need hardware to validate, so the arm64 guest keeps
+the cooperative path (it runs at EL1 with IRQs masked); the HVF backend sets
+the pending IRQ by analogy with KVM but is unverified. The arm64 trap vector
+(`VBAR_EL1`) is installed when that work lands.
+
 Risk: interrupt injection without an emulated controller differs per backend
 (KVM x86 without an in-kernel irqchip, KVM arm64 without a vGIC, and HVF IRQ
-injection). Budget a short research spike here. It is the least certain
-mechanism in the design.
+injection). It is the least certain mechanism in the design.
 
 ## M5: networking
 
