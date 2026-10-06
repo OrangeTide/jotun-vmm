@@ -243,11 +243,21 @@ downloading only the objects it lacks and verifying each against its hash
 from a URL, and it is deferred to its own later milestone; the first cut uses a
 local packfile.
 
-Optionally, and in a later stage, the same bundle can also carry the bootable
-unikernel ELF as one more object in the tree, resolved by a well-known path.
-The host lifts that image out to boot the guest, then serves the rest as the
-filesystem, so one file packages the kernel and its filesystem together. This
-is not needed for the first cut.
+The same bundle also carries the bootable unikernel ELF as one more object in
+the tree, at the well-known path boot/kernel. The host lifts that image out to
+boot the guest, then serves the rest as the filesystem, so one signed object set
+packages the kernel and its filesystem together.
+
+One image can span several CPU architectures. Image identity is a small text
+object in the store, a jimage manifest, that names a root tree hash per arch;
+the object's own hash is what gets distributed. The host selects the row for its
+own arch, serves that root, and lifts boot/kernel from it. Because each arch
+root is an independent tree in a content-addressed store, arch-neutral files and
+whole identical subtrees are shared across arches, so a multi-arch image costs
+little more than the arch-specific binaries, and migrating between arches
+transfers only the objects that are missing. A ref may point at a jimage object
+or at a plain root tree, and the jimage object can be pinned by hash for an
+immutable snapshot. The format and the builder are in doc/jimage-format.md.
 
 The manifest ties these together. One manifest, read by the host at launch,
 names the bundle, the subtree within it the guest may see, the init program and

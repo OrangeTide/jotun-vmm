@@ -825,13 +825,44 @@ Sub-milestones:
 Suggested order: M10.0 first (unblocks the rest), then M10.1 and M10.2 together
 (shared id plumbing), then M10.3 and M10.4.
 
-## M11: single-file packaging
+## M11: single-file packaging (done)
 
 Goal: one artifact that carries both the bootable unikernel ELF and its
-filesystem, docker-image style. The bundle also holds the kernel ELF; the host
-lifts it out to boot the guest and serves the rest as the 9P filesystem, so a
+filesystem, docker-image style, and that spans several CPU architectures. A
 pull delivers a complete, signed, bootable image in one object set. Depends on
 M3 and M8.
+
+What landed: image identity is a small typed CAS object, a jimage manifest,
+that names a root tree hash per architecture. The object's own hash is the
+distributable image id. Each arch root is an independent tree, so in the
+content-addressed store arch-neutral files and whole identical subtrees are
+shared across arches, and migrating between arches, or between a single-arch
+and a multi-arch image, only transfers the objects that are missing.
+
+- Host read path. `p9smolvfs_open` takes an arch token (uname-style `x86_64` /
+  `aarch64`, fixed at build time from `__x86_64__` / `__aarch64__`, since KVM
+  and HVF both run the host CPU). When the resolved ref or pinned hash names a
+  jimage object it selects the matching arch row and serves that root; an
+  ordinary tree root is served directly as before (so existing bundles are
+  unchanged). The kernel is lifted from `boot/kernel` inside the served root;
+  `elf_load_mem` loads it from memory. A command-line kernel still overrides for
+  development, and the historical `test_guest.elf` default still boots a bare
+  run. A pinned jimage hash composes with M10.4, giving an immutable image
+  snapshot.
+- jimage format. An RFC 822 / deb822 style text object: a magic line `jimage
+  <version>`, then `key value` fields where a line beginning with whitespace
+  folds onto the previous field (so a `note` may span lines), blank lines are
+  ignored, and unknown keys are skipped for forward growth. The host reads only
+  the version line and the `arch <token> <root-hash>` rows; `name`, `version`,
+  `upstream`, and `note` are informational. See `doc/jimage-format.md`.
+- Build path. `jbundle` mirrors a staging directory per arch into the depot
+  (preserving nested directories, so `boot/kernel` lands where the host looks),
+  then writes the jimage object and commits the ref. Entry uid/gid/mtime are
+  zeroed so the same inputs always hash the same way. `make bundle` builds a
+  multi-arch image by default: the native arch reuses the tested `libos.elf` /
+  `hello.elf`, and every other arch is cross-built with clang and lld.
+  `BUNDLE_ARCHS` selects which arches go in; set it to this host's arch for a
+  single-arch image that needs no cross toolchain.
 
 ## M12: snapshot and restore
 
