@@ -92,6 +92,17 @@ endif
 
 TARGET = jotun
 
+# Canonical guest arch token (uname-style, matching the host's JOTUN_ARCH),
+# normalising Darwin's arm64 to aarch64. This is the arch this box builds
+# natively; other arches in an image are cross-built below.
+ifeq ($(OS),Darwin)
+GUEST_ARCH := aarch64
+else ifeq ($(ARCH),x86_64)
+GUEST_ARCH := x86_64
+else
+GUEST_ARCH := aarch64
+endif
+
 # Bundled programs are standalone ELFs whose image lies within the program
 # region that begins at JOTUN_PROG_BASE (0x400000, abi/jotun_svc.h). The linker
 # puts the ELF headers one page below -Ttext, so text goes at base + one page,
@@ -118,10 +129,11 @@ echo.elf: guest/echo.c
 
 # The library OS is multiple translation units: the portable core plus the
 # selected arch file. It needs its own include path and links all objects.
-LIBOS_SRC = guest/libos/main.c guest/libos/mem.c guest/libos/task.c \
+LIBOS_SRC_COMMON = guest/libos/main.c guest/libos/mem.c guest/libos/task.c \
     guest/libos/boot.c guest/libos/p9.c guest/libos/elfload.c \
     guest/libos/prog.c guest/libos/jsh.c guest/libos/ns.c guest/libos/net.c \
-    guest/libos/draw.c guest/libos/string.c guest/libos/fmt.c $(LIBOS_ARCH)
+    guest/libos/draw.c guest/libos/string.c guest/libos/fmt.c
+LIBOS_SRC = $(LIBOS_SRC_COMMON) $(LIBOS_ARCH)
 
 # triton.c is the only guest translation unit built with the FPU enabled: it is
 # the software rasterizer and uses floating point. The rest of the guest stays
@@ -186,12 +198,90 @@ castool: $(CASTOOL_SRC)
 jbundle: host/jbundle.c $(SMOLVFS_SRC)
 	$(CC) $(CFLAGS) -o $@ $^
 
-bundle: $(PROGS) castool
+# Multi-arch image build. The native arch reuses the tested libos.elf/hello.elf;
+# every other arch is cross-built with clang + lld to a freestanding ELF. The
+# per-arch guest flags are self-contained here, independent of the native
+# single-arch GUEST_CFLAGS above. BUNDLE_ARCHS selects which arches go into the
+# image; the default is all supported arches, so a plain `make bundle` produces
+# a multi-arch image (which needs clang + lld for the non-native arch; set
+# BUNDLE_ARCHS to this host's arch to build a single-arch image with no cross
+# toolchain).
+BUNDLE_ARCHS ?= x86_64 aarch64
+
+GUEST_BASE = -ffreestanding -fno-pic -fno-pie -nostdlib -fno-builtin -Iabi \
+    -fno-asynchronous-unwind-tables -mgeneral-regs-only \
+    -Wl,-e_start -Wl,--build-id=none
+GUEST_BASE_FP = $(filter-out -mgeneral-regs-only,$(GUEST_BASE))
+GUEST_BASE_OBJ = $(filter-out -Wl%,$(GUEST_BASE)) -ffunction-sections \
+    -fdata-sections
+
+CROSSCC_x86_64  ?= clang --target=x86_64-unknown-none-elf -fuse-ld=lld
+CROSSCC_aarch64 ?= clang --target=aarch64-unknown-none-elf -fuse-ld=lld
+TEXT_x86_64  := 0x100000
+TEXT_aarch64 := 0x200000
+AFLAGS_x86_64  :=
+AFLAGS_aarch64 := -mno-outline-atomics
+ASRC_x86_64  := guest/libos/arch/x86_64.c guest/libos/arch/x86_64_ctx.S \
+    guest/libos/arch/x86_64_isr.S guest/libos/arch/x86_64_boot.S
+ASRC_aarch64 := guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
+    guest/libos/arch/arm64_boot.S
+
+# Generate the cross-build rules for one arch: the kernel (libos) and the hello
+# program, under build/img/<arch>/. Used only for arches other than this host's.
+define IMG_ARCH_template
+build/img/$(1):
+	mkdir -p build/img/$(1)
+build/img/$(1)/triton.o: guest/libos/triton.c guest/libos/triton.h | build/img/$(1)
+	$(2) $$(GUEST_BASE_FP) $(4) -Iguest/libos -c -o $$@ $$<
+build/img/$(1)/kernel: $$(LIBOS_SRC_COMMON) $(5) build/img/$(1)/triton.o | build/img/$(1)
+	$(2) $$(GUEST_BASE) $(4) -Iguest/libos -Wl,-Ttext=$(3) -o $$@ \
+	    $$(LIBOS_SRC_COMMON) $(5) build/img/$(1)/triton.o
+build/img/$(1)/libc_fmt.o: guest/libos/fmt.c | build/img/$(1)
+	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
+build/img/$(1)/libc_string.o: guest/libos/string.c | build/img/$(1)
+	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
+build/img/$(1)/libc_io.o: guest/prog/libc/progio.c | build/img/$(1)
+	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
+build/img/$(1)/libc_stdlib.o: guest/prog/libc/progstdlib.c | build/img/$(1)
+	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
+build/img/$(1)/hello: guest/prog/hello.c build/img/$(1)/libc_fmt.o \
+    build/img/$(1)/libc_string.o build/img/$(1)/libc_io.o \
+    build/img/$(1)/libc_stdlib.o | build/img/$(1)
+	$(2) $$(GUEST_BASE) $(4) -Wl,--gc-sections $$(PROG_INC) \
+	    -Wl,-Ttext=$$(PROG_TEXT) -o $$@ guest/prog/hello.c \
+	    build/img/$(1)/libc_fmt.o build/img/$(1)/libc_string.o \
+	    build/img/$(1)/libc_io.o build/img/$(1)/libc_stdlib.o
+endef
+
+NONNATIVE_ARCHS := $(filter-out $(GUEST_ARCH),x86_64 aarch64)
+$(foreach a,$(NONNATIVE_ARCHS),$(eval $(call IMG_ARCH_template,$(a),$(CROSSCC_$(a)),$(TEXT_$(a)),$(AFLAGS_$(a)),$(ASRC_$(a)))))
+
+# The kernel and program for one arch: the native arch reuses the top-level
+# build, every other arch comes from its cross-build directory.
+img_kernel = $(if $(filter $(1),$(GUEST_ARCH)),libos.elf,build/img/$(1)/kernel)
+img_prog   = $(if $(filter $(1),$(GUEST_ARCH)),hello.elf,build/img/$(1)/hello)
+BUNDLE_DEPS = $(foreach a,$(BUNDLE_ARCHS),$(call img_kernel,$(a)) $(call img_prog,$(a)))
+
+# Assemble a per-arch staging tree (the shared files plus boot/kernel and the
+# program for that arch) and build one multi-arch image from it with jbundle.
+bundle: castool jbundle $(BUNDLE_DEPS)
 	rm -rf $(BUNDLE_DEPOT) bundle-staging
-	mkdir bundle-staging
-	cp example/bundle/* bundle-staging/
-	cp hello.elf bundle-staging/hello
-	./castool -d $(BUNDLE_DEPOT) import root bundle-staging/*
+	@args=""; \
+	for a in $(BUNDLE_ARCHS); do \
+	    d=bundle-staging/$$a; \
+	    mkdir -p $$d/boot; \
+	    cp example/bundle/* $$d/; \
+	    if [ "$$a" = "$(GUEST_ARCH)" ]; then \
+	        k=libos.elf; p=hello.elf; \
+	    else \
+	        k=build/img/$$a/kernel; p=build/img/$$a/hello; \
+	    fi; \
+	    cp $$k $$d/boot/kernel; \
+	    cp $$p $$d/hello; \
+	    args="$$args --arch $$a=$$d"; \
+	    echo "bundle: staged $$a from $$k"; \
+	done; \
+	./jbundle -d $(BUNDLE_DEPOT) --ref root --name jotun-demo $$args
 	./castool -d $(BUNDLE_DEPOT) pack
 
 # macsyntax: syntax-check the macOS-only net path from a Linux dev box, so the
@@ -208,6 +298,6 @@ macsyntax:
 
 clean:
 	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool jbundle
-	rm -rf $(BUNDLE_DEPOT) bundle-staging build
+	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
 .PHONY: all clean bundle macsyntax
