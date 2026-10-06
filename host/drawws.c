@@ -23,10 +23,13 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
-#define WS_GUID    "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-#define WS_INMAX   8192        /* largest inbound (event) frame we accept */
+#define WS_GUID     "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+#define WS_MAXFRAME 16384      /* largest inbound frame accepted (events are tiny) */
+#define WS_RBUF     (WS_MAXFRAME + 16)  /* input buffer: one max frame plus a header */
+#define WS_EVRATE   200        /* inbound events per second before extras are dropped */
 
 struct drawws {
     int listen_fd;
@@ -39,6 +42,16 @@ struct drawws {
     volatile int stop;
     drawws_event_fn on_event;
     void *ctx;
+
+    /* Inbound framing: bytes from the browser accumulate here and are parsed a
+     * whole frame at a time. The browser is not trusted, so every field is
+     * bounds-checked against what has actually arrived. */
+    uint8_t rbuf[WS_RBUF];
+    size_t rlen;
+
+    /* Event rate limit, a one-second sliding window. */
+    long ev_sec;
+    int ev_count;
 };
 
 /****************************************************************
@@ -134,19 +147,6 @@ base64_encode(const uint8_t *in, int len, char *out)
  ****************************************************************/
 
 static int
-read_all(int fd, void *buf, int n)
-{
-    int got = 0;
-    while (got < n) {
-        int r = (int)read(fd, (uint8_t *)buf + got, (size_t)(n - got));
-        if (r <= 0)
-            return -1;
-        got += r;
-    }
-    return got;
-}
-
-static int
 write_all(int fd, const void *buf, size_t n)
 {
     size_t sent = 0;
@@ -157,42 +157,6 @@ write_all(int fd, const void *buf, size_t n)
         sent += (size_t)w;
     }
     return 0;
-}
-
-/* Read one WebSocket frame into payload. Returns payload length or -1. */
-static int
-ws_read(int fd, uint8_t *payload, int max, int *opcode)
-{
-    uint8_t hdr[2];
-    if (read_all(fd, hdr, 2) < 0)
-        return -1;
-    *opcode = hdr[0] & 0x0f;
-    int masked = (hdr[1] & 0x80) != 0;
-    uint64_t len = hdr[1] & 0x7f;
-    if (len == 126) {
-        uint8_t ext[2];
-        if (read_all(fd, ext, 2) < 0)
-            return -1;
-        len = (uint16_t)ext[0] << 8 | ext[1];
-    } else if (len == 127) {
-        uint8_t ext[8];
-        if (read_all(fd, ext, 8) < 0)
-            return -1;
-        len = 0;
-        for (int i = 0; i < 8; i++)
-            len = (len << 8) | ext[i];
-    }
-    if (len > (uint64_t)max)
-        return -1;
-    uint8_t mask[4] = { 0 };
-    if (masked && read_all(fd, mask, 4) < 0)
-        return -1;
-    if (len && read_all(fd, payload, (int)len) < 0)
-        return -1;
-    if (masked)
-        for (uint64_t i = 0; i < len; i++)
-            payload[i] ^= mask[i % 4];
-    return (int)len;
 }
 
 /* Write one unmasked text frame (server to client). */
@@ -364,6 +328,7 @@ ws_close(struct drawws *w)
         close(w->ws_fd);
         w->ws_fd = -1;
     }
+    w->rlen = 0;                /* next connection starts with a clean buffer */
 }
 
 /* Send the stored latest scene to the browser, clearing the dirty flag. */
@@ -383,10 +348,10 @@ send_latest(struct drawws *w)
 }
 
 static void
-set_rcvtimeo(int fd, int secs)
+set_timeo(int fd, int opt, int secs)
 {
     struct timeval tv = { .tv_sec = secs, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, opt, &tv, sizeof tv);
 }
 
 /* Handle an accepted TCP connection: serve the page or complete the upgrade.
@@ -398,7 +363,7 @@ accept_conn(struct drawws *w)
     int cfd = accept(w->listen_fd, NULL, NULL);
     if (cfd < 0)
         return;
-    set_rcvtimeo(cfd, 3);
+    set_timeo(cfd, SO_RCVTIMEO, 3);
 
     char req[4096];
     if (read_request(cfd, req, sizeof req) < 0) {
@@ -411,7 +376,8 @@ accept_conn(struct drawws *w)
             close(cfd);
             return;
         }
-        set_rcvtimeo(cfd, 0);   /* an upgraded browser may idle indefinitely */
+        set_timeo(cfd, SO_RCVTIMEO, 0);     /* an upgraded browser may idle */
+        set_timeo(cfd, SO_SNDTIMEO, 5);     /* but a stuck write must not wedge us */
         ws_close(w);            /* one browser at a time: replace the old */
         w->ws_fd = cfd;
         send_latest(w);         /* first paint */
@@ -446,22 +412,103 @@ dispatch_event(struct drawws *w, uint8_t *payload, int plen)
         w->on_event(w->ctx, node, (uint16_t)type, value, vlen);
 }
 
+/* Admit an event under the one-second rate window. Returns 1 to proceed, 0 to
+ * drop. Protects the guest and this thread from an event flood. */
+static int
+rate_ok(struct drawws *w)
+{
+    long now = (long)time(NULL);
+    if (now != w->ev_sec) {
+        w->ev_sec = now;
+        w->ev_count = 0;
+    }
+    return ++w->ev_count <= WS_EVRATE;
+}
+
+/* Parse and dispatch every complete frame in rbuf. The browser is untrusted, so
+ * each frame is validated before any byte of its payload is read: reserved bits
+ * must be clear, a client frame must be masked, a control frame must be final
+ * and at most 125 bytes, and the payload length must fit the frame cap and be
+ * fully present. Returns 0 to keep the connection, -1 to drop it. */
+static int
+ws_consume(struct drawws *w)
+{
+    for (;;) {
+        if (w->rlen < 2)
+            return 0;
+        uint8_t *b = w->rbuf;
+        uint8_t b0 = b[0], b1 = b[1];
+        if (b0 & 0x70)                      /* reserved bits must be clear */
+            return -1;
+        int fin = b0 & 0x80;
+        int op = b0 & 0x0f;
+        int masked = b1 & 0x80;
+        uint64_t len = b1 & 0x7f;
+        size_t hdr = 2;
+
+        if (len == 126) {
+            if (w->rlen < 4)
+                return 0;
+            len = (uint64_t)b[2] << 8 | b[3];
+            hdr = 4;
+        } else if (len == 127) {
+            if (w->rlen < 10)
+                return 0;
+            len = 0;
+            for (int i = 0; i < 8; i++)
+                len = len << 8 | b[2 + i];
+            hdr = 10;
+        }
+        if (!masked)                        /* client frames must be masked */
+            return -1;
+        if (op >= 0x8 && (!fin || len > 125))   /* control frame rules */
+            return -1;
+        if (len > WS_MAXFRAME)
+            return -1;
+
+        size_t total = hdr + 4 + len;       /* + 4-byte mask */
+        if (w->rlen < total)
+            return 0;                        /* wait for the rest */
+
+        uint8_t *mask = b + hdr;
+        uint8_t *pay = mask + 4;
+        for (uint64_t i = 0; i < len; i++)
+            pay[i] ^= mask[i % 4];
+
+        if (op == 0x8) {                    /* close */
+            return -1;
+        } else if (op == 0x9) {             /* ping */
+            ws_pong(w->ws_fd, pay, (int)len);
+        } else if (op == 0x1 && len > 0) {  /* text: an event */
+            if (rate_ok(w))
+                dispatch_event(w, pay, (int)len);
+        }
+        /* 0x0 continuation, 0xA pong, and anything else are ignored. */
+
+        memmove(w->rbuf, w->rbuf + total, w->rlen - total);
+        w->rlen -= total;
+    }
+}
+
+/* Drain what the browser has sent into the frame buffer, then parse. Reads once
+ * per readiness (poll already said the socket is readable), so this never
+ * blocks. A buffer that fills without yielding a frame means an over-long frame,
+ * and the connection is dropped. */
 static void
 handle_ws_in(struct drawws *w)
 {
-    uint8_t payload[WS_INMAX];
-    int opcode;
-    int plen = ws_read(w->ws_fd, payload, sizeof payload, &opcode);
-    if (plen < 0 || opcode == 0x8) {    /* error or close */
+    if (w->rlen >= sizeof w->rbuf) {        /* no room and still no frame */
         ws_close(w);
         return;
     }
-    if (opcode == 0x9) {                /* ping */
-        ws_pong(w->ws_fd, payload, plen);
+    ssize_t r = read(w->ws_fd, w->rbuf + w->rlen, sizeof w->rbuf - w->rlen);
+    if (r <= 0) {                           /* peer closed or error */
+        ws_close(w);
         return;
     }
-    if (opcode == 0x1 && plen > 0)      /* text */
-        dispatch_event(w, payload, plen);
+    w->rlen += (size_t)r;
+    if (ws_consume(w) < 0)
+        ws_close(w);
 }
 
 static void *
