@@ -1,12 +1,21 @@
 # Makefile
 # smolvfs provides the bundle store the host 9P server reads from. Its sources
 # are vendored in-tree under third_party/smolvfs (no external checkout); the
-# host compiles the read-path sources directly.
+# host compiles them directly. The read path backs the 9P server; the sign path
+# (cas-sign/cas-topic with the bundled monocypher EdDSA-BLAKE2b backend) verifies
+# pulled refs for M8; the miniz codec reads DEFLATE-compressed objects.
 SMOLVFS_DIR = third_party/smolvfs
-SMOLVFS_SRC = $(SMOLVFS_DIR)/cas.c $(SMOLVFS_DIR)/cas-tree.c \
+SMOLVFS_READ = $(SMOLVFS_DIR)/cas.c $(SMOLVFS_DIR)/cas-tree.c \
     $(SMOLVFS_DIR)/cas-pack.c $(SMOLVFS_DIR)/cas-codec.c
+SMOLVFS_SIGN = $(SMOLVFS_DIR)/cas-sign.c $(SMOLVFS_DIR)/cas-topic.c \
+    $(SMOLVFS_DIR)/cas-sign-monocypher.c $(SMOLVFS_DIR)/third_party/monocypher.c
+SMOLVFS_CODEC = $(SMOLVFS_DIR)/cas-codec-miniz.c $(SMOLVFS_DIR)/third_party/miniz.c
+SMOLVFS_SRC = $(SMOLVFS_READ) $(SMOLVFS_SIGN) $(SMOLVFS_CODEC)
 
-CFLAGS = -Wall -Wextra -std=c11 -pthread -Iabi -I$(SMOLVFS_DIR)
+# The vendored crypto and codec select their backends at compile time.
+SMOLVFS_DEFS = -DCAS_WITH_MONOCYPHER -DCAS_WITH_MINIZ -DMINIZ_NO_STDIO
+
+CFLAGS = -Wall -Wextra -std=c11 -pthread -Iabi -I$(SMOLVFS_DIR) $(SMOLVFS_DEFS)
 LDFLAGS =
 ifeq ($(OS),)
     OS := $(shell uname -s)
@@ -32,7 +41,7 @@ ifeq ($(OS), Darwin)
     CFLAGS += -D__APPLE__
     LDFLAGS += -framework Hypervisor
     SRC = host/vmm_hvf.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c \
-        host/p9smolvfs.c host/p9overlay.c host/manifest.c host/net.c host/draw.c host/drawws.c host/png.c host/main.c $(SMOLVFS_SRC)
+        host/p9smolvfs.c host/p9overlay.c host/manifest.c host/net.c host/draw.c host/drawws.c host/png.c host/http.c host/bundlepull.c host/main.c $(SMOLVFS_SRC)
     CC = clang
     GUEST = test_guest.elf echo.elf libos.elf
     GUEST_SRC = guest/test_guest_arm64.c
@@ -49,7 +58,7 @@ ifeq ($(OS), Darwin)
 else
     CFLAGS += -D__linux__
     SRC = host/vmm_kvm.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c \
-        host/p9smolvfs.c host/p9overlay.c host/manifest.c host/net.c host/draw.c host/drawws.c host/png.c host/main.c $(SMOLVFS_SRC)
+        host/p9smolvfs.c host/p9overlay.c host/manifest.c host/net.c host/draw.c host/drawws.c host/png.c host/http.c host/bundlepull.c host/main.c $(SMOLVFS_SRC)
     CC = gcc
     GUEST_CFLAGS += -no-pie
     ifeq ($(ARCH), x86_64)
@@ -133,11 +142,11 @@ hello.elf: guest/prog/hello.c
 # JOTUN_BUNDLE=bundle-depot ./jotun libos.elf. castool is built from the
 # vendored smolvfs sources (no external checkout). Signing is not enabled here;
 # the ref-signing path arrives with M8.
-CASTOOL_SRC = $(SMOLVFS_DIR)/castool.c $(SMOLVFS_DIR)/cas-topic.c \
-    $(SMOLVFS_DIR)/cas-sign.c $(SMOLVFS_DIR)/cas-tree.c $(SMOLVFS_DIR)/cas-gc.c \
-    $(SMOLVFS_DIR)/cas-pack.c $(SMOLVFS_DIR)/cas.c $(SMOLVFS_DIR)/cas-codec.c
+CASTOOL_SRC = $(SMOLVFS_DIR)/castool.c $(SMOLVFS_DIR)/cas-gc.c $(SMOLVFS_SRC)
 BUNDLE_DEPOT = bundle-depot
 
+# castool builds with the same backends as the host, so it can sign refs
+# (keygen/publish) and write compressed packs.
 castool: $(CASTOOL_SRC)
 	$(CC) $(CFLAGS) -o $@ $^
 
