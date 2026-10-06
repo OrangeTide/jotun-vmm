@@ -8,6 +8,7 @@
  * Later M2 steps add the scheduler and context switch; for now _start is the
  * whole of the init task. */
 #include "arch.h"
+#include "boot.h"
 #include "mem.h"
 #include "print.h"
 #include "task.h"
@@ -98,11 +99,35 @@ init_task(void)
     con_puts("init: done\n");
 }
 
+/* Report the host-supplied boot parameters: RAM size and the argument vector,
+ * with argv[0] the init program. */
+static void
+show_boot_params(void)
+{
+    if (boot_init() != 0) {
+        con_puts("boot: no parameter block\n");
+        return;
+    }
+    con_puts("boot: ram ");
+    con_putu(boot_ram_size());
+    con_puts(" bytes, argc ");
+    con_putu((uint64_t)boot_argc());
+    con_putc('\n');
+    for (int i = 0; i < boot_argc(); i++) {
+        con_puts("  argv[");
+        con_putu((uint64_t)i);
+        con_puts("] = ");
+        con_puts(boot_argv(i));
+        con_putc('\n');
+    }
+}
+
 void
 _start(void)
 {
     con_puts("libos up\n");
     heap_selftest();
+    show_boot_params();
 
     task_spawn("init", init_task);
     sched_start();

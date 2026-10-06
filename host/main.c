@@ -9,6 +9,7 @@
 #include "elf.h"
 #include "uart.h"
 #include "jotun_abi.h"
+#include "jotun_boot.h"
 
 /* Guest physical RAM mapped at address 0. 8 MiB is ample for the test guest
  * plus per-vcpu stacks. */
@@ -49,6 +50,35 @@ gpa_to_host(uint64_t gpa, uint64_t len)
     if (gpa > gm.size || len > gm.size - gpa)
         return NULL;
     return gm.base + gpa;
+}
+
+/* Write the boot parameter block into guest RAM before the vcpu starts. The
+ * guest argv is whatever follows the kernel image on the command line, with
+ * argv[0] the init program. */
+static void
+setup_bootinfo(int gargc, char **gargv)
+{
+    struct jotun_bootinfo *b = gpa_to_host(JOTUN_BOOT_BASE, sizeof(*b));
+    if (!b)
+        return;
+
+    memset(b, 0, sizeof(*b));
+    b->magic = JOTUN_BOOT_MAGIC;
+    b->version = JOTUN_BOOT_VERSION;
+    b->ram_size = gm.size;
+
+    uint32_t off = 0;
+    int n = 0;
+    for (int i = 0; i < gargc; i++) {
+        size_t len = strlen(gargv[i]) + 1;
+        if (off + len > JOTUN_BOOT_BLOB_MAX)
+            break;
+        memcpy(&b->blob[off], gargv[i], len);
+        off += (uint32_t)len;
+        n++;
+    }
+    b->argc = (uint32_t)n;
+    b->blob_len = off;
 }
 
 /* Doorbell handler: drain the request ring, echo each message into the
@@ -202,6 +232,11 @@ main(int argc, char **argv)
         vmm_vm_destroy(vm);
         return 1;
     }
+
+    /* Hand the guest its parameters: everything after the kernel image. */
+    int gargc = (argc > 2) ? argc - 2 : 0;
+    char **gargv = (argc > 2) ? argv + 2 : argv;
+    setup_bootinfo(gargc, gargv);
 
     uart_init(&uart);
 

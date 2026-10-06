@@ -15,6 +15,25 @@ con_puts(const char *s)
         con_putc(*s++);
 }
 
+/* Print a 64-bit value in decimal. */
+static inline void
+con_putu(uint64_t v)
+{
+    char buf[20];
+    int n = 0;
+
+    if (v == 0) {
+        con_putc('0');
+        return;
+    }
+    while (v > 0) {
+        buf[n++] = (char)('0' + (int)(v % 10));
+        v /= 10;
+    }
+    while (n > 0)
+        con_putc(buf[--n]);
+}
+
 /* Print a 64-bit value as "0x" followed by 16 hex digits. */
 static inline void
 con_puthex(uint64_t v)
