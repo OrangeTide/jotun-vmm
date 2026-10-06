@@ -147,7 +147,8 @@ struct dnode {
 
 struct drawdev {
     struct jotun_draw *chan;
-    void (*wake)(void);
+    void (*wake)(void *ctx);
+    void *wake_ctx;
     int test;
     int bench;                  /* JOTUN_DRAW_BENCH: time apply and serialize */
     const char *svg_path;       /* JOTUN_DRAW_SVG, or NULL */
@@ -1576,7 +1577,7 @@ on_ws_event(void *ctx, uint32_t node, uint16_t type, const char *value, int vlen
     enqueue(dd, node, type, value, (uint16_t)vlen);
     __atomic_store_n(&dd->chan->evt, 1, __ATOMIC_SEQ_CST);
     if (dd->wake)
-        dd->wake();
+        dd->wake(dd->wake_ctx);
 }
 
 /****************************************************************
@@ -1584,14 +1585,15 @@ on_ws_event(void *ctx, uint32_t node, uint16_t type, const char *value, int vlen
  ****************************************************************/
 
 struct drawdev *
-draw_init(struct jotun_draw *chan, void (*wake)(void), int test,
-          draw_gpa_fn gpa, void *gpa_ctx)
+draw_init(struct jotun_draw *chan, void (*wake)(void *ctx), void *wake_ctx,
+          int test, draw_gpa_fn gpa, void *gpa_ctx)
 {
     struct drawdev *dd = calloc(1, sizeof(*dd));
     if (!dd)
         return NULL;
     dd->chan = chan;
     dd->wake = wake;
+    dd->wake_ctx = wake_ctx;
     dd->test = test;
     dd->gpa = gpa;
     dd->gpa_ctx = gpa_ctx;
@@ -1685,7 +1687,7 @@ handle_submit(struct drawdev *dd, struct jotun_draw *chan)
         enqueue(dd, click_node, DEV_CLICK, NULL, 0);
         __atomic_store_n(&chan->evt, 1, __ATOMIC_SEQ_CST);
         if (dd->wake)
-            dd->wake();
+            dd->wake(dd->wake_ctx);
     }
 }
 

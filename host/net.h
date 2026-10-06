@@ -35,11 +35,12 @@ struct net_policy {
 
 /* Create the provider. chan is the guest net channel in host memory (where the
  * poll thread sets the readiness flag). wake is called from the poll thread
- * when a registered socket becomes ready; it must rouse the guest (inject the
- * event interrupt into running vcpus and wake idle ones). policy is borrowed
- * and must outlive the provider. Returns NULL on failure. */
-struct netdev *net_init(struct jotun_net *chan, void (*wake)(void),
-                        const struct net_policy *policy);
+ * when a registered socket becomes ready, with wake_ctx; it must rouse the
+ * guest that owns this provider (inject the event interrupt into running vcpus
+ * and wake idle ones). policy is borrowed and must outlive the provider.
+ * Returns NULL on failure. */
+struct netdev *net_init(struct jotun_net *chan, void (*wake)(void *ctx),
+                        void *wake_ctx, const struct net_policy *policy);
 
 /* Handle one request already written into the channel, writing the result back
  * into it. Called from the net doorbell. */

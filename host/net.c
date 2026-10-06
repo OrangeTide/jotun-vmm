@@ -62,7 +62,8 @@ struct netdev {
     pthread_mutex_t lock;   /* guards conns and the poller set */
     volatile int stop;
     struct jotun_net *chan; /* guest channel, for the readiness flag */
-    void (*wake)(void);
+    void (*wake)(void *ctx);
+    void *wake_ctx;
     const struct net_policy *policy;
 };
 
@@ -647,14 +648,14 @@ poll_loop(void *arg)
             /* Readiness is delivered generically: flag the channel and rouse
              * the guest, which re-readies and retries its parked net tasks. */
             __atomic_store_n(&nd->chan->evt, 1, __ATOMIC_SEQ_CST);
-            nd->wake();
+            nd->wake(nd->wake_ctx);
         }
     }
     return NULL;
 }
 
 struct netdev *
-net_init(struct jotun_net *chan, void (*wake)(void),
+net_init(struct jotun_net *chan, void (*wake)(void *ctx), void *wake_ctx,
          const struct net_policy *policy)
 {
     struct netdev *nd = calloc(1, sizeof(*nd));
@@ -665,6 +666,7 @@ net_init(struct jotun_net *chan, void (*wake)(void),
         nd->conns[i].fd = -1;
     nd->chan = chan;
     nd->wake = wake;
+    nd->wake_ctx = wake_ctx;
     nd->policy = policy;
     pthread_mutex_init(&nd->lock, NULL);
 

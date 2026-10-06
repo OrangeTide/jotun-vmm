@@ -19,12 +19,13 @@ struct drawdev;
  * it does not lie entirely within guest RAM. */
 typedef void *(*draw_gpa_fn)(void *ctx, uint64_t gpa, uint64_t len);
 
-/* Create the sink. chan is the guest draw channel in host memory. wake rouses
- * the guest when an input event is queued (the net provider's contract). test,
- * when nonzero, enables the self-test event source. gpa (with gpa_ctx) reads
- * image pixels from guest RAM and may be NULL to disable image nodes. Returns
- * NULL on failure. */
-struct drawdev *draw_init(struct jotun_draw *chan, void (*wake)(void), int test,
+/* Create the sink. chan is the guest draw channel in host memory. wake (with
+ * wake_ctx) rouses the guest that owns this sink when an input event is queued
+ * (the net provider's contract). test, when nonzero, enables the self-test
+ * event source. gpa (with gpa_ctx) reads image pixels from guest RAM and may be
+ * NULL to disable image nodes. Returns NULL on failure. */
+struct drawdev *draw_init(struct jotun_draw *chan, void (*wake)(void *ctx),
+                          void *wake_ctx, int test,
                           draw_gpa_fn gpa, void *gpa_ctx);
 
 /* Handle one request already written into the channel, writing the result

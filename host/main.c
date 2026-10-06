@@ -109,21 +109,25 @@ vcpu_idle_wait(struct vcpu_ctx *c)
     pthread_mutex_unlock(&c->idle_m);
 }
 
-/* Rouse every vcpu for a device event: inject the event interrupt into running
- * vcpus (breaking their run so the guest ISR fires) and wake any that are idle
- * (so they leave the idle rendezvous and recheck). The net poll thread calls
- * this when a socket a guest task waits on becomes ready, and the draw sink
- * when an input event is queued. */
+/* Rouse every vcpu of one guest for a device event: inject the event interrupt
+ * into its running vcpus (breaking their run so the guest ISR fires) and wake
+ * any that are idle (so they leave the idle rendezvous and recheck). The net
+ * poll thread calls this (with the owning guest as ctx) when a socket a guest
+ * task waits on becomes ready, and the draw sink when an input event is queued.
+ * Only this guest's vcpus are touched, so one guest's device traffic never
+ * disturbs another. */
 static void
-rouse_vcpus(void)
+rouse_vcpus(void *ctx)
 {
-    for (int i = 0; i < g.nvcpus; i++) {
-        if (__atomic_load_n(&g.ctx[i].live, __ATOMIC_SEQ_CST)) {
-            vmm_vcpu_interrupt(g.ctx[i].vcpu, JOTUN_EVENT_VECTOR);
-            if (g.threads[i])
-                pthread_kill(g.threads[i], SIGUSR1);
+    struct guest *gp = ctx;
+
+    for (int i = 0; i < gp->nvcpus; i++) {
+        if (__atomic_load_n(&gp->ctx[i].live, __ATOMIC_SEQ_CST)) {
+            vmm_vcpu_interrupt(gp->ctx[i].vcpu, JOTUN_EVENT_VECTOR);
+            if (gp->threads[i])
+                pthread_kill(gp->threads[i], SIGUSR1);
         }
-        vcpu_wake(&g.ctx[i]);
+        vcpu_wake(&gp->ctx[i]);
     }
 }
 
@@ -537,7 +541,7 @@ main(int argc, char **argv)
      * socket becomes ready. It is created before the 9P server so the /net
      * overlay can read its live connections. */
     struct jotun_net *netchan = gpa_to_host(&g, JOTUN_NET_BASE, sizeof(*netchan));
-    g.netdev = netchan ? net_init(netchan, rouse_vcpus, &g.policy) : NULL;
+    g.netdev = netchan ? net_init(netchan, rouse_vcpus, &g, &g.policy) : NULL;
 
     /* The draw sink shares the guest draw channel and rouses vcpus when an
      * input event is queued. JOTUN_DRAW_TEST turns on the self-test event
@@ -545,7 +549,7 @@ main(int argc, char **argv)
     int draw_test = getenv("JOTUN_DRAW_TEST") != NULL;
     struct jotun_draw *drawchan = gpa_to_host(&g, JOTUN_DRAW_BASE, sizeof(*drawchan));
     g.drawdev = drawchan
-        ? draw_init(drawchan, rouse_vcpus, draw_test, draw_gpa, &g) : NULL;
+        ? draw_init(drawchan, rouse_vcpus, &g, draw_test, draw_gpa, &g) : NULL;
 
     /* If a signed origin is named, pull the bundle into a local cache depot and
      * serve that, exactly as a local depot. A pull failure refuses the boot:
