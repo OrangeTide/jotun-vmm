@@ -460,6 +460,40 @@ Acceptance: `jotun` pulls a bundle from a URL, fetching only the missing
 objects, verifies the signed ref against a trusted key, and boots a guest from
 it; a bundle whose ref signature is missing or wrong is refused.
 
+## M9: guest libc-lite
+
+Goal: a small freestanding library for the guest, so the libOS stops
+open-coding the same primitives and bundle programs become writable. Not a
+full libc. It is cross-cutting and independent of the display and distribution
+work, so it lands opportunistically rather than in sequence.
+
+Scope: `string.h` (mem{cpy,set,move,cmp}, str{len,cmp,ncmp}, a bounded
+strlcpy); a bounded formatter (`vsnprintf` or a sink-callback `vfctprintf`)
+whose output goes through the service vector, never a syscall; `strtol`/`atoi`.
+Deliberately excluded: `malloc` (the libOS already has `kmalloc`; programs get
+a bump allocator if needed later), any file or stdio-stream model, and anything
+syscall-shaped. These are written jotun-native; the formatter may be based on
+the nyctos `printf.c` format engine (`nyctos`, 0BSD) with
+its header preserved if copied. nyctos's `sys`, `console`, `file`, and `compose`
+layers do not transfer, because they are bound to its syscall and fs model and
+it has no x86_64 port.
+
+Steps:
+
+- M9.1 (done): the `mem*`/`string.h` insurance. A freestanding target must
+  provide memcpy, memmove, memset, and memcmp, because the compiler can lower a
+  struct copy or an array initializer into a call to one even where the source
+  never names it; the guest referenced none of them and was one such construct
+  away from a link failure. `guest/libos/string.c` provides those four plus
+  strlen, strcmp, strncmp, and strlcpy, compiled into the libOS.
+- M9.2: de-duplicate the open-coded helpers onto this header (ns.c `sstrlen`,
+  net.c `ncopy`, task.c `scopy`, and the ad-hoc loops in p9.c and jsh.c).
+- M9.3: the bounded formatter, output via the service vector.
+- M9.4: expose the library to bundle programs. Decide between extending the
+  service vector with these entries and linking a small `libc.a` into each
+  program (leaning toward the linked archive, to keep the `jotun_svc` ABI
+  minimal), then give programs `strtol`/`atoi` and the formatter.
+
 ## Cross-cutting concerns
 
 - The per-guest manifest is the sandbox's control surface. It appears at M3,
