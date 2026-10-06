@@ -141,9 +141,32 @@ build/triton.o: guest/libos/triton.c guest/libos/triton.h | build
 libos.elf: $(LIBOS_SRC) $(LIBOS_FP_OBJ)
 	$(GUEST_CC) $(GUEST_CFLAGS) -Iguest/libos -Wl,-Ttext=$(GUEST_TEXT) -o $@ $(LIBOS_SRC) $(LIBOS_FP_OBJ)
 
-# Standalone programs, linked at the program base and loaded from the bundle.
-hello.elf: guest/prog/hello.c
-	$(GUEST_CC) $(GUEST_CFLAGS) -Iguest/prog -Wl,-Ttext=$(PROG_TEXT) -o $@ $<
+# The program C library (jlibc): the formatter and string primitives shared
+# with the libOS, plus program-side printf and numeric parsing, compiled to
+# objects and linked into each bundle program. Kept as plain objects rather than
+# an ar archive, for cross-toolchain portability (no ranlib step); building each
+# function into its own section and linking with --gc-sections drops whatever a
+# given program does not use, so unused library code costs it nothing.
+PROG_INC = -Iguest/prog/libc -Iguest/prog -Iguest/libos -Iabi
+PROG_LIBC_OBJS = build/libc_fmt.o build/libc_string.o build/libc_io.o \
+    build/libc_stdlib.o
+GUEST_COBJ_CFLAGS = $(filter-out -Wl%,$(GUEST_CFLAGS)) \
+    -ffunction-sections -fdata-sections
+
+build/libc_fmt.o: guest/libos/fmt.c | build
+	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
+build/libc_string.o: guest/libos/string.c | build
+	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
+build/libc_io.o: guest/prog/libc/progio.c | build
+	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
+build/libc_stdlib.o: guest/prog/libc/progstdlib.c | build
+	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
+
+# Standalone programs, linked at the program base and loaded from the bundle,
+# with the program C library and dead-code elimination of its unused parts.
+hello.elf: guest/prog/hello.c $(PROG_LIBC_OBJS)
+	$(GUEST_CC) $(GUEST_CFLAGS) -Wl,--gc-sections $(PROG_INC) \
+	    -Wl,-Ttext=$(PROG_TEXT) -o $@ guest/prog/hello.c $(PROG_LIBC_OBJS)
 
 # Build a test bundle depot from example/bundle/ using castool, then run with
 # JOTUN_BUNDLE=bundle-depot ./jotun libos.elf. castool is built from the

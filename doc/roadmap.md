@@ -624,7 +624,7 @@ signed by an untrusted key are each refused; and a compressed depot pulls,
 decodes, verifies, and boots. The pull transport is loose objects only; the
 pack byte-range transport and key rotation stay out of scope.
 
-## M9: guest libc-lite
+## M9: guest libc-lite (done, bar a deferred threads shim)
 
 Goal: a small freestanding library for the guest, so the libOS stops
 open-coding the same primitives and bundle programs become writable. Not a
@@ -666,10 +666,17 @@ Steps:
   engine matches glibc snprintf across a case sweep, and compiles integer-only
   on arm64 under -mgeneral-regs-only (no FP varargs, no 64-bit-divide helper).
   Exposing it to bundle programs is M9.4.
-- M9.4: expose the library to bundle programs. Decide between extending the
-  service vector with these entries and linking a small `libc.a` into each
-  program (leaning toward the linked archive, to keep the `jotun_svc` ABI
-  minimal), then give programs `strtol`/`atoi` and the formatter.
+- M9.4 (done): expose the library to bundle programs. The `jotun_svc` ABI stays
+  minimal (putc/puts/exit); the convenience code is a small program C library
+  linked into each program instead. `guest/prog/libc/` holds the umbrella header
+  `jlibc.h`, program-side `printf`/`vprintf`/`putchar`/`puts` that route through
+  the service vector's putc (progio.c), and `strtol`/`atoi` (progstdlib.c); the
+  shared `fmt.c` and `string.c` compile into it too. It is linked as plain
+  objects, not an ar archive, for cross-toolchain portability; each function is
+  its own section and programs link with `--gc-sections`, so unused library code
+  costs nothing. `hello` now uses printf and strtol/atoi. strtol matches glibc
+  across a case sweep; the program objects compile integer-only on arm64 under
+  -mgeneral-regs-only.
 
 Atomics and threading are deliberately not libc work here. C11 `<stdatomic.h>`
 is a compiler-provided freestanding header, and the word-sized atomics the guest
@@ -731,8 +738,9 @@ Independent of the milestones above, tracked so they are not lost:
   extents of a packfile), key rotation, and multi-arch bundles.
 - Display input: text and paste, which need a text-input primitive the
   restricted SVG vocabulary excludes today.
-- libc-lite (M9): the remaining M9.2 through M9.4, and a `<threads.h>` shim over
-  `task.c` once a bundle program needs the standard API.
+- libc-lite (M9): a `<threads.h>` shim (`thrd_*`/`mtx_*`/`cnd_*`) over `task.c`,
+  deferred until a bundle program needs the standard API so a real consumer
+  shapes it. M9.1 through M9.4 are done.
 
 ## Cross-cutting concerns
 
