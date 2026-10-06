@@ -186,6 +186,23 @@ static const struct p9_backend sv_backend = {
     .readf = sv_readf,
 };
 
+/* A ref is either a ref name (which its owner may advance) or a fixed 64-hex
+ * root hash that pins an immutable snapshot. Pinning lets a guest sharing
+ * another guest's depot serve a stable tree even as the owner commits new
+ * roots. Return 1 if s is exactly a content-hash hex string. */
+static int
+is_root_hash(const char *s)
+{
+    size_t n = 0;
+    for (; s[n]; n++) {
+        char c = s[n];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+              || (c >= 'A' && c <= 'F')))
+            return 0;
+    }
+    return n == CAS_HASH_HEX;
+}
+
 const struct p9_backend *
 p9smolvfs_open(const char *depot, const char *ref, const char *subtree,
                void **ctx_out)
@@ -199,8 +216,19 @@ p9smolvfs_open(const char *depot, const char *ref, const char *subtree,
         ctx.store = NULL;
         return NULL;
     }
-    if (cas_tree_ref_read(ctx.ct, ref, ctx.root) != CAS_OK)
+    if (ref && is_root_hash(ref)) {
+        strncpy(ctx.root, ref, sizeof ctx.root - 1);        /* pinned snapshot */
+        ctx.root[sizeof ctx.root - 1] = '\0';
+        /* A ref name always resolves to a committed root, but a pinned hash
+         * is caller-supplied. Confirm it names a real tree so a mistyped
+         * pin fails here rather than mounting an empty, broken root. */
+        struct cas_tree_dir d;
+        if (cas_tree_load(ctx.ct, ctx.root, &d) != CAS_OK)
+            goto fail;
+        cas_tree_dir_free(&d);
+    } else if (cas_tree_ref_read(ctx.ct, ref, ctx.root) != CAS_OK) {
         goto fail;
+    }
     /* Confine the served root to the manifest's subtree. */
     if (subtree && descend_subtree(ctx.ct, ctx.root, subtree) != 0)
         goto fail;

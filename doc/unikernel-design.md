@@ -216,6 +216,20 @@ pull-from-URL stage (roadmap M8), where a bundle first arrives from an origin
 that is not already trusted; a local bundle until then carries a ref trusted
 directly. Multi-arch stays out of scope.
 
+Because the store is immutable and content addressed, several guests in one host
+process can read the same depot at once without copying it (roadmap M10.4). The
+depot's write lock is taken only when a ref is committed, never on a read, so
+concurrent readers never block each other. A manifest ref is resolved as either
+a ref name or a fixed 64-hex root tree hash. A ref name tracks whatever root its
+owner last committed, so one guest can own the ref and advance it while another
+reads the live tree. A root hash instead pins an immutable snapshot: a consumer
+serving `ref <hash>` sees exactly that tree forever, even as the owner commits
+new roots behind the same name. A pinned hash is caller-supplied rather than
+resolved from a signed ref, so the host checks that it loads as a real tree and
+refuses the mount otherwise. This shares a whole tree as a guest's root; grafting
+a shared subtree at a path inside a guest's own tree is a later step (roadmap
+M13).
+
 Per-object compression is available (smolvfs ships a DEFLATE codec); the first
 cut can leave objects uncompressed. Compression is per object, so a very large
 file decompresses whole rather than by cluster, which does not matter for a

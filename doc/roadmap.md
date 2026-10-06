@@ -804,13 +804,22 @@ Sub-milestones:
   in `doc/draw-vocabulary.md`: several simultaneous viewers and in-host session
   authentication are deliberately not implemented; a deployment that needs them
   puts them in the reverse proxy in front.
-- M10.4: shared read-only filesystem mount between guests. Point two guests' 9P
-  subtree at the same bundle depot or snapshot, one side owning ref commits and
-  the other mounting a fixed root read-only. Safe because the store is a
-  content-addressed, immutable CAS, and cheap because the host already serves
-  both 9P trees in one process. Declared in the manifest. The inter-guest
-  network link (an in-host virtual switch) is deferred: it needs a net
-  listen/accept or rendezvous primitive that does not exist yet (design
+- M10.4 (done): shared read-only filesystem mount between guests. Two guests
+  point their 9P subtree at the same bundle depot, one side owning ref commits
+  and the other reading. This already worked for a live ref (the depot is a
+  content-addressed, immutable CAS, so concurrent readers never block a reader:
+  the depot lock is taken only on a ref commit, not on reads). The step that
+  landed is snapshot pinning: a manifest ref may be either a ref name (which its
+  owner may advance) or a fixed 64-hex root tree hash, which pins an immutable
+  snapshot. A consumer serving `ref <hash>` sees a stable tree even as the owner
+  commits new roots behind the same `head` ref. A pinned hash is caller-supplied,
+  so the host validates it loads as a real tree and fails the mount cleanly
+  otherwise, rather than serving an empty root. Demonstrated by the two-guest
+  run in M10.0e, which already shares one depot. Grafting a shared mount at a
+  path inside a guest's own tree (rather than as the whole root) is deferred to
+  M13; it needs per-fid backend routing, which does not exist yet. The
+  inter-guest network link (an in-host virtual switch) is also deferred: it needs
+  a net listen/accept or rendezvous primitive that does not exist yet (design
   section 8), so it is tracked under opportunistic work, not M10.
 
 Suggested order: M10.0 first (unblocks the rest), then M10.1 and M10.2 together
@@ -829,6 +838,16 @@ M3 and M8.
 Goal: capture a running guest's memory and device state and resume it later.
 Optional, and the heaviest of the forward items; it interacts with SMP (M4) and
 with the channel state on each device. Shape it when a concrete need appears.
+
+## M13: graft a shared read-only mount at a path
+
+Goal: mount another guest's (or a shared depot's) read-only subtree at a path
+inside a guest's own filesystem, rather than serving it as the whole root as
+M10.4 does. The 9P server would route per fid to one of two backends by the
+subtree the fid walked into, and offset the grafted backend's qid range so the
+two trees' qid paths cannot collide. Declared in the manifest as a second mount.
+Deferred until a guest needs both its own tree and a shared tree at once; M10.4
+covers the whole-root case, which is enough for the current two-guest sharing.
 
 ## Opportunistic and deferred work
 
@@ -868,4 +887,4 @@ Independent of the milestones above, tracked so they are not lost:
   M4.
 - Multi-guest multiplexing and session authentication, snapshot and restore, and
   single-file packaging were earlier cross-cutting notes; they are now the
-  forward milestones M10, M12, and M11 above.
+  forward milestones M10, M12, M11, and M13 above.
