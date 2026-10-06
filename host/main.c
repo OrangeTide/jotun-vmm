@@ -439,6 +439,59 @@ run_timer(void *arg)
     return NULL;
 }
 
+/* Bring up one guest's VM and RAM: create the VM, map a fresh RAM buffer at
+ * guest-physical address 0 (in two slots, which exercises the multi-slot path),
+ * and load the kernel image. Fills gp->vm, gp->gm, and gp->img. Returns 0, or
+ * -1 on failure with anything partially allocated already released. Each guest
+ * gets its own VM and buffer, so several can run side by side. */
+static int
+guest_vm_init(struct guest *gp, const char *image_path)
+{
+    gp->vm = vmm_vm_create();
+    if (!gp->vm) {
+        fprintf(stderr, "Failed to create VM\n");
+        return -1;
+    }
+
+    void *ram = mmap(NULL, GUEST_RAM_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ram == MAP_FAILED) {
+        fprintf(stderr, "Failed to allocate guest memory\n");
+        vmm_vm_destroy(gp->vm);
+        gp->vm = NULL;
+        return -1;
+    }
+    size_t half = GUEST_RAM_SIZE / 2;
+    vmm_vm_map_memory(gp->vm, ram, 0, half);
+    vmm_vm_map_memory(gp->vm, (char *)ram + half, half, GUEST_RAM_SIZE - half);
+    gp->gm.base = ram;
+    gp->gm.size = GUEST_RAM_SIZE;
+
+    if (elf_load_file(image_path, ram, GUEST_RAM_SIZE, &gp->img) != 0) {
+        fprintf(stderr, "Failed to load guest image '%s'\n", image_path);
+        munmap(ram, GUEST_RAM_SIZE);
+        gp->gm.base = NULL;
+        vmm_vm_destroy(gp->vm);
+        gp->vm = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+/* Release a guest's VM and RAM. Safe to call after a partial or failed init. */
+static void
+guest_vm_free(struct guest *gp)
+{
+    if (gp->vm) {
+        vmm_vm_destroy(gp->vm);
+        gp->vm = NULL;
+    }
+    if (gp->gm.base) {
+        munmap(gp->gm.base, gp->gm.size);
+        gp->gm.base = NULL;
+    }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -457,35 +510,8 @@ main(int argc, char **argv)
     const char *cap_env = getenv("JOTUN_MAX_EXITS");
     max_exits = cap_env ? strtoul(cap_env, NULL, 0) : 0;
 
-    g.vm = vmm_vm_create();
-    if (!g.vm) {
-        fprintf(stderr, "Failed to create VM\n");
+    if (guest_vm_init(&g, path) != 0)
         return 1;
-    }
-
-    // Allocate guest RAM and map it at guest-physical address 0, in two slots
-    // from one buffer, which exercises the multi-slot path.
-    void *ram = mmap(NULL, GUEST_RAM_SIZE, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (ram == MAP_FAILED) {
-        fprintf(stderr, "Failed to allocate guest memory\n");
-        vmm_vm_destroy(g.vm);
-        return 1;
-    }
-    size_t half = GUEST_RAM_SIZE / 2;
-    vmm_vm_map_memory(g.vm, ram, 0, half);
-    vmm_vm_map_memory(g.vm, (char *)ram + half, half, GUEST_RAM_SIZE - half);
-
-    g.gm.base = ram;
-    g.gm.size = GUEST_RAM_SIZE;
-
-    // Load the guest image once into shared RAM.
-    if (elf_load_file(path, ram, GUEST_RAM_SIZE, &g.img) != 0) {
-        fprintf(stderr, "Failed to load guest image '%s'\n", path);
-        munmap(ram, GUEST_RAM_SIZE);
-        vmm_vm_destroy(g.vm);
-        return 1;
-    }
 
     /* A manifest, when given, is the full description of the guest domain: the
      * bundle and ref to serve, the subtree the guest is confined to, and the
@@ -653,7 +679,6 @@ main(int argc, char **argv)
     net_shutdown(g.netdev);
     draw_shutdown(g.drawdev);
 
-    vmm_vm_destroy(g.vm);
-    munmap(ram, GUEST_RAM_SIZE);
+    guest_vm_free(&g);
     return rc;
 }
