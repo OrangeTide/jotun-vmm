@@ -130,7 +130,7 @@ This replaces the current x86 setup. Today the KVM backend puts the vcpu into
 both to 64-bit long mode with an identity-mapped page table and a 64-bit guest
 build.
 
-## M3: 9P over the ring, the bundle, and guest parameters (in progress)
+## M3: 9P over the ring, the bundle, and guest parameters (done)
 
 Goal: the guest sees a host filesystem, loads programs from it, and boots with
 host-supplied parameters.
@@ -155,8 +155,19 @@ done: with no console input device yet it runs a startup script read from the
 bundle (named by the first boot argument), with `echo`, `ls`, and `cat`
 built in and any other word run as a bundled program. The acceptance is met:
 `./jotun libos.elf rc` boots, lists the bundle, cats a file, and runs the
-`hello` program. Remaining in M3: guest namespace `bind` and `mount`, and the
-per-guest manifest.
+`hello` program. The namespace and the manifest close out M3. `guest/libos/ns.c`
+resolves every path through a mount table (longest-prefix) before walking the
+9P tree; jsh gains `bind` and `mount`, and `prog_run` resolves names the same
+way. `host/manifest.c` reads a per-guest manifest naming the bundle, ref,
+subtree, and init arguments; `JOTUN_MANIFEST` selects it. The smolvfs backend
+confines the served root to the manifest's subtree, so the guest cannot name
+anything outside it. A bad subtree is refused.
+
+Scope: one global namespace (per-process namespaces are later), and the bundle
+is flat, since castool's import builds a single directory level; nested
+subtrees need the smolvfs library API and are deferred. bind and mount are the
+same operation over the single filesystem; real additional mounts arrive with
+networking (M5) and display (M6).
 
 Transition from M2: M2's `exec` resolves a function directly and the guest has
 no loader. M3 adds the loader and makes `exec` resolve a program by name, read

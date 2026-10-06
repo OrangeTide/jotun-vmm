@@ -11,6 +11,41 @@
 #include "cas.h"
 #include "cas-tree.h"
 
+/* Walk a slash-separated subtree from the given tree hash, following only
+ * directories, and write the resulting tree hash into cur. Returns 0 on
+ * success, -1 if a component is missing or is not a directory. */
+static int
+descend_subtree(struct cas_tree *ct, char *cur, const char *subtree)
+{
+    char buf[256];
+    size_t i = 0;
+    for (; subtree[i] && i < sizeof buf - 1; i++)
+        buf[i] = subtree[i];
+    buf[i] = '\0';
+
+    char *p = buf;
+    while (*p) {
+        while (*p == '/')
+            p++;
+        if (!*p)
+            break;
+        char *comp = p;
+        while (*p && *p != '/')
+            p++;
+        if (*p)
+            *p++ = '\0';
+
+        struct cas_tree_entry e;
+        if (cas_tree_lookup(ct, cur, comp, &e) != CAS_OK)
+            return -1;
+        if ((e.mode & CAS_TREE_S_IFMT) != CAS_TREE_S_IFDIR)
+            return -1;
+        for (int k = 0; k <= CAS_HASH_HEX; k++)
+            cur[k] = e.hash[k];
+    }
+    return 0;
+}
+
 struct smolctx {
     struct cas      *store;
     struct cas_tree *ct;
@@ -152,7 +187,8 @@ static const struct p9_backend sv_backend = {
 };
 
 const struct p9_backend *
-p9smolvfs_open(const char *depot, const char *ref, void **ctx_out)
+p9smolvfs_open(const char *depot, const char *ref, const char *subtree,
+               void **ctx_out)
 {
     ctx.store = cas_new(depot);
     if (!ctx.store)
@@ -163,12 +199,18 @@ p9smolvfs_open(const char *depot, const char *ref, void **ctx_out)
         ctx.store = NULL;
         return NULL;
     }
-    if (cas_tree_ref_read(ctx.ct, ref, ctx.root) != CAS_OK) {
-        cas_tree_free(ctx.ct);
-        cas_free(ctx.store);
-        ctx.store = NULL;
-        return NULL;
-    }
+    if (cas_tree_ref_read(ctx.ct, ref, ctx.root) != CAS_OK)
+        goto fail;
+    /* Confine the served root to the manifest's subtree. */
+    if (subtree && descend_subtree(ctx.ct, ctx.root, subtree) != 0)
+        goto fail;
+
     *ctx_out = &ctx;
     return &sv_backend;
+
+fail:
+    cas_tree_free(ctx.ct);
+    cas_free(ctx.store);
+    ctx.store = NULL;
+    return NULL;
 }

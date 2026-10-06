@@ -1,0 +1,5 @@
+# jotun guest manifest: the full description of a guest domain.
+bundle bundle-depot
+ref root
+subtree /
+init rc

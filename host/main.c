@@ -14,6 +14,7 @@
 #include "p9srv.h"
 #include "p9mem.h"
 #include "p9smolvfs.h"
+#include "manifest.h"
 
 /* Guest physical RAM mapped at address 0. 8 MiB is ample for the test guest
  * plus per-vcpu stacks. */
@@ -251,27 +252,58 @@ main(int argc, char **argv)
         return 1;
     }
 
-    /* Hand the guest its parameters: everything after the kernel image. */
-    int gargc = (argc > 2) ? argc - 2 : 0;
-    char **gargv = (argc > 2) ? argv + 2 : argv;
+    /* A manifest, when given, is the full description of the guest domain: the
+     * bundle and ref to serve, the subtree the guest is confined to, and the
+     * init arguments. Without one, fall back to environment and command line. */
+    struct manifest m;
+    int have_manifest = 0;
+    const char *manifest_path = getenv("JOTUN_MANIFEST");
+    if (manifest_path) {
+        if (manifest_load(manifest_path, &m) == 0)
+            have_manifest = 1;
+        else
+            fprintf(stderr, "[manifest] failed to load %s\n", manifest_path);
+    }
+
+    const char *bundle, *ref, *subtree;
+    int gargc;
+    char *gargv[MANIFEST_MAXARG];
+    if (have_manifest) {
+        bundle = m.bundle;
+        ref = m.ref;
+        subtree = m.subtree;
+        gargc = m.argc;
+        for (int i = 0; i < m.argc; i++)
+            gargv[i] = m.argv[i];
+    } else {
+        bundle = getenv("JOTUN_BUNDLE");
+        ref = getenv("JOTUN_REF");
+        if (!ref)
+            ref = "root";
+        subtree = "";
+        gargc = (argc > 2) ? argc - 2 : 0;
+        if (gargc > MANIFEST_MAXARG)
+            gargc = MANIFEST_MAXARG;
+        for (int i = 0; i < gargc; i++)
+            gargv[i] = argv[2 + i];
+    }
+
+    /* Hand the guest its parameters before it starts. */
     setup_bootinfo(gargc, gargv);
 
     uart_init(&uart);
 
     /* Serve a smolvfs bundle if one is named, else the in-memory tree. */
-    const char *bundle = getenv("JOTUN_BUNDLE");
-    const char *ref = getenv("JOTUN_REF");
-    if (!ref)
-        ref = "root";
     const struct p9_backend *be = NULL;
     void *p9ctx = NULL;
-    if (bundle)
-        be = p9smolvfs_open(bundle, ref, &p9ctx);
+    if (bundle && bundle[0])
+        be = p9smolvfs_open(bundle, ref, subtree, &p9ctx);
     if (be) {
         p9srv_init(&p9, be, p9ctx);
-        fprintf(stderr, "[9p] serving bundle %s (ref %s)\n", bundle, ref);
+        fprintf(stderr, "[9p] serving bundle %s (ref %s, subtree %s)\n",
+                bundle, ref, subtree[0] ? subtree : "/");
     } else {
-        if (bundle)
+        if (bundle && bundle[0])
             fprintf(stderr, "[9p] could not open bundle %s, using in-memory tree\n",
                     bundle);
         p9srv_init(&p9, p9mem_backend(), NULL);

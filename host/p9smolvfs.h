@@ -4,10 +4,12 @@
 
 #include "p9srv.h"
 
-/* Open a smolvfs depot and resolve ref to its root tree. On success returns
- * the backend and stores a context pointer in *ctx_out. Returns NULL if the
- * depot cannot be opened or the ref does not resolve. */
+/* Open a smolvfs depot, resolve ref to its root tree, and confine the served
+ * root to the given subtree (empty or "/" serves the whole tree). On success
+ * returns the backend and stores a context pointer in *ctx_out. Returns NULL
+ * if the depot cannot be opened, the ref does not resolve, or the subtree does
+ * not exist or is not a directory. */
 const struct p9_backend *p9smolvfs_open(const char *depot, const char *ref,
-                                        void **ctx_out);
+                                        const char *subtree, void **ctx_out);
 
 #endif /* P9SMOLVFS_H */
