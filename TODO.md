@@ -17,10 +17,12 @@ checkout. Upstream projects are named, never cited by a filesystem path.
       Makefile dependency variable, and the "Sources" citations in
       `doc/roadmap.md` and `doc/unikernel-design.md`. Upstream projects are now
       named without a filesystem path.
-- [ ] Rewrite the entire git history to remove these external path references
-      from historical file contents, so none remain in any commit. This is
-      destructive: it rewrites every commit hash. Do it only with an explicit
-      go-ahead and a backup.
+- [x] Rewrite the entire git history to remove these external path references
+      from historical file contents (and one commit message), so none remain in
+      any commit. Done with git filter-repo over a replacement map; every commit
+      hash changed. A pre-rewrite backup was kept outside the repo. Verified: no
+      external home-directory path token remains in any blob or message.
 
-Relates to M8: the pull client adds more smolvfs sources, so vendoring comes
-first.
+Self-containment is complete. Relates to M8: the pull client vendors the
+remaining smolvfs sources (sign path, monocypher, and miniz for compressed
+depots) in-tree the same way.
