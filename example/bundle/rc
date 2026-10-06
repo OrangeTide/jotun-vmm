@@ -1,0 +1,9 @@
+# jotun guest startup script, run by jsh
+echo jotun guest starting
+echo --- files in / ---
+ls /
+echo --- motd ---
+cat motd
+echo --- running the hello program ---
+hello
+echo rc complete

@@ -150,9 +150,13 @@ PT_LOAD segments over 9P into a fixed program region, and `prog_run`
 (`guest/libos/prog.c`) runs it as a child task and collects its exit status. A
 program is a standalone ELF (`guest/prog/`) that reaches the libOS through a
 service vector the kernel publishes (`abi/jotun_svc.h`), since there is no
-privilege boundary to trap across. init loads `hello` from the bundle, which
-prints and exits `prog-ok`. Next: `jsh`, a shell that reads the bundle and
-spawns programs by name.
+privilege boundary to trap across. The shell `jsh` (`guest/libos/jsh.c`) is
+done: with no console input device yet it runs a startup script read from the
+bundle (named by the first boot argument), with `echo`, `ls`, and `cat`
+built in and any other word run as a bundled program. The acceptance is met:
+`./jotun libos.elf rc` boots, lists the bundle, cats a file, and runs the
+`hello` program. Remaining in M3: guest namespace `bind` and `mount`, and the
+per-guest manifest.
 
 Transition from M2: M2's `exec` resolves a function directly and the guest has
 no loader. M3 adds the loader and makes `exec` resolve a program by name, read
