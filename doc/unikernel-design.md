@@ -158,6 +158,48 @@ Services appear in the guest namespace, Plan 9 style:
 - networking: a `/net` tree (section 8),
 - display: a `/dev/draw` endpoint the guest writes a command stream to.
 
+### 7.1 Guest parameters and the filesystem bundle
+
+A guest launch takes two host-supplied inputs beyond the guest kernel image: a
+set of parameters and a filesystem bundle.
+
+Parameters reach the guest through a boot-info block the host writes into guest
+RAM at a fixed low address before the vcpu starts. The library OS reads it at
+boot. It carries the essentials the guest cannot discover on its own: the guest
+RAM size, the name of the init program to run, and a packed argv and env blob
+for it. The ring and doorbell layout is already fixed by the ABI, so it need
+not be repeated here. Richer or late-bound configuration is exposed as files in
+the namespace, Plan 9 style, for example an `/env` or `/cfg` tree, rather than
+growing the block.
+
+The filesystem bundle is a single read-only image the host serves to the guest
+over 9P. It packages everything the guest domain runs together: the init
+program, a shell interpreter, the additional small programs that init or the
+shell spawn, and their config and data files. One guest domain, one bundle, so
+the whole domain is a single immutable artifact that is easy to distribute,
+pin, and reason about. Because exec resolves a program by name (section 6), the
+bundle is what turns that name into an ELF image. The loader reads the file
+from the 9P namespace and loads it, so several programs cooperate inside one
+guest the way processes do on a normal system, while still sharing the single
+trust domain.
+
+The host owns parsing the bundle. The guest only issues 9P reads, so no
+archive-format code runs in the guest and the host validates every path. The
+bundle format is read-only, random access, and compressed. squashfs is the
+recommended format: it is purpose-built for immutable images (it backs
+AppImage, snaps, and initramfs), it is produced with the standard mksquashfs
+tool, and its inode and directory structure maps directly onto 9P stat and walk
+operations. A zip archive is simpler to parse but models an archive rather than
+a filesystem, so directory, mode, and symlink semantics fit a POSIX-ish tree
+less well. The first implementation may serve a plain host directory, with the
+bundle as the packaged production form, so the 9P server and the bundle reader
+can land in that order.
+
+The manifest ties these together. One manifest, read by the host at launch,
+names the bundle, the subtree within it the guest may see, the init program and
+its parameters, and the coarse network and display rights. It is the full
+description of a guest domain.
+
 ## 8. Networking
 
 A `/net` provider in the host enforces container-style policy from the guest

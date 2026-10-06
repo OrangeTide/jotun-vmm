@@ -130,17 +130,41 @@ This replaces the current x86 setup. Today the KVM backend puts the vcpu into
 both to 64-bit long mode with an identity-mapped page table and a 64-bit guest
 build.
 
-## M3: 9P over the ring
+## M3: 9P over the ring, the bundle, and guest parameters
 
-Goal: the guest sees a host filesystem.
+Goal: the guest sees a host filesystem, loads programs from it, and boots with
+host-supplied parameters.
 
+Transition from M2: M2's `exec` resolves a function directly and the guest has
+no loader. M3 adds the loader and makes `exec` resolve a program by name, read
+as an ELF file from the namespace. This is where the JOS ELF loader, vfs, and
+device table, held back from M2, land.
+
+- Boot-info block: the host writes a parameter block into guest RAM at a fixed
+  low address before the vcpu starts, carrying the RAM size, the init program
+  name, and a packed argv and env blob. The library OS reads it at boot and
+  runs the named init with those parameters. This is the general host-to-guest
+  parameter channel; see `unikernel-design.md` section 7.1.
 - Guest 9P client on the `archp9rpc` seam, routed to the ring.
-- Host 9P2000.u server exposing a read-only subtree.
+- Host 9P2000.u server. It serves a read-only subtree backed by a filesystem
+  bundle, a single read-only image that packages the domain's programs (init, a
+  shell, small helpers) and their config and data. squashfs is the planned
+  bundle format; the first cut may serve a plain host directory, with the
+  bundle layered in once the 9P path works. The host owns all bundle parsing;
+  the guest only issues 9P reads.
+- Guest-side ELF loader reading programs from the namespace, so `exec(name)`
+  loads the named program out of the bundle. Several bundled programs then run
+  together in one guest domain.
 - Guest namespace `bind` and `mount`.
-- Introduce the per-guest manifest here; it grants the filesystem subtree.
+- Per-guest manifest, read by the host at launch: it names the bundle, the
+  subtree the guest may see, the init program and its parameters, and the
+  coarse rights that grow through M5 and M6. It is the full description of a
+  guest domain.
 
-Acceptance: the `jsh` shell in the guest does directory and file reads over the
-mounted host tree and spawns a command.
+Acceptance: a bundle holding `jsh` and a couple of small programs boots; the
+host passes init parameters through the boot-info block; `jsh` does directory
+and file reads over the mounted bundle and spawns one of the bundled programs
+by name.
 
 ## M4: preemption and SMP
 
@@ -198,8 +222,9 @@ composited under the 2D chrome.
 
 ## Cross-cutting concerns
 
-- The per-guest manifest is the sandbox's control surface. It appears at M3 for
-  the filesystem and grows through M5 for networking and M6 for display.
+- The per-guest manifest is the sandbox's control surface. It appears at M3,
+  naming the filesystem bundle and the init parameters, and grows through M5
+  for networking and M6 for display.
 - Validation of every guest-to-host message is a standing requirement, not a
   phase.
 - Multiplexing several guests onto one browser session, and any session
