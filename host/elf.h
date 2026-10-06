@@ -23,4 +23,10 @@ typedef struct elf_image {
 int elf_load_file(const char *path, uint8_t *ram, size_t ram_size,
                   elf_image *img);
 
+/* Like elf_load_file, but the image is already in memory: `b` holds `size`
+ * bytes of ELF. `name` labels the image in error messages. The buffer is not
+ * freed. Used to boot a kernel lifted out of the bundle. */
+int elf_load_mem(const char *name, const uint8_t *b, long size,
+                 uint8_t *ram, size_t ram_size, elf_image *img);
+
 #endif /* ELF_H */

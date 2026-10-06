@@ -25,6 +25,20 @@
 #include "net.h"
 #include "draw.h"
 
+/* This host runs native-arch guests (KVM and HVF both run the host CPU), so the
+ * build arch is the guest arch, and this token selects the matching variant in
+ * a multi-arch image. The tokens match uname -m. */
+#if defined(__x86_64__)
+#define JOTUN_ARCH "x86_64"
+#elif defined(__aarch64__)
+#define JOTUN_ARCH "aarch64"
+#else
+#define JOTUN_ARCH "unknown"
+#endif
+
+/* The path a bootable kernel is lifted from inside an image's arch root. */
+#define JOTUN_KERNEL_PATH "boot/kernel"
+
 /* Guest physical RAM mapped at address 0. 8 MiB is ample for the test guest
  * plus per-vcpu stacks. */
 #define GUEST_RAM_SIZE (8u * 1024 * 1024)
@@ -447,13 +461,14 @@ run_timer(void *arg)
     return NULL;
 }
 
-/* Bring up one guest's VM and RAM: create the VM, map a fresh RAM buffer at
- * guest-physical address 0 (in two slots, which exercises the multi-slot path),
- * and load the kernel image. Fills gp->vm, gp->gm, and gp->img. Returns 0, or
- * -1 on failure with anything partially allocated already released. Each guest
- * gets its own VM and buffer, so several can run side by side. */
+/* Create one guest's VM and RAM: create the VM and map a fresh RAM buffer at
+ * guest-physical address 0 (in two slots, which exercises the multi-slot path).
+ * Fills gp->vm and gp->gm. The kernel image is loaded separately, once the
+ * bundle it may come from is open. Returns 0, or -1 on failure with anything
+ * partially allocated already released. Each guest gets its own VM and buffer,
+ * so several can run side by side. */
 static int
-guest_vm_init(struct guest *gp, const char *image_path)
+guest_vm_create(struct guest *gp)
 {
     gp->vm = vmm_vm_create();
     if (!gp->vm) {
@@ -474,16 +489,38 @@ guest_vm_init(struct guest *gp, const char *image_path)
     vmm_vm_map_memory(gp->vm, (char *)ram + half, half, GUEST_RAM_SIZE - half);
     gp->gm.base = ram;
     gp->gm.size = GUEST_RAM_SIZE;
-
-    if (elf_load_file(image_path, ram, GUEST_RAM_SIZE, &gp->img) != 0) {
-        fprintf(stderr, "Failed to load guest image '%s'\n", image_path);
-        munmap(ram, GUEST_RAM_SIZE);
-        gp->gm.base = NULL;
-        vmm_vm_destroy(gp->vm);
-        gp->vm = NULL;
-        return -1;
-    }
     return 0;
+}
+
+/* Load the guest kernel into RAM. The image comes from `cli_kernel` when the
+ * command line named one (a dev override), else from the bundle at
+ * JOTUN_KERNEL_PATH when it is a smolvfs backend that holds one, else from the
+ * historical test_guest.elf default so a bare run still boots. svctx is the
+ * smolvfs context from p9smolvfs_open, or NULL for the in-memory backend.
+ * Fills gp->img. Returns 0, or -1 on failure. */
+static int
+guest_load_kernel(struct guest *gp, int gid, const char *cli_kernel,
+                  void *svctx)
+{
+    if (cli_kernel)
+        return elf_load_file(cli_kernel, gp->gm.base, GUEST_RAM_SIZE, &gp->img);
+
+    if (svctx) {
+        void *img = NULL;
+        size_t len = 0;
+        if (p9smolvfs_readfile(svctx, JOTUN_KERNEL_PATH, &img, &len) == 0) {
+            int rc = elf_load_mem(JOTUN_KERNEL_PATH, img, (long)len,
+                                  gp->gm.base, GUEST_RAM_SIZE, &gp->img);
+            free(img);
+            if (rc == 0)
+                fprintf(stderr, "[boot] guest %d: kernel lifted from image"
+                        " (%s)\n", gid, JOTUN_KERNEL_PATH);
+            return rc;
+        }
+    }
+
+    return elf_load_file("test_guest.elf", gp->gm.base, GUEST_RAM_SIZE,
+                         &gp->img);
 }
 
 /* Release a guest's VM and RAM. Safe to call after a partial or failed init. */
@@ -514,7 +551,7 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
 {
     gp->gid = gid;
 
-    if (guest_vm_init(gp, kernel) != 0)
+    if (guest_vm_create(gp) != 0)
         return -1;
 
     /* A manifest, when given, is the full description of the guest domain: the
@@ -549,6 +586,60 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
             gargv[i] = targv[i];
     }
 
+    /* If a signed origin is named, pull the bundle into a local cache depot and
+     * serve that, exactly as a local depot. The kernel and the filesystem then
+     * both come from the verified object set. A pull failure refuses the boot:
+     * the bundle's authenticity could not be established. */
+    const char *origin = have_manifest ? gp->manifest.origin : getenv("JOTUN_ORIGIN");
+    const char *trust_key = have_manifest ? gp->manifest.key : getenv("JOTUN_KEY");
+    const char *label = have_manifest ? gp->manifest.label : getenv("JOTUN_LABEL");
+    if (label && !label[0])
+        label = NULL;
+    if (origin && origin[0]) {
+        const char *cache = getenv("JOTUN_CACHE");
+        if (!cache || !cache[0])
+            cache = "bundle-cache";
+        if (!trust_key || !trust_key[0]) {
+            fprintf(stderr, "[pull] guest %d: origin set but no trusted key"
+                    " (set JOTUN_KEY or manifest 'key')\n", gid);
+            return -1;
+        }
+        fprintf(stderr, "[pull] guest %d: fetching %s into %s\n", gid, origin, cache);
+        if (bundle_pull(origin, trust_key, label, cache, ref) != 0) {
+            fprintf(stderr, "[pull] guest %d: refusing to boot:"
+                    " bundle not pulled/verified\n", gid);
+            return -1;
+        }
+        bundle = cache;                 /* serve the verified cache depot */
+    }
+
+    /* Open the bundle, selecting this host's arch from a multi-arch image, or
+     * fall back to the in-memory tree. svctx is the smolvfs context: it lifts
+     * the kernel below, and the /net overlay wraps it to serve files. */
+    const struct p9_backend *be = NULL;
+    void *p9ctx = NULL;
+    void *svctx = NULL;
+    if (bundle && bundle[0])
+        be = p9smolvfs_open(bundle, ref, subtree, JOTUN_ARCH, &p9ctx);
+    if (be) {
+        svctx = p9ctx;
+        fprintf(stderr, "[9p] guest %d: serving bundle %s (ref %s, subtree %s)\n",
+                gid, bundle, ref, subtree[0] ? subtree : "/");
+    } else {
+        if (bundle && bundle[0])
+            fprintf(stderr, "[9p] guest %d: could not open bundle %s,"
+                    " using in-memory tree\n", gid, bundle);
+        be = p9mem_backend();
+        p9ctx = NULL;
+    }
+
+    /* Load the kernel into RAM now that any bundle is open: a command-line image
+     * overrides, else it is lifted from the bundle, else the historical default. */
+    if (guest_load_kernel(gp, gid, kernel, svctx) != 0) {
+        fprintf(stderr, "guest %d: failed to load kernel\n", gid);
+        return -1;
+    }
+
     setup_bootinfo(gp, gargc, gargv);
 
     /* Build the net policy from the manifest rules. With no rules the provider
@@ -575,49 +666,6 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
     gp->drawdev = drawchan
         ? draw_init(drawchan, gid, fe, rouse_vcpus, gp, draw_test, draw_gpa, gp)
         : NULL;
-
-    /* If a signed origin is named, pull the bundle into a local cache depot and
-     * serve that, exactly as a local depot. A pull failure refuses the boot:
-     * the bundle's authenticity could not be established. */
-    const char *origin = have_manifest ? gp->manifest.origin : getenv("JOTUN_ORIGIN");
-    const char *trust_key = have_manifest ? gp->manifest.key : getenv("JOTUN_KEY");
-    const char *label = have_manifest ? gp->manifest.label : getenv("JOTUN_LABEL");
-    if (label && !label[0])
-        label = NULL;
-    if (origin && origin[0]) {
-        const char *cache = getenv("JOTUN_CACHE");
-        if (!cache || !cache[0])
-            cache = "bundle-cache";
-        if (!trust_key || !trust_key[0]) {
-            fprintf(stderr, "[pull] guest %d: origin set but no trusted key"
-                    " (set JOTUN_KEY or manifest 'key')\n", gid);
-            return -1;
-        }
-        fprintf(stderr, "[pull] guest %d: fetching %s into %s\n", gid, origin, cache);
-        if (bundle_pull(origin, trust_key, label, cache, ref) != 0) {
-            fprintf(stderr, "[pull] guest %d: refusing to boot:"
-                    " bundle not pulled/verified\n", gid);
-            return -1;
-        }
-        bundle = cache;                 /* serve the verified cache depot */
-    }
-
-    /* Serve a smolvfs bundle if one is named, else the in-memory tree, with the
-     * read-only /net overlay wrapping whichever backend is chosen. */
-    const struct p9_backend *be = NULL;
-    void *p9ctx = NULL;
-    if (bundle && bundle[0])
-        be = p9smolvfs_open(bundle, ref, subtree, &p9ctx);
-    if (be) {
-        fprintf(stderr, "[9p] guest %d: serving bundle %s (ref %s, subtree %s)\n",
-                gid, bundle, ref, subtree[0] ? subtree : "/");
-    } else {
-        if (bundle && bundle[0])
-            fprintf(stderr, "[9p] guest %d: could not open bundle %s,"
-                    " using in-memory tree\n", gid, bundle);
-        be = p9mem_backend();
-        p9ctx = NULL;
-    }
 
     struct p9overlay *ov = p9overlay_new(be, p9ctx, &gp->policy, gp->netdev);
     if (ov)
@@ -673,8 +721,8 @@ main(int argc, char **argv)
             targv[targc++] = argv[i];
         }
     }
-    if (!kernel)
-        kernel = "test_guest.elf";
+    /* With no bare kernel argument, guest_load_kernel lifts one from the bundle
+     * or falls back to the historical default, so leave kernel NULL here. */
 
     int nvcpus = 1;
     const char *vcpus_env = getenv("JOTUN_VCPUS");

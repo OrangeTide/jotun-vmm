@@ -48,7 +48,7 @@ ifeq ($(OS), Darwin)
     CFLAGS += -D__APPLE__
     LDFLAGS += -framework Hypervisor
     SRC = host/vmm_hvf.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c \
-        host/p9smolvfs.c host/p9overlay.c host/manifest.c host/net.c host/draw.c host/drawws.c host/png.c host/http.c host/bundlepull.c host/main.c $(SMOLVFS_SRC)
+        host/p9smolvfs.c host/p9overlay.c host/manifest.c host/jimage.c host/net.c host/draw.c host/drawws.c host/png.c host/http.c host/bundlepull.c host/main.c $(SMOLVFS_SRC)
     CC = clang
     GUEST = test_guest.elf echo.elf libos.elf
     GUEST_SRC = guest/test_guest_arm64.c
@@ -65,7 +65,7 @@ ifeq ($(OS), Darwin)
 else
     CFLAGS += -D__linux__
     SRC = host/vmm_kvm.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c \
-        host/p9smolvfs.c host/p9overlay.c host/manifest.c host/net.c host/draw.c host/drawws.c host/png.c host/http.c host/bundlepull.c host/main.c $(SMOLVFS_SRC)
+        host/p9smolvfs.c host/p9overlay.c host/manifest.c host/jimage.c host/net.c host/draw.c host/drawws.c host/png.c host/http.c host/bundlepull.c host/main.c $(SMOLVFS_SRC)
     CC = gcc
     GUEST_CFLAGS += -no-pie
     ifeq ($(ARCH), x86_64)
@@ -180,6 +180,12 @@ BUNDLE_DEPOT = bundle-depot
 castool: $(CASTOOL_SRC)
 	$(CC) $(CFLAGS) -o $@ $^
 
+# jbundle assembles a jotun guest image: it imports a staging directory per
+# arch into the depot and writes the jimage manifest object that ties the
+# per-arch roots together. It links the same smolvfs sources as the host.
+jbundle: host/jbundle.c $(SMOLVFS_SRC)
+	$(CC) $(CFLAGS) -o $@ $^
+
 bundle: $(PROGS) castool
 	rm -rf $(BUNDLE_DEPOT) bundle-staging
 	mkdir bundle-staging
@@ -201,7 +207,7 @@ macsyntax:
 	@echo "macsyntax: macOS net path OK"
 
 clean:
-	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool
+	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool jbundle
 	rm -rf $(BUNDLE_DEPOT) bundle-staging build
 
 .PHONY: all clean bundle macsyntax

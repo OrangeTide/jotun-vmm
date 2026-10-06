@@ -6,10 +6,13 @@
  * length is obtained by opening its blob. */
 #include "p9smolvfs.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cas.h"
 #include "cas-tree.h"
+#include "jimage.h"
 
 /* Walk a slash-separated subtree from the given tree hash, following only
  * directories, and write the resulting tree hash into cur. Returns 0 on
@@ -203,9 +206,45 @@ is_root_hash(const char *s)
     return n == CAS_HASH_HEX;
 }
 
+/* If ctx.root names a jimage manifest object, replace it with the root tree
+ * for `arch`. Leaves ctx.root untouched when it is an ordinary tree. Returns 0
+ * on success, -1 if the object is a jimage this host cannot use (bad format or
+ * no row for arch). */
+static int
+resolve_image(const char *arch)
+{
+    struct cas_file cf;
+    char type[CAS_TYPE_MAX + 1] = "";
+
+    if (cas_open_object(ctx.store, &cf, ctx.root, type, sizeof type) != CAS_OK)
+        return 0;                       /* not readable as a typed object: treat as a tree */
+    if (strcmp(type, JIMAGE_TYPE) != 0) {
+        cas_close(&cf);
+        return 0;                       /* an ordinary tree root */
+    }
+
+    struct jimage im;
+    int ok = jimage_parse((const char *)cf.data, cf.len, &im) == 0;
+    cas_close(&cf);
+    if (!ok) {
+        fprintf(stderr, "[9p] image manifest is malformed or unsupported\n");
+        return -1;
+    }
+
+    const char *r = jimage_root_for(&im, arch ? arch : "");
+    if (!r) {
+        fprintf(stderr, "[9p] image has no variant for arch '%s'\n",
+                arch ? arch : "");
+        return -1;
+    }
+    strncpy(ctx.root, r, sizeof ctx.root - 1);
+    ctx.root[sizeof ctx.root - 1] = '\0';
+    return 0;
+}
+
 const struct p9_backend *
 p9smolvfs_open(const char *depot, const char *ref, const char *subtree,
-               void **ctx_out)
+               const char *arch, void **ctx_out)
 {
     ctx.store = cas_new(depot);
     if (!ctx.store)
@@ -219,16 +258,23 @@ p9smolvfs_open(const char *depot, const char *ref, const char *subtree,
     if (ref && is_root_hash(ref)) {
         strncpy(ctx.root, ref, sizeof ctx.root - 1);        /* pinned snapshot */
         ctx.root[sizeof ctx.root - 1] = '\0';
-        /* A ref name always resolves to a committed root, but a pinned hash
-         * is caller-supplied. Confirm it names a real tree so a mistyped
-         * pin fails here rather than mounting an empty, broken root. */
-        struct cas_tree_dir d;
-        if (cas_tree_load(ctx.ct, ctx.root, &d) != CAS_OK)
-            goto fail;
-        cas_tree_dir_free(&d);
     } else if (cas_tree_ref_read(ctx.ct, ref, ctx.root) != CAS_OK) {
         goto fail;
     }
+
+    /* The resolved object is either a root tree (serve it) or a jimage manifest
+     * that points at a root tree per arch (select this host's). */
+    if (resolve_image(arch) != 0)
+        goto fail;
+
+    /* Confirm the root names a real tree. A ref name always resolves to a
+     * committed tree, but a pinned or image-selected hash is caller-supplied,
+     * so a mistyped one fails here rather than mounting an empty, broken root. */
+    struct cas_tree_dir d;
+    if (cas_tree_load(ctx.ct, ctx.root, &d) != CAS_OK)
+        goto fail;
+    cas_tree_dir_free(&d);
+
     /* Confine the served root to the manifest's subtree. */
     if (subtree && descend_subtree(ctx.ct, ctx.root, subtree) != 0)
         goto fail;
@@ -241,4 +287,59 @@ fail:
     cas_free(ctx.store);
     ctx.store = NULL;
     return NULL;
+}
+
+int
+p9smolvfs_readfile(void *vctx, const char *path, void **out, size_t *len)
+{
+    struct smolctx *c = vctx;
+    char cur[CAS_HASH_HEX + 1];
+    char buf[256];
+    size_t i = 0;
+
+    for (; path[i] && i < sizeof buf - 1; i++)
+        buf[i] = path[i];
+    buf[i] = '\0';
+
+    for (int k = 0; k <= CAS_HASH_HEX; k++)
+        cur[k] = c->root[k];
+
+    /* Walk the path. Every component but the last is a directory to descend;
+     * the last names the file whose blob we return. */
+    char *p = buf;
+    struct cas_tree_entry e;
+    int have = 0;
+    while (*p) {
+        while (*p == '/')
+            p++;
+        if (!*p)
+            break;
+        char *comp = p;
+        while (*p && *p != '/')
+            p++;
+        if (*p)
+            *p++ = '\0';
+
+        if (cas_tree_lookup(c->ct, cur, comp, &e) != CAS_OK)
+            return -1;
+        have = 1;
+        for (int k = 0; k <= CAS_HASH_HEX; k++)
+            cur[k] = e.hash[k];
+    }
+    if (!have || (e.mode & CAS_TREE_S_IFMT) == CAS_TREE_S_IFDIR)
+        return -1;
+
+    struct cas_file cf;
+    if (cas_open(c->store, &cf, cur) != CAS_OK)
+        return -1;
+    void *b = malloc(cf.len ? cf.len : 1);
+    if (!b) {
+        cas_close(&cf);
+        return -1;
+    }
+    memcpy(b, cf.data, cf.len);
+    *out = b;
+    *len = cf.len;
+    cas_close(&cf);
+    return 0;
 }

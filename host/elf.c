@@ -105,33 +105,29 @@ load_segment(const char *path, const uint8_t *b, long size, uint8_t *ram,
 }
 
 int
-elf_load_file(const char *path, uint8_t *ram, size_t ram_size, elf_image *img)
+elf_load_mem(const char *name, const uint8_t *b, long size, uint8_t *ram,
+             size_t ram_size, elf_image *img)
 {
-    long size;
-    uint8_t *b = slurp(path, &size);
     uint64_t phoff;
     uint32_t phentsize, phnum, i;
     int is64;
 
-    if (!b)
-        return -1;
-
     if (size < 52 || memcmp(b, "\177ELF", 4) != 0) {
-        fprintf(stderr, "elf: %s is not an ELF file\n", path);
-        goto fail;
+        fprintf(stderr, "elf: %s is not an ELF file\n", name);
+        return -1;
     }
     if (b[4] != ELFCLASS32 && b[4] != ELFCLASS64) {
-        fprintf(stderr, "elf: %s has an unknown ELF class\n", path);
-        goto fail;
+        fprintf(stderr, "elf: %s has an unknown ELF class\n", name);
+        return -1;
     }
     if (b[5] != ELFDATA2LSB) {
-        fprintf(stderr, "elf: %s is not little-endian\n", path);
-        goto fail;
+        fprintf(stderr, "elf: %s is not little-endian\n", name);
+        return -1;
     }
     is64 = (b[4] == ELFCLASS64);
     if (rd16(b + 16) != ET_EXEC) {
-        fprintf(stderr, "elf: %s is not an executable image\n", path);
-        goto fail;
+        fprintf(stderr, "elf: %s is not an executable image\n", name);
+        return -1;
     }
 
     memset(img, 0, sizeof(*img));
@@ -150,8 +146,8 @@ elf_load_file(const char *path, uint8_t *ram, size_t ram_size, elf_image *img)
         phnum = rd16(b + 44);
     }
     if (phnum == 0 || phoff == 0) {
-        fprintf(stderr, "elf: %s has no program headers\n", path);
-        goto fail;
+        fprintf(stderr, "elf: %s has no program headers\n", name);
+        return -1;
     }
 
     for (i = 0; i < phnum; i++) {
@@ -161,8 +157,8 @@ elf_load_file(const char *path, uint8_t *ram, size_t ram_size, elf_image *img)
 
         if (phoff + (uint64_t)(i + 1) * phentsize > (uint64_t)size) {
             fprintf(stderr, "elf: %s: program headers past end of file\n",
-                    path);
-            goto fail;
+                    name);
+            return -1;
         }
         type = rd32(ph + 0);
         if (type != PT_LOAD)
@@ -180,20 +176,29 @@ elf_load_file(const char *path, uint8_t *ram, size_t ram_size, elf_image *img)
             memsz = rd32(ph + 20);
         }
 
-        if (load_segment(path, b, size, ram, ram_size, img, i, offset,
+        if (load_segment(name, b, size, ram, ram_size, img, i, offset,
                          paddr, filesz, memsz) != 0)
-            goto fail;
+            return -1;
     }
 
     if (img->nsegments == 0) {
-        fprintf(stderr, "elf: %s has no loadable segments\n", path);
-        goto fail;
+        fprintf(stderr, "elf: %s has no loadable segments\n", name);
+        return -1;
     }
 
-    free(b);
     return 0;
+}
 
-fail:
+int
+elf_load_file(const char *path, uint8_t *ram, size_t ram_size, elf_image *img)
+{
+    long size;
+    uint8_t *b = slurp(path, &size);
+    int rc;
+
+    if (!b)
+        return -1;
+    rc = elf_load_mem(path, b, size, ram, ram_size, img);
     free(b);
-    return -1;
+    return rc;
 }

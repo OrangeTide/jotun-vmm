@@ -4,7 +4,9 @@ echo.elf
 libos.elf
 hello.elf
 castool
+jbundle
 bundle-depot
+image-depot
 bundle-staging
 bundle-cache
 build/
