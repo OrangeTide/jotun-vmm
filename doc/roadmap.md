@@ -272,7 +272,7 @@ Risk: interrupt injection without an emulated controller differs per backend
 (KVM x86 without an in-kernel irqchip, KVM arm64 without a vGIC, and HVF IRQ
 injection). It is the least certain mechanism in the design.
 
-## M5: networking
+## M5: networking (in progress)
 
 Goal: container-style limited networking.
 
@@ -282,6 +282,43 @@ Goal: container-style limited networking.
 
 Acceptance: the guest dials an allowed host and port through `/net`, and a
 disallowed port is refused.
+
+Decisions (made): the guest-facing API is a hybrid. A socket-like client
+(`net_dial`/`net_read`/`net_write`/`net_close`, plus UDP `net_sendto`/
+`net_recvfrom`) carries the data path over a new net channel with the same
+shape as the 9P channel: a shared request/response buffer and a synchronous
+doorbell. `/net` itself is a read-only information tree served through the
+existing 9P backend (`/net/policy`, `/net/conn/...`), for naming and
+observability, not for byte transfer. Scope is outbound TCP connect and UDP
+datagrams; listen/accept is deferred.
+
+The host provider opens real host sockets (that is the NAT) and keeps them
+non-blocking. A host poll thread (epoll, modelled on the timer thread) watches
+registered fds; each cycle, while an fd is ready, it injects the event vector
+into running vcpus and wakes any idle vcpus, so readiness is level-triggered
+and re-delivered rather than edge-latched.
+
+Blocking is at task granularity, not vcpu granularity, so a task waiting on the
+network does not stall the other tasks on its cpu. A `net_read` that would
+block parks the task (a new `TASK_BLOCKED` scheduler state) and the task is
+re-readied on the next net event. The parking reuses the yield invariant that a
+task is never re-queued until its stack pointer is saved: a wake only re-queues
+a task the scheduler has already parked (a `parked` flag set after the switch),
+and because readiness is re-delivered each poll cycle, the rare
+blocked-but-not-yet-parked miss self-heals within one interval.
+
+Steps:
+
+- M5.1: the scheduler sleep/wake primitive. A `TASK_BLOCKED` state, `task_block`
+  and `task_wake`, a quiescence check that does not shut down while tasks are
+  blocked, and a re-ready pass when an idle cpu is woken. Self-tested in the
+  guest with no sockets.
+- M5.2: the net channel ABI, the host net provider (TCP connect, non-blocking,
+  poll thread, policy stub), and the guest net client, with an end-to-end
+  dial/read/write demo.
+- M5.3: UDP `sendto`/`recvfrom`.
+- M5.4: the `/net` information tree over 9P, the manifest network-policy fields
+  and their enforcement, and the allowed/refused acceptance test.
 
 ## M6: display, the 2D vector path
 

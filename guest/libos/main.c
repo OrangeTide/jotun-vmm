@@ -127,6 +127,42 @@ smp_demo(void)
              ? " ok\n" : " WRONG\n");
 }
 
+/* Sleep/wake test: a child parks itself with task_block and the parent wakes
+ * it by id. Exercises the TASK_BLOCKED path and the no-lost-wakeup handoff
+ * without any device, so the scheduler change can be checked on its own. */
+static void
+block_waiter(void)
+{
+    con_puts("waiter: blocking\n");
+    task_block();
+    con_puts("waiter: woken\n");
+    task_exits("woke");
+}
+
+static void
+block_demo(void)
+{
+    con_puts("block: sleep/wake test\n");
+    int id = task_spawn("waiter", block_waiter);
+    if (id < 0) {
+        con_puts("block: spawn failed\n");
+        return;
+    }
+
+    /* Give the waiter a few scheduling rounds to run and park. */
+    for (int i = 0; i < 3; i++)
+        task_yield();
+
+    con_puts("block: waking waiter\n");
+    task_wake(id);
+
+    char status[STATUS_MAX];
+    task_await(status, sizeof status);
+    con_puts("block: waiter returned '");
+    con_puts(status);
+    con_puts("'\n");
+}
+
 /* The init task: either the preemption demo or the startup script, selected by
  * the first boot argument (default "rc"). */
 static void
@@ -139,6 +175,8 @@ init_task(void)
     } else if (script[0] == 's' && script[1] == 'm') {  /* "smp" */
         spin_demo();
         smp_demo();
+    } else if (script[0] == 'b' && script[1] == 'l') {  /* "block" */
+        block_demo();
     } else {
         con_puts("init: running script /");
         con_puts(script);

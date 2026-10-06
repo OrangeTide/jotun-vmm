@@ -40,6 +40,7 @@ enum task_state {
     TASK_FREE,
     TASK_READY,
     TASK_RUNNING,
+    TASK_BLOCKED,       /* parked on an event, not runnable until woken */
     TASK_ZOMBIE,        /* exited, awaiting reap */
 };
 
@@ -52,6 +53,8 @@ struct task {
     void                *sp;        /* saved stack pointer when not running */
     unsigned char       *stack;     /* kmalloc'd base, freed at exit */
     struct task         *qnext;     /* ready-queue link */
+    int                 parked;     /* BLOCKED and its sp is saved: safe to wake */
+    int                 wake_pending; /* a wake arrived before the task parked */
     char                status[STATUS_MAX];
     char                notes[NNOTES][NOTE_MAX];
     int                 note_head;
@@ -76,6 +79,7 @@ static struct task *runq_head;
 static struct task *runq_tail;
 static volatile int runq_lock;      /* guards runq + tasks table + counters */
 static int running_count;           /* tasks currently executing on some cpu */
+static int blocked_count;           /* tasks parked on an event */
 static volatile int shutdown;       /* set once the system has quiesced */
 
 static struct percpu *
@@ -203,6 +207,8 @@ task_spawn(const char *name, task_fn fn)
         t->sp = stack_init(stack, TASK_STACK, task_trampoline);
         t->status[0] = '\0';
         t->note_head = t->note_tail = 0;
+        t->parked = 0;
+        t->wake_pending = 0;
         t->state = TASK_READY;
         enqueue(t);
         id = i;
@@ -234,6 +240,8 @@ task_exec(task_fn fn)
     t->stack = stack;
     t->sp = stack_init(stack, TASK_STACK, task_trampoline);
     t->status[0] = '\0';
+    t->parked = 0;
+    t->wake_pending = 0;
     t->state = TASK_READY;
     /* Discard this context. The scheduler re-enqueues t (now READY with a
      * fresh sp) and frees pc->reap once the switch has left this stack. */
@@ -256,16 +264,19 @@ sched_start(void)
 
         struct task *t = dequeue();
         if (!t) {
-            if (running_count == 0) {
-                /* Queue empty and nothing running: the system has quiesced.
-                 * Signal every cpu to leave its scheduler. */
+            if (running_count == 0 && blocked_count == 0) {
+                /* Queue empty, nothing running, nothing parked: the system
+                 * has quiesced. Signal every cpu to leave its scheduler. */
                 shutdown = 1;
                 unlock_irq(f);
                 smp_wake_all();
                 return;
             }
             unlock_irq(f);
-            smp_idle();         /* wait for another cpu to queue work */
+            /* Either another cpu is busy and will queue work, or every task is
+             * parked and a waker (another task, or a host event) will ready
+             * one. Block until a wake doorbell rouses us, then recheck. */
+            smp_idle();
             continue;
         }
 
@@ -288,6 +299,18 @@ sched_start(void)
             /* Yielded or exec'd. Its sp is saved now, so it is safe to let
              * another cpu pick it up. */
             enqueue(done);
+        } else if (done->state == TASK_BLOCKED) {
+            /* Parked on an event. Its sp is saved now, so a wake may re-queue
+             * it. If a wake raced in before it parked, honour that instead of
+             * parking. */
+            if (done->wake_pending) {
+                done->wake_pending = 0;
+                done->state = TASK_READY;
+                enqueue(done);
+            } else {
+                done->parked = 1;
+                blocked_count++;
+            }
         } else if (done->state == TASK_ZOMBIE && done->stack) {
             /* Exited: free the stack, leave status and slot for a reaper. */
             free1 = done->stack;
@@ -321,6 +344,51 @@ task_yield(void)
      * the way back, when the sp is safely stored. */
     ctx_switch(&pc->cur->sp, pc->sched_sp);
     arch_irq_restore(f);
+}
+
+void
+task_block(void)
+{
+    unsigned long f = arch_irq_save();
+    struct percpu *pc = this_cpu();
+
+    /* A wake that arrived while we were still running (before parking) cancels
+     * the block: consume it and stay runnable. */
+    if (pc->cur->wake_pending) {
+        pc->cur->wake_pending = 0;
+        arch_irq_restore(f);
+        return;
+    }
+    pc->cur->state = TASK_BLOCKED;
+    /* Like yield, do not touch the run queue here. The scheduler parks the
+     * task after the switch saves its sp; only then can a wake re-queue it. */
+    ctx_switch(&pc->cur->sp, pc->sched_sp);
+    arch_irq_restore(f);
+}
+
+void
+task_wake(int id)
+{
+    if (id < 0 || id >= MAX_TASKS)
+        return;
+
+    unsigned long f = lock_irq();
+    struct task *t = &tasks[id];
+    if (t->state == TASK_BLOCKED && t->parked) {
+        /* Parked and sp saved: safe to make runnable now. */
+        t->parked = 0;
+        t->state = TASK_READY;
+        blocked_count--;
+        enqueue(t);
+    } else {
+        /* Blocked but not yet parked, or not blocked yet: record the wake so
+         * task_block (or the scheduler's park step) honours it and does not
+         * sleep through it. */
+        t->wake_pending = 1;
+    }
+    unlock_irq(f);
+
+    smp_wake_all();     /* a newly runnable task: rouse any idle cpu */
 }
 
 /* Called from the event ISR. Reschedule the running task; if the scheduler
@@ -417,6 +485,7 @@ state_name(enum task_state s)
     case TASK_FREE:     return "free";
     case TASK_READY:    return "ready";
     case TASK_RUNNING:  return "running";
+    case TASK_BLOCKED:  return "blocked";
     case TASK_ZOMBIE:   return "zombie";
     }
     return "?";

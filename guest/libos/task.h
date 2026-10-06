@@ -42,6 +42,16 @@ void sched_start(void);
 /* Yield the CPU to the next ready task. Returns when scheduled again. */
 void task_yield(void);
 
+/* Park the current task until task_wake(its id) is called. Unlike yield, a
+ * blocked task is not runnable and is not rescheduled on its own. A wake that
+ * races in just before the task parks is not lost. Used to wait on an external
+ * event (for example network readiness) without busy-polling. */
+void task_block(void);
+
+/* Make a blocked task runnable again. Safe to call whether or not the task has
+ * parked yet, and whether or not it is currently blocked. */
+void task_wake(int id);
+
 /* End the current task with an exit status (NULL or "" means success). Does
  * not return. A task that returns from its function exits with success. */
 void task_exits(const char *status);
