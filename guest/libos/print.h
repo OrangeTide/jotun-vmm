@@ -5,14 +5,42 @@
 #ifndef LIBOS_PRINT_H
 #define LIBOS_PRINT_H
 
+#include <stdarg.h>
 #include <stdint.h>
 #include "arch.h"
+#include "fmt.h"
 
 static inline void
 con_puts(const char *s)
 {
     while (*s)
         con_putc(*s++);
+}
+
+/* The console as a format sink: one byte at a time to con_putc. */
+static inline void
+con_sink(char c, void *arg)
+{
+    (void)arg;
+    con_putc(c);
+}
+
+/* Formatted console output. Nothing is buffered, so there is no length cap;
+ * each byte goes straight to con_putc. Returns the number of bytes written. */
+static inline int
+con_vprintf(const char *fmt, va_list ap)
+{
+    return vfctprintf(con_sink, NULL, fmt, ap);
+}
+
+static inline int
+con_printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vfctprintf(con_sink, NULL, fmt, ap);
+    va_end(ap);
+    return n;
 }
 
 /* Print a 64-bit value in decimal. */

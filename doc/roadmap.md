@@ -656,7 +656,16 @@ Steps:
   `strcmp() == 0`; each file now includes `string.h`. p9.c was left as is: its
   loops are 9P wire marshalling and stream decoding through the bounds-checked
   codec in `abi/jotun_9p.h`, which host and guest share, not string helpers.
-- M9.3: the bounded formatter, output via the service vector.
+- M9.3 (done): the bounded formatter. `guest/libos/fmt.c` is a sink-based
+  engine, `vfctprintf(out, arg, fmt, ap)`, with `snprintf`/`vsnprintf` built on
+  a bounded buffer sink and `con_printf`/`con_vprintf` (print.h) built on a
+  console sink, so formatted output reaches con_putc without a trap (the guest
+  has no syscalls). It is jotun-native, not copied, so it carries no third-party
+  header. Flags `- 0 + space #`, numeric or `*` width and precision, length
+  `h hh l ll z t j`, and conversions `d i u o x X b c s p %`; no allocation. The
+  engine matches glibc snprintf across a case sweep, and compiles integer-only
+  on arm64 under -mgeneral-regs-only (no FP varargs, no 64-bit-divide helper).
+  Exposing it to bundle programs is M9.4.
 - M9.4: expose the library to bundle programs. Decide between extending the
   service vector with these entries and linking a small `libc.a` into each
   program (leaning toward the linked archive, to keep the `jotun_svc` ABI

@@ -121,7 +121,7 @@ echo.elf: guest/echo.c
 LIBOS_SRC = guest/libos/main.c guest/libos/mem.c guest/libos/task.c \
     guest/libos/boot.c guest/libos/p9.c guest/libos/elfload.c \
     guest/libos/prog.c guest/libos/jsh.c guest/libos/ns.c guest/libos/net.c \
-    guest/libos/draw.c guest/libos/string.c $(LIBOS_ARCH)
+    guest/libos/draw.c guest/libos/string.c guest/libos/fmt.c $(LIBOS_ARCH)
 
 # triton.c is the only guest translation unit built with the FPU enabled: it is
 # the software rasterizer and uses floating point. The rest of the guest stays

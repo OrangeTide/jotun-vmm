@@ -579,18 +579,10 @@ show_boot_params(void)
         con_puts("boot: no parameter block\n");
         return;
     }
-    con_puts("boot: ram ");
-    con_putu(boot_ram_size());
-    con_puts(" bytes, argc ");
-    con_putu((uint64_t)boot_argc());
-    con_putc('\n');
-    for (int i = 0; i < boot_argc(); i++) {
-        con_puts("  argv[");
-        con_putu((uint64_t)i);
-        con_puts("] = ");
-        con_puts(boot_argv(i));
-        con_putc('\n');
-    }
+    con_printf("boot: ram %lu bytes, argc %d\n",
+               (unsigned long)boot_ram_size(), boot_argc());
+    for (int i = 0; i < boot_argc(); i++)
+        con_printf("  argv[%d] = %s\n", i, boot_argv(i));
 }
 
 /* Set once cpu 0 has finished shared bring-up and spawned init. Secondary cpus
