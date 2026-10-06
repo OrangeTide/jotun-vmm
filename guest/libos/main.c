@@ -344,6 +344,11 @@ draw_demo(void)
     /* Move the circle with SET, a post-create mutation. */
     draw_set(5, DSA_CX, 40);
 
+    /* Create then remove a node, exercising the removal path. Node 8 must not
+     * appear in the authored scene, and the rest of the tree must stay intact. */
+    draw_rect(8, 1, 0, 0, 10, 10, 0, &box);
+    draw_remove(8);
+
     draw_flush();
     con_puts("draw: scene submitted, waiting for event\n");
 
@@ -362,6 +367,39 @@ draw_demo(void)
     }
     con_putc('\n');
     con_puts("draw: done\n");
+}
+
+/* Draw scale benchmark: build a grid of many rects in one surface and submit
+ * it, so the host (with JOTUN_DRAW_BENCH) can time apply and serialize as the
+ * node count grows. The count comes from the second boot argument. */
+static void
+drawbench(void)
+{
+    int n = 1000;
+    if (boot_argc() > 1) {
+        const char *s = boot_argv(1);
+        int v = 0;
+        while (*s >= '0' && *s <= '9')
+            v = v * 10 + (*s++ - '0');
+        if (v > 0)
+            n = v;
+    }
+
+    con_puts("bench: building ");
+    con_putu((uint64_t)n);
+    con_puts(" rects\n");
+
+    draw_surface(1, 0, 0, 1000, 1000, "bench");
+    struct draw_style st = { .mask = DST_FILL, .fill = 0x4080c0 };
+    for (int i = 0; i < n; i++) {
+        int col = i % 40, row = i / 40;
+        draw_rect((uint32_t)(i + 2), 1, col * 24, row * 24, 20, 20, 2, &st);
+    }
+    draw_flush();
+
+    con_puts("bench: submitted ");
+    con_putu((uint64_t)n);
+    con_puts(" rects\n");
 }
 
 /* The init task: either the preemption demo or the startup script, selected by
@@ -384,6 +422,8 @@ init_task(void)
         udp_demo();
     } else if (script[0] == 'd' && script[1] == 'r') {  /* "draw" */
         draw_demo();
+    } else if (script[0] == 'b' && script[1] == 'e') {  /* "bench" */
+        drawbench();
     } else {
         con_puts("init: running script /");
         con_puts(script);

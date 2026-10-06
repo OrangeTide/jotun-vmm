@@ -471,7 +471,19 @@ Steps:
   emit SSE the guest never enabled, which faulted the vcpu. Text and paste input
   stay deferred since they need a text-input primitive the restricted vocabulary
   excludes (no foreignObject).
-- M6.6: scale and latency characterization (node ceiling, mutation throughput).
+- M6.6 (done): scale and latency. The host scene tree gained an id-to-slot hash
+  index (O(1) lookup), a free-slot stack (O(1) allocation), and creation-order
+  sibling links, so the whole scene serializes in one O(n) walk. This replaced
+  the first cut's linear scans. Full-scene serialize at the 4096-node ceiling
+  dropped from about 111 ms to about 2.6 ms (42x), and is now linear in node
+  count; applying an op is O(1). The node ceiling (4096 per guest, matching the
+  browser SVG DOM limit) is enforced. A benchmark hook (JOTUN_DRAW_BENCH) times
+  apply and serialize per SUBMIT, driven by a `bench` guest demo that builds a
+  grid of N rects. Numbers and method are in `doc/draw-vocabulary.md`. The
+  guest-to-host op-rate question is resolved: synchronous submission is its own
+  backpressure, so no explicit limit is needed. The remaining lever for very
+  large scenes under steady mutation is incremental (changed-node) updates
+  instead of full re-render, noted for later.
 
 ## M7: display, the pixel path
 

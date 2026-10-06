@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <time.h>
 
 #define DRAW_MAXEVT    16       /* queued input events before the oldest drops */
 #define DRAW_VALMAX    64       /* event value bytes retained (matches guest) */
@@ -40,6 +41,7 @@
 #define DRAW_MAXINTER  4        /* interaction annotations per node */
 #define DRAW_MAXPTS    1024     /* points in a polyline */
 #define DRAW_MAXSEG    512      /* segments in a path */
+#define DRAW_IDHASH    8192     /* id index buckets (power of two, > 2x nodes) */
 
 /* The guest id namespaces browser DOM ids as qu-<guest>-<node>. One guest
  * domain exists today; multi-guest namespacing arrives with multiple domains. */
@@ -111,12 +113,18 @@ struct dnode {
     int      click;             /* a click listener is attached */
     int      close;             /* a close listener is attached */
     int      hidden;            /* SET VISIBLE 0: emitted as display:none */
+
+    /* Tree links (slot indices, -1 for none). Children are kept in creation
+     * order so serialization is a single O(n) walk, no per-parent scan. */
+    int      first_child, last_child;
+    int      prev_sib, next_sib;
 };
 
 struct drawdev {
     struct jotun_draw *chan;
     void (*wake)(void);
     int test;
+    int bench;                  /* JOTUN_DRAW_BENCH: time apply and serialize */
     const char *svg_path;       /* JOTUN_DRAW_SVG, or NULL */
     struct drawws *ws;          /* the browser front end, or NULL */
 
@@ -131,6 +139,15 @@ struct drawdev {
     int nnodes;                 /* live node count */
     int nsurf;                  /* live surface count */
     uint32_t seqctr;
+
+    /* id -> slot+1 open-addressed index (0 is empty), so a lookup is O(1). */
+    int idx[DRAW_IDHASH];
+    /* Free-slot stack, so allocating a node is O(1) rather than a table scan. */
+    int freelist[DRAW_MAXNODES];
+    int nfree;
+    /* The surface forest, in creation order (slot indices, -1 for none). */
+    int root_first, root_last;
+    int inited;                 /* freelist and roots laid out once */
 };
 
 /****************************************************************
@@ -229,15 +246,79 @@ rd_style(struct rd *r, struct draw_style *st)
 
 /****************************************************************
  * Scene tree
+ *
+ * An id-to-slot hash index makes lookup O(1); a free-slot stack makes
+ * allocation O(1); and sibling links keep children in creation order so the
+ * whole scene serializes in one O(n) walk with no per-parent scan.
  ****************************************************************/
 
+/* Lay out the free list and empty the forest. Done once, lazily, so a
+ * calloc'd drawdev (every link zero) becomes a valid empty tree. */
+static void
+tree_init(struct drawdev *dd)
+{
+    if (dd->inited)
+        return;
+    for (int i = 0; i < DRAW_MAXNODES; i++)
+        dd->freelist[i] = DRAW_MAXNODES - 1 - i;    /* pop low slots first */
+    dd->nfree = DRAW_MAXNODES;
+    dd->root_first = dd->root_last = -1;
+    dd->inited = 1;
+}
+
+static unsigned
+idx_hash(uint32_t id)
+{
+    return (id * 2654435761u) & (DRAW_IDHASH - 1);
+}
+
+/* Return the slot holding id, or -1. */
 static int
 find(struct drawdev *dd, uint32_t id)
 {
-    for (int i = 0; i < DRAW_MAXNODES; i++)
-        if (dd->nodes[i].in_use && dd->nodes[i].id == id)
-            return i;
+    for (unsigned i = idx_hash(id); dd->idx[i]; i = (i + 1) & (DRAW_IDHASH - 1))
+        if (dd->nodes[dd->idx[i] - 1].id == id)
+            return dd->idx[i] - 1;
     return -1;
+}
+
+static void
+idx_insert(struct drawdev *dd, uint32_t id, int slot)
+{
+    unsigned i = idx_hash(id);
+    while (dd->idx[i])
+        i = (i + 1) & (DRAW_IDHASH - 1);
+    dd->idx[i] = slot + 1;
+}
+
+/* Remove id from the index with backward-shift deletion, which keeps the
+ * table free of tombstones so probe chains stay short. */
+static void
+idx_remove(struct drawdev *dd, uint32_t id)
+{
+    unsigned mask = DRAW_IDHASH - 1;
+    unsigned i = idx_hash(id);
+    while (dd->idx[i] && dd->nodes[dd->idx[i] - 1].id != id)
+        i = (i + 1) & mask;
+    if (!dd->idx[i])
+        return;
+
+    for (;;) {
+        dd->idx[i] = 0;
+        unsigned j = i;
+        for (;;) {
+            j = (j + 1) & mask;
+            if (!dd->idx[j])
+                return;
+            unsigned k = idx_hash(dd->nodes[dd->idx[j] - 1].id);
+            /* Move j back to i only if k is not within the (i, j] window. */
+            if (i <= j ? (k > i && k <= j) : (k > i || k <= j))
+                continue;
+            dd->idx[i] = dd->idx[j];
+            i = j;
+            break;
+        }
+    }
 }
 
 /* A parent must be an existing surface or group. */
@@ -251,28 +332,64 @@ parent_ok(struct drawdev *dd, uint32_t parent)
     return t == DOP_SURFACE || t == DOP_GROUP;
 }
 
+/* Append slot to the tail of a sibling list (the parent's children, or the
+ * surface forest when parent_slot is -1). */
+static void
+link_child(struct drawdev *dd, int parent_slot, int slot)
+{
+    int *first = parent_slot < 0 ? &dd->root_first : &dd->nodes[parent_slot].first_child;
+    int *last = parent_slot < 0 ? &dd->root_last : &dd->nodes[parent_slot].last_child;
+    dd->nodes[slot].prev_sib = *last;
+    dd->nodes[slot].next_sib = -1;
+    if (*last >= 0)
+        dd->nodes[*last].next_sib = slot;
+    else
+        *first = slot;
+    *last = slot;
+}
+
+/* Detach slot from its sibling list. */
+static void
+unlink_child(struct drawdev *dd, int parent_slot, int slot)
+{
+    int *first = parent_slot < 0 ? &dd->root_first : &dd->nodes[parent_slot].first_child;
+    int *last = parent_slot < 0 ? &dd->root_last : &dd->nodes[parent_slot].last_child;
+    int p = dd->nodes[slot].prev_sib, n = dd->nodes[slot].next_sib;
+    if (p >= 0)
+        dd->nodes[p].next_sib = n;
+    else
+        *first = n;
+    if (n >= 0)
+        dd->nodes[n].prev_sib = p;
+    else
+        *last = p;
+}
+
 /* Create a node. Rejects id 0 (reserved), a duplicate id, or a full table.
  * Parent validation is the caller's, since a surface has none. Returns the new
  * node, or NULL. */
 static struct dnode *
 node_new(struct drawdev *dd, uint32_t id, uint8_t type, uint32_t parent)
 {
-    if (id == 0 || find(dd, id) >= 0 || dd->nnodes >= DRAW_MAXNODES)
+    tree_init(dd);
+    if (id == 0 || find(dd, id) >= 0 || dd->nfree == 0)
         return NULL;
-    for (int i = 0; i < DRAW_MAXNODES; i++) {
-        struct dnode *n = &dd->nodes[i];
-        if (n->in_use)
-            continue;
-        memset(n, 0, sizeof *n);
-        n->in_use = 1;
-        n->id = id;
-        n->type = type;
-        n->parent = parent;
-        n->seq = dd->seqctr++;
-        dd->nnodes++;
-        return n;
-    }
-    return NULL;
+
+    int slot = dd->freelist[--dd->nfree];
+    struct dnode *n = &dd->nodes[slot];
+    memset(n, 0, sizeof *n);
+    n->in_use = 1;
+    n->id = id;
+    n->type = type;
+    n->parent = parent;
+    n->seq = dd->seqctr++;
+    n->first_child = n->last_child = -1;
+    n->prev_sib = n->next_sib = -1;
+    dd->nnodes++;
+
+    idx_insert(dd, id, slot);
+    link_child(dd, parent ? find(dd, parent) : -1, slot);
+    return n;
 }
 
 /* Remove a node and, recursively, everything parented to it. */
@@ -283,12 +400,17 @@ node_remove(struct drawdev *dd, uint32_t id)
     if (s < 0)
         return;
 
-    /* Children first: scan for anything whose parent is this node. */
-    for (int i = 0; i < DRAW_MAXNODES; i++)
-        if (dd->nodes[i].in_use && dd->nodes[i].parent == id)
-            node_remove(dd, dd->nodes[i].id);
+    /* Children first, walking the sibling list and capturing the next link
+     * before the child unlinks itself. */
+    for (int c = dd->nodes[s].first_child; c >= 0; ) {
+        int next = dd->nodes[c].next_sib;
+        node_remove(dd, dd->nodes[c].id);
+        c = next;
+    }
 
     struct dnode *n = &dd->nodes[s];
+    unlink_child(dd, n->parent ? find(dd, n->parent) : -1, s);
+    idx_remove(dd, id);
     if (n->type == DOP_SURFACE)
         dd->nsurf--;
     free(n->text);
@@ -298,6 +420,7 @@ node_remove(struct drawdev *dd, uint32_t id)
     n->pts = NULL;
     n->segs = NULL;
     n->in_use = 0;
+    dd->freelist[dd->nfree++] = s;
     dd->nnodes--;
 }
 
@@ -918,31 +1041,13 @@ emit_common(struct sbuf *b, const struct dnode *n)
 
 static void emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n);
 
-/* Emit every child of parent id in creation order: repeatedly pick the child
- * with the smallest seq greater than the last emitted. O(n^2) over the tree,
- * which is fine at the node cap; an index is M6.6 work. */
+/* Emit a sibling list in creation order, following the next links. O(children),
+ * so the whole scene serializes in one O(n) pass. */
 static void
-emit_children_ordered(struct sbuf *b, struct drawdev *dd, uint32_t parent)
+emit_siblings(struct sbuf *b, struct drawdev *dd, int head)
 {
-    int have_last = 0;
-    uint32_t last = 0;
-    for (;;) {
-        const struct dnode *pick = NULL;
-        for (int i = 0; i < DRAW_MAXNODES; i++) {
-            const struct dnode *c = &dd->nodes[i];
-            if (!c->in_use || c->parent != parent)
-                continue;
-            if (have_last && c->seq <= last)
-                continue;
-            if (!pick || c->seq < pick->seq)
-                pick = c;
-        }
-        if (!pick)
-            break;
-        emit_node(b, dd, pick);
-        last = pick->seq;
-        have_last = 1;
-    }
+    for (int s = head; s >= 0; s = dd->nodes[s].next_sib)
+        emit_node(b, dd, &dd->nodes[s]);
 }
 
 static void
@@ -969,14 +1074,14 @@ emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n)
                   " font-family=\"sans-serif\" font-size=\"12\""
                   " data-qu-listen=\"close\">x</text>",
                   n->geo.surface.w - 12);
-        emit_children_ordered(b, dd, n->id);
+        emit_siblings(b, dd, n->first_child);
         sb_puts(b, "</g>");
         break;
     case DOP_GROUP:
         sb_printf(b, "<g id=\"qu-%d-%u\" transform=\"translate(%d,%d)\"%s>",
                   DRAW_GUEST, n->id, n->geo.group.tx, n->geo.group.ty,
                   n->hidden ? " display=\"none\"" : "");
-        emit_children_ordered(b, dd, n->id);
+        emit_siblings(b, dd, n->first_child);
         sb_puts(b, "</g>");
         break;
     case DOP_RECT:
@@ -1063,12 +1168,11 @@ emit_node(struct sbuf *b, struct drawdev *dd, const struct dnode *n)
 static char *
 serialize(struct drawdev *dd)
 {
-    /* Canvas size: enough to contain every surface. */
+    /* Canvas size: enough to contain every surface. Surfaces are the forest
+     * roots, so walk the root list rather than scanning the whole table. */
     int cw = 1, ch = 1;
-    for (int i = 0; i < DRAW_MAXNODES; i++) {
-        const struct dnode *n = &dd->nodes[i];
-        if (!n->in_use || n->type != DOP_SURFACE)
-            continue;
+    for (int s = dd->root_first; s >= 0; s = dd->nodes[s].next_sib) {
+        const struct dnode *n = &dd->nodes[s];
         int right = n->geo.surface.x + n->geo.surface.w;
         int bottom = n->geo.surface.y + n->geo.surface.h;
         if (right > cw)
@@ -1081,7 +1185,7 @@ serialize(struct drawdev *dd)
     sb_printf(&b, "<svg xmlns=\"http://www.w3.org/2000/svg\""
               " width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\">",
               cw, ch, cw, ch);
-    emit_children_ordered(&b, dd, 0);       /* surfaces have parent 0 */
+    emit_siblings(&b, dd, dd->root_first);
     sb_puts(&b, "</svg>");
     return b.p;
 }
@@ -1139,8 +1243,10 @@ draw_init(struct jotun_draw *chan, void (*wake)(void), int test)
     dd->chan = chan;
     dd->wake = wake;
     dd->test = test;
+    dd->bench = getenv("JOTUN_DRAW_BENCH") != NULL;
     dd->svg_path = getenv("JOTUN_DRAW_SVG");
     pthread_mutex_init(&dd->qlock, NULL);
+    tree_init(dd);              /* so an empty forest has root_first == -1 */
 
     /* The browser front end is opt-out: start it unless JOTUN_DRAW_PORT is 0.
      * The default port is localhost-only. */
@@ -1171,13 +1277,28 @@ handle_submit(struct drawdev *dd, struct jotun_draw *chan)
         return;
     }
 
+    struct timespec t0, t1, t2;
+    if (dd->bench)
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
     uint32_t click_node = 0;
     int rc = apply(dd, chan->buf, len, dd->test ? &click_node : NULL);
+
+    if (dd->bench)
+        clock_gettime(CLOCK_MONOTONIC, &t1);
 
     /* Author the scene once: push it to the browser and, when requested, drop a
      * snapshot to disk. A partial scene from a rejected stream is still shown,
      * so it is inspectable during bring-up. */
     char *svg = serialize(dd);
+
+    if (dd->bench) {
+        clock_gettime(CLOCK_MONOTONIC, &t2);
+        long au = (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000;
+        long su = (t2.tv_sec - t1.tv_sec) * 1000000L + (t2.tv_nsec - t1.tv_nsec) / 1000;
+        fprintf(stderr, "[draw bench] nodes=%d svg=%zu apply=%ld us serialize=%ld us\n",
+                dd->nnodes, svg ? strlen(svg) : 0, au, su);
+    }
     if (svg) {
         if (dd->ws)
             drawws_push(dd->ws, svg);

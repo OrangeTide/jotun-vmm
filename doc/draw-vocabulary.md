@@ -193,6 +193,44 @@ and for any public-facing rate limiting, keeping that policy out of the host.
 The host's own limits (frame size, event rate, a single browser at a time)
 still apply underneath.
 
+## Scale and latency (M6.6)
+
+The host keeps the scene in an id-indexed tree: an id-to-slot hash makes lookup
+O(1), a free-slot stack makes allocation O(1), and sibling links keep children
+in creation order so the whole scene serializes in one O(n) walk. These replaced
+the first implementation's linear scans, which were quadratic over a build.
+
+Measured on linux/x86-64 (KVM), authoring the full SVG for a scene of rects:
+
+| nodes | serialize (first cut) | serialize (indexed) |
+|-------|-----------------------|---------------------|
+| 500   | 8.4 ms                | 0.36 ms             |
+| 1000  | 18 ms                 | 0.69 ms             |
+| 2000  | 43 ms                 | 1.3 ms              |
+| 4000  | 111 ms                | 2.6 ms              |
+
+Serialize is now linear in node count, about 0.65 us per node, so a full
+re-render of a scene at the node ceiling is about 2.6 ms. Applying an op is
+O(1), so building the whole 4096-node scene applies in under 2 ms total.
+Building a 4000-node scene from scratch (13 channel chunks, each re-rendered) is
+about 21 ms of host work in all.
+
+The node ceiling is 4096 per guest, matching the browser's SVG DOM limit (the
+Quaoar research puts it at five to ten thousand). Ops past the cap are dropped,
+and the ceiling holds: a run that asks for 5000 rects settles at 4096 nodes.
+
+The remaining cost is that every SUBMIT re-renders the whole scene. That is fine
+at these sizes (a 2.6 ms re-render), but a future lever for steady-state
+mutation of a large scene is an incremental update path that ships only the
+changed nodes rather than the whole document.
+
+On bounding the guest-to-host op rate (the earlier open question): the submit
+path is synchronous. Each SUBMIT occupies the vcpu until the host returns, so
+the guest is naturally backpressured and cannot outrun the host. An explicit
+guest op-rate limit is not needed while submission is synchronous; it would only
+matter if asynchronous or batched submission were added later. The inbound
+browser event rate is separately capped (M6.5).
+
 ## Deferred
 
 Out of scope for the M6 acceptance test, candidates for M6.5 vocabulary breadth:
