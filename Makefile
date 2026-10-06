@@ -17,7 +17,7 @@ ifeq ($(OS), Darwin)
     # macos/arm64: Hypervisor.framework, arm64 guest.
     CFLAGS += -D__APPLE__
     LDFLAGS += -framework Hypervisor
-    SRC = host/vmm_hvf.c host/elf.c host/uart.c host/main.c
+    SRC = host/vmm_hvf.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c host/main.c
     CC = clang
     GUEST = test_guest.elf echo.elf libos.elf
     GUEST_SRC = guest/test_guest_arm64.c
@@ -29,7 +29,7 @@ ifeq ($(OS), Darwin)
     GUEST_TEXT = 0x200000
 else
     CFLAGS += -D__linux__
-    SRC = host/vmm_kvm.c host/elf.c host/uart.c host/main.c
+    SRC = host/vmm_kvm.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c host/main.c
     CC = gcc
     GUEST_CFLAGS += -no-pie
     ifeq ($(ARCH), x86_64)
@@ -72,7 +72,7 @@ echo.elf: guest/echo.c
 # The library OS is multiple translation units: the portable core plus the
 # selected arch file. It needs its own include path and links all objects.
 LIBOS_SRC = guest/libos/main.c guest/libos/mem.c guest/libos/task.c \
-    guest/libos/boot.c $(LIBOS_ARCH)
+    guest/libos/boot.c guest/libos/p9.c $(LIBOS_ARCH)
 
 libos.elf: $(LIBOS_SRC)
 	$(GUEST_CC) $(GUEST_CFLAGS) -Iguest/libos -Wl,-Ttext=$(GUEST_TEXT) -o $@ $^

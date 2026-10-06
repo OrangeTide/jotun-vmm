@@ -10,6 +10,9 @@
 #include "uart.h"
 #include "jotun_abi.h"
 #include "jotun_boot.h"
+#include "jotun_9p.h"
+#include "p9srv.h"
+#include "p9mem.h"
 
 /* Guest physical RAM mapped at address 0. 8 MiB is ample for the test guest
  * plus per-vcpu stacks. */
@@ -24,6 +27,7 @@
 static uart_16550 uart;
 static pthread_mutex_t dev_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long max_exits;     /* 0 means no cap */
+static struct p9srv p9;             /* the 9P server, guarded by dev_lock */
 
 struct vcpu_ctx {
     int index;
@@ -108,6 +112,17 @@ ring_service(void)
     r->evt_pending |= JOTUN_EVT_RSP;
 }
 
+/* 9P doorbell handler: process the T-message in the shared channel and write
+ * the reply back into it. Called with dev_lock held. */
+static void
+p9_service(void)
+{
+    struct jotun_p9 *c = gpa_to_host(JOTUN_P9_BASE, sizeof(*c));
+    if (!c)
+        return;
+    c->rsp_len = p9srv_handle(&p9, c->req, c->req_len, c->rsp, JOTUN_P9_MSIZE);
+}
+
 /* One vcpu: create it on this thread (required by Hypervisor.framework), point
  * it at the entry and its own stack, then service exits until it stops. */
 static void *
@@ -158,6 +173,8 @@ run_vcpu(void *arg)
                 /* serviced by the console */
             } else if (e.mmio.write && e.mmio.address == JOTUN_DOORBELL) {
                 ring_service();
+            } else if (e.mmio.write && e.mmio.address == JOTUN_P9_DOORBELL) {
+                p9_service();
             } else if (e.mmio.write && e.mmio.address == MMIO_POWEROFF) {
                 printf("\n[vcpu %d powered off]\n", c->index);
                 fflush(stdout);
@@ -239,6 +256,7 @@ main(int argc, char **argv)
     setup_bootinfo(gargc, gargv);
 
     uart_init(&uart);
+    p9srv_init(&p9, p9mem_backend(), NULL);
 
     pthread_t threads[MAX_VCPUS];
     struct vcpu_ctx ctx[MAX_VCPUS];
