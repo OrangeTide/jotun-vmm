@@ -165,8 +165,20 @@ bundle: $(PROGS) castool
 	./castool -d $(BUNDLE_DEPOT) import root bundle-staging/*
 	./castool -d $(BUNDLE_DEPOT) pack
 
+# macsyntax: syntax-check the macOS-only net path from a Linux dev box, so the
+# kqueue backend does not rot between real macOS builds. It compiles host/net.c
+# with the __APPLE__ branch selected against a minimal shim of the kqueue API
+# (macOS has <sys/event.h>; Linux does not; see test/macshim). SO_NOSIGPIPE is
+# given its Darwin value so set_nosigpipe's setsockopt line is exercised too.
+# This needs clang; building and running on macOS remains the real confirmation.
+MACSHIM = test/macshim
+macsyntax:
+	clang -fsyntax-only -Wall -Wextra -std=c11 -D__APPLE__ \
+	    -DSO_NOSIGPIPE=0x1022 -I$(MACSHIM) -Iabi -I$(SMOLVFS_DIR) host/net.c
+	@echo "macsyntax: macOS net path OK"
+
 clean:
 	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool
 	rm -rf $(BUNDLE_DEPOT) bundle-staging build
 
-.PHONY: all clean bundle
+.PHONY: all clean bundle macsyntax
