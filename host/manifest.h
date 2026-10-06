@@ -7,6 +7,15 @@
 #define MANIFEST_H
 
 #define MANIFEST_MAXARG 16
+#define MANIFEST_MAXNET 16
+
+/* One "net allow <cidr> <ports> [proto]" rule, kept as unparsed strings; the
+ * host turns these into the numeric net policy. */
+struct manifest_net {
+    char cidr[64];                      /* "a.b.c.d" or "a.b.c.d/prefix" */
+    char ports[32];                     /* "p", "lo-hi", or "*" */
+    char proto[8];                      /* "tcp", "udp", or "" for any */
+};
 
 struct manifest {
     char bundle[256];                   /* depot path */
@@ -14,6 +23,8 @@ struct manifest {
     char subtree[256];                  /* guest root within the bundle */
     int  argc;
     char argv[MANIFEST_MAXARG][64];     /* init program and arguments */
+    int  nnet;
+    struct manifest_net net[MANIFEST_MAXNET];   /* network-allow rules */
 };
 
 /* Parse the manifest file at path. Returns 0 on success, -1 on error. */

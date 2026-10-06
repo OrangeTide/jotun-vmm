@@ -3,3 +3,11 @@ bundle bundle-depot
 ref root
 subtree /
 init rc
+
+# Network policy: "net allow <cidr> <ports> [tcp|udp]". With no net rule the
+# guest may dial anywhere; with one or more, only matching targets are allowed
+# and everything else is refused. ports is a single port, a "lo-hi" range, or
+# "*"; the protocol defaults to both. Matching is against the resolved address.
+# net allow 127.0.0.1/32 18080 tcp
+# net allow 10.0.0.0/8 1-1024
+# net allow * 53 udp

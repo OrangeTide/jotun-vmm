@@ -8,16 +8,38 @@
 #ifndef NET_H
 #define NET_H
 
+#include <stdint.h>
+
 #include "jotun_net.h"
 
 struct netdev;
 
+#define NET_MAXRULES 16
+
+/* One network-policy rule: an IPv4 CIDR, an inclusive port range, and a
+ * protocol (0 means any). A target is allowed if it matches any rule. */
+struct net_rule {
+    uint32_t addr;          /* network address, host byte order */
+    uint32_t mask;          /* netmask derived from the prefix length */
+    uint16_t port_lo;
+    uint16_t port_hi;
+    int      proto;         /* 0 = any, else NET_PROTO_TCP / NET_PROTO_UDP */
+};
+
+/* The resolved policy. With no rules every target is allowed; with one or more
+ * rules the default is to deny, and only matching targets pass. */
+struct net_policy {
+    struct net_rule rules[NET_MAXRULES];
+    int n;
+};
+
 /* Create the provider. chan is the guest net channel in host memory (where the
  * poll thread sets the readiness flag). wake is called from the poll thread
  * when a registered socket becomes ready; it must rouse the guest (inject the
- * event interrupt into running vcpus and wake idle ones). Returns NULL on
- * failure. */
-struct netdev *net_init(struct jotun_net *chan, void (*wake)(void));
+ * event interrupt into running vcpus and wake idle ones). policy is borrowed
+ * and must outlive the provider. Returns NULL on failure. */
+struct netdev *net_init(struct jotun_net *chan, void (*wake)(void),
+                        const struct net_policy *policy);
 
 /* Handle one request already written into the channel, writing the result back
  * into it. Called from the net doorbell. */

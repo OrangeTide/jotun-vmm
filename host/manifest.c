@@ -56,7 +56,30 @@ manifest_load(const char *path, struct manifest *m)
         while (*val == ' ' || *val == '\t')
             val++;
 
-        if (strcmp(key, "bundle") == 0) {
+        if (strcmp(key, "net") == 0) {
+            /* "net allow <cidr> <ports> [proto]". Tokenize the value. */
+            char *tok[4];
+            int nt = 0;
+            char *p = val;
+            while (*p && nt < 4) {
+                while (*p == ' ' || *p == '\t')
+                    p++;
+                if (!*p)
+                    break;
+                tok[nt++] = p;
+                while (*p && *p != ' ' && *p != '\t')
+                    p++;
+                if (*p)
+                    *p++ = '\0';
+            }
+            if (nt >= 3 && strcmp(tok[0], "allow") == 0
+                && m->nnet < MANIFEST_MAXNET) {
+                struct manifest_net *r = &m->net[m->nnet++];
+                copy_field(r->cidr, sizeof r->cidr, tok[1]);
+                copy_field(r->ports, sizeof r->ports, tok[2]);
+                copy_field(r->proto, sizeof r->proto, nt >= 4 ? tok[3] : "");
+            }
+        } else if (strcmp(key, "bundle") == 0) {
             copy_field(m->bundle, sizeof m->bundle, val);
         } else if (strcmp(key, "ref") == 0) {
             copy_field(m->ref, sizeof m->ref, val);

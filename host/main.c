@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <signal.h>
@@ -193,6 +194,49 @@ net_service(void)
     if (!c || !netdev)
         return;
     net_handle(netdev, c);
+}
+
+/* Turn one manifest rule (strings) into a numeric net_rule. Returns 0, or -1
+ * if the CIDR or ports do not parse (the rule is then skipped). */
+static int
+build_net_rule(const struct manifest_net *mn, struct net_rule *r)
+{
+    char cidr[64];
+    snprintf(cidr, sizeof cidr, "%s", mn->cidr);
+    char *slash = strchr(cidr, '/');
+    int prefix = 32;
+    if (slash) {
+        *slash = '\0';
+        prefix = (int)strtol(slash + 1, NULL, 10);
+        if (prefix < 0 || prefix > 32)
+            return -1;
+    }
+    struct in_addr in;
+    if (inet_pton(AF_INET, cidr, &in) != 1)
+        return -1;
+    r->addr = ntohl(in.s_addr);
+    r->mask = prefix == 0 ? 0u : (0xffffffffu << (32 - prefix));
+
+    if (strcmp(mn->ports, "*") == 0) {
+        r->port_lo = 0;
+        r->port_hi = 65535;
+    } else {
+        char *dash = strchr(mn->ports, '-');
+        long lo = strtol(mn->ports, NULL, 10);
+        long hi = dash ? strtol(dash + 1, NULL, 10) : lo;
+        if (lo < 0 || hi > 65535 || lo > hi)
+            return -1;
+        r->port_lo = (uint16_t)lo;
+        r->port_hi = (uint16_t)hi;
+    }
+
+    if (strcmp(mn->proto, "tcp") == 0)
+        r->proto = NET_PROTO_TCP;
+    else if (strcmp(mn->proto, "udp") == 0)
+        r->proto = NET_PROTO_UDP;
+    else
+        r->proto = 0;           /* any */
+    return 0;
 }
 
 /* One vcpu: create it on this thread (required by Hypervisor.framework), point
@@ -468,10 +512,20 @@ main(int argc, char **argv)
     all_threads = threads;
     all_n = nvcpus;
 
+    /* Build the net policy from the manifest rules. With no rules the provider
+     * allows every target; with rules it denies by default. */
+    static struct net_policy policy;
+    policy.n = 0;
+    if (have_manifest) {
+        for (int i = 0; i < m.nnet && policy.n < NET_MAXRULES; i++)
+            if (build_net_rule(&m.net[i], &policy.rules[policy.n]) == 0)
+                policy.n++;
+    }
+
     /* The net provider shares the guest net channel and rouses vcpus when a
      * socket becomes ready. */
     struct jotun_net *netchan = gpa_to_host(JOTUN_NET_BASE, sizeof(*netchan));
-    netdev = netchan ? net_init(netchan, net_wake_vcpus) : NULL;
+    netdev = netchan ? net_init(netchan, net_wake_vcpus, &policy) : NULL;
 
     for (int i = 0; i < nvcpus; i++) {
         ctx[i].index = i;

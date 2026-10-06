@@ -338,8 +338,18 @@ Steps:
   address and blocks the task until a datagram arrives, reusing the same park
   path as TCP. IPv4 for now. Verified on x86 KVM against a loopback UDP echo
   server on one and two vcpus with the timer on.
-- M5.4: the `/net` information tree over 9P, the manifest network-policy fields
-  and their enforcement, and the allowed/refused acceptance test.
+- M5.4 (done): manifest network policy and its enforcement. The manifest gains
+  `net allow <cidr> <ports> [tcp|udp]` rules; the host resolves each dial or
+  sendto target and the net provider allows it only if the resolved address
+  matches a rule. With no rules every target is allowed; with one or more the
+  default is deny. Matching on the resolved address, not the dialed name, means
+  a name cannot reach a blocked address. IPv4 rules for now. The allowed/
+  refused acceptance test passes on x86 KVM: a permitted loopback port connects
+  and exchanges data, a port outside the rules is refused (NET_EPERM), and the
+  proto field distinguishes a TCP rule from a UDP one on the same port.
+- M5.5: the `/net` information tree over 9P (`/net/policy`, `/net/conn`), via a
+  read-only overlay backend that serves `/net` synthetically and delegates the
+  rest to the bundle backend. Observability only; split out from M5.4.
 
 ## M6: display, the 2D vector path
 

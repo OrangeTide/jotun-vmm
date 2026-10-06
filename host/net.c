@@ -4,9 +4,11 @@
 
 #include "net.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +35,7 @@ struct netdev {
     volatile int stop;
     struct jotun_net *chan; /* guest channel, for the readiness flag */
     void (*wake)(void);
+    const struct net_policy *policy;
 };
 
 /* Set a result code and clear the payload length. */
@@ -56,15 +59,44 @@ arm(struct netdev *nd, struct net_conn *c, uint32_t events)
     }
 }
 
-/* Policy stub: allow every target for now. The manifest network rules replace
- * this in M5.4, where the allowed/refused acceptance test lives. */
+/* Extract the IPv4 address (host byte order) and port from a sockaddr. Returns
+ * 0 for anything that is not AF_INET, since the policy rules are IPv4. */
 static int
-policy_allow(const char *host, const char *port, int proto)
+sa_v4(const struct sockaddr *sa, uint32_t *ip, uint16_t *port)
 {
-    (void)host;
-    (void)port;
-    (void)proto;
+    if (sa->sa_family != AF_INET)
+        return 0;
+    const struct sockaddr_in *in = (const struct sockaddr_in *)sa;
+    *ip = ntohl(in->sin_addr.s_addr);
+    *port = ntohs(in->sin_port);
     return 1;
+}
+
+/* Decide whether a resolved address is allowed. With no rules every target is
+ * allowed; otherwise a target must match at least one rule. A non-IPv4 target
+ * can only pass the no-rules case, since the rules are IPv4. */
+static int
+policy_allows(const struct net_policy *p, const struct sockaddr *sa, int proto)
+{
+    if (p->n == 0)
+        return 1;
+
+    uint32_t ip;
+    uint16_t port;
+    if (!sa_v4(sa, &ip, &port))
+        return 0;
+
+    for (int i = 0; i < p->n; i++) {
+        const struct net_rule *r = &p->rules[i];
+        if ((ip & r->mask) != (r->addr & r->mask))
+            continue;
+        if (port < r->port_lo || port > r->port_hi)
+            continue;
+        if (r->proto != 0 && r->proto != proto)
+            continue;
+        return 1;
+    }
+    return 0;
 }
 
 static struct net_conn *
@@ -99,11 +131,6 @@ do_dial(struct netdev *nd, struct jotun_net *chan)
     const char *host = target;
     const char *port = bang + 1;
 
-    if (!policy_allow(host, port, (int)chan->proto)) {
-        reply(chan, NET_EPERM, 0);
-        return;
-    }
-
     struct addrinfo hints = { 0 };
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = chan->proto == NET_PROTO_UDP ? SOCK_DGRAM : SOCK_STREAM;
@@ -128,26 +155,37 @@ do_dial(struct netdev *nd, struct jotun_net *chan)
         return;
     }
 
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    /* Try each resolved address that policy allows, connecting to the first
+     * that works. Policy is checked against the resolved address, so a name
+     * cannot smuggle a connection to a blocked address. */
+    int fd = -1;
+    int any_allowed = 0;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        if (!policy_allows(nd->policy, ai->ai_addr, NET_PROTO_TCP))
+            continue;
+        any_allowed = 1;
+
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0)
+            continue;
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+
+        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc == 0 || errno == EINPROGRESS)
+            break;              /* connected, or in progress */
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+
     if (fd < 0) {
         pthread_mutex_unlock(&nd->lock);
-        freeaddrinfo(res);
-        reply(chan, NET_ECONN, 0);
-        return;
-    }
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-
-    int rc = connect(fd, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
-    if (rc != 0 && errno != EINPROGRESS) {
-        close(fd);
-        pthread_mutex_unlock(&nd->lock);
-        reply(chan, NET_ECONN, 0);
+        reply(chan, any_allowed ? NET_ECONN : NET_EPERM, 0);
         return;
     }
 
     nd->conns[handle].fd = fd;
-    nd->conns[handle].proto = (int)chan->proto;
+    nd->conns[handle].proto = NET_PROTO_TCP;
     nd->conns[handle].in_epoll = 0;
     pthread_mutex_unlock(&nd->lock);
 
@@ -276,17 +314,18 @@ do_sendto(struct netdev *nd, struct jotun_net *chan)
     const char *host = target;
     const char *port = bang + 1;
 
-    if (!policy_allow(host, port, NET_PROTO_UDP)) {
-        reply(chan, NET_EPERM, 0);
-        return;
-    }
-
     struct addrinfo hints = { 0 };
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
     struct addrinfo *res = NULL;
     if (getaddrinfo(host, port, &hints, &res) != 0 || !res) {
         reply(chan, NET_ENORES, 0);
+        return;
+    }
+
+    if (!policy_allows(nd->policy, res->ai_addr, NET_PROTO_UDP)) {
+        freeaddrinfo(res);
+        reply(chan, NET_EPERM, 0);
         return;
     }
 
@@ -428,7 +467,8 @@ poll_loop(void *arg)
 }
 
 struct netdev *
-net_init(struct jotun_net *chan, void (*wake)(void))
+net_init(struct jotun_net *chan, void (*wake)(void),
+         const struct net_policy *policy)
 {
     struct netdev *nd = calloc(1, sizeof(*nd));
     if (!nd)
@@ -438,6 +478,7 @@ net_init(struct jotun_net *chan, void (*wake)(void))
         nd->conns[i].fd = -1;
     nd->chan = chan;
     nd->wake = wake;
+    nd->policy = policy;
     pthread_mutex_init(&nd->lock, NULL);
 
     nd->epfd = epoll_create1(0);
