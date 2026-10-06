@@ -96,8 +96,13 @@ guests build 64-bit, and the `-m32` path is retired. The libOS skeleton is up:
 has an arch seam (`arch.h` with a console byte sink and halt, implemented per
 arch under `arch/`), and carries the JOS-derived first-fit allocator. `make`
 builds `libos.elf`; it boots, runs a heap self-test, prints `libos up` /
-`heap ok`, and halts. Next: the scheduler and context switch, then
-spawn/exec/await.
+`heap ok`, and halts. The cooperative round-robin scheduler is up too: a task
+is a function on a `kmalloc`'d stack, with greenfield 64-bit context switches
+(`arch/<arch>_ctx.S` plus a `stack_init` per arch) and a scheduler that
+ping-pongs with the boot context. `task_spawn`, `task_yield`, `task_exit`, and
+a `task_dump` for observability are in `task.c`. The demo spawns two tasks that
+interleave and exit, dumps the table before and after, then halts. Next:
+spawn/exec/await and notes as signals (preemption waits for M4).
 
 - Import the JOS core: allocator, ELF loader, proc, vfs, 9p, device table.
 - Write the greenfield x86-64 and arm64 arch ports: boot to C, context switch,

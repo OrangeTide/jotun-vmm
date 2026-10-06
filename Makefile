@@ -21,7 +21,7 @@ ifeq ($(OS), Darwin)
     CC = clang
     GUEST = test_guest.elf echo.elf libos.elf
     GUEST_SRC = guest/test_guest_arm64.c
-    LIBOS_ARCH = guest/libos/arch/arm64.c
+    LIBOS_ARCH = guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S
     # Apple's toolchain emits Mach-O; produce an ELF with an LLVM ELF target
     # and lld (install with e.g. `brew install lld`).
     GUEST_CC = clang --target=aarch64-unknown-none-elf -fuse-ld=lld
@@ -36,7 +36,7 @@ else
         # linux/x86-64: KVM, 64-bit long-mode x86 guest at 1 MiB.
         GUEST = test_guest.elf echo.elf libos.elf
         GUEST_SRC = guest/test_guest_x86.c
-        LIBOS_ARCH = guest/libos/arch/x86_64.c
+        LIBOS_ARCH = guest/libos/arch/x86_64.c guest/libos/arch/x86_64_ctx.S
         GUEST_CC = $(CC)
         GUEST_TEXT = 0x100000
     endif
@@ -44,7 +44,7 @@ else
         # linux/arm64: KVM, arm64 guest.
         GUEST = test_guest.elf echo.elf libos.elf
         GUEST_SRC = guest/test_guest_arm64.c
-        LIBOS_ARCH = guest/libos/arch/arm64.c
+        LIBOS_ARCH = guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S
         GUEST_CC = $(CC)
         GUEST_TEXT = 0x200000
     endif
@@ -71,7 +71,7 @@ echo.elf: guest/echo.c
 
 # The library OS is multiple translation units: the portable core plus the
 # selected arch file. It needs its own include path and links all objects.
-LIBOS_SRC = guest/libos/main.c guest/libos/mem.c $(LIBOS_ARCH)
+LIBOS_SRC = guest/libos/main.c guest/libos/mem.c guest/libos/task.c $(LIBOS_ARCH)
 
 libos.elf: $(LIBOS_SRC)
 	$(GUEST_CC) $(GUEST_CFLAGS) -Iguest/libos -Wl,-Ttext=$(GUEST_TEXT) -o $@ $^
