@@ -8,6 +8,7 @@
 #include "vmm.h"
 #include "elf.h"
 #include "uart.h"
+#include "jotun_abi.h"
 
 /* Guest physical RAM mapped at address 0. 8 MiB is ample for the test guest
  * plus per-vcpu stacks. */
@@ -30,6 +31,52 @@ struct vcpu_ctx {
     uint64_t sp;
     int rc;
 };
+
+/* Guest physical memory as the host sees it, identity-mapped for now (guest
+ * physical address N is host byte N of this buffer). */
+struct guest_mem {
+    uint8_t *base;
+    uint64_t size;
+};
+static struct guest_mem gm;
+
+/* Translate a guest-physical range to a host pointer, or NULL if it does not
+ * fit entirely within guest RAM. Every guest-supplied address is checked here
+ * before the host dereferences it. */
+static void *
+gpa_to_host(uint64_t gpa, uint64_t len)
+{
+    if (gpa > gm.size || len > gm.size - gpa)
+        return NULL;
+    return gm.base + gpa;
+}
+
+/* Doorbell handler: drain the request ring, echo each message into the
+ * response ring, and raise the response event. Called with dev_lock held. */
+static void
+ring_service(void)
+{
+    struct jotun_ring *r = gpa_to_host(JOTUN_RING_BASE, sizeof(*r));
+    if (!r)
+        return;
+
+    while (r->req_tail != r->req_head) {
+        struct jotun_msg *q = &r->req[r->req_tail % JOTUN_RING_SLOTS];
+        uint16_t len = q->len;
+        if (len > JOTUN_MSG_MAX)
+            len = JOTUN_MSG_MAX;
+
+        struct jotun_msg *s = &r->rsp[r->rsp_head % JOTUN_RING_SLOTS];
+        s->len = len;
+        memcpy(s->data, q->data, len);
+        r->rsp_head++;
+        r->req_tail++;
+
+        fprintf(stderr, "[ring] echoed %u bytes: %.*s\n",
+                (unsigned)len, (int)len, q->data);
+    }
+    r->evt_pending |= JOTUN_EVT_RSP;
+}
 
 /* One vcpu: create it on this thread (required by Hypervisor.framework), point
  * it at the entry and its own stack, then service exits until it stops. */
@@ -79,6 +126,8 @@ run_vcpu(void *arg)
             pthread_mutex_lock(&dev_lock);
             if (uart_mmio(&e)) {
                 /* serviced by the console */
+            } else if (e.mmio.write && e.mmio.address == JOTUN_DOORBELL) {
+                ring_service();
             } else if (e.mmio.write && e.mmio.address == MMIO_POWEROFF) {
                 printf("\n[vcpu %d powered off]\n", c->index);
                 fflush(stdout);
@@ -141,6 +190,9 @@ main(int argc, char **argv)
     size_t half = GUEST_RAM_SIZE / 2;
     vmm_vm_map_memory(vm, ram, 0, half);
     vmm_vm_map_memory(vm, (char *)ram + half, half, GUEST_RAM_SIZE - half);
+
+    gm.base = ram;
+    gm.size = GUEST_RAM_SIZE;
 
     // Load the guest image once into shared RAM.
     elf_image img;

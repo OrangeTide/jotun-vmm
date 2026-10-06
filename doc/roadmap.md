@@ -38,7 +38,7 @@ assigns a distinct memory slot per mapping and a unique vcpu id per core
 (atomic, since threads create vcpus); device state and stdout are mutex-guarded;
 the build links `-pthread`.
 
-## M1: transport ABI
+## M1: transport ABI (done)
 
 Goal: the single contract everything else rides on.
 
@@ -62,8 +62,23 @@ the same hook point where `MMIO_POWEROFF` is handled today.
   style of the current test guests. This milestone does not need the M2 library
   OS.
 
-Acceptance: an echo service over the ring (the guest sends bytes, the host
-replies), driven by one doorbell exit per batch.
+Acceptance (met): `./jotun echo.elf` runs the echo guest, which sends a message
+over the ring, the host echoes it back, the guest verifies it and sends a
+second message. The host prints both, so the round trip is visible in each
+direction, one doorbell exit per message.
+
+As built: `abi/jotun_abi.h` holds the ring, doorbell, and event-channel layout;
+`guest/jotun_ring.h` is the guest ring library; `guest/echo.c` is the throwaway
+echo guest; the host adds `gpa_to_host` and `ring_service`, hung off the MMIO
+exit dispatch at the doorbell address and serialized by the device lock. The
+doorbell is a synchronous MMIO exit, so the response is ready when the store
+returns; the event-channel pending bit is set anyway so the mechanism exists
+for M4.
+
+Scope: there is one global ring at a fixed address, validated single-vcpu.
+Running the echo guest on several vcpus races on that one ring, which is
+expected. Per-vcpu rings need a guest-visible vcpu id and come in a later
+milestone.
 
 Decision: start with guest-polled event channels. The guest checks the pending
 bitmap at safe points, which avoids interrupt injection entirely. Real
