@@ -10,6 +10,9 @@
 
 typedef void (*task_fn)(void);
 
+/* The task-table size, so other subsystems can size per-task arrays. */
+#define TASK_MAX    8
+
 /* Bind this vcpu's per-cpu state and make arch_get_percpu return it. Each vcpu
  * calls this once, with its vcpu id, before touching any task primitive. */
 void cpu_init(unsigned long id);
@@ -51,6 +54,14 @@ void task_block(void);
 /* Make a blocked task runnable again. Safe to call whether or not the task has
  * parked yet, and whether or not it is currently blocked. */
 void task_wake(int id);
+
+/* The id of the running task. Valid only inside a task, not the scheduler. */
+int task_self(void);
+
+/* Register a hook the scheduler calls on an event interrupt and whenever an
+ * idle cpu is woken. A subsystem (for example the net client) uses it to wake
+ * its own parked tasks when a device event arrives. One hook; NULL clears it. */
+void task_set_event_hook(void (*fn)(void));
 
 /* End the current task with an exit status (NULL or "" means success). Does
  * not return. A task that returns from its function exits with success. */

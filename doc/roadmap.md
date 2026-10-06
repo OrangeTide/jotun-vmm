@@ -322,9 +322,15 @@ Steps:
   and `task_wake`, a quiescence check that does not shut down while tasks are
   blocked, and a re-ready pass when an idle cpu is woken. Self-tested in the
   guest with no sockets.
-- M5.2: the net channel ABI, the host net provider (TCP connect, non-blocking,
-  poll thread, policy stub), and the guest net client, with an end-to-end
-  dial/read/write demo.
+- M5.2 (done): the net channel ABI (`abi/jotun_net.h`), the host net provider
+  (`host/net.c`: TCP connect, non-blocking sockets, an epoll poll thread,
+  policy stubbed to allow-all), and the guest net client
+  (`guest/libos/net.c`: `net_dial`/`net_write`/`net_read`/`net_close`). A
+  would-block parks the calling task through the M5.1 primitive and the net
+  event hook re-readies it. Verified end to end on x86 KVM against a loopback
+  server: dial, write, blocking read, close, on one and two vcpus and with the
+  preemption timer on (10 iterations clean), plus a clean error on a refused
+  connection. Policy enforcement and the `/net` tree arrive in M5.4.
 - M5.3: UDP `sendto`/`recvfrom`.
 - M5.4: the `/net` information tree over 9P, the manifest network-policy fields
   and their enforcement, and the allowed/refused acceptance test.

@@ -10,6 +10,7 @@
 #include "boot.h"
 #include "jsh.h"
 #include "mem.h"
+#include "net.h"
 #include "ns.h"
 #include "p9.h"
 #include "print.h"
@@ -163,6 +164,54 @@ block_demo(void)
     con_puts("'\n");
 }
 
+/* Networking demo: dial a target ("host!port", from the second boot argument),
+ * send a line, print the reply, and close. The read blocks the task until the
+ * host reports data, without stalling the rest of the system. */
+static void
+net_demo(void)
+{
+    const char *target = (boot_argc() > 1) ? boot_argv(1) : "127.0.0.1!7";
+
+    con_puts("net: dialing ");
+    con_puts(target);
+    con_putc('\n');
+
+    int h = net_dial(NET_PROTO_TCP, target);
+    if (h < 0) {
+        con_puts("net: dial failed\n");
+        return;
+    }
+
+    const char *msg = "ping\n";
+    long w = net_write(h, msg, 5);
+    if (w < 0) {
+        con_puts("net: write failed\n");
+        net_close(h);
+        return;
+    }
+    con_puts("net: wrote ");
+    con_putu((uint64_t)w);
+    con_puts(" bytes\n");
+
+    char buf[256];
+    long r = net_read(h, buf, sizeof buf - 1);
+    if (r < 0) {
+        con_puts("net: read error\n");
+        net_close(h);
+        return;
+    }
+    buf[r] = '\0';
+    con_puts("net: read ");
+    con_putu((uint64_t)r);
+    con_puts(" bytes: ");
+    con_puts(buf);
+    if (r == 0 || buf[r - 1] != '\n')
+        con_putc('\n');
+
+    net_close(h);
+    con_puts("net: done\n");
+}
+
 /* The init task: either the preemption demo or the startup script, selected by
  * the first boot argument (default "rc"). */
 static void
@@ -177,6 +226,8 @@ init_task(void)
         smp_demo();
     } else if (script[0] == 'b' && script[1] == 'l') {  /* "block" */
         block_demo();
+    } else if (script[0] == 'n' && script[1] == 'e') {  /* "net" */
+        net_demo();
     } else {
         con_puts("init: running script /");
         con_puts(script);
@@ -231,6 +282,7 @@ kmain(unsigned long id)
         else
             con_puts("9p: mounted\n");
         ns_init();
+        net_init();
 
         task_spawn("init", init_task);
         __atomic_store_n(&boot_ready, 1, __ATOMIC_RELEASE);

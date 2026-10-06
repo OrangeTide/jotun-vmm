@@ -13,10 +13,12 @@
 #include "jotun_abi.h"
 #include "jotun_boot.h"
 #include "jotun_9p.h"
+#include "jotun_net.h"
 #include "p9srv.h"
 #include "p9mem.h"
 #include "p9smolvfs.h"
 #include "manifest.h"
+#include "net.h"
 
 /* Guest physical RAM mapped at address 0. 8 MiB is ample for the test guest
  * plus per-vcpu stacks. */
@@ -53,7 +55,11 @@ struct vcpu_ctx {
 /* The vcpu table, published so a wake doorbell on one vcpu's thread can reach
  * another's idle rendezvous. */
 static struct vcpu_ctx *all_ctx;
+static pthread_t *all_threads;
 static int all_n;
+
+/* The net provider, and its guest channel in host memory. */
+static struct netdev *netdev;
 
 static void
 vcpu_wake(struct vcpu_ctx *c)
@@ -72,6 +78,23 @@ vcpu_idle_wait(struct vcpu_ctx *c)
         pthread_cond_wait(&c->idle_c, &c->idle_m);
     c->woken = 0;
     pthread_mutex_unlock(&c->idle_m);
+}
+
+/* Rouse every vcpu for a net event: inject the event interrupt into running
+ * vcpus (breaking their run so the guest ISR fires) and wake any that are idle
+ * (so they leave the idle rendezvous and recheck). The net poll thread calls
+ * this when a socket a guest task waits on becomes ready. */
+static void
+net_wake_vcpus(void)
+{
+    for (int i = 0; i < all_n; i++) {
+        if (__atomic_load_n(&all_ctx[i].live, __ATOMIC_SEQ_CST)) {
+            vmm_vcpu_interrupt(all_ctx[i].vcpu, JOTUN_EVENT_VECTOR);
+            if (all_threads[i])
+                pthread_kill(all_threads[i], SIGUSR1);
+        }
+        vcpu_wake(&all_ctx[i]);
+    }
 }
 
 /* Guest physical memory as the host sees it, identity-mapped for now (guest
@@ -160,6 +183,18 @@ p9_service(void)
     c->rsp_len = p9srv_handle(&p9, c->req, c->req_len, c->rsp, JOTUN_P9_MSIZE);
 }
 
+/* Net doorbell handler: process the request in the net channel and write the
+ * result back. Called without dev_lock, since the provider has its own lock
+ * and a dial may resolve a name, which should not block the console. */
+static void
+net_service(void)
+{
+    struct jotun_net *c = gpa_to_host(JOTUN_NET_BASE, sizeof(*c));
+    if (!c || !netdev)
+        return;
+    net_handle(netdev, c);
+}
+
 /* One vcpu: create it on this thread (required by Hypervisor.framework), point
  * it at the entry and its own stack, then service exits until it stops. */
 static void *
@@ -228,6 +263,10 @@ run_vcpu(void *arg)
             } else if ((int)target < all_n) {
                 vcpu_wake(&all_ctx[target]);
             }
+            continue;
+        } else if (e.reason == VMM_EXIT_REASON_MMIO
+                   && e.mmio.write && e.mmio.address == JOTUN_NET_DOORBELL) {
+            net_service();
             continue;
         } else if (e.reason == VMM_EXIT_REASON_MMIO) {
             int stop = 0;
@@ -410,22 +449,30 @@ main(int argc, char **argv)
         p9srv_init(&p9, p9mem_backend(), NULL);
     }
 
-    /* A preemption timer is opt-in: JOTUN_HZ ticks per second. The signal
-     * handler lets a tick break a running vcpu out of its run. */
+    /* SIGUSR1 breaks a running vcpu out of its run (no SA_RESTART, so KVM_RUN
+     * returns EINTR). Both the preemption timer and the net poll thread use it,
+     * so install it unconditionally. */
+    struct sigaction sa = { 0 };
+    sa.sa_handler = sig_noop;
+    sigaction(SIGUSR1, &sa, NULL);
+
+    /* A preemption timer is opt-in: JOTUN_HZ ticks per second. */
     unsigned hz = 0;
     const char *hz_env = getenv("JOTUN_HZ");
     if (hz_env)
         hz = (unsigned)strtoul(hz_env, NULL, 0);
-    if (hz > 0) {
-        struct sigaction sa = { 0 };
-        sa.sa_handler = sig_noop;        /* no SA_RESTART: KVM_RUN returns EINTR */
-        sigaction(SIGUSR1, &sa, NULL);
-    }
 
     pthread_t threads[MAX_VCPUS];
     struct vcpu_ctx ctx[MAX_VCPUS];
     all_ctx = ctx;
+    all_threads = threads;
     all_n = nvcpus;
+
+    /* The net provider shares the guest net channel and rouses vcpus when a
+     * socket becomes ready. */
+    struct jotun_net *netchan = gpa_to_host(JOTUN_NET_BASE, sizeof(*netchan));
+    netdev = netchan ? net_init(netchan, net_wake_vcpus) : NULL;
+
     for (int i = 0; i < nvcpus; i++) {
         ctx[i].index = i;
         ctx[i].vm = vm;
@@ -460,6 +507,8 @@ main(int argc, char **argv)
         __atomic_store_n(&tctx.stop, 1, __ATOMIC_SEQ_CST);
         pthread_join(timer_thread, NULL);
     }
+
+    net_shutdown(netdev);
 
     vmm_vm_destroy(vm);
     munmap(ram, GUEST_RAM_SIZE);

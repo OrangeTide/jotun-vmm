@@ -31,7 +31,7 @@
 #include "mem.h"
 #include "print.h"
 
-#define MAX_TASKS   8
+#define MAX_TASKS   TASK_MAX
 #define MAX_CPUS    8
 #define TASK_STACK  8192
 #define NO_PARENT   (-1)
@@ -81,6 +81,7 @@ static volatile int runq_lock;      /* guards runq + tasks table + counters */
 static int running_count;           /* tasks currently executing on some cpu */
 static int blocked_count;           /* tasks parked on an event */
 static volatile int shutdown;       /* set once the system has quiesced */
+static void (*event_hook)(void);    /* called on an event / idle-wake */
 
 static struct percpu *
 this_cpu(void)
@@ -277,6 +278,10 @@ sched_start(void)
              * parked and a waker (another task, or a host event) will ready
              * one. Block until a wake doorbell rouses us, then recheck. */
             smp_idle();
+            /* A device event may be what woke us; let the hook ready its
+             * parked tasks before we look at the queue again. */
+            if (event_hook)
+                event_hook();
             continue;
         }
 
@@ -391,11 +396,26 @@ task_wake(int id)
     smp_wake_all();     /* a newly runnable task: rouse any idle cpu */
 }
 
-/* Called from the event ISR. Reschedule the running task; if the scheduler
- * itself was interrupted (cur is NULL) there is nothing to preempt. */
+int
+task_self(void)
+{
+    return this_cpu()->cur->id;
+}
+
+void
+task_set_event_hook(void (*fn)(void))
+{
+    event_hook = fn;
+}
+
+/* Called from the event ISR. Give the event hook a chance to ready its parked
+ * tasks (for example net waiters), then reschedule the running task; if the
+ * scheduler itself was interrupted (cur is NULL) there is nothing to preempt. */
 void
 irq_event(void)
 {
+    if (event_hook)
+        event_hook();
     if (this_cpu()->cur)
         task_yield();
 }
