@@ -12,6 +12,7 @@
 #include "mem.h"
 #include "p9.h"
 #include "print.h"
+#include "prog.h"
 #include "task.h"
 
 /* The heap lives in .bss. Guest RAM is zero-filled by the host before entry,
@@ -39,63 +40,20 @@ heap_selftest(void)
         con_puts("heap leak\n");
 }
 
-/* worker_a: print, drain any notes posted to it, yield once, then exit with a
- * status string. */
-static void
-worker_a(void)
-{
-    char note[NOTE_MAX];
-
-    con_puts("  A: running\n");
-    while (task_recv_note(note, sizeof note)) {
-        con_puts("  A: note '");
-        con_puts(note);
-        con_puts("'\n");
-    }
-    task_yield();
-    task_exits("a-ok");
-}
-
-/* The program worker_b exec's into. It runs on a fresh stack as the same task,
- * then exits with its own status. */
-static void
-worker_b2(void)
-{
-    con_puts("  B2: running after exec\n");
-    task_yield();
-    task_exits("b-done");
-}
-
-/* worker_b: replace itself with worker_b2. task_exec does not return. */
-static void
-worker_b(void)
-{
-    con_puts("  B: exec-ing into B2\n");
-    task_exec(worker_b2);
-}
-
-/* The init task: spawn the workers, send one a note, then await both and
- * report each child's string exit status. */
+/* The init task: load and run a bundled program by name, then report its
+ * string exit status. */
 static void
 init_task(void)
 {
     con_puts("init: starting\n");
 
-    int a = task_spawn("worker-a", worker_a);
-    task_spawn("worker-b", worker_b);
-    task_note(a, "ping");
-
-    con_puts("init: spawned, table now:\n");
-    task_dump();
-
-    char status[STATUS_MAX];
-    int id;
-    while ((id = task_await(status, sizeof status)) >= 0) {
-        con_puts("init: child ");
-        con_putc('0' + (char)id);
-        con_puts(" exited '");
+    const char *status = prog_run("hello");
+    if (status) {
+        con_puts("init: hello exited '");
         con_puts(status);
         con_puts("'\n");
+    } else {
+        con_puts("init: hello failed to run\n");
     }
     con_puts("init: done\n");
 }
@@ -169,6 +127,7 @@ _start(void)
     heap_selftest();
     show_boot_params();
     fs_demo();
+    svc_publish();
 
     task_spawn("init", init_task);
     sched_start();

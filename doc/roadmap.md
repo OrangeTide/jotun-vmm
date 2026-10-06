@@ -144,8 +144,15 @@ The host 9P2000 server (`host/p9srv.c`) runs behind a small backend vtable;
 `host/p9smolvfs.c` resolves a ref in a smolvfs depot and serves its tree and
 blobs, and `host/p9mem.c` is an in-memory fallback. The guest client
 (`guest/libos/p9.c`) mounts, walks, reads, and lists. `make bundle` builds a
-test depot from `example/bundle/` with smolvfs's castool. Next: the guest ELF
-loader reading programs from the namespace, so exec resolves a name.
+test depot from `example/bundle/` with smolvfs's castool. The guest ELF loader
+and exec-by-name are done too: `guest/libos/elfload.c` loads a program's
+PT_LOAD segments over 9P into a fixed program region, and `prog_run`
+(`guest/libos/prog.c`) runs it as a child task and collects its exit status. A
+program is a standalone ELF (`guest/prog/`) that reaches the libOS through a
+service vector the kernel publishes (`abi/jotun_svc.h`), since there is no
+privilege boundary to trap across. init loads `hello` from the bundle, which
+prints and exits `prog-ok`. Next: `jsh`, a shell that reads the bundle and
+spawns programs by name.
 
 Transition from M2: M2's `exec` resolves a function directly and the guest has
 no loader. M3 adds the loader and makes `exec` resolve a program by name, read

@@ -2,4 +2,6 @@ jotun
 test_guest.elf
 echo.elf
 libos.elf
+hello.elf
 bundle-depot
+bundle-staging

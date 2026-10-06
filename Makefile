@@ -60,7 +60,14 @@ endif
 
 TARGET = jotun
 
-all: $(TARGET) $(GUEST)
+# Bundled programs are standalone ELFs whose image lies within the program
+# region that begins at JOTUN_PROG_BASE (0x400000, abi/jotun_svc.h). The linker
+# puts the ELF headers one page below -Ttext, so text goes at base + one page,
+# which lands the headers exactly at the region base. Same on both arches.
+PROG_TEXT = 0x401000
+PROGS = hello.elf
+
+all: $(TARGET) $(GUEST) $(PROGS)
 
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -80,23 +87,31 @@ echo.elf: guest/echo.c
 # The library OS is multiple translation units: the portable core plus the
 # selected arch file. It needs its own include path and links all objects.
 LIBOS_SRC = guest/libos/main.c guest/libos/mem.c guest/libos/task.c \
-    guest/libos/boot.c guest/libos/p9.c $(LIBOS_ARCH)
+    guest/libos/boot.c guest/libos/p9.c guest/libos/elfload.c \
+    guest/libos/prog.c $(LIBOS_ARCH)
 
 libos.elf: $(LIBOS_SRC)
 	$(GUEST_CC) $(GUEST_CFLAGS) -Iguest/libos -Wl,-Ttext=$(GUEST_TEXT) -o $@ $^
+
+# Standalone programs, linked at the program base and loaded from the bundle.
+hello.elf: guest/prog/hello.c
+	$(GUEST_CC) $(GUEST_CFLAGS) -Iguest/prog -Wl,-Ttext=$(PROG_TEXT) -o $@ $<
 
 # Build a test bundle depot from example/bundle/ using smolvfs's castool, then
 # run with JOTUN_BUNDLE=bundle-depot ./jotun libos.elf.
 BUNDLE_DEPOT = bundle-depot
 
-bundle:
+bundle: $(PROGS)
 	$(MAKE) -C $(SMOLVFS_DIR) castool
-	rm -rf $(BUNDLE_DEPOT)
-	$(SMOLVFS_DIR)/castool -d $(BUNDLE_DEPOT) import root example/bundle/*
+	rm -rf $(BUNDLE_DEPOT) bundle-staging
+	mkdir bundle-staging
+	cp example/bundle/* bundle-staging/
+	cp hello.elf bundle-staging/hello
+	$(SMOLVFS_DIR)/castool -d $(BUNDLE_DEPOT) import root bundle-staging/*
 	$(SMOLVFS_DIR)/castool -d $(BUNDLE_DEPOT) pack
 
 clean:
-	rm -f $(TARGET) test_guest.elf echo.elf libos.elf
-	rm -rf $(BUNDLE_DEPOT)
+	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS)
+	rm -rf $(BUNDLE_DEPOT) bundle-staging
 
 .PHONY: all clean bundle
