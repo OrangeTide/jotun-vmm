@@ -3,8 +3,9 @@
  * A subset of a Glide-style immediate-mode API: gouraud-shaded, z-buffered
  * triangles rendered into an RGBA8888 framebuffer in guest RAM, with
  * perspective-correct texturing, the Glide color-combine modes, point and
- * bilinear filtering, mip-mapped (trilinear) textures, and source-over alpha
- * blending. The rasterizer runs entirely inside the guest; the host only ever
+ * bilinear filtering, mip-mapped (trilinear) textures, anisotropic filtering,
+ * and source-over alpha blending. The rasterizer runs entirely inside the
+ * guest; the host only ever
  * receives the resulting pixels, through the draw pixel path. This is the raster
  * side of the security split in the design doc (section 9.2): no rendering
  * command stream and no rasterizer cross into the trusted host.
@@ -85,6 +86,7 @@ struct tr_target {
     int      combine;           /* enum tr_combine */
     int      blend;             /* 0 = opaque, 1 = source-over alpha blend */
     int      filter;            /* enum tr_filter */
+    int      maxaniso;          /* max anisotropic taps; 0 or 1 = isotropic */
 };
 
 /* Clear the color buffer to (r,g,b) and the depth buffer to the far plane. */
@@ -95,6 +97,13 @@ void tr_tex_source(struct tr_target *t, const struct tr_texture *tex);
 void tr_color_combine(struct tr_target *t, int mode);
 void tr_blend(struct tr_target *t, int enable);
 void tr_tex_filter(struct tr_target *t, int filter);
+
+/* Set the maximum number of anisotropic texture taps (1 = isotropic). With more
+ * than one, a mipped texture viewed at a grazing angle is sampled several times
+ * along the long axis of its footprint, each tap at a mip level matched to the
+ * short axis, which keeps it sharp where isotropic sampling would blur it.
+ * Needs a mip chain; without one it has no effect. */
+void tr_tex_aniso(struct tr_target *t, int maxaniso);
 
 /* Rasterize one triangle with a less-or-equal depth test, applying the target's
  * texture, combine mode, and blend state. An opaque triangle writes depth; a

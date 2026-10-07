@@ -2,8 +2,9 @@
  *
  * Gouraud-shaded, z-buffered triangles into an RGBA8888 framebuffer in guest
  * RAM, with perspective-correct texturing, the Glide-style color-combine modes,
- * point and bilinear filtering, mip-mapped (trilinear) textures, and source-over
- * alpha blending. The host never sees a rendering command, only the finished
+ * point and bilinear filtering, mip-mapped (trilinear) textures, anisotropic
+ * filtering, and source-over alpha blending. The host never sees a rendering
+ * command, only the finished
  * pixels, which it reads through the draw pixel path. This file uses floating
  * point and so is built with the FPU enabled, unlike the integer-only rest of
  * the library OS.
@@ -193,6 +194,81 @@ sample(const struct tr_texture *tx, float u, float v, float lod,
         o[k] = a[k] + (b[k] - a[k]) * f;
 }
 
+/* Square root, without libm: a bit-hack initial guess refined by two Newton
+ * steps. Used for footprint lengths, where a small error is harmless. */
+static float
+sqrt_approx(float x)
+{
+    if (x <= 0.0f)
+        return 0.0f;
+    union { float f; uint32_t i; } u = { x };
+    u.i = (u.i >> 1) + 0x1fbd1df5u;
+    float y = u.f;
+    y = 0.5f * (y + x / y);
+    y = 0.5f * (y + x / y);
+    return y;
+}
+
+/* Sample a texture over an elliptical footprint given by the per-pixel texture-
+ * coordinate derivatives (dudx, dvdx) and (dudy, dvdy), in texels. The footprint
+ * is approximated by the longer and shorter of those two vectors: several
+ * trilinear taps are spread along the long axis, each at a mip level matched to
+ * the short axis, and averaged. With maxaniso == 1 (or a round footprint) this
+ * is one ordinary trilinear tap. */
+static void
+sample_aniso(const struct tr_texture *tx, float u, float v,
+             float dudx, float dvdx, float dudy, float dvdy,
+             float tw, float th, int maxaniso, int filter, float o[4])
+{
+    float lx2 = dudx * dudx + dvdx * dvdx;      /* squared footprint lengths */
+    float ly2 = dudy * dudy + dvdy * dvdy;
+
+    float majdu, majdv, majlen2, minlen2;
+    if (lx2 >= ly2) {
+        majdu = dudx; majdv = dvdx; majlen2 = lx2; minlen2 = ly2;
+    } else {
+        majdu = dudy; majdv = dvdy; majlen2 = ly2; minlen2 = lx2;
+    }
+    float pmax = sqrt_approx(majlen2);
+    float pmin = sqrt_approx(minlen2);
+    if (pmin < 1e-4f)
+        pmin = 1e-4f;
+
+    int n = (int)(pmax / pmin + 0.5f);          /* taps = footprint aspect */
+    if (n < 1) n = 1;
+    if (n > maxaniso) n = maxaniso;
+
+    /* Each tap covers about the short-axis extent, so pick its level there. */
+    float lvl = pmax / (float)n;
+    float lod = lvl > 1.0f ? log2_approx(lvl) : 0.0f;
+
+    if (n == 1) {
+        sample(tx, u, v, lod, filter, o);
+        return;
+    }
+
+    /* The full long-axis footprint vector, in normalized uv, spread the taps
+     * across [-0.5, 0.5) of it. */
+    float mu = majdu / tw, mv = majdv / th;
+    float acc[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < n; i++) {
+        float s = ((float)i + 0.5f) / (float)n - 0.5f;
+        float c[4];
+        sample(tx, u + mu * s, v + mv * s, lod, filter, c);
+        for (int k = 0; k < 4; k++)
+            acc[k] += c[k];
+    }
+    float invn = 1.0f / (float)n;
+    for (int k = 0; k < 4; k++)
+        o[k] = acc[k] * invn;
+}
+
+void
+tr_tex_aniso(struct tr_target *t, int maxaniso)
+{
+    t->maxaniso = maxaniso;
+}
+
 void
 tr_triangle(struct tr_target *t, const struct tr_vertex *a,
             const struct tr_vertex *b, const struct tr_vertex *c)
@@ -279,22 +355,21 @@ tr_triangle(struct tr_target *t, const struct tr_vertex *a,
                 float vo = l0 * voa + l1 * vob + l2 * voc;
                 float u = uo * invW, v = vo * invW;
 
-                float lod = 0.0f;
+                float tc[4];
                 if (do_mip) {
+                    /* Texel-space derivatives of (u, v), by the quotient rule
+                     * on the perspective-correct interpolants. */
                     float w2 = invW * invW;
                     float dudx = (dUodx * W - uo * dIWdx) * w2 * tw;
                     float dudy = (dUody * W - uo * dIWdy) * w2 * tw;
                     float dvdx = (dVodx * W - vo * dIWdx) * w2 * th;
                     float dvdy = (dVody * W - vo * dIWdy) * w2 * th;
-                    float sx = dudx * dudx + dvdx * dvdx;
-                    float sy = dudy * dudy + dvdy * dvdy;
-                    float maxsq = sx > sy ? sx : sy;
-                    if (maxsq > 1.0f)
-                        lod = 0.5f * log2_approx(maxsq);
+                    int na = t->maxaniso < 1 ? 1 : t->maxaniso;
+                    sample_aniso(t->tex, u, v, dudx, dvdx, dudy, dvdy,
+                                 tw, th, na, t->filter, tc);
+                } else {
+                    sample(t->tex, u, v, 0.0f, t->filter, tc);
                 }
-
-                float tc[4];
-                sample(t->tex, u, v, lod, t->filter, tc);
                 switch (t->combine) {
                 case TR_COMBINE_TEXTURE:
                     cr = tc[0]; cg = tc[1]; cb = tc[2]; ca = tc[3];
@@ -430,6 +505,7 @@ render_frame(struct tr_target *t, float cx, float sx, float cy, float sy)
     tr_tex_source(t, &checker_tex);
     tr_color_combine(t, TR_COMBINE_MODULATE);
     tr_tex_filter(t, TR_FILTER_BILINEAR);
+    tr_tex_aniso(t, 8);
     tr_blend(t, 0);
     for (int f = 0; f < 6; f++)
         draw_face(t, v, face[f]);
