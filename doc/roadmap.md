@@ -558,10 +558,19 @@ Goal: raster content where vector does not fit.
   mip level matched to the short axis, and averages them. The tap count is the
   footprint's long/short axis ratio, rounded and clamped to a per-target maximum,
   which reduces to one tap (plain trilinear) wherever the footprint is round.
-  `sqrt` is another small freestanding approximation. The demo now projects the
-  cube in perspective and draws it checker-textured, gouraud-modulated, bilinear,
-  mipped and anisotropic, behind a translucent screen-space panel, so every path
-  runs each frame.
+  `sqrt` is another small freestanding approximation. Finally a vertex transform
+  and clip stage in front of the rasterizer: it multiplies object-space vertices
+  by a 4x4 matrix (there are builders for translate, the three axis rotations
+  that take cos and sin directly so no sin/cos routine is needed, and a
+  perspective projection), clips the triangle against the near and far planes
+  with Sutherland-Hodgman interpolating every attribute, divides by w, and maps
+  to the viewport. The near clip is what lets geometry cross behind the camera
+  safely, instead of the old hand projection's rule that every vertex stay in
+  front of it. The demo now builds the cube's matrix from the running rotation
+  and draws it checker-textured, gouraud-modulated, bilinear, mipped and
+  anisotropic, over a ground plane that runs from behind the camera out past the
+  far plane so both clip planes trim it each frame, behind a translucent
+  screen-space panel. Every path runs each frame.
   Enabling it meant turning on the guest FPU, since the rasterizer uses floating
   point. The FPU is enabled per cpu at boot (`arch_fpu_init`: CR0/CR4 for SSE on
   x86-64, CPACR_EL1 for FP/SIMD on arm64). The rest of the guest stays
@@ -972,10 +981,11 @@ the wrapper) left until a need appears.
 Independent of the milestones above, tracked so they are not lost:
 
 - Guest rasterizer (M7.4): texturing (perspective-correct), the Glide combine
-  units, alpha blend, bilinear filtering, mip-mapped trilinear sampling, and
-  anisotropic filtering all landed on the minimal 3D core (see M7.4). Still
-  beyond it: a vertex transform/clip stage (the demo projects by hand and relies
-  on the whole cube staying in front of the camera).
+  units, alpha blend, bilinear filtering, mip-mapped trilinear sampling,
+  anisotropic filtering, and a vertex transform and near/far clip stage all
+  landed on the minimal 3D core (see M7.4). It now has the full planned feature
+  set; back-face culling and a scene/mesh layer above the per-triangle API are
+  possible future additions, not currently needed.
 - Pull transport (M8): the pack byte-range transport and key rotation landed
   (see M8). Still open: pack-aware resume granularity and a published multi-pack
   layout for very large origins.
