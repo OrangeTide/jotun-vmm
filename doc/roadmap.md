@@ -1082,14 +1082,15 @@ and authentication off-box, so the host gains no auth code. M15 is the off-box
 layer that decision points to.
 
 What is needed:
-- M15.1: TLS and public reachability. The listener binds `127.0.0.1` only and
-  speaks plain HTTP, while a browser over the internet needs `wss:`. There is no
-  TLS library in tree (the vendored monocypher does signing, not TLS), so the
-  MVP terminates TLS at a reverse proxy (for example Caddy for automatic certs,
-  or nginx) that forwards to the loopback port, as M10 already decided. This is
-  mostly configuration, not new host code. On its own it puts a single shared
-  session on the web; the single-browser behaviour (a new connection replaces
-  the old) is acceptable for one user.
+- M15.1 (done): TLS and public reachability. The listener binds `127.0.0.1`
+  only and speaks plain HTTP, while a browser over the internet needs `wss:`.
+  There is no TLS library in tree (the vendored monocypher does signing, not
+  TLS), so TLS terminates at a reverse proxy that forwards to the loopback port,
+  as M10 already decided, with no new host code. The committed recipe is
+  `example/web/Caddyfile` (Caddy with `tls internal` locally, a real domain in
+  production), a `make web` target, and `doc/web-hosting.md`. On its own it puts
+  a single shared session on the web; the single-browser behaviour (a new
+  connection replaces the old) is acceptable for one user.
 - M15.2: a session broker. Today one host process is one front end serving one
   browser. For independent users, one `jotun` process (or guest group) runs per
   session: the broker accepts a connection, starts a process with a chosen
@@ -1107,12 +1108,16 @@ What is needed:
   pins the right bundle for a session rather than baking one in.
 
 Cross-cutting decisions, independent of the tiers above:
-- Keyboard and text input. `DEV_TEXT` and `DEV_PASTE` are in the draw ABI
-  (`abi/jotun_draw.h`) but unimplemented on both ends: the client has no
-  keydown or paste handler and the host never emits them. Anything past click
-  and drag, such as a shell or a text field, needs this wired through the
-  existing event path. It is bounded work, deferrable when the first hosted
-  guest is click-driven.
+- Keyboard and text input (done). `DEV_TEXT` and `DEV_PASTE` are now wired end
+  to end. The host-to-guest path was already variable-length, so the only new
+  pieces were a document-level keydown and paste handler in the client (paste
+  split into short UTF-8 chunks under the 63-byte event-value cap) and a guest
+  that consumes the text. That guest is `webterm` (`guest/libos/webterm.c`): the
+  jsh shell rendered as a monospace text screen over the draw channel, a usable
+  web terminal. It needed a console-output seam (a portable `con_putc` over the
+  arch `con_raw_putc`, with `con_set_sink` to mirror output on screen) and an
+  interactive `jsh_exec_line`. This is the showcase of a hosted, keyboard-driven
+  session on the single-session recipe above.
 - Frame efficiency. The draw path was exercised end to end for the first time
   (beyond the SVG-dump): a live guest on `JOTUN_DRAW_PORT` reached over a real
   WebSocket, framed and input-driven, and the same path through a Caddy TLS
