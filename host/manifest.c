@@ -112,6 +112,8 @@ manifest_load(const char *path, struct manifest *m)
             copy_field(m->key, sizeof m->key, val);
         } else if (strcmp(key, "label") == 0) {
             copy_field(m->label, sizeof m->label, val);
+        } else if (strcmp(key, "name") == 0) {
+            copy_field(m->name, sizeof m->name, val);
         } else if (strcmp(key, "ref") == 0) {
             copy_field(m->ref, sizeof m->ref, val);
         } else if (strcmp(key, "subtree") == 0) {

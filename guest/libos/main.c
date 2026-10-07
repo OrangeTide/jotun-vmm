@@ -242,6 +242,74 @@ net_demo(void)
     con_puts("net: done\n");
 }
 
+/* Serve demo: listen in-host on port 9 under this guest's name, accept one
+ * connection, echo the first message back, and close. A peer reaches it by
+ * dialing "tcp!<thisguest>!9". */
+static void
+serve_once(void)
+{
+    con_puts("serve: listening tcp!*!9\n");
+    int l = net_listen("tcp!*!9");
+    if (l < 0) {
+        con_puts("serve: listen failed\n");
+        return;
+    }
+
+    char peer[64];
+    int c = net_accept(l, peer, sizeof peer);
+    if (c < 0) {
+        con_puts("serve: accept failed\n");
+        net_close(l);
+        return;
+    }
+    con_puts("serve: accepted from ");
+    con_puts(peer);
+    con_putc('\n');
+
+    char buf[256];
+    long r = net_read(c, buf, sizeof buf - 1);
+    if (r > 0) {
+        buf[r] = '\0';
+        con_puts("serve: got ");
+        con_puts(buf);
+        if (buf[r - 1] != '\n')
+            con_putc('\n');
+        net_write(c, buf, (unsigned long)r);    /* echo it back */
+    }
+    net_close(c);
+    net_close(l);
+    con_puts("serve: done\n");
+}
+
+static void
+serve_demo(void)
+{
+    serve_once();
+}
+
+static void
+link_client(void)
+{
+    net_demo();         /* dials boot_argv(1), e.g. "tcp!self!9" */
+}
+
+/* Link self-test: one guest talks to itself over the in-host switch. A server
+ * task listens and a client task dials this guest's own name, so the whole
+ * socketpair splice runs in a single guest with ordered console output. Run as
+ * JOTUN_NAME=self with init "link tcp!self!9". */
+static void
+link_demo(void)
+{
+    task_spawn("srv", serve_once);
+    task_yield();       /* let the server listen and park on accept first */
+    task_spawn("cli", link_client);
+
+    char status[64];
+    while (task_await(status, sizeof status) >= 0)
+        ;
+    con_puts("link: done\n");
+}
+
 /* UDP demo: open a datagram socket, send one datagram to a target, and print
  * the reply with its source address. The recvfrom blocks the task until a
  * datagram arrives. */
@@ -551,6 +619,10 @@ init_task(void)
         block_demo();
     } else if (script[0] == 'n' && script[1] == 'e') {  /* "net" */
         net_demo();
+    } else if (script[0] == 's' && script[1] == 'e') {  /* "serve" */
+        serve_demo();
+    } else if (script[0] == 'l' && script[1] == 'i') {  /* "link" */
+        link_demo();
     } else if (script[0] == 'u' && script[1] == 'd') {  /* "udp" */
         udp_demo();
     } else if (script[0] == 'd' && script[1] == 'r') {  /* "draw" */

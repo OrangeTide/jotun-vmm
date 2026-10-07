@@ -42,10 +42,14 @@
 #define NET_WANT_READ  1
 #define NET_WANT_WRITE 2
 
+struct vlistener;
+
 struct net_conn {
     int fd;                 /* host socket, -1 if the slot is free */
     int proto;
     int in_poll;            /* fd is registered with the poller */
+    int is_listener;        /* an in-host listener: fd is its wake pipe */
+    struct vlistener *vl;   /* the in-host listener registration, if any */
     char peer[64];          /* "host!port" for a dial, "-" for a UDP socket */
 };
 
@@ -65,7 +69,80 @@ struct netdev {
     void (*wake)(void *ctx);
     void *wake_ctx;
     const struct net_policy *policy;
+    struct vswitch *vsw;    /* process-wide in-host name service, or NULL */
+    char name[64];          /* this guest's network name, or "" */
 };
+
+/* The in-host name service and switch. Shared by every guest's provider in the
+ * process. It holds the set of guest names (so the host field of a dial string
+ * resolves to a co-running guest or, failing that, to an external name) and the
+ * live listeners each guest has registered. A dial to a guest is spliced with a
+ * socketpair, so the data path is an ordinary fd and never touches the network;
+ * the host is the only bridge between guests. */
+#define VSW_MAXNAME    16
+#define VSW_MAXLISTEN  32
+#define VSW_BACKLOG    8
+
+struct vlistener {
+    int used;
+    char name[64];                      /* owning guest's name */
+    uint16_t port;
+    struct netdev *owner;               /* for the /net view; wake is via fd */
+    int wake_wr;                        /* write end of the owner's listen pipe */
+    int fds[VSW_BACKLOG];               /* pending far socketpair ends */
+    char peers[VSW_BACKLOG][64];        /* dialer name per pending connection */
+    int head, count;
+};
+
+struct vswitch {
+    pthread_mutex_t lock;
+    char names[VSW_MAXNAME][64];
+    int nnames;
+    struct vlistener listeners[VSW_MAXLISTEN];
+};
+
+struct vswitch *
+vswitch_new(void)
+{
+    struct vswitch *v = calloc(1, sizeof *v);
+    if (v)
+        pthread_mutex_init(&v->lock, NULL);
+    return v;
+}
+
+/* Register a guest's name so the name service can resolve it. Idempotent. */
+static void
+vsw_register_name(struct vswitch *v, const char *name)
+{
+    if (!v || !name || !name[0])
+        return;
+    pthread_mutex_lock(&v->lock);
+    for (int i = 0; i < v->nnames; i++)
+        if (strcmp(v->names[i], name) == 0) {
+            pthread_mutex_unlock(&v->lock);
+            return;
+        }
+    if (v->nnames < VSW_MAXNAME)
+        snprintf(v->names[v->nnames++], sizeof v->names[0], "%s", name);
+    pthread_mutex_unlock(&v->lock);
+}
+
+/* Whether a name belongs to a co-running guest (caller holds no lock). */
+static int
+vsw_is_guest(struct vswitch *v, const char *name)
+{
+    if (!v)
+        return 0;
+    int found = 0;
+    pthread_mutex_lock(&v->lock);
+    for (int i = 0; i < v->nnames; i++)
+        if (strcmp(v->names[i], name) == 0) {
+            found = 1;
+            break;
+        }
+    pthread_mutex_unlock(&v->lock);
+    return found;
+}
 
 /* Suppress SIGPIPE on a socket where the platform needs a per-socket option
  * (macOS). On Linux MSG_NOSIGNAL on the send covers it, so this is a no-op. */
@@ -307,6 +384,105 @@ conn_of(struct netdev *nd, int32_t handle)
     return &nd->conns[handle];
 }
 
+/* Find a free connection slot (caller holds nd->lock). Returns an index, or -1
+ * when the table is full. */
+static int
+alloc_conn(struct netdev *nd)
+{
+    for (int i = 0; i < NET_MAXCONN; i++)
+        if (nd->conns[i].fd < 0)
+            return i;
+    return -1;
+}
+
+/* Parse a decimal port. Returns 0 on error (0 is not a valid service port). */
+static uint16_t
+parse_port(const char *s)
+{
+    long v = strtol(s, NULL, 10);
+    if (v <= 0 || v > 65535)
+        return 0;
+    return (uint16_t)v;
+}
+
+/* Dial a co-running guest's service by name. The two guests are spliced with a
+ * socketpair, so the data path is an ordinary fd and no traffic touches the
+ * real network. The dialer keeps one end; the other is queued on the target's
+ * accept backlog and its listen pipe is poked, so the target guest wakes and
+ * accepts. */
+static void
+do_dial_inhost(struct netdev *nd, struct jotun_net *chan, const char *host,
+               const char *portstr)
+{
+    struct vswitch *v = nd->vsw;
+    uint16_t port = parse_port(portstr);
+    if (!v || port == 0) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        reply(chan, NET_ECONN, 0);
+        return;
+    }
+    fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL, 0) | O_NONBLOCK);
+    fcntl(sv[1], F_SETFL, fcntl(sv[1], F_GETFL, 0) | O_NONBLOCK);
+
+    pthread_mutex_lock(&nd->lock);
+    int handle = alloc_conn(nd);
+    if (handle >= 0) {
+        nd->conns[handle].fd = sv[0];
+        nd->conns[handle].proto = NET_PROTO_TCP;
+        nd->conns[handle].in_poll = 0;
+        nd->conns[handle].is_listener = 0;
+        nd->conns[handle].vl = NULL;
+        snprintf(nd->conns[handle].peer, sizeof nd->conns[handle].peer,
+                 "%.40s!%.16s", host, portstr);
+    }
+    pthread_mutex_unlock(&nd->lock);
+    if (handle < 0) {
+        close(sv[0]);
+        close(sv[1]);
+        reply(chan, NET_ENORES, 0);
+        return;
+    }
+
+    pthread_mutex_lock(&v->lock);
+    struct vlistener *vl = NULL;
+    for (int i = 0; i < VSW_MAXLISTEN; i++)
+        if (v->listeners[i].used && v->listeners[i].port == port
+            && strcmp(v->listeners[i].name, host) == 0) {
+            vl = &v->listeners[i];
+            break;
+        }
+    int ok = vl && vl->count < VSW_BACKLOG;
+    if (ok) {
+        int slot = (vl->head + vl->count) % VSW_BACKLOG;
+        vl->fds[slot] = sv[1];
+        snprintf(vl->peers[slot], sizeof vl->peers[0], "%s", nd->name);
+        vl->count++;
+        char b = 'x';
+        ssize_t wr = write(vl->wake_wr, &b, 1);
+        (void)wr;
+    }
+    pthread_mutex_unlock(&v->lock);
+
+    if (!ok) {
+        /* The guest exists but is not listening on that port (or its backlog is
+         * full): roll the dialer slot back and refuse. */
+        pthread_mutex_lock(&nd->lock);
+        nd->conns[handle].fd = -1;
+        pthread_mutex_unlock(&nd->lock);
+        close(sv[0]);
+        close(sv[1]);
+        reply(chan, NET_ECONN, 0);
+        return;
+    }
+
+    reply(chan, handle, 0);
+}
+
 static void
 do_dial(struct netdev *nd, struct jotun_net *chan)
 {
@@ -346,6 +522,13 @@ do_dial(struct netdev *nd, struct jotun_net *chan)
         proto = NET_PROTO_UDP;
     else {
         reply(chan, NET_EINVAL, 0);
+        return;
+    }
+
+    /* The name service resolves the host field: a co-running guest's name is an
+     * in-host link, anything else resolves externally below. */
+    if (proto == NET_PROTO_TCP && vsw_is_guest(nd->vsw, host)) {
+        do_dial_inhost(nd, chan, host, port);
         return;
     }
 
@@ -626,18 +809,220 @@ do_recvfrom(struct netdev *nd, struct jotun_net *chan)
     reply(chan, NET_ECONN, 0);
 }
 
+/* Free a listener's switch registration: close its wake pipe and any unaccepted
+ * backlog ends, and release the slot. */
+static void
+free_listener(struct vswitch *v, struct vlistener *vl)
+{
+    pthread_mutex_lock(&v->lock);
+    if (vl->used) {
+        close(vl->wake_wr);
+        for (int i = 0; i < vl->count; i++)
+            close(vl->fds[(vl->head + i) % VSW_BACKLOG]);
+        vl->used = 0;
+    }
+    pthread_mutex_unlock(&v->lock);
+}
+
 static void
 do_close(struct netdev *nd, struct jotun_net *chan)
 {
     pthread_mutex_lock(&nd->lock);
     struct net_conn *c = conn_of(nd, chan->handle);
+    struct vlistener *vl = NULL;
     if (c) {
         poller_del(nd, c);
+        if (c->is_listener)
+            vl = c->vl;
         close(c->fd);
         c->fd = -1;
+        c->is_listener = 0;
+        c->vl = NULL;
     }
     pthread_mutex_unlock(&nd->lock);
+    if (vl)
+        free_listener(nd->vsw, vl);
     reply(chan, 0, 0);
+}
+
+/* Register an in-host service under this guest's name. The first cut serves
+ * "tcp!*!port": external binding is a later step. The listener's wake pipe is
+ * its readiness fd, so a waiting accept parks on it like any socket. */
+static void
+do_listen(struct netdev *nd, struct jotun_net *chan)
+{
+    char target[256];
+    uint32_t n = chan->len;
+    if (n >= sizeof target) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+    memcpy(target, chan->data, n);
+    target[n] = '\0';
+
+    char *net_bang = strchr(target, '!');
+    if (!net_bang) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+    *net_bang = '\0';
+    const char *network = target;
+    char *rest = net_bang + 1;
+    char *bang = strchr(rest, '!');
+    if (!bang) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+    *bang = '\0';
+    const char *host = rest;
+    const char *portstr = bang + 1;
+
+    if (strcmp(network, "tcp") != 0 || strcmp(host, "*") != 0) {
+        reply(chan, NET_EINVAL, 0);     /* external bind not yet supported */
+        return;
+    }
+    struct vswitch *v = nd->vsw;
+    if (!v || !nd->name[0]) {
+        reply(chan, NET_EPERM, 0);      /* no name: cannot offer a service */
+        return;
+    }
+    uint16_t port = parse_port(portstr);
+    if (port == 0) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+
+    int p[2];
+    if (pipe(p) != 0) {
+        reply(chan, NET_ECONN, 0);
+        return;
+    }
+    fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL, 0) | O_NONBLOCK);
+    fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL, 0) | O_NONBLOCK);
+
+    pthread_mutex_lock(&v->lock);
+    for (int i = 0; i < VSW_MAXLISTEN; i++)
+        if (v->listeners[i].used && v->listeners[i].port == port
+            && strcmp(v->listeners[i].name, nd->name) == 0) {
+            pthread_mutex_unlock(&v->lock);
+            close(p[0]);
+            close(p[1]);
+            reply(chan, NET_EINVAL, 0);     /* already listening */
+            return;
+        }
+    struct vlistener *vl = NULL;
+    for (int i = 0; i < VSW_MAXLISTEN; i++)
+        if (!v->listeners[i].used) {
+            vl = &v->listeners[i];
+            break;
+        }
+    if (!vl) {
+        pthread_mutex_unlock(&v->lock);
+        close(p[0]);
+        close(p[1]);
+        reply(chan, NET_ENORES, 0);
+        return;
+    }
+    memset(vl, 0, sizeof *vl);
+    vl->used = 1;
+    snprintf(vl->name, sizeof vl->name, "%s", nd->name);
+    vl->port = port;
+    vl->owner = nd;
+    vl->wake_wr = p[1];
+    pthread_mutex_unlock(&v->lock);
+
+    pthread_mutex_lock(&nd->lock);
+    int handle = alloc_conn(nd);
+    if (handle >= 0) {
+        nd->conns[handle].fd = p[0];
+        nd->conns[handle].proto = NET_PROTO_TCP;
+        nd->conns[handle].in_poll = 0;
+        nd->conns[handle].is_listener = 1;
+        nd->conns[handle].vl = vl;
+        snprintf(nd->conns[handle].peer, sizeof nd->conns[handle].peer,
+                 "listen %.32s!%u", nd->name, (unsigned)port);
+    }
+    pthread_mutex_unlock(&nd->lock);
+    if (handle < 0) {
+        free_listener(v, vl);
+        close(p[0]);
+        reply(chan, NET_ENORES, 0);
+        return;
+    }
+
+    reply(chan, handle, 0);
+}
+
+/* Accept one pending in-host connection on a listening handle. */
+static void
+do_accept(struct netdev *nd, struct jotun_net *chan)
+{
+    pthread_mutex_lock(&nd->lock);
+    struct net_conn *c = conn_of(nd, chan->handle);
+    if (!c || !c->is_listener) {
+        pthread_mutex_unlock(&nd->lock);
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+    struct vlistener *vl = c->vl;
+    int lfd = c->fd;
+    pthread_mutex_unlock(&nd->lock);
+
+    struct vswitch *v = nd->vsw;
+    int farfd = -1;
+    char peer[64] = "";
+    pthread_mutex_lock(&v->lock);
+    if (vl->count > 0) {
+        farfd = vl->fds[vl->head];
+        snprintf(peer, sizeof peer, "%s", vl->peers[vl->head]);
+        vl->head = (vl->head + 1) % VSW_BACKLOG;
+        vl->count--;
+    }
+    pthread_mutex_unlock(&v->lock);
+
+    if (farfd < 0) {
+        /* Nothing pending: drain stale wake bytes, then park on the listen
+         * pipe so a later dial wakes this accept. */
+        char drain[64];
+        while (read(lfd, drain, sizeof drain) > 0)
+            ;
+        pthread_mutex_lock(&nd->lock);
+        c = conn_of(nd, chan->handle);
+        if (c)
+            poller_arm(nd, c, NET_WANT_READ);
+        pthread_mutex_unlock(&nd->lock);
+        reply(chan, NET_EAGAIN, 0);
+        return;
+    }
+
+    char one;
+    ssize_t rd = read(lfd, &one, 1);   /* consume one wake byte */
+    (void)rd;
+
+    pthread_mutex_lock(&nd->lock);
+    int handle = alloc_conn(nd);
+    if (handle >= 0) {
+        nd->conns[handle].fd = farfd;
+        nd->conns[handle].proto = NET_PROTO_TCP;
+        nd->conns[handle].in_poll = 0;
+        nd->conns[handle].is_listener = 0;
+        nd->conns[handle].vl = NULL;
+        snprintf(nd->conns[handle].peer, sizeof nd->conns[handle].peer,
+                 "%s", peer[0] ? peer : "-");
+    }
+    pthread_mutex_unlock(&nd->lock);
+    if (handle < 0) {
+        close(farfd);
+        reply(chan, NET_ENORES, 0);
+        return;
+    }
+
+    uint32_t pn = (uint32_t)strlen(peer);
+    if (pn > JOTUN_NET_ADDRMAX)
+        pn = JOTUN_NET_ADDRMAX;
+    memcpy(chan->addr, peer, pn);
+    chan->addrlen = pn;
+    reply(chan, handle, 0);
 }
 
 void
@@ -651,6 +1036,8 @@ net_handle(struct netdev *nd, struct jotun_net *chan)
     case NET_OP_UDP:      do_udp(nd, chan);      break;
     case NET_OP_SENDTO:   do_sendto(nd, chan);   break;
     case NET_OP_RECVFROM: do_recvfrom(nd, chan); break;
+    case NET_OP_LISTEN:   do_listen(nd, chan);   break;
+    case NET_OP_ACCEPT:   do_accept(nd, chan);   break;
     default:              reply(chan, NET_EINVAL, 0); break;
     }
 }
@@ -676,7 +1063,8 @@ poll_loop(void *arg)
 
 struct netdev *
 net_init(struct jotun_net *chan, void (*wake)(void *ctx), void *wake_ctx,
-         const struct net_policy *policy)
+         const struct net_policy *policy, struct vswitch *vsw,
+         const char *name)
 {
     struct netdev *nd = calloc(1, sizeof(*nd));
     if (!nd)
@@ -688,6 +1076,10 @@ net_init(struct jotun_net *chan, void (*wake)(void *ctx), void *wake_ctx,
     nd->wake = wake;
     nd->wake_ctx = wake_ctx;
     nd->policy = policy;
+    nd->vsw = vsw;
+    if (name)
+        snprintf(nd->name, sizeof nd->name, "%s", name);
+    vsw_register_name(vsw, nd->name);
     pthread_mutex_init(&nd->lock, NULL);
 
     if (poller_create(nd) != 0) {
@@ -730,9 +1122,12 @@ net_shutdown(struct netdev *nd)
     poller_wake(nd);
     pthread_join(nd->poll_thread, NULL);
 
-    for (int i = 0; i < NET_MAXCONN; i++)
+    for (int i = 0; i < NET_MAXCONN; i++) {
+        if (nd->conns[i].is_listener && nd->conns[i].vl)
+            free_listener(nd->vsw, nd->conns[i].vl);
         if (nd->conns[i].fd >= 0)
             close(nd->conns[i].fd);
+    }
     poller_destroy(nd);
     free(nd);
 }

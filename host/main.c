@@ -57,6 +57,7 @@
 static uart_16550 uart;
 static pthread_mutex_t dev_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long max_exits;     /* 0 means no cap */
+static struct vswitch *g_vswitch;   /* in-host name service, shared by guests */
 
 struct guest;                       /* defined below; vcpu_ctx points back to it */
 
@@ -656,8 +657,11 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
     /* The net provider shares this guest's net channel and rouses its vcpus
      * when a socket becomes ready. Created before the 9P server so the /net
      * overlay can read its live connections. */
+    const char *netname = have_manifest ? gp->manifest.name : getenv("JOTUN_NAME");
     struct jotun_net *netchan = gpa_to_host(gp, JOTUN_NET_BASE, sizeof(*netchan));
-    gp->netdev = netchan ? net_init(netchan, rouse_vcpus, gp, &gp->policy) : NULL;
+    gp->netdev = netchan
+        ? net_init(netchan, rouse_vcpus, gp, &gp->policy, g_vswitch, netname)
+        : NULL;
 
     /* Every guest gets a draw sink attached to the one shared front end, which
      * composites their scenes into a single browser session. With no front end
@@ -786,6 +790,10 @@ main(int argc, char **argv)
     struct sigaction sa = { 0 };
     sa.sa_handler = sig_noop;
     sigaction(SIGUSR1, &sa, NULL);
+
+    /* One in-host switch backs the whole process, so guests can reach each
+     * other by name. */
+    g_vswitch = vswitch_new();
 
     nguests = nmanifests > 0 ? nmanifests : 1;
 

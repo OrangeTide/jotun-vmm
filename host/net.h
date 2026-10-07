@@ -14,6 +14,11 @@
 
 struct netdev;
 
+/* The process-wide in-host name service and switch, shared by every guest's
+ * provider. Create one and pass it to each net_init. */
+struct vswitch;
+struct vswitch *vswitch_new(void);
+
 #define NET_MAXRULES 16
 
 /* One network-policy rule: an IPv4 CIDR, an inclusive port range, and a
@@ -38,9 +43,14 @@ struct net_policy {
  * when a registered socket becomes ready, with wake_ctx; it must rouse the
  * guest that owns this provider (inject the event interrupt into running vcpus
  * and wake idle ones). policy is borrowed and must outlive the provider.
- * Returns NULL on failure. */
+ * Returns NULL on failure.
+ *
+ * vsw is the shared in-host switch (or NULL for no inter-guest networking), and
+ * name is this guest's network name (or NULL/"" if it has none, in which case
+ * the guest cannot be dialed by name or offer in-host services). */
 struct netdev *net_init(struct jotun_net *chan, void (*wake)(void *ctx),
-                        void *wake_ctx, const struct net_policy *policy);
+                        void *wake_ctx, const struct net_policy *policy,
+                        struct vswitch *vsw, const char *name);
 
 /* Handle one request already written into the channel, writing the result back
  * into it. Called from the net doorbell. */

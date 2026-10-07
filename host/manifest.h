@@ -24,6 +24,7 @@ struct manifest {
     char label[64];                     /* topic label, or "" for the bare topic */
     char ref[64];                       /* ref name, default "root" */
     char subtree[256];                  /* guest root within the bundle */
+    char name[64];                      /* this guest's network name, or "" */
     int  argc;
     char argv[MANIFEST_MAXARG][64];     /* init program and arguments */
     int  nnet;
