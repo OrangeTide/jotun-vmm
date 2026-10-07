@@ -1,0 +1,31 @@
+# Front the Jotun draw server with TLS so a browser can reach it over the web.
+#
+# The draw server (host/drawws.c) speaks plain HTTP and WebSocket on a loopback
+# port and has no TLS or auth of its own, by design: the proxy owns TLS and, if
+# wanted, authentication, off the box. reverse_proxy passes the WebSocket
+# upgrade through unchanged, so wss: on this side becomes ws: to the guest.
+#
+# Local use: `caddy run --config example/web/Caddyfile` then open
+# https://localhost:8443/ (accept the local CA certificate once).
+
+{
+	admin off
+	auto_https disable_redirects
+}
+
+# Local development: Caddy's internal CA mints a self-signed certificate.
+https://localhost:8443 {
+	tls internal
+	reverse_proxy 127.0.0.1:9230
+}
+
+# Public deployment: name a real domain and Caddy obtains a certificate
+# automatically over ACME. Uncomment and set the domain, then optionally gate
+# access with basic auth (the host itself authenticates no one).
+#
+# term.example.com {
+# 	reverse_proxy 127.0.0.1:9230
+# 	# basic_auth {
+# 	# 	# user <bcrypt-hash>   # caddy hash-password
+# 	# }
+# }

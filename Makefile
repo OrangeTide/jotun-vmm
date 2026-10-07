@@ -297,8 +297,15 @@ macsyntax:
 	    -DSO_NOSIGPIPE=0x1022 -I$(MACSHIM) -Iabi -I$(SMOLVFS_DIR) host/net.c
 	@echo "macsyntax: macOS net path OK"
 
+## Run the web terminal guest with the draw server open on port 9230. Front it
+## with Caddy for TLS (see example/web/Caddyfile and doc/web-hosting.md) and open
+## https://localhost:8443/. Needs a bundle first: make bundle BUNDLE_ARCHS=$(ARCH)
+web: $(TARGET) libos.elf
+	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root JOTUN_DRAW_PORT=9230 \
+	    ./$(TARGET) libos.elf webterm
+
 clean:
 	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool jbundle
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax
+.PHONY: all clean bundle macsyntax web
