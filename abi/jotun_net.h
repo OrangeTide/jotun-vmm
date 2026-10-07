@@ -29,16 +29,33 @@
 
 /* Operations (guest to host). */
 enum {
-    NET_OP_DIAL     = 1,    /* open a connection to data[] as "host!port" */
+    NET_OP_DIAL     = 1,    /* open a connection to the dial string in data[] */
     NET_OP_SEND     = 2,    /* write len bytes of data[] to a connection */
     NET_OP_RECV     = 3,    /* read up to maxlen bytes from a connection */
     NET_OP_CLOSE    = 4,    /* close a connection */
     NET_OP_UDP      = 5,    /* open an unconnected UDP socket */
     NET_OP_SENDTO   = 6,    /* send a datagram (data[]) to addr[] "host!port" */
     NET_OP_RECVFROM = 7,    /* receive a datagram, addr[] filled with the source */
+    NET_OP_LISTEN   = 8,    /* bind/register the dial string in data[], return a
+                               listening handle */
+    NET_OP_ACCEPT   = 9,    /* accept one connection on a listening handle, the
+                               new connection's handle in status, the peer in
+                               addr[] */
 };
 
-/* Protocols for NET_OP_DIAL. */
+/* A dial string is a Plan 9 style "network!host!port":
+ *   tcp!host!port      a TCP connection
+ *   udp!host!port      a UDP connection
+ * NET_OP_DIAL and NET_OP_LISTEN both take this form. The host runs one name
+ * service over the host field: a name assigned to a co-running guest resolves
+ * to an in-host link, and any other name resolves externally (DNS). An in-host
+ * link is backed by a socketpair, so its data path (send/recv/readiness) is
+ * identical to a real socket, and the external and inter-guest cases differ
+ * only in how the name resolved. There is no path to the real network except
+ * through the host.
+ *
+ * NET_PROTO_* classify a live connection for the /net information tree and the
+ * policy rules. */
 enum {
     NET_PROTO_TCP = 1,
     NET_PROTO_UDP = 2,
@@ -55,7 +72,7 @@ enum {
 
 struct jotun_net {
     uint32_t op;                /* NET_OP_* (guest to host) */
-    uint32_t proto;             /* NET_PROTO_* for DIAL (guest to host) */
+    uint32_t reserved;          /* was proto; the dial string now carries it */
     int32_t  handle;            /* connection handle for SEND/RECV/CLOSE (in) */
     int32_t  status;            /* result code, handle, or byte count (out) */
     uint32_t len;               /* data length: SEND in, RECV out */

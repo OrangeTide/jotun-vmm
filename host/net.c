@@ -320,18 +320,38 @@ do_dial(struct netdev *nd, struct jotun_net *chan)
     memcpy(target, chan->data, n);
     target[n] = '\0';
 
-    char *bang = strchr(target, '!');
+    /* "network!host!port": split the network token, then host and port. */
+    char *net_bang = strchr(target, '!');
+    if (!net_bang) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+    *net_bang = '\0';
+    const char *network = target;
+    char *rest = net_bang + 1;
+
+    char *bang = strchr(rest, '!');
     if (!bang) {
         reply(chan, NET_EINVAL, 0);
         return;
     }
     *bang = '\0';
-    const char *host = target;
+    const char *host = rest;
     const char *port = bang + 1;
+
+    int proto;
+    if (strcmp(network, "tcp") == 0)
+        proto = NET_PROTO_TCP;
+    else if (strcmp(network, "udp") == 0)
+        proto = NET_PROTO_UDP;
+    else {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
 
     struct addrinfo hints = { 0 };
     hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = chan->proto == NET_PROTO_UDP ? SOCK_DGRAM : SOCK_STREAM;
+    hints.ai_socktype = proto == NET_PROTO_UDP ? SOCK_DGRAM : SOCK_STREAM;
     struct addrinfo *res = NULL;
     if (getaddrinfo(host, port, &hints, &res) != 0 || !res) {
         reply(chan, NET_ENORES, 0);
@@ -359,7 +379,7 @@ do_dial(struct netdev *nd, struct jotun_net *chan)
     int fd = -1;
     int any_allowed = 0;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-        if (!policy_allows(nd->policy, ai->ai_addr, NET_PROTO_TCP))
+        if (!policy_allows(nd->policy, ai->ai_addr, proto))
             continue;
         any_allowed = 1;
 
@@ -384,7 +404,7 @@ do_dial(struct netdev *nd, struct jotun_net *chan)
     }
 
     nd->conns[handle].fd = fd;
-    nd->conns[handle].proto = NET_PROTO_TCP;
+    nd->conns[handle].proto = proto;
     nd->conns[handle].in_poll = 0;
     snprintf(nd->conns[handle].peer, sizeof nd->conns[handle].peer,
              "%.40s!%.16s", host, port);

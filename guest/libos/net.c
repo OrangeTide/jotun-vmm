@@ -74,7 +74,7 @@ net_init(void)
 }
 
 int
-net_dial(int proto, const char *target)
+net_dial(const char *target)
 {
     unsigned long len = 0;
     while (target[len] != '\0')
@@ -85,13 +85,77 @@ net_dial(int proto, const char *target)
     unsigned long f = lock_chan();
     struct jotun_net *c = chan();
     c->op = NET_OP_DIAL;
-    c->proto = (uint32_t)proto;
     c->len = (uint32_t)len;
     memcpy(c->data, target, len);
     doorbell();
     int st = c->status;
     unlock_chan(f);
     return st;
+}
+
+/* Bind/register a dial string and return a listening handle, or a negative
+ * error. In-host listening ("tcp!*!port") offers the service under this guest's
+ * network name. */
+int
+net_listen(const char *target)
+{
+    unsigned long len = 0;
+    while (target[len] != '\0')
+        len++;
+    if (len > JOTUN_NET_MSIZE)
+        return NET_EINVAL;
+
+    unsigned long f = lock_chan();
+    struct jotun_net *c = chan();
+    c->op = NET_OP_LISTEN;
+    c->len = (uint32_t)len;
+    memcpy(c->data, target, len);
+    doorbell();
+    int st = c->status;
+    unlock_chan(f);
+    return st;
+}
+
+/* One non-blocking accept RPC. Returns a new handle, NET_EAGAIN, or an error;
+ * on success peer[] (capacity from addrlen) is filled with the dialer's name. */
+static int
+accept_once(int handle, char *peer, unsigned long peercap)
+{
+    unsigned long f = lock_chan();
+    struct jotun_net *c = chan();
+    c->op = NET_OP_ACCEPT;
+    c->handle = handle;
+    doorbell();
+    int st = c->status;
+    if (st >= 0 && peer && peercap) {
+        unsigned long n = c->addrlen;
+        if (n >= peercap)
+            n = peercap - 1;
+        memcpy(peer, c->addr, n);
+        peer[n] = '\0';
+    }
+    unlock_chan(f);
+    return st;
+}
+
+/* Accept one connection on a listening handle, blocking the calling task until
+ * a connection arrives. Returns the new connection's handle, or a negative
+ * error. The dialer's name is written to peer (truncated to peercap). */
+int
+net_accept(int handle, char *peer, unsigned long peercap)
+{
+    int me = task_self();
+
+    __atomic_store_n(&net_waiting[me], 1, __ATOMIC_SEQ_CST);
+    for (;;) {
+        int st = accept_once(handle, peer, peercap);
+        if (st == NET_EAGAIN) {
+            task_block();
+            continue;
+        }
+        __atomic_store_n(&net_waiting[me], 0, __ATOMIC_SEQ_CST);
+        return st;
+    }
 }
 
 /* One non-blocking send RPC. Returns the byte count, NET_EAGAIN, or an error. */

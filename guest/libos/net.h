@@ -12,9 +12,22 @@
 /* Register the net event hook with the scheduler. Call once at boot. */
 void net_init(void);
 
-/* Open a connection to target ("host!port") over the given NET_PROTO_*.
- * Returns a non-negative handle, or a negative NET_* error. */
-int net_dial(int proto, const char *target);
+/* Open a connection to a dial string "network!host!port" (network is tcp or
+ * udp). The host resolves the host field: a co-running guest's name gives an
+ * in-host link, any other name resolves externally. Returns a non-negative
+ * handle, or a negative NET_* error. */
+int net_dial(const char *target);
+
+/* Offer a service named by a dial string and return a listening handle, or a
+ * negative NET_* error. "tcp!*!port" listens in-host under this guest's name,
+ * so a peer reaches it by dialing "tcp!<thisguest>!port". */
+int net_listen(const char *target);
+
+/* Accept one connection on a listening handle, blocking the calling task until
+ * one arrives. Returns the new connection's handle (use net_read/net_write/
+ * net_close on it), or a negative NET_* error. The dialer's name is written to
+ * peer, truncated to peercap. */
+int net_accept(int handle, char *peer, unsigned long peercap);
 
 /* Write n bytes, blocking until all are sent. Returns n, or a negative NET_*
  * error. */

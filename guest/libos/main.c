@@ -196,13 +196,13 @@ cat_path(const char *path)
 static void
 net_demo(void)
 {
-    const char *target = (boot_argc() > 1) ? boot_argv(1) : "127.0.0.1!7";
+    const char *target = (boot_argc() > 1) ? boot_argv(1) : "tcp!127.0.0.1!7";
 
     con_puts("net: dialing ");
     con_puts(target);
     con_putc('\n');
 
-    int h = net_dial(NET_PROTO_TCP, target);
+    int h = net_dial(target);
     if (h < 0) {
         con_puts("net: dial failed\n");
         return;
