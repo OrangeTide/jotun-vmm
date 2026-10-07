@@ -3,8 +3,8 @@
  * Gouraud-shaded, z-buffered triangles into an RGBA8888 framebuffer in guest
  * RAM, with perspective-correct texturing, the Glide-style color-combine modes,
  * point and bilinear filtering, mip-mapped (trilinear) textures, anisotropic
- * filtering, and source-over alpha blending. The host never sees a rendering
- * command, only the finished
+ * filtering, and source-over alpha blending, fronted by a vertex transform and
+ * near/far clip stage. The host never sees a rendering command, only the finished
  * pixels, which it reads through the draw pixel path. This file uses floating
  * point and so is built with the FPU enabled, unlike the integer-only rest of
  * the library OS.
@@ -401,6 +401,171 @@ tr_triangle(struct tr_target *t, const struct tr_vertex *a,
 }
 
 /****************************************************************
+ * Vertex transform and clip stage
+ ****************************************************************/
+
+void
+tr_mat4_identity(struct tr_mat4 *o)
+{
+    for (int i = 0; i < 16; i++)
+        o->m[i] = 0.0f;
+    o->m[0] = o->m[5] = o->m[10] = o->m[15] = 1.0f;
+}
+
+void
+tr_mat4_mul(struct tr_mat4 *o, const struct tr_mat4 *a, const struct tr_mat4 *b)
+{
+    struct tr_mat4 r;
+    for (int row = 0; row < 4; row++) {
+        for (int col = 0; col < 4; col++) {
+            float s = 0.0f;
+            for (int k = 0; k < 4; k++)
+                s += a->m[row * 4 + k] * b->m[k * 4 + col];
+            r.m[row * 4 + col] = s;
+        }
+    }
+    *o = r;                             /* r is local, so o may alias a or b */
+}
+
+void
+tr_mat4_translate(struct tr_mat4 *o, float x, float y, float z)
+{
+    tr_mat4_identity(o);
+    o->m[3] = x;
+    o->m[7] = y;
+    o->m[11] = z;
+}
+
+void
+tr_mat4_rotx(struct tr_mat4 *o, float c, float s)
+{
+    tr_mat4_identity(o);
+    o->m[5] = c;  o->m[6]  = -s;
+    o->m[9] = s;  o->m[10] =  c;
+}
+
+void
+tr_mat4_roty(struct tr_mat4 *o, float c, float s)
+{
+    tr_mat4_identity(o);
+    o->m[0] =  c;  o->m[2]  = s;
+    o->m[8] = -s;  o->m[10] = c;
+}
+
+void
+tr_mat4_rotz(struct tr_mat4 *o, float c, float s)
+{
+    tr_mat4_identity(o);
+    o->m[0] = c;  o->m[1] = -s;
+    o->m[4] = s;  o->m[5] =  c;
+}
+
+void
+tr_mat4_perspective(struct tr_mat4 *o, float znear, float zfar,
+                    float sx, float sy)
+{
+    float d = zfar - znear;
+    tr_mat4_identity(o);
+    o->m[0]  = sx;
+    o->m[5]  = sy;
+    o->m[10] = zfar / d;    o->m[11] = -zfar * znear / d;
+    o->m[14] = 1.0f;        o->m[15] = 0.0f;    /* clip w = view-space z */
+}
+
+/* A clip-space vertex carried through clipping as a flat array so the plane
+ * clip and the attribute interpolation can loop over every component. */
+enum { CX, CY, CZ, CW, CR, CG, CB, CA, CU, CV, NCOMP };
+#define NCLIP 8                         /* a triangle clipped by two planes */
+
+static void
+xform(float o[NCOMP], const struct tr_mat4 *m, const struct tr_vin *v)
+{
+    o[CX] = m->m[0]  * v->x + m->m[1]  * v->y + m->m[2]  * v->z + m->m[3];
+    o[CY] = m->m[4]  * v->x + m->m[5]  * v->y + m->m[6]  * v->z + m->m[7];
+    o[CZ] = m->m[8]  * v->x + m->m[9]  * v->y + m->m[10] * v->z + m->m[11];
+    o[CW] = m->m[12] * v->x + m->m[13] * v->y + m->m[14] * v->z + m->m[15];
+    o[CR] = v->r; o[CG] = v->g; o[CB] = v->b; o[CA] = v->a;
+    o[CU] = v->u; o[CV] = v->v;
+}
+
+/* Signed distance to a clip plane, positive inside: plane 0 is the near plane
+ * (z >= 0) and plane 1 the far plane (z <= w). */
+static float
+plane_dist(const float v[NCOMP], int plane)
+{
+    return plane == 0 ? v[CZ] : v[CW] - v[CZ];
+}
+
+static void
+vlerp(float o[NCOMP], const float a[NCOMP], const float b[NCOMP], float t)
+{
+    for (int k = 0; k < NCOMP; k++)
+        o[k] = a[k] + (b[k] - a[k]) * t;
+}
+
+/* Sutherland-Hodgman against one plane: emit the kept vertices and an
+ * intersection wherever an edge crosses the plane. Returns the output count. */
+static int
+clip_plane(const float in[][NCOMP], int nin, float out[][NCOMP], int plane)
+{
+    int nout = 0;
+    for (int i = 0; i < nin && nout < NCLIP; i++) {
+        const float *a = in[i];
+        const float *b = in[(i + 1) % nin];
+        float da = plane_dist(a, plane), db = plane_dist(b, plane);
+        int ina = da >= 0.0f, inb = db >= 0.0f;
+        if (ina) {
+            for (int k = 0; k < NCOMP; k++)
+                out[nout][k] = a[k];
+            nout++;
+        }
+        if (ina != inb && nout < NCLIP)
+            vlerp(out[nout++], a, b, da / (da - db));
+    }
+    return nout;
+}
+
+void
+tr_draw_triangle(struct tr_target *t, const struct tr_mat4 *mvp,
+                 const struct tr_vin *a, const struct tr_vin *b,
+                 const struct tr_vin *c)
+{
+    float pa[NCLIP][NCOMP], pb[NCLIP][NCOMP];
+    xform(pa[0], mvp, a);
+    xform(pa[1], mvp, b);
+    xform(pa[2], mvp, c);
+
+    int n = clip_plane(pa, 3, pb, 0);           /* near */
+    if (n < 3)
+        return;
+    n = clip_plane(pb, n, pa, 1);               /* far; result back in pa */
+    if (n < 3)
+        return;
+
+    /* Perspective divide and viewport map. The near clip guarantees w > 0 for a
+     * standard projection, so the divide is safe. The viewport fills the whole
+     * target: the centre is its half-size and the y axis flips to screen down. */
+    float ox = t->w * 0.5f, oy = t->h * 0.5f;
+    float hw = t->w * 0.5f, hh = t->h * 0.5f;
+    struct tr_vertex win[NCLIP];
+    for (int i = 0; i < n; i++) {
+        const float *v = pa[i];
+        float inv = 1.0f / v[CW];
+        win[i].x = ox + v[CX] * inv * hw;
+        win[i].y = oy - v[CY] * inv * hh;
+        win[i].z = clampf(v[CZ] * inv, 0.0f, 1.0f);
+        win[i].w = v[CW];
+        win[i].r = v[CR]; win[i].g = v[CG]; win[i].b = v[CB];
+        win[i].a = v[CA];
+        win[i].u = v[CU]; win[i].v = v[CV];
+    }
+
+    /* Fan-triangulate the clipped polygon. */
+    for (int i = 1; i + 1 < n; i++)
+        tr_triangle(t, &win[0], &win[i], &win[i + 1]);
+}
+
+/****************************************************************
  * Cube demo
  ****************************************************************/
 
@@ -449,66 +614,99 @@ static const int face[6][4] = {
     { 3, 2, 6, 7 },     /* top    */
 };
 
-/* Rotate each corner by the running angles and project in perspective: the cube
- * is pushed away from the camera by DIST and divided by its view-space depth,
- * which is stored as the vertex w so the rasterizer can texture it
- * perspective-correctly. Depth and a per-corner color come from its position. */
-#define DIST  4.0f                      /* camera distance from the cube centre */
+/* The camera sits at the world origin looking down +z; a view transform pushes
+ * the world DIST away from it, so the near plane at view-space z = 2 cuts
+ * anything closer than that. The projection's x and y scales reproduce the old
+ * hand-rolled focal length (so the cube keeps its size) and put the view-space
+ * depth in the clip w for perspective-correct texturing. */
+#define DIST  4.0f                      /* view transform: push the world back */
 #define FOCAL ((float)TW * 0.9f)        /* focal length, pixels */
+#define ZNEAR 2.0f
+#define ZFAR  6.0f
+
+/* Build the projection-times-view matrix shared by everything in the scene. */
 static void
-project(struct tr_vertex out[8], float cx, float sx, float cy, float sy)
+proj_view(struct tr_mat4 *pv)
 {
-    float ox = (float)TW * 0.5f, oy = (float)TH * 0.5f;
-    for (int i = 0; i < 8; i++) {
-        float x = corner[i][0], y = corner[i][1], z = corner[i][2];
-        /* rotate about Y, then about X */
-        float x1 =  x * cy + z * sy;
-        float z1 = -x * sy + z * cy;
-        float y2 =  y * cx - z1 * sx;
-        float z2 =  y * sx + z1 * cx;
-        float zc = z2 + DIST;                   /* view-space depth, > 0 */
-        out[i].w = zc;
-        out[i].x = ox + x1 * FOCAL / zc;
-        out[i].y = oy - y2 * FOCAL / zc;
-        out[i].z = clampf((zc - 2.0f) * 0.25f, 0.0f, 1.0f);
-        out[i].r = (corner[i][0] + 1.0f) * 0.5f;
-        out[i].g = (corner[i][1] + 1.0f) * 0.5f;
-        out[i].b = (corner[i][2] + 1.0f) * 0.5f;
-        out[i].a = 1.0f;
-    }
+    struct tr_mat4 p, view;
+    tr_mat4_perspective(&p, ZNEAR, ZFAR,
+                        FOCAL * 2.0f / (float)TW, FOCAL * 2.0f / (float)TH);
+    tr_mat4_translate(&view, 0.0f, 0.0f, DIST);
+    tr_mat4_mul(pv, &p, &view);
 }
 
-/* Draw one cube face as two triangles, assigning texture coordinates to its
- * four corners so the bound texture maps across the whole face. */
-static void
-draw_face(struct tr_target *t, const struct tr_vertex *v, const int *q)
+/* A cube corner as a transform-stage vertex, its color taken from its position
+ * (texture coordinates are assigned per face). */
+static struct tr_vin
+cube_vin(int i)
 {
-    struct tr_vertex a = v[q[0]], b = v[q[1]], c = v[q[2]], d = v[q[3]];
+    struct tr_vin v = {
+        corner[i][0], corner[i][1], corner[i][2],
+        (corner[i][0] + 1.0f) * 0.5f,
+        (corner[i][1] + 1.0f) * 0.5f,
+        (corner[i][2] + 1.0f) * 0.5f,
+        1.0f, 0.0f, 0.0f,
+    };
+    return v;
+}
+
+/* Draw one cube face as two triangles through the transform stage, assigning
+ * texture coordinates to its four corners so the texture maps across the face. */
+static void
+draw_face(struct tr_target *t, const struct tr_mat4 *mvp, const int *q)
+{
+    struct tr_vin a = cube_vin(q[0]), b = cube_vin(q[1]);
+    struct tr_vin c = cube_vin(q[2]), d = cube_vin(q[3]);
     a.u = 0; a.v = 0;
     b.u = 1; b.v = 0;
     c.u = 1; c.v = 1;
     d.u = 0; d.v = 1;
-    tr_triangle(t, &a, &b, &c);
-    tr_triangle(t, &a, &c, &d);
+    tr_draw_triangle(t, mvp, &a, &b, &c);
+    tr_draw_triangle(t, mvp, &a, &c, &d);
+}
+
+/* A ground plane under the cube. It runs from behind the camera out past the
+ * far plane, so the transform stage clips it against both the near and the far
+ * plane every frame; without clipping, its vertices behind the camera would
+ * divide by a non-positive depth. */
+static void
+draw_floor(struct tr_target *t, const struct tr_mat4 *mvp)
+{
+    struct tr_vin a = { -5.0f, -1.3f, -4.0f,  1, 1, 1, 1,  0, 0 };
+    struct tr_vin b = {  5.0f, -1.3f, -4.0f,  1, 1, 1, 1,  1, 0 };
+    struct tr_vin c = {  5.0f, -1.3f, 10.0f,  1, 1, 1, 1,  1, 1 };
+    struct tr_vin d = { -5.0f, -1.3f, 10.0f,  1, 1, 1, 1,  0, 1 };
+    tr_draw_triangle(t, mvp, &a, &b, &c);
+    tr_draw_triangle(t, mvp, &a, &c, &d);
 }
 
 static void
 render_frame(struct tr_target *t, float cx, float sx, float cy, float sy)
 {
-    struct tr_vertex v[8];
-    project(v, cx, sx, cy, sy);
+    struct tr_mat4 pv, mvp, rx, ry;
+    proj_view(&pv);
+
     tr_clear(t, 0x10, 0x18, 0x30);
 
-    /* The cube: the checker texture modulated by the gouraud color, so it is
-     * both textured and lit. Bilinear and the mip chain keep the fine checker
-     * smooth and alias-free as the faces foreshorten in perspective. */
+    /* The checker texture modulated by the iterated color, so geometry is both
+     * textured and lit. Bilinear, the mip chain and anisotropic sampling keep
+     * the fine checker smooth and alias-free as surfaces foreshorten. */
     tr_tex_source(t, &checker_tex);
     tr_color_combine(t, TR_COMBINE_MODULATE);
     tr_tex_filter(t, TR_FILTER_BILINEAR);
     tr_tex_aniso(t, 8);
     tr_blend(t, 0);
+
+    /* The floor is static in the world: projection and view only. */
+    draw_floor(t, &pv);
+
+    /* The cube spins about the world origin: view times the running rotation. */
+    tr_mat4_rotx(&rx, cx, sx);
+    tr_mat4_roty(&ry, cy, sy);
+    tr_mat4_mul(&mvp, &pv, &rx);
+    tr_mat4_mul(&mvp, &mvp, &ry);
     for (int f = 0; f < 6; f++)
-        draw_face(t, v, face[f]);
+        draw_face(t, &mvp, face[f]);
 
     /* A translucent panel in front, to exercise the alpha-blend path: a flat
      * iterated color at half alpha, depth-tested against the cube but not

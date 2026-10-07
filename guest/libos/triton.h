@@ -4,8 +4,11 @@
  * triangles rendered into an RGBA8888 framebuffer in guest RAM, with
  * perspective-correct texturing, the Glide color-combine modes, point and
  * bilinear filtering, mip-mapped (trilinear) textures, anisotropic filtering,
- * and source-over alpha blending. The rasterizer runs entirely inside the
- * guest; the host only ever
+ * and source-over alpha blending. In front of the rasterizer sits an optional
+ * vertex transform and clip stage: it multiplies object-space vertices by a 4x4
+ * matrix, clips the triangle against the near and far planes, and maps the
+ * result to the viewport, so geometry may cross behind the camera safely. The
+ * rasterizer runs entirely inside the guest; the host only ever
  * receives the resulting pixels, through the draw pixel path. This is the raster
  * side of the security split in the design doc (section 9.2): no rendering
  * command stream and no rasterizer cross into the trusted host.
@@ -107,9 +110,54 @@ void tr_tex_aniso(struct tr_target *t, int maxaniso);
 
 /* Rasterize one triangle with a less-or-equal depth test, applying the target's
  * texture, combine mode, and blend state. An opaque triangle writes depth; a
- * blended one tests but does not write it, the usual translucency convention. */
+ * blended one tests but does not write it, the usual translucency convention.
+ * The vertices are in window space; the transform stage below feeds this. */
 void tr_triangle(struct tr_target *t, const struct tr_vertex *a,
                  const struct tr_vertex *b, const struct tr_vertex *c);
+
+/* A 4x4 matrix in row-major order: element (row, col) is m[row*4 + col], and it
+ * multiplies a column vector [x y z 1] on the right. The builders below compose
+ * with tr_mat4_mul, whose result applies b first and then a (o = a * b). */
+struct tr_mat4 {
+    float m[16];
+};
+
+void tr_mat4_identity(struct tr_mat4 *o);
+void tr_mat4_mul(struct tr_mat4 *o, const struct tr_mat4 *a,
+                 const struct tr_mat4 *b);
+void tr_mat4_translate(struct tr_mat4 *o, float x, float y, float z);
+
+/* Rotations take the cosine and sine of the angle directly, so the guest needs
+ * no sin/cos routine; a spinning caller can advance them by the angle-sum
+ * identities. rotx, roty and rotz rotate about the x, y and z axes. */
+void tr_mat4_rotx(struct tr_mat4 *o, float c, float s);
+void tr_mat4_roty(struct tr_mat4 *o, float c, float s);
+void tr_mat4_rotz(struct tr_mat4 *o, float c, float s);
+
+/* A perspective projection for a camera at the origin looking down +z. znear
+ * and zfar are the clip-plane depths (0 < znear < zfar); sx and sy scale x and
+ * y into normalized device coordinates (cot(fov/2) per axis, so a larger value
+ * is a narrower field of view). It maps znear to window z 0 and zfar to 1, and
+ * puts the view-space depth in the clip w for perspective-correct texturing. */
+void tr_mat4_perspective(struct tr_mat4 *o, float znear, float zfar,
+                         float sx, float sy);
+
+/* A vertex entering the transform stage, in object (or world) space: position
+ * x, y, z, gouraud color r, g, b with alpha a, and texture coordinates u, v. */
+struct tr_vin {
+    float x, y, z;
+    float r, g, b, a;
+    float u, v;
+};
+
+/* Transform three vertices by mvp into clip space, clip the triangle against
+ * the near and far planes, divide by w, map to the viewport (the whole target),
+ * and rasterize the result with the target's current texture, combine and blend
+ * state. Clipping against the near plane is what lets geometry cross behind the
+ * camera safely. One input triangle can emit up to three after clipping. */
+void tr_draw_triangle(struct tr_target *t, const struct tr_mat4 *mvp,
+                      const struct tr_vin *a, const struct tr_vin *b,
+                      const struct tr_vin *c);
 
 /* The demo: render a spinning, shaded cube and show it through the pixel path.
  * Called from the init task (the "triton" boot argument). */
