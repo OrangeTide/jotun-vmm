@@ -631,7 +631,7 @@ signed by an untrusted key are each refused; and a compressed depot pulls,
 decodes, verifies, and boots. The pull transport is loose objects only; the
 pack byte-range transport and key rotation stay out of scope.
 
-## M9: guest libc-lite (done, bar a deferred threads shim)
+## M9: guest libc-lite (done)
 
 Goal: a small freestanding library for the guest, so the libOS stops
 open-coding the same primitives and bundle programs become writable. Not a
@@ -692,9 +692,18 @@ x86-64 and arm64 under the guest's flags, with `-mno-outline-atomics` on arm64).
 So atomics need no library code; use `<stdatomic.h>` directly in place of raw
 `__atomic_*` builtins. (Only 16-byte atomics would pull in libatomic, and the
 guest uses none.) Threading already has its substrate in `task.c` (spawn,
-block/wake, self, spinlocks). A standard `<threads.h>` shim (`thrd_*`/`mtx_*`/
-`cnd_*`) over `task.c` is deferred until a bundle program actually needs the
-standard API, so the wrapper is shaped by a real consumer rather than guessed.
+block/wake, self, spinlocks). The standard `<threads.h>` shim (`thrd_*`/`mtx_*`/
+`cnd_*`, plus `call_once`) over `task.c` landed in `guest/libos/threads.c`: a
+thrd_t is a task id, a thread is a child task joined by its creator (task_await
+reaps it), create hands the start function to a trampoline through a per-id
+table with a release/acquire handshake, join collects the int return and buffers
+out-of-order completions, mutexes are compare-and-swap locks that yield while
+contended, and condition variables park waiters with task_block/task_wake. The
+`threads` guest demo runs it (a condvar-gated waiter, mutex-protected counting
+workers, and call_once), verified under multiple vcpus. Limits of the subset,
+noted for the next consumer: a thread is joined by its creator, there is no
+guest clock so the timed variants are omitted and thrd_sleep is a cooperative
+yield, and tss_* thread-specific storage is not provided.
 
 ## After M8: the forward milestones
 
@@ -936,9 +945,10 @@ Independent of the milestones above, tracked so they are not lost:
   extents of a packfile), key rotation, and multi-arch bundles.
 - Display input: text and paste, which need a text-input primitive the
   restricted SVG vocabulary excludes today.
-- libc-lite (M9): a `<threads.h>` shim (`thrd_*`/`mtx_*`/`cnd_*`) over `task.c`,
-  deferred until a bundle program needs the standard API so a real consumer
-  shapes it. M9.1 through M9.4 are done.
+- libc-lite (M9): the `<threads.h>` shim landed (see M9). Still open: the timed
+  variants (`mtx_timedlock`, `cnd_timedwait`) and precise `thrd_sleep`, which
+  need a guest clock, and `tss_*` thread-specific storage. M9.1 through M9.4 are
+  done.
 - Inter-guest network link: landed in M14.
 
 ## M14: the net name service, listen/accept, and inter-guest links (done)
