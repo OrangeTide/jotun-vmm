@@ -142,11 +142,13 @@ base64(const uint8_t *in, size_t len)
 }
 
 /****************************************************************
- * DEFLATE (fixed Huffman, LZ77), enough to really compress the frame
+ * DEFLATE (dynamic Huffman, LZ77)
  *
- * A single fixed-Huffman block over the filtered image data. Long runs of a
- * repeated pixel, which flat raster content is mostly made of, collapse into
- * length/distance matches. Bits pack least-significant-first into bytes;
+ * A single dynamic-Huffman block over the filtered image data. LZ77 (hash
+ * chains) first turns repeated content into length/distance matches; the
+ * literal/length and distance symbols are then counted and given per-frame
+ * Huffman codes, length-limited to 15 bits, which beats the fixed codes by
+ * fitting the actual frequencies. Bits pack least-significant-first into bytes;
  * Huffman codes pack most-significant-bit first, per RFC 1951.
  ****************************************************************/
 
@@ -187,18 +189,115 @@ bw_flush(struct bw *w)
     }
 }
 
-/* Emit a fixed-Huffman literal/length symbol (0..287). */
+/* Canonical length-limited Huffman over an alphabet of n symbols with the given
+ * frequencies. huff_lengths fills len[] with each symbol's code length (0 for
+ * unused), capped at maxbits; huff_codes then assigns the canonical codes. */
+#define HUFF_MAXSYM 288
+
 static void
-emit_litlen(struct bw *w, int sym)
+huff_lengths(const uint32_t *freq, int n, int maxbits, uint8_t *len)
 {
-    if (sym <= 143)
-        bw_huff(w, 0x30 + sym, 8);
-    else if (sym <= 255)
-        bw_huff(w, 0x190 + (sym - 144), 9);
-    else if (sym <= 279)
-        bw_huff(w, sym - 256, 7);
-    else
-        bw_huff(w, 0xc0 + (sym - 280), 8);
+    for (int i = 0; i < n; i++)
+        len[i] = 0;
+
+    /* Build the Huffman tree: leaves for used symbols, then repeated merges of
+     * the two lowest-weight active nodes. Small alphabets, so linear scans. */
+    uint32_t w[2 * HUFF_MAXSYM];
+    int lc[2 * HUFF_MAXSYM], rc[2 * HUFF_MAXSYM], sym[2 * HUFF_MAXSYM];
+    int act[2 * HUFF_MAXSYM];
+    int nn = 0, na = 0;
+    for (int i = 0; i < n; i++) {
+        if (freq[i]) {
+            w[nn] = freq[i]; lc[nn] = -1; rc[nn] = -1; sym[nn] = i;
+            act[na++] = nn; nn++;
+        }
+    }
+    if (na == 0)
+        return;
+    if (na == 1) {
+        len[sym[act[0]]] = 1;           /* a lone symbol still needs one bit */
+        return;
+    }
+    while (na > 1) {
+        int i1 = 0;
+        for (int k = 1; k < na; k++)
+            if (w[act[k]] < w[act[i1]]) i1 = k;
+        int a = act[i1]; act[i1] = act[--na];
+        int i2 = 0;
+        for (int k = 1; k < na; k++)
+            if (w[act[k]] < w[act[i2]]) i2 = k;
+        int b = act[i2]; act[i2] = act[--na];
+        int p = nn++;
+        w[p] = w[a] + w[b]; lc[p] = a; rc[p] = b; sym[p] = -1;
+        act[na++] = p;
+    }
+
+    /* Leaf depths are the unlimited code lengths; tally them per length. */
+    int bl_count[2 * HUFF_MAXSYM];
+    for (int i = 0; i < 2 * HUFF_MAXSYM; i++) bl_count[i] = 0;
+    int stk[2 * HUFF_MAXSYM], dep[2 * HUFF_MAXSYM], sp = 0, maxdepth = 0;
+    stk[sp] = act[0]; dep[sp] = 0; sp++;
+    while (sp > 0) {
+        sp--;
+        int node = stk[sp], d = dep[sp];
+        if (lc[node] < 0) {
+            if (d < 1) d = 1;
+            if (d > maxdepth) maxdepth = d;
+            bl_count[d]++;
+        } else {
+            stk[sp] = lc[node]; dep[sp] = d + 1; sp++;
+            stk[sp] = rc[node]; dep[sp] = d + 1; sp++;
+        }
+    }
+
+    /* Cap lengths at maxbits by redistributing the overflow (zlib's method),
+     * which keeps the length multiset a complete prefix code. */
+    int overflow = 0;
+    for (int d = maxbits + 1; d <= maxdepth; d++) {
+        bl_count[maxbits] += bl_count[d];
+        overflow += bl_count[d];
+        bl_count[d] = 0;
+    }
+    while (overflow > 0) {
+        int b = maxbits - 1;
+        while (b > 0 && bl_count[b] == 0) b--;
+        if (b == 0) break;
+        bl_count[b]--;
+        bl_count[b + 1] += 2;
+        bl_count[maxbits]--;
+        overflow -= 2;
+    }
+
+    /* Hand the shortest lengths to the most frequent symbols. */
+    int us[HUFF_MAXSYM], m = 0;
+    for (int i = 0; i < n; i++)
+        if (freq[i]) us[m++] = i;
+    for (int i = 1; i < m; i++) {
+        int s = us[i], j = i - 1;
+        while (j >= 0 && freq[us[j]] < freq[s]) { us[j + 1] = us[j]; j--; }
+        us[j + 1] = s;
+    }
+    int idx = 0;
+    for (int l = 1; l <= maxbits; l++)
+        for (int k = 0; k < bl_count[l] && idx < m; k++)
+            len[us[idx++]] = (uint8_t)l;
+}
+
+static void
+huff_codes(const uint8_t *len, int n, int maxbits, uint16_t *code)
+{
+    int bl_count[16];
+    for (int i = 0; i <= maxbits; i++) bl_count[i] = 0;
+    for (int i = 0; i < n; i++)
+        if (len[i]) bl_count[len[i]]++;
+    uint32_t next[16], c = 0;
+    next[0] = 0;
+    for (int b = 1; b <= maxbits; b++) {
+        c = (c + (uint32_t)bl_count[b - 1]) << 1;
+        next[b] = c;
+    }
+    for (int i = 0; i < n; i++)
+        if (len[i]) code[i] = (uint16_t)next[len[i]]++;
 }
 
 /* Length symbols 257..285: base length and extra-bit count. */
@@ -221,20 +320,24 @@ static const int dist_extra[30] = {
     7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
 };
 
-static void
-emit_match(struct bw *w, int len, int dist)
+/* The length symbol (0..28, mapping to litlen 257..285) for a match length,
+ * and the distance symbol (0..29) for a match distance. */
+static int
+len_sym(int len)
 {
     int ls = 28;
     while (ls > 0 && len < len_base[ls])
         ls--;
-    emit_litlen(w, 257 + ls);
-    bw_bits(w, (uint32_t)(len - len_base[ls]), len_extra[ls]);
+    return ls;
+}
 
+static int
+dist_sym(int dist)
+{
     int ds = 29;
     while (ds > 0 && dist < dist_base[ds])
         ds--;
-    bw_huff(w, (uint32_t)ds, 5);        /* fixed distance codes are 5 bits */
-    bw_bits(w, (uint32_t)(dist - dist_base[ds]), dist_extra[ds]);
+    return ds;
 }
 
 #define PNG_HASHBITS 15
@@ -250,8 +353,23 @@ png_hash(const uint8_t *p)
     return ((p[0] << 10) ^ (p[1] << 5) ^ p[2]) & (PNG_HASHSIZE - 1);
 }
 
-/* Compress raw into a zlib stream (header, one fixed-Huffman block, Adler-32)
- * appended to b. head/prev are scratch of PNG_HASHSIZE and PNG_WINDOW ints. */
+/* One LZ77 token: len == 0 is a literal byte in `dist`; len > 0 is a match of
+ * that length at that distance. */
+struct tok {
+    int len;
+    int dist;
+};
+
+/* The 19 code-length-code symbols in the order their lengths are written. */
+static const int cl_order[19] = {
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+};
+
+/* Compress raw into a zlib stream (header, one dynamic-Huffman block, Adler-32)
+ * appended to b. head/prev are scratch of PNG_HASHSIZE and PNG_WINDOW ints. The
+ * first pass runs LZ77 into a token list and counts symbol frequencies; the
+ * second builds the Huffman tables, writes the block header, and emits the
+ * tokens. */
 static void
 zlib_deflate(struct buf *b, const uint8_t *raw, size_t rawlen,
              int *head, int *prev)
@@ -262,10 +380,17 @@ zlib_deflate(struct buf *b, const uint8_t *raw, size_t rawlen,
     for (int i = 0; i < PNG_HASHSIZE; i++)
         head[i] = -1;
 
-    struct bw w = { .b = b };
-    bw_bits(&w, 1, 1);          /* BFINAL = 1 */
-    bw_bits(&w, 1, 2);          /* BTYPE = 01, fixed Huffman */
+    struct tok *toks = malloc((rawlen ? rawlen : 1) * sizeof *toks);
+    if (!toks) {
+        b->oom = 1;
+        return;
+    }
+    size_t nt = 0;
+    uint32_t fll[288], fd[30];
+    for (int i = 0; i < 288; i++) fll[i] = 0;
+    for (int i = 0; i < 30; i++) fd[i] = 0;
 
+    /* Pass 1: LZ77 parse, collecting tokens and symbol frequencies. */
     size_t i = 0;
     while (i < rawlen) {
         int best_len = 0, best_dist = 0;
@@ -294,8 +419,11 @@ zlib_deflate(struct buf *b, const uint8_t *raw, size_t rawlen,
         }
 
         if (best_len >= PNG_MINMATCH) {
-            emit_match(&w, best_len, best_dist);
-            /* Insert the matched positions into the hash chains. */
+            toks[nt].len = best_len;
+            toks[nt].dist = best_dist;
+            nt++;
+            fll[257 + len_sym(best_len)]++;
+            fd[dist_sym(best_dist)]++;
             size_t end = i + best_len;
             while (i < end) {
                 if (i + PNG_MINMATCH <= rawlen) {
@@ -306,7 +434,10 @@ zlib_deflate(struct buf *b, const uint8_t *raw, size_t rawlen,
                 i++;
             }
         } else {
-            emit_litlen(&w, raw[i]);
+            toks[nt].len = 0;
+            toks[nt].dist = raw[i];
+            nt++;
+            fll[raw[i]]++;
             if (i + PNG_MINMATCH <= rawlen) {
                 uint32_t h = png_hash(raw + i);
                 prev[i & (PNG_WINDOW - 1)] = head[h];
@@ -315,10 +446,117 @@ zlib_deflate(struct buf *b, const uint8_t *raw, size_t rawlen,
             i++;
         }
     }
+    fll[256]++;                 /* end-of-block symbol */
 
-    emit_litlen(&w, 256);       /* end of block */
+    /* DEFLATE wants at least one distance code even when nothing matched. */
+    int any_dist = 0;
+    for (int k = 0; k < 30; k++)
+        if (fd[k]) { any_dist = 1; break; }
+    if (!any_dist)
+        fd[0] = 1;
+
+    uint8_t ll_len[288], d_len[30], cl_len[19];
+    uint16_t ll_code[288], d_code[30], cl_code[19];
+    huff_lengths(fll, 286, 15, ll_len);
+    huff_codes(ll_len, 286, 15, ll_code);
+    huff_lengths(fd, 30, 15, d_len);
+    huff_codes(d_len, 30, 15, d_code);
+
+    int hlit = 286;
+    while (hlit > 257 && ll_len[hlit - 1] == 0) hlit--;
+    int hdist = 30;
+    while (hdist > 1 && d_len[hdist - 1] == 0) hdist--;
+
+    /* Run-length-encode the concatenated code lengths into the code-length
+     * alphabet (0..15 literal, 16 repeat-last, 17/18 repeat-zero). */
+    uint8_t cl[286 + 30];
+    int cln = 0;
+    for (int k = 0; k < hlit; k++) cl[cln++] = ll_len[k];
+    for (int k = 0; k < hdist; k++) cl[cln++] = d_len[k];
+
+    int clsym[2 * (286 + 30)], clext[2 * (286 + 30)], clnb[2 * (286 + 30)];
+    int cls = 0;
+    uint32_t fcl[19];
+    for (int k = 0; k < 19; k++) fcl[k] = 0;
+    for (int p = 0; p < cln; ) {
+        int cur = cl[p], run = 1;
+        while (p + run < cln && cl[p + run] == cur) run++;
+        if (cur == 0) {
+            while (run >= 11) {
+                int r = run > 138 ? 138 : run;
+                clsym[cls] = 18; clext[cls] = r - 11; clnb[cls] = 7; cls++;
+                fcl[18]++; run -= r; p += r;
+            }
+            while (run >= 3) {
+                int r = run > 10 ? 10 : run;
+                clsym[cls] = 17; clext[cls] = r - 3; clnb[cls] = 3; cls++;
+                fcl[17]++; run -= r; p += r;
+            }
+            while (run-- > 0) {
+                clsym[cls] = 0; clext[cls] = 0; clnb[cls] = 0; cls++;
+                fcl[0]++; p++;
+            }
+        } else {
+            clsym[cls] = cur; clext[cls] = 0; clnb[cls] = 0; cls++;
+            fcl[cur]++; p++; run--;
+            while (run >= 3) {
+                int r = run > 6 ? 6 : run;
+                clsym[cls] = 16; clext[cls] = r - 3; clnb[cls] = 2; cls++;
+                fcl[16]++; run -= r; p += r;
+            }
+            while (run-- > 0) {
+                clsym[cls] = cur; clext[cls] = 0; clnb[cls] = 0; cls++;
+                fcl[cur]++; p++;
+            }
+        }
+    }
+
+    /* The code-length code itself must be a complete prefix code, so make sure
+     * at least two of its symbols are present. */
+    int cl_used = 0;
+    for (int k = 0; k < 19; k++)
+        if (fcl[k]) cl_used++;
+    if (cl_used < 2) {
+        for (int k = 0; k < 19 && cl_used < 2; k++)
+            if (!fcl[k]) { fcl[k] = 1; cl_used++; }
+    }
+    huff_lengths(fcl, 19, 7, cl_len);
+    huff_codes(cl_len, 19, 7, cl_code);
+
+    int hclen = 19;
+    while (hclen > 4 && cl_len[cl_order[hclen - 1]] == 0) hclen--;
+
+    /* Pass 2: write the dynamic block header and the token stream. */
+    struct bw w = { .b = b };
+    bw_bits(&w, 1, 1);          /* BFINAL = 1 */
+    bw_bits(&w, 2, 2);          /* BTYPE = 10, dynamic Huffman */
+    bw_bits(&w, (uint32_t)(hlit - 257), 5);
+    bw_bits(&w, (uint32_t)(hdist - 1), 5);
+    bw_bits(&w, (uint32_t)(hclen - 4), 4);
+    for (int k = 0; k < hclen; k++)
+        bw_bits(&w, cl_len[cl_order[k]], 3);
+    for (int k = 0; k < cls; k++) {
+        bw_huff(&w, cl_code[clsym[k]], cl_len[clsym[k]]);
+        if (clnb[k])
+            bw_bits(&w, (uint32_t)clext[k], clnb[k]);
+    }
+    for (size_t k = 0; k < nt; k++) {
+        if (toks[k].len == 0) {
+            int lit = toks[k].dist;
+            bw_huff(&w, ll_code[lit], ll_len[lit]);
+        } else {
+            int ls = len_sym(toks[k].len);
+            bw_huff(&w, ll_code[257 + ls], ll_len[257 + ls]);
+            bw_bits(&w, (uint32_t)(toks[k].len - len_base[ls]), len_extra[ls]);
+            int ds = dist_sym(toks[k].dist);
+            bw_huff(&w, d_code[ds], d_len[ds]);
+            bw_bits(&w, (uint32_t)(toks[k].dist - dist_base[ds]), dist_extra[ds]);
+        }
+    }
+    bw_huff(&w, ll_code[256], ll_len[256]);     /* end of block */
     bw_flush(&w);
 
+    free(toks);
     buf_be32(b, adler32_bytes(raw, rawlen));
 }
 
