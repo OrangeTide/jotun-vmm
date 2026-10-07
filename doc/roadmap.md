@@ -551,10 +551,17 @@ Goal: raster content where vector does not fit.
   trilinear sampling. The mip level is picked per pixel from the screen-space
   derivatives of the texture coordinates, formed from the barycentric gradients
   (constant per triangle) by the quotient rule; `log2` for the level and `floor`
-  are small freestanding approximations, since the guest has no libm. The demo
-  now projects the cube in perspective and draws it checker-textured,
-  gouraud-modulated, bilinear and mipped, behind a translucent screen-space
-  panel, so every path runs each frame.
+  are small freestanding approximations, since the guest has no libm. Last:
+  anisotropic filtering. At a grazing angle the per-pixel texel footprint is
+  elongated, so a single trilinear tap at the long axis blurs the texture; the
+  core instead takes several trilinear taps spread along the long axis, each at a
+  mip level matched to the short axis, and averages them. The tap count is the
+  footprint's long/short axis ratio, rounded and clamped to a per-target maximum,
+  which reduces to one tap (plain trilinear) wherever the footprint is round.
+  `sqrt` is another small freestanding approximation. The demo now projects the
+  cube in perspective and draws it checker-textured, gouraud-modulated, bilinear,
+  mipped and anisotropic, behind a translucent screen-space panel, so every path
+  runs each frame.
   Enabling it meant turning on the guest FPU, since the rasterizer uses floating
   point. The FPU is enabled per cpu at boot (`arch_fpu_init`: CR0/CR4 for SSE on
   x86-64, CPACR_EL1 for FP/SIMD on arm64). The rest of the guest stays
@@ -965,10 +972,10 @@ the wrapper) left until a need appears.
 Independent of the milestones above, tracked so they are not lost:
 
 - Guest rasterizer (M7.4): texturing (perspective-correct), the Glide combine
-  units, alpha blend, bilinear filtering, and mip-mapped trilinear sampling all
-  landed on the minimal 3D core (see M7.4). Still beyond it: anisotropic
-  filtering, and a vertex transform/clip stage (the demo projects by hand and
-  relies on the whole cube staying in front of the camera).
+  units, alpha blend, bilinear filtering, mip-mapped trilinear sampling, and
+  anisotropic filtering all landed on the minimal 3D core (see M7.4). Still
+  beyond it: a vertex transform/clip stage (the demo projects by hand and relies
+  on the whole cube staying in front of the camera).
 - Pull transport (M8): the pack byte-range transport and key rotation landed
   (see M8). Still open: pack-aware resume granularity and a published multi-pack
   layout for very large origins.

@@ -382,8 +382,8 @@ the guest produces pixels itself and the host simply delivers them.
   (`guest/libos/triton.c`). It rasterizes gouraud-shaded, z-buffered triangles
   with perspective-correct texturing, the Glide color-combine modes (iterated,
   texture, modulate, add), point and bilinear filtering, mip-mapped trilinear
-  sampling, and source-over alpha blending. The rasterizer runs entirely inside
-  the guest.
+  sampling, anisotropic filtering, and source-over alpha blending. The
+  rasterizer runs entirely inside the guest.
 - The framebuffer lives in a shared-memory region. The guest marks dirty
   rectangles and signals the host.
 - The host validates the region geometry (width, height, stride, and bytes per
