@@ -623,13 +623,34 @@ Status (done):
   `JOTUN_LABEL`, and `JOTUN_CACHE`. When an origin is set the host pulls before
   serving, and any failure refuses the boot rather than falling back. See
   `example/manifest-pull`.
+- M8.5: pack byte-range transport. When the origin serves a packfile, the client
+  reads only the extents it needs instead of downloading whole objects. It
+  range-fetches the footer (a suffix request) for the entry count, then the
+  sorted index, then each missing object's own `[data | trailer]` span, whose
+  bytes are byte-identical to a loose object and so verify through the same
+  path. `host/http.c` gained `http_get_range` (a `Range` request that reads the
+  resource size from `Content-Range`). An origin may mix a pack with loose
+  objects: an object absent from the index falls back to a loose GET, and an
+  origin with no pack (or a server that ignores `Range`) pulls loose as before.
+  The walk also learned to descend a jimage, enqueuing each per-arch root tree,
+  so a multi-arch image pulls every arch with the shared objects transferred
+  once (this is what makes an M11 jimage bundle pullable at all).
+- M8.6: key rotation. A topic name is the hash of its key, so a key is never
+  changed in place; rotation is an endorsement from the retiring key to its
+  successor. The publisher puts a record on the retiring key's reserved
+  `successor` topic whose root names the successor's own head record. A client
+  pinned to the old key follows the endorsement (signed by the old key) to that
+  record, adopts the key it is signed by, and resolves the bundle under the new
+  key, all without trusting the transport. The follow is bounded and chains
+  across several rotations.
 
 Verified end to end on linux/x86-64: a cold pull fetches and verifies the
 objects and boots the guest; a warm run fetches only the ref and reuses the
 cache; a wrong trusted key, a corrupt object, a corrupt record, and a record
 signed by an untrusted key are each refused; and a compressed depot pulls,
-decodes, verifies, and boots. The pull transport is loose objects only; the
-pack byte-range transport and key rotation stay out of scope.
+decodes, verifies, and boots. A packed origin (loose objects pruned) pulls by
+byte range and boots; a client pinned to a retired key follows a signed
+endorsement to the active key and boots, while an untrusted key is refused.
 
 ## M9: guest libc-lite (done)
 
@@ -941,8 +962,9 @@ Independent of the milestones above, tracked so they are not lost:
 - Guest rasterizer (M7.4): point-sampled texturing, the Glide combine units, and
   alpha blend landed on the minimal 3D core (see M7.4). Still beyond it:
   perspective-correct texturing, bilinear filtering, and mip-mapping.
-- Pull transport (M8): the pack byte-range transport (fetch only the changed
-  extents of a packfile), key rotation, and multi-arch bundles.
+- Pull transport (M8): the pack byte-range transport and key rotation landed
+  (see M8). Still open: pack-aware resume granularity and a published multi-pack
+  layout for very large origins.
 - Display input: text and paste, which need a text-input primitive the
   restricted SVG vocabulary excludes today.
 - libc-lite (M9): the `<threads.h>` shim landed (see M9). Still open: the timed
