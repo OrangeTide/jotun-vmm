@@ -1,11 +1,11 @@
 /* png.c : a minimal, dependency-free PNG encoder (RGBA8888 -> base64 PNG).
  *
  * The image is written as a truecolor-with-alpha PNG. The IDAT payload is a
- * zlib stream whose DEFLATE body is a sequence of stored (uncompressed) blocks,
- * so there is no compressor here, only framing: zlib header, stored blocks over
- * the filtered rows, and an Adler-32 trailer. CRC-32 guards each chunk. This is
- * enough for the non-realtime pixel path; swapping the stored blocks for a real
- * DEFLATE encoder later would not change the interface. */
+ * zlib stream: a single fixed-Huffman DEFLATE block with hash-chain LZ77 over
+ * the image rows, wrapped with a zlib header and an Adler-32 trailer, and each
+ * chunk guarded by a CRC-32. Each row is first run through an adaptively chosen
+ * PNG filter (None, Sub, Up, Average or Paeth), which turns smooth or repeated
+ * content into small deltas the LZ77 and Huffman stages then compress well. */
 #include "png.h"
 
 #include <stdlib.h>
@@ -322,6 +322,41 @@ zlib_deflate(struct buf *b, const uint8_t *raw, size_t rawlen,
     buf_be32(b, adler32_bytes(raw, rawlen));
 }
 
+/****************************************************************
+ * Adaptive PNG row filtering
+ ****************************************************************/
+
+#define PNG_BPP 4               /* RGBA, so the left neighbour is 4 bytes back */
+
+/* The PNG Paeth predictor over the left (a), above (b) and above-left (c)
+ * bytes: it returns whichever neighbour the gradient a+b-c is nearest to. */
+static int
+paeth(int a, int b, int c)
+{
+    int p = a + b - c;
+    int pa = p > a ? p - a : a - p;
+    int pb = p > b ? p - b : b - p;
+    int pc = p > c ? p - c : c - p;
+    if (pa <= pb && pa <= pc)
+        return a;
+    return pb <= pc ? b : c;
+}
+
+/* The filtered byte for one of the five filter types, from the current byte x
+ * and its neighbours a (left), b (above) and c (above-left). The neighbours are
+ * the original bytes: the decoder reconstructs the same values in order. */
+static uint8_t
+filt_byte(int type, int x, int a, int b, int c)
+{
+    switch (type) {
+    case 1: return (uint8_t)(x - a);
+    case 2: return (uint8_t)(x - b);
+    case 3: return (uint8_t)(x - ((a + b) >> 1));
+    case 4: return (uint8_t)(x - paeth(a, b, c));
+    default: return (uint8_t)x;
+    }
+}
+
 char *
 png_base64_rgba(const uint8_t *rgba, int width, int height, int stride)
 {
@@ -332,17 +367,46 @@ png_base64_rgba(const uint8_t *rgba, int width, int height, int stride)
     if (stride < width * 4)
         return NULL;
 
-    /* Filtered raw data: each row is a filter byte (0 = none) then its pixels. */
+    /* Filtered raw data: each row is a filter byte then its filtered pixels.
+     * For each row we try all five filters into scratch and keep the one whose
+     * bytes have the smallest total signed magnitude, the standard heuristic. */
     size_t rowbytes = (size_t)width * 4;
     size_t rawlen = (size_t)height * (1 + rowbytes);
     uint8_t *raw = malloc(rawlen);
-    if (!raw)
+    uint8_t *scratch = malloc(5 * rowbytes);
+    if (!raw || !scratch) {
+        free(raw);
+        free(scratch);
         return NULL;
-    for (int y = 0; y < height; y++) {
-        uint8_t *dst = raw + (size_t)y * (1 + rowbytes);
-        *dst++ = 0;
-        memcpy(dst, rgba + (size_t)y * stride, rowbytes);
     }
+    for (int y = 0; y < height; y++) {
+        const uint8_t *cur = rgba + (size_t)y * stride;
+        const uint8_t *up = y > 0 ? rgba + (size_t)(y - 1) * stride : NULL;
+        int best = 0;
+        long best_score = -1;
+        for (int type = 0; type < 5; type++) {
+            uint8_t *fb = scratch + (size_t)type * rowbytes;
+            long score = 0;
+            for (size_t x = 0; x < rowbytes; x++) {
+                int cx = cur[x];
+                int a = x >= PNG_BPP ? cur[x - PNG_BPP] : 0;
+                int b = up ? up[x] : 0;
+                int c = (up && x >= PNG_BPP) ? up[x - PNG_BPP] : 0;
+                uint8_t f = filt_byte(type, cx, a, b, c);
+                fb[x] = f;
+                int sv = (int8_t)f;
+                score += sv < 0 ? -sv : sv;
+            }
+            if (best_score < 0 || score < best_score) {
+                best_score = score;
+                best = type;
+            }
+        }
+        uint8_t *dst = raw + (size_t)y * (1 + rowbytes);
+        *dst++ = (uint8_t)best;
+        memcpy(dst, scratch + (size_t)best * rowbytes, rowbytes);
+    }
+    free(scratch);
 
     struct buf b = { 0 };
     static const uint8_t sig[8] = { 137, 80, 78, 71, 13, 10, 26, 10 };
