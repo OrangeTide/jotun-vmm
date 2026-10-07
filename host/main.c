@@ -273,9 +273,11 @@ build_net_rule(const struct manifest_net *mn, struct net_rule *r)
     char cidr[64];
     snprintf(cidr, sizeof cidr, "%s", mn->cidr);
 
+    r->addr = 0;
+    r->mask = 0;
+    r->name[0] = '\0';
     if (strcmp(cidr, "*") == 0) {
-        r->addr = 0;                /* match any address */
-        r->mask = 0;
+        r->kind = NET_RULE_ANY;     /* any target: external or by name */
     } else {
         char *slash = strchr(cidr, '/');
         int prefix = 32;
@@ -286,10 +288,17 @@ build_net_rule(const struct manifest_net *mn, struct net_rule *r)
                 return -1;
         }
         struct in_addr in;
-        if (inet_pton(AF_INET, cidr, &in) != 1)
-            return -1;
-        r->addr = ntohl(in.s_addr);
-        r->mask = prefix == 0 ? 0u : (0xffffffffu << (32 - prefix));
+        if (inet_pton(AF_INET, cidr, &in) == 1) {
+            r->kind = NET_RULE_CIDR;
+            r->addr = ntohl(in.s_addr);
+            r->mask = prefix == 0 ? 0u : (0xffffffffu << (32 - prefix));
+        } else if (!slash) {
+            /* Not an address: take it as a co-running guest's name. */
+            r->kind = NET_RULE_NAME;
+            snprintf(r->name, sizeof r->name, "%s", cidr);
+        } else {
+            return -1;              /* "name/prefix" is meaningless */
+        }
     }
 
     if (strcmp(mn->ports, "*") == 0) {

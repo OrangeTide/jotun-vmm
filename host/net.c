@@ -518,7 +518,34 @@ policy_allows(const struct net_policy *p, const struct sockaddr *sa, int proto)
 
     for (int i = 0; i < p->n; i++) {
         const struct net_rule *r = &p->rules[i];
+        if (r->kind == NET_RULE_NAME)   /* a name rule never allows an IP */
+            continue;
         if ((ip & r->mask) != (r->addr & r->mask))
+            continue;
+        if (port < r->port_lo || port > r->port_hi)
+            continue;
+        if (r->proto != 0 && r->proto != proto)
+            continue;
+        return 1;
+    }
+    return 0;
+}
+
+/* Decide whether a guest may dial a co-running guest by name. Like external
+ * dialing this is default-allow: with no rules any peer is reachable; with
+ * rules the name must match a NAME rule or the match-any "*". A CIDR rule is
+ * about external addresses and never authorises a by-name link. */
+static int
+policy_allows_name(const struct net_policy *p, const char *name, uint16_t port,
+                   int proto)
+{
+    if (p->n == 0)
+        return 1;
+    for (int i = 0; i < p->n; i++) {
+        const struct net_rule *r = &p->rules[i];
+        if (r->kind == NET_RULE_CIDR)
+            continue;
+        if (r->kind == NET_RULE_NAME && strcmp(r->name, name) != 0)
             continue;
         if (port < r->port_lo || port > r->port_hi)
             continue;
@@ -532,7 +559,9 @@ policy_allows(const struct net_policy *p, const struct sockaddr *sa, int proto)
 /* Decide whether a guest may bind a real local listening port. Unlike dialing,
  * binding an external port is opt-in: with no rules a listen is in-host only,
  * and a real bind needs an explicit rule naming the port. The rule is matched
- * by port and protocol; its address range does not apply to a local bind. */
+ * by port and protocol; its address range does not apply to a local bind. A
+ * name rule is about in-host reach, not external exposure, so it never opens a
+ * local port. */
 static int
 policy_allows_bind(const struct net_policy *p, uint16_t port, int proto)
 {
@@ -540,6 +569,8 @@ policy_allows_bind(const struct net_policy *p, uint16_t port, int proto)
         return 0;
     for (int i = 0; i < p->n; i++) {
         const struct net_rule *r = &p->rules[i];
+        if (r->kind == NET_RULE_NAME)
+            continue;
         if (port < r->port_lo || port > r->port_hi)
             continue;
         if (r->proto != 0 && r->proto != proto)
@@ -716,6 +747,10 @@ do_dial(struct netdev *nd, struct jotun_net *chan)
     /* The name service resolves the host field: a co-running guest's name is an
      * in-host link, anything else resolves externally below. */
     if (proto == NET_PROTO_TCP && vsw_is_guest(nd->vsw, host)) {
+        if (!policy_allows_name(nd->policy, host, parse_port(port), proto)) {
+            reply(chan, NET_EPERM, 0);
+            return;
+        }
         do_dial_inhost(nd, chan, host, port);
         return;
     }
@@ -981,6 +1016,11 @@ do_sendto(struct netdev *nd, struct jotun_net *chan)
 
     /* A datagram to a co-running guest's name is routed in-host, like a dial. */
     if (vsw_is_guest(nd->vsw, host)) {
+        if (!policy_allows_name(nd->policy, host, parse_port(port),
+                                NET_PROTO_UDP)) {
+            reply(chan, NET_EPERM, 0);
+            return;
+        }
         do_sendto_inhost(nd, chan, host, port);
         return;
     }

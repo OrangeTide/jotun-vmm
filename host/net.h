@@ -28,18 +28,33 @@ void vsw_register_name(struct vswitch *v, const char *name);
 
 #define NET_MAXRULES 16
 
-/* One network-policy rule: an IPv4 CIDR, an inclusive port range, and a
- * protocol (0 means any). A target is allowed if it matches any rule. */
+/* What a rule's target field matches. ANY ("*") matches any external address
+ * and any guest name; CIDR matches an IPv4 range only; NAME matches a single
+ * co-running guest by name only. The three keep external and in-host targets
+ * from authorising each other. */
+enum {
+    NET_RULE_ANY = 0,
+    NET_RULE_CIDR,
+    NET_RULE_NAME,
+};
+
+/* One network-policy rule: a target (an IPv4 CIDR, a guest name, or any), an
+ * inclusive port range, and a protocol (0 means any). A target is allowed if it
+ * matches any rule. */
 struct net_rule {
-    uint32_t addr;          /* network address, host byte order */
-    uint32_t mask;          /* netmask derived from the prefix length */
+    int      kind;          /* NET_RULE_* */
+    uint32_t addr;          /* network address, host byte order (CIDR) */
+    uint32_t mask;          /* netmask derived from the prefix length (CIDR) */
+    char     name[64];      /* guest name (NAME) */
     uint16_t port_lo;
     uint16_t port_hi;
     int      proto;         /* 0 = any, else NET_PROTO_TCP / NET_PROTO_UDP */
 };
 
 /* The resolved policy. With no rules every target is allowed; with one or more
- * rules the default is to deny, and only matching targets pass. */
+ * rules the default is to deny, and only matching targets pass. This gates a
+ * guest's outbound reach (external dials and by-name links alike); what a guest
+ * may offer in-host is not gated, as the in-host trust model is flat. */
 struct net_policy {
     struct net_rule rules[NET_MAXRULES];
     int n;

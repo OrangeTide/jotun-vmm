@@ -15,13 +15,17 @@ init rc
 # more sensitive than dialing out, so it is opt-in:
 # net allow * 8080 tcp     # also bind 8080 for inbound connections
 
-# Network policy: "net allow <cidr> <ports> [tcp|udp]". With no net rule the
-# guest may dial anywhere; with one or more, only matching targets are allowed
-# and everything else is refused. ports is a single port, a "lo-hi" range, or
-# "*"; the protocol defaults to both. Matching is against the resolved address.
-# net allow 127.0.0.1/32 18080 tcp
+# Network policy: "net allow <who> <ports> [tcp|udp]". With no net rule the
+# guest may reach anywhere; with one or more, only matching targets are allowed
+# and everything else is refused. <who> is an IPv4 CIDR (matched against the
+# resolved address of an external target), a co-running guest's name (an in-host
+# link to that guest), or "*" for any target, external or in-host. ports is a
+# single port, a "lo-hi" range, or "*"; the protocol defaults to both. The rules
+# gate what a guest may reach, not what it may offer in-host.
+# net allow 127.0.0.1/32 18080 tcp   # an external address
 # net allow 10.0.0.0/8 1-1024
 # net allow * 53 udp
+# net allow web 8080 tcp             # may dial co-running guest "web" on 8080
 
 # Graft a shared read-only tree at a top-level name in the guest root, in
 # addition to the guest's own tree: "mount <name> <bundle> <ref> [subtree]".
