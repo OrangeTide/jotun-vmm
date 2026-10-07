@@ -299,9 +299,15 @@ inter-guest connections differ only in how the name resolved.
 A guest offers a service with `net_listen`/`net_accept`. `net_listen("tcp!*!
 port")` registers the service in-host under the guest's own name, so a peer
 reaches it by dialing `tcp!<thatguest>!port`; accept blocks the calling task
-until a peer connects and returns an ordinary connection. Binding a real
-external port, inter-guest UDP, policy over inter-guest links, and rate limits
-are not yet implemented.
+until a peer connects and returns an ordinary connection. The same listen also
+binds a real external port when the manifest explicitly allows it, so the guest
+can accept connections from outside the host as well. Binding is opt-in and
+default-deny: with no rules a listen is in-host only, and a real bind needs a
+`net allow` rule naming the port, since offering a port to the outside is more
+sensitive than dialing out. A named guest that binds is reachable both ways at
+once, and accept takes a pending in-host peer before a real inbound connection.
+Inter-guest UDP, policy over inter-guest links, and rate limits are not yet
+implemented.
 
 ## 9. Display subsystem
 

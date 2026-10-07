@@ -952,6 +952,13 @@ What landed:
   the guest's name; `net_accept` blocks the task until a peer connects. The
   listener's wake pipe doubles as its readiness fd, so accept parks on it like
   any socket.
+- External bind. The same listen also opens a real listening socket, so a guest
+  can accept connections from outside the host. It is opt-in: with no policy
+  rules a listen is in-host only, and a real bind needs an explicit manifest
+  rule naming the port (binding is default-deny, unlike dialing). A named guest
+  that binds is reachable both ways at once: accept takes a pending in-host
+  peer first, then a real inbound connection. The poller arms an arbitrary fd,
+  so a listener watches its in-host wake pipe and its real socket together.
 - Inter-guest links over a socketpair. A dial to a guest makes a socketpair,
   keeps one end as the dialer's connection, and queues the other on the
   target's accept backlog, poking its wake pipe. Send, recv, readiness, and
@@ -959,9 +966,9 @@ What landed:
   the real network and the host stays the only bridge. The trust model is flat
   and host-mediated: any co-running guest may offer or reach any name.
 
-Deferred: binding a real external port (listen serves in-host only for now),
-inter-guest UDP, policy over inter-guest links, rate limits, and a dial retry
-for the startup race where a client dials before the server has listened.
+Deferred: inter-guest UDP, policy over inter-guest links, rate limits, and a
+dial retry for the startup race where a client dials before the server has
+listened.
 
 ## Cross-cutting concerns
 

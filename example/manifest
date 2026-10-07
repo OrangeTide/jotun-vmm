@@ -10,6 +10,11 @@ init rc
 # own name, which the host's name service resolves through DNS instead.
 # name web
 
+# A listen is in-host only unless a net rule names the port, in which case the
+# same listen also binds a real external port. Offering a port externally is
+# more sensitive than dialing out, so it is opt-in:
+# net allow * 8080 tcp     # also bind 8080 for inbound connections
+
 # Network policy: "net allow <cidr> <ports> [tcp|udp]". With no net rule the
 # guest may dial anywhere; with one or more, only matching targets are allowed
 # and everything else is refused. ports is a single port, a "lo-hi" range, or
