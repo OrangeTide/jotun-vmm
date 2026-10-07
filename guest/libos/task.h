@@ -65,7 +65,7 @@ void task_add_event_hook(void (*fn)(void));
 
 /* End the current task with an exit status (NULL or "" means success). Does
  * not return. A task that returns from its function exits with success. */
-void task_exits(const char *status);
+void task_exits(const char *status) __attribute__((noreturn));
 
 /* Wait for any child to exit. Copies its status into buf (truncated to nbuf)
  * and returns the child's id. Returns -1 at once if the caller has no

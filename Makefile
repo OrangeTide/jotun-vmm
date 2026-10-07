@@ -132,7 +132,8 @@ echo.elf: guest/echo.c
 LIBOS_SRC_COMMON = guest/libos/main.c guest/libos/mem.c guest/libos/task.c \
     guest/libos/boot.c guest/libos/p9.c guest/libos/elfload.c \
     guest/libos/prog.c guest/libos/jsh.c guest/libos/ns.c guest/libos/net.c \
-    guest/libos/draw.c guest/libos/string.c guest/libos/fmt.c
+    guest/libos/draw.c guest/libos/string.c guest/libos/fmt.c \
+    guest/libos/threads.c
 LIBOS_SRC = $(LIBOS_SRC_COMMON) $(LIBOS_ARCH)
 
 # triton.c is the only guest translation unit built with the FPU enabled: it is

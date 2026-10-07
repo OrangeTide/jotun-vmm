@@ -17,6 +17,7 @@
 #include "print.h"
 #include "prog.h"
 #include "task.h"
+#include "threads.h"
 #include "triton.h"
 
 /* The heap lives in .bss. Guest RAM is zero-filled by the host before entry,
@@ -476,6 +477,109 @@ ulink_demo(void)
     con_puts("ulink: done\n");
 }
 
+/* Threads demo: exercise the C11 <threads.h> shim. A condition variable gates a
+ * waiter task, several worker threads bump a shared counter under a mutex, and
+ * call_once runs an initializer exactly once. All are joined for their return
+ * values, so the whole thrd/mtx/cnd path runs. Run as init "threads". */
+#define THRD_WORKERS 3
+#define THRD_ITERS   100
+
+static mtx_t     td_mtx;        /* guards td_counter */
+static int       td_counter;
+static mtx_t     td_cmtx;       /* paired with td_cnd */
+static cnd_t     td_cnd;
+static int       td_ready;
+static once_flag td_once = ONCE_FLAG_INIT;
+
+static void
+td_init_once(void)
+{
+    con_puts("threads: call_once ran\n");
+}
+
+static int
+td_worker(void *arg)
+{
+    long iters = (long)arg;
+    for (long i = 0; i < iters; i++) {
+        mtx_lock(&td_mtx);
+        td_counter++;
+        mtx_unlock(&td_mtx);
+        thrd_yield();
+    }
+    return (int)iters;
+}
+
+static int
+td_waiter(void *arg)
+{
+    (void)arg;
+    mtx_lock(&td_cmtx);
+    while (!td_ready)
+        cnd_wait(&td_cnd, &td_cmtx);
+    mtx_unlock(&td_cmtx);
+    con_puts("threads: waiter released by condvar\n");
+    return 42;
+}
+
+static void
+threads_demo(void)
+{
+    con_puts("threads: starting\n");
+    call_once(&td_once, td_init_once);
+    call_once(&td_once, td_init_once);      /* must not run a second time */
+
+    mtx_init(&td_mtx, mtx_plain);
+    mtx_init(&td_cmtx, mtx_plain);
+    cnd_init(&td_cnd);
+    td_counter = 0;
+    td_ready = 0;
+
+    thrd_t waiter;
+    if (thrd_create(&waiter, td_waiter, NULL) != thrd_success) {
+        con_puts("threads: create waiter failed\n");
+        return;
+    }
+
+    thrd_t w[THRD_WORKERS];
+    for (int i = 0; i < THRD_WORKERS; i++)
+        if (thrd_create(&w[i], td_worker, (void *)(long)THRD_ITERS)
+            != thrd_success) {
+            con_puts("threads: create worker failed\n");
+            return;
+        }
+
+    /* Release the waiter through the condition variable. */
+    mtx_lock(&td_cmtx);
+    td_ready = 1;
+    cnd_signal(&td_cnd);
+    mtx_unlock(&td_cmtx);
+
+    int res, sum = 0;
+    for (int i = 0; i < THRD_WORKERS; i++) {
+        thrd_join(w[i], &res);
+        sum += res;
+    }
+    thrd_join(waiter, &res);
+
+    con_puts("threads: counter=");
+    con_putu((uint64_t)td_counter);
+    con_puts(" (expect ");
+    con_putu((uint64_t)(THRD_WORKERS * THRD_ITERS));
+    con_puts(")\n");
+    con_puts("threads: worker return sum=");
+    con_putu((uint64_t)sum);
+    con_puts("\n");
+    con_puts("threads: waiter return=");
+    con_putu((uint64_t)res);
+    con_puts("\n");
+
+    mtx_destroy(&td_mtx);
+    mtx_destroy(&td_cmtx);
+    cnd_destroy(&td_cnd);
+    con_puts("threads: done\n");
+}
+
 /* Draw demo: build a tiny scene with one clickable rectangle, submit it, then
  * block on the first input event. With JOTUN_DRAW_TEST set on the host, the
  * sink feeds back a synthetic click on that rectangle, so the submit, park, and
@@ -754,6 +858,8 @@ init_task(void)
         drawbench();
     } else if (script[0] == 'p' && script[1] == 'i') {  /* "pixel" */
         drawpixel();
+    } else if (script[0] == 't' && script[1] == 'h') {  /* "threads" */
+        threads_demo();
     } else if (script[0] == 't' && script[1] == 'r') {  /* "triton" */
         triton_demo();
     } else {
