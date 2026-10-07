@@ -1091,21 +1091,58 @@ What is needed:
   production), a `make web` target, and `doc/web-hosting.md`. On its own it puts
   a single shared session on the web; the single-browser behaviour (a new
   connection replaces the old) is acceptable for one user.
-- M15.2: a session broker. Today one host process is one front end serving one
-  browser. For independent users, one `jotun` process (or guest group) runs per
-  session: the broker accepts a connection, starts a process with a chosen
-  bundle, assigns it a port, routes the WebSocket to it, and tears it down on
-  disconnect. This is the one substantial new component, and the natural place
-  for per-session limits on RAM, CPU, and wall-clock time. Because each user
-  gets a private process, the single-browser-per-process limit stops mattering.
-- M15.3: admission and auth, which is the off-box authentication M10 delegated
-  to the proxy, made concrete. The broker is the trust boundary that decides who
-  may start a guest and which bundle they get; the draw port keeps no auth of
-  its own. This fits the section 9.2 split cleanly: the host stays trusted, the
-  guest stays sandboxed, and the web gateway is an explicit new front, not a
-  hole in the existing model.
-- M15.4: per-session bundle delivery. Reuse the signed pull (M8) so the broker
-  pins the right bundle for a session rather than baking one in.
+- M15.2: a session broker, split into host mechanism and a broker guest (design
+  decided 2026-10-07). Today one host process is one front end serving one
+  browser; independent users need one guest per session, spawned on demand.
+  Rather than write the broker as trusted host C, keep the host to mechanism and
+  put the policy in a guest, so the trusted base stays small and the broker's own
+  logic is sandboxed and restartable. This is the mechanism/policy split applied
+  to session management.
+  - Host mechanism (trusted, minimal). Two new primitives. First, runtime guest
+    spawn and destroy: today guests are static, named by `-m` at boot, so this
+    adds creating a VM at run time from a bundle with resource limits and reaping
+    it. Second, token-keyed display routing: binding a browser's draw connection
+    to one session guest. Routing must stay host-side, because draw frames are
+    read out of the session guest's RAM, which no other guest may touch. Both
+    reach a guest through a new broker control channel, the same
+    doorbell-plus-shared-buffer pattern as the net, draw, and 9P devices, granted
+    only to a guest marked `broker` in its manifest: spawn(bundle, params,
+    limits) returns a handle, destroy(handle), bind(token, handle), and events
+    connected / disconnected / guest_exited. The host enforces quotas on all of
+    it (max session guests, total RAM, spawn rate), so a buggy or hostile broker
+    is at worst bounded denial of service, never a sandbox escape or a read of
+    another guest.
+  - Broker guest (policy, sandboxed). Admission (who gets a session, rate
+    limits), which bundle to run, the limit values, session bookkeeping, and the
+    landing and auth UX. It already has what it needs: external listen and accept
+    (M14), the task model, and jsh.
+  - Control plane in the guest, data plane in the host. Caddy routes `/` to the
+    broker guest's own HTTP socket and `/ws` to the host draw server. A browser
+    hits `/`; the broker runs policy, asks the host to spawn a session guest,
+    gets a handle, issues a token bound to it, and returns a page whose WebSocket
+    URL carries the token. The browser opens `/ws` with the token; the host
+    validates it against the spawn the broker registered and routes that draw
+    stream to the bound guest. The broker never touches pixels.
+  - Trust model. This moves from M14's flat, host-mediated peers to one
+    bounded-privilege guest holding a capability, a deliberate quota-shaped grant
+    rather than a hole. Caveat: dynamic spawn and draw routing are trusted host
+    code either way; the gain is that policy leaves the trusted base and the
+    broker is sandboxed, not that the hardest mechanism disappears.
+  - Incremental path. Build the host mechanism first with trivial inline policy
+    (a fixed bundle per connection), which already gives working multi-user
+    hosting, then lift policy into the broker guest over the control channel.
+    Designing the channel up front makes the second step additive, not a rewrite.
+- M15.3: admission and auth. With the M15.2 split this lives in the broker guest
+  as policy: it authenticates the request and decides who may start a guest and
+  which bundle they get, off the box behind the TLS proxy as M10 decided. The
+  host contributes only mechanism, the per-request quotas on the control channel
+  and the token binding that ties a browser's draw stream to the guest the broker
+  spawned. The draw port still keeps no auth of its own. This fits the section
+  9.2 split: the host stays trusted and minimal, the session guests stay
+  sandboxed, and the broker guest is an explicit, bounded-privilege front.
+- M15.4: per-session bundle delivery. The broker guest names the bundle in its
+  spawn request and the host resolves it through the signed pull (M8), so a
+  session's image is pinned per request rather than baked in.
 
 Cross-cutting decisions, independent of the tiers above:
 - Keyboard and text input (done). `DEV_TEXT` and `DEV_PASTE` are now wired end
@@ -1139,11 +1176,11 @@ Cross-cutting decisions, independent of the tiers above:
   gets the saving for free. Remaining lever if a smooth high-rate pixel stream
   ever needs it: a binary tile-delta in place of PNG-in-SVG.
 
-Open decision, to settle before building: is the MVP one shared public session
-or per-user sessions? The first is M15.1 alone, close to zero new code. The
-second needs the M15.2 broker and is the real work. A click-driven first guest
-can defer M15 keyboard input and frame-encoding, so the minimal real MVP is
-M15.1 plus M15.2.
+Status: the single-session MVP is live. M15.1 (the hosting recipe), keyboard and
+text input, and the webterm jsh terminal all shipped, so one shared session is
+hostable and usable today. The remaining step is per-user hosting, the M15.2
+broker, now designed as the host-mechanism / broker-guest split above and ready
+to build when wanted.
 
 ## Cross-cutting concerns
 
