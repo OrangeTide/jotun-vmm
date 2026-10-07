@@ -246,10 +246,12 @@ net_demo(void)
  * connection, echo the first message back, and close. A peer reaches it by
  * dialing "tcp!<thisguest>!9". */
 static void
-serve_once(void)
+serve_on(const char *spec)
 {
-    con_puts("serve: listening tcp!*!9\n");
-    int l = net_listen("tcp!*!9");
+    con_puts("serve: listening ");
+    con_puts(spec);
+    con_putc('\n');
+    int l = net_listen(spec);
     if (l < 0) {
         con_puts("serve: listen failed\n");
         return;
@@ -281,10 +283,19 @@ serve_once(void)
     con_puts("serve: done\n");
 }
 
+/* The standalone server takes its listen string from argv, so it can bind a
+ * real external port (e.g. "serve tcp!*!18080") given a matching policy rule. */
 static void
 serve_demo(void)
 {
-    serve_once();
+    serve_on((boot_argc() > 1) ? boot_argv(1) : "tcp!*!9");
+}
+
+/* The link self-test's server always offers the in-host port 9. */
+static void
+serve_inhost9(void)
+{
+    serve_on("tcp!*!9");
 }
 
 static void
@@ -300,7 +311,7 @@ link_client(void)
 static void
 link_demo(void)
 {
-    task_spawn("srv", serve_once);
+    task_spawn("srv", serve_inhost9);
     task_yield();       /* let the server listen and park on accept first */
     task_spawn("cli", link_client);
 

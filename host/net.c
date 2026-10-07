@@ -50,6 +50,8 @@ struct net_conn {
     int in_poll;            /* fd is registered with the poller */
     int is_listener;        /* an in-host listener: fd is its wake pipe */
     struct vlistener *vl;   /* the in-host listener registration, if any */
+    int lfd;                /* a listener's real listening socket, or -1 */
+    int lfd_in_poll;        /* lfd is registered with the poller */
     char peer[64];          /* "host!port" for a dial, "-" for a UDP socket */
 };
 
@@ -181,25 +183,40 @@ poller_create(struct netdev *nd)
     return 0;
 }
 
-/* Arm one direction, one-shot: it fires once and stays quiet until re-armed. */
+/* Arm one direction of one fd, one-shot: it fires once and stays quiet until
+ * re-armed. */
 static void
-poller_arm(struct netdev *nd, struct net_conn *c, int want)
+poller_arm_fd(struct netdev *nd, int fd, int *in_poll, int want)
 {
     int16_t filt = (want & NET_WANT_WRITE) ? EVFILT_WRITE : EVFILT_READ;
     struct kevent kev;
-    EV_SET(&kev, c->fd, filt, EV_ADD | EV_ONESHOT, 0, 0, NULL);
+    EV_SET(&kev, fd, filt, EV_ADD | EV_ONESHOT, 0, 0, NULL);
     kevent(nd->kqfd, &kev, 1, NULL, 0, NULL);
-    c->in_poll = 1;
+    *in_poll = 1;
+}
+
+static void
+poller_del_fd(struct netdev *nd, int fd, int *in_poll)
+{
+    struct kevent kev[2];
+    EV_SET(&kev[0], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    EV_SET(&kev[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+    kevent(nd->kqfd, kev, 2, NULL, 0, NULL);        /* ENOENT is harmless */
+    *in_poll = 0;
+}
+
+static void
+poller_arm(struct netdev *nd, struct net_conn *c, int want)
+{
+    poller_arm_fd(nd, c->fd, &c->in_poll, want);
 }
 
 static void
 poller_del(struct netdev *nd, struct net_conn *c)
 {
-    struct kevent kev[2];
-    EV_SET(&kev[0], c->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-    EV_SET(&kev[1], c->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-    kevent(nd->kqfd, kev, 2, NULL, 0, NULL);        /* ENOENT is harmless */
-    c->in_poll = 0;
+    poller_del_fd(nd, c->fd, &c->in_poll);
+    if (c->lfd >= 0)
+        poller_del_fd(nd, c->lfd, &c->lfd_in_poll);
 }
 
 /* Block until a socket is ready or the wakeup fires. Returns 1 if a real socket
@@ -207,8 +224,8 @@ poller_del(struct netdev *nd, struct net_conn *c)
 static int
 poller_wait(struct netdev *nd)
 {
-    struct kevent evs[NET_MAXCONN + 1];
-    int n = kevent(nd->kqfd, NULL, 0, evs, NET_MAXCONN + 1, NULL);
+    struct kevent evs[2 * NET_MAXCONN + 1];
+    int n = kevent(nd->kqfd, NULL, 0, evs, 2 * NET_MAXCONN + 1, NULL);
     if (n < 0)
         return errno == EINTR ? 0 : -1;
     int woke = 0;
@@ -263,31 +280,45 @@ poller_create(struct netdev *nd)
 /* Arm (or re-arm) the socket one-shot, so it fires once and then stays quiet
  * until the next would-block re-arms it. */
 static void
-poller_arm(struct netdev *nd, struct net_conn *c, int want)
+poller_arm_fd(struct netdev *nd, int fd, int *in_poll, int want)
 {
     uint32_t events = ((want & NET_WANT_READ) ? EPOLLIN : 0)
                     | ((want & NET_WANT_WRITE) ? EPOLLOUT : 0);
-    struct epoll_event ev = { .events = events | EPOLLONESHOT, .data.fd = c->fd };
-    if (c->in_poll) {
-        epoll_ctl(nd->epfd, EPOLL_CTL_MOD, c->fd, &ev);
-    } else if (epoll_ctl(nd->epfd, EPOLL_CTL_ADD, c->fd, &ev) == 0) {
-        c->in_poll = 1;
+    struct epoll_event ev = { .events = events | EPOLLONESHOT, .data.fd = fd };
+    if (*in_poll) {
+        epoll_ctl(nd->epfd, EPOLL_CTL_MOD, fd, &ev);
+    } else if (epoll_ctl(nd->epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
+        *in_poll = 1;
     }
+}
+
+static void
+poller_del_fd(struct netdev *nd, int fd, int *in_poll)
+{
+    if (*in_poll)
+        epoll_ctl(nd->epfd, EPOLL_CTL_DEL, fd, NULL);
+    *in_poll = 0;
+}
+
+static void
+poller_arm(struct netdev *nd, struct net_conn *c, int want)
+{
+    poller_arm_fd(nd, c->fd, &c->in_poll, want);
 }
 
 static void
 poller_del(struct netdev *nd, struct net_conn *c)
 {
-    if (c->in_poll)
-        epoll_ctl(nd->epfd, EPOLL_CTL_DEL, c->fd, NULL);
-    c->in_poll = 0;
+    poller_del_fd(nd, c->fd, &c->in_poll);
+    if (c->lfd >= 0)
+        poller_del_fd(nd, c->lfd, &c->lfd_in_poll);
 }
 
 static int
 poller_wait(struct netdev *nd)
 {
-    struct epoll_event evs[NET_MAXCONN + 1];
-    int n = epoll_wait(nd->epfd, evs, NET_MAXCONN + 1, -1);
+    struct epoll_event evs[2 * NET_MAXCONN + 1];
+    int n = epoll_wait(nd->epfd, evs, 2 * NET_MAXCONN + 1, -1);
     if (n < 0)
         return errno == EINTR ? 0 : -1;
     int woke = 0;
@@ -374,6 +405,26 @@ policy_allows(const struct net_policy *p, const struct sockaddr *sa, int proto)
     return 0;
 }
 
+/* Decide whether a guest may bind a real local listening port. Unlike dialing,
+ * binding an external port is opt-in: with no rules a listen is in-host only,
+ * and a real bind needs an explicit rule naming the port. The rule is matched
+ * by port and protocol; its address range does not apply to a local bind. */
+static int
+policy_allows_bind(const struct net_policy *p, uint16_t port, int proto)
+{
+    if (p->n == 0)
+        return 0;
+    for (int i = 0; i < p->n; i++) {
+        const struct net_rule *r = &p->rules[i];
+        if (port < r->port_lo || port > r->port_hi)
+            continue;
+        if (r->proto != 0 && r->proto != proto)
+            continue;
+        return 1;
+    }
+    return 0;
+}
+
 static struct net_conn *
 conn_of(struct netdev *nd, int32_t handle)
 {
@@ -384,14 +435,22 @@ conn_of(struct netdev *nd, int32_t handle)
     return &nd->conns[handle];
 }
 
-/* Find a free connection slot (caller holds nd->lock). Returns an index, or -1
+/* Find a free connection slot and reset its bookkeeping (caller holds
+ * nd->lock). The caller then sets fd, proto, and peer. Returns an index, or -1
  * when the table is full. */
 static int
 alloc_conn(struct netdev *nd)
 {
     for (int i = 0; i < NET_MAXCONN; i++)
-        if (nd->conns[i].fd < 0)
+        if (nd->conns[i].fd < 0) {
+            struct net_conn *c = &nd->conns[i];
+            c->in_poll = 0;
+            c->is_listener = 0;
+            c->vl = NULL;
+            c->lfd = -1;
+            c->lfd_in_poll = 0;
             return i;
+        }
     return -1;
 }
 
@@ -542,13 +601,7 @@ do_dial(struct netdev *nd, struct jotun_net *chan)
     }
 
     pthread_mutex_lock(&nd->lock);
-    int handle = -1;
-    for (int i = 0; i < NET_MAXCONN; i++) {
-        if (nd->conns[i].fd < 0) {
-            handle = i;
-            break;
-        }
-    }
+    int handle = alloc_conn(nd);
     if (handle < 0) {
         pthread_mutex_unlock(&nd->lock);
         freeaddrinfo(res);
@@ -665,13 +718,7 @@ static void
 do_udp(struct netdev *nd, struct jotun_net *chan)
 {
     pthread_mutex_lock(&nd->lock);
-    int handle = -1;
-    for (int i = 0; i < NET_MAXCONN; i++) {
-        if (nd->conns[i].fd < 0) {
-            handle = i;
-            break;
-        }
-    }
+    int handle = alloc_conn(nd);
     if (handle < 0) {
         pthread_mutex_unlock(&nd->lock);
         reply(chan, NET_ENORES, 0);
@@ -836,6 +883,10 @@ do_close(struct netdev *nd, struct jotun_net *chan)
             vl = c->vl;
         close(c->fd);
         c->fd = -1;
+        if (c->lfd >= 0) {
+            close(c->lfd);
+            c->lfd = -1;
+        }
         c->is_listener = 0;
         c->vl = NULL;
     }
@@ -845,9 +896,35 @@ do_close(struct netdev *nd, struct jotun_net *chan)
     reply(chan, 0, 0);
 }
 
-/* Register an in-host service under this guest's name. The first cut serves
- * "tcp!*!port": external binding is a later step. The listener's wake pipe is
- * its readiness fd, so a waiting accept parks on it like any socket. */
+/* Bind a non-blocking TCP listening socket on all interfaces at port. Returns
+ * the fd, or -1 if the socket, bind, or listen fails. */
+static int
+bind_listen(uint16_t port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    set_nosigpipe(fd);
+
+    struct sockaddr_in sa = { 0 };
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    sa.sin_port = htons(port);
+    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(fd, 8) != 0) {
+        close(fd);
+        return -1;
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    return fd;
+}
+
+/* Register a service under this guest's name ("tcp!*!port"). The service is
+ * in-host by default; it also binds a real external port when the manifest
+ * explicitly allows that port. The listener's wake pipe (in-host) or its real
+ * socket (real-only) is its readiness fd, so a waiting accept parks like any
+ * socket; a listener with both watches both. */
 static void
 do_listen(struct netdev *nd, struct jotun_net *chan)
 {
@@ -878,12 +955,7 @@ do_listen(struct netdev *nd, struct jotun_net *chan)
     const char *portstr = bang + 1;
 
     if (strcmp(network, "tcp") != 0 || strcmp(host, "*") != 0) {
-        reply(chan, NET_EINVAL, 0);     /* external bind not yet supported */
-        return;
-    }
-    struct vswitch *v = nd->vsw;
-    if (!v || !nd->name[0]) {
-        reply(chan, NET_EPERM, 0);      /* no name: cannot offer a service */
+        reply(chan, NET_EINVAL, 0);     /* only "tcp!*!port" for now */
         return;
     }
     uint16_t port = parse_port(portstr);
@@ -892,60 +964,98 @@ do_listen(struct netdev *nd, struct jotun_net *chan)
         return;
     }
 
-    int p[2];
-    if (pipe(p) != 0) {
-        reply(chan, NET_ECONN, 0);
+    struct vswitch *v = nd->vsw;
+    int want_inhost = v && nd->name[0];
+
+    /* Bind a real external port when the manifest explicitly allows it; with no
+     * such rule the service is in-host only. */
+    int rfd = -1;
+    if (policy_allows_bind(nd->policy, port, NET_PROTO_TCP)) {
+        rfd = bind_listen(port);
+        if (rfd < 0) {
+            reply(chan, NET_ECONN, 0);      /* port in use or bind refused */
+            return;
+        }
+    }
+    if (!want_inhost && rfd < 0) {
+        reply(chan, NET_EPERM, 0);  /* no name and no permitted external port */
         return;
     }
-    fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL, 0) | O_NONBLOCK);
-    fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL, 0) | O_NONBLOCK);
 
-    pthread_mutex_lock(&v->lock);
-    for (int i = 0; i < VSW_MAXLISTEN; i++)
-        if (v->listeners[i].used && v->listeners[i].port == port
-            && strcmp(v->listeners[i].name, nd->name) == 0) {
+    /* Register the in-host service (with its wake pipe) when the guest is
+     * named. A real-only listener skips this and uses rfd as its fd. */
+    struct vlistener *vl = NULL;
+    int pipe_rd = -1;
+    if (want_inhost) {
+        int p[2];
+        if (pipe(p) != 0) {
+            if (rfd >= 0)
+                close(rfd);
+            reply(chan, NET_ECONN, 0);
+            return;
+        }
+        fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL, 0) | O_NONBLOCK);
+        fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL, 0) | O_NONBLOCK);
+
+        pthread_mutex_lock(&v->lock);
+        for (int i = 0; i < VSW_MAXLISTEN; i++)
+            if (v->listeners[i].used && v->listeners[i].port == port
+                && strcmp(v->listeners[i].name, nd->name) == 0) {
+                pthread_mutex_unlock(&v->lock);
+                close(p[0]);
+                close(p[1]);
+                if (rfd >= 0)
+                    close(rfd);
+                reply(chan, NET_EINVAL, 0);     /* already listening */
+                return;
+            }
+        for (int i = 0; i < VSW_MAXLISTEN; i++)
+            if (!v->listeners[i].used) {
+                vl = &v->listeners[i];
+                break;
+            }
+        if (!vl) {
             pthread_mutex_unlock(&v->lock);
             close(p[0]);
             close(p[1]);
-            reply(chan, NET_EINVAL, 0);     /* already listening */
+            if (rfd >= 0)
+                close(rfd);
+            reply(chan, NET_ENORES, 0);
             return;
         }
-    struct vlistener *vl = NULL;
-    for (int i = 0; i < VSW_MAXLISTEN; i++)
-        if (!v->listeners[i].used) {
-            vl = &v->listeners[i];
-            break;
-        }
-    if (!vl) {
+        memset(vl, 0, sizeof *vl);
+        vl->used = 1;
+        snprintf(vl->name, sizeof vl->name, "%s", nd->name);
+        vl->port = port;
+        vl->owner = nd;
+        vl->wake_wr = p[1];
         pthread_mutex_unlock(&v->lock);
-        close(p[0]);
-        close(p[1]);
-        reply(chan, NET_ENORES, 0);
-        return;
+        pipe_rd = p[0];
     }
-    memset(vl, 0, sizeof *vl);
-    vl->used = 1;
-    snprintf(vl->name, sizeof vl->name, "%s", nd->name);
-    vl->port = port;
-    vl->owner = nd;
-    vl->wake_wr = p[1];
-    pthread_mutex_unlock(&v->lock);
 
+    /* The connection's primary fd is the wake pipe for an in-host listener, or
+     * the real socket for a real-only one; the real socket (if any) also lives
+     * in lfd so accept can watch both. */
     pthread_mutex_lock(&nd->lock);
     int handle = alloc_conn(nd);
     if (handle >= 0) {
-        nd->conns[handle].fd = p[0];
-        nd->conns[handle].proto = NET_PROTO_TCP;
-        nd->conns[handle].in_poll = 0;
-        nd->conns[handle].is_listener = 1;
-        nd->conns[handle].vl = vl;
-        snprintf(nd->conns[handle].peer, sizeof nd->conns[handle].peer,
-                 "listen %.32s!%u", nd->name, (unsigned)port);
+        struct net_conn *c = &nd->conns[handle];
+        c->fd = want_inhost ? pipe_rd : rfd;
+        c->proto = NET_PROTO_TCP;
+        c->is_listener = 1;
+        c->vl = vl;
+        c->lfd = want_inhost ? rfd : -1;
+        snprintf(c->peer, sizeof c->peer, "listen %.32s!%u",
+                 want_inhost ? nd->name : "*", (unsigned)port);
     }
     pthread_mutex_unlock(&nd->lock);
     if (handle < 0) {
-        free_listener(v, vl);
-        close(p[0]);
+        if (vl)
+            free_listener(v, vl);
+        if (pipe_rd >= 0)
+            close(pipe_rd);
+        if (rfd >= 0)
+            close(rfd);
         reply(chan, NET_ENORES, 0);
         return;
     }
@@ -953,7 +1063,8 @@ do_listen(struct netdev *nd, struct jotun_net *chan)
     reply(chan, handle, 0);
 }
 
-/* Accept one pending in-host connection on a listening handle. */
+/* Accept one connection on a listening handle: a pending in-host peer first,
+ * then a real inbound connection, else park on both sources. */
 static void
 do_accept(struct netdev *nd, struct jotun_net *chan)
 {
@@ -965,54 +1076,76 @@ do_accept(struct netdev *nd, struct jotun_net *chan)
         return;
     }
     struct vlistener *vl = c->vl;
-    int lfd = c->fd;
+    int wake_fd = vl ? c->fd : -1;          /* in-host wake pipe, if any */
+    int real_fd = vl ? c->lfd : c->fd;      /* real listening socket, or -1 */
     pthread_mutex_unlock(&nd->lock);
 
-    struct vswitch *v = nd->vsw;
-    int farfd = -1;
+    int newfd = -1;
     char peer[64] = "";
-    pthread_mutex_lock(&v->lock);
-    if (vl->count > 0) {
-        farfd = vl->fds[vl->head];
-        snprintf(peer, sizeof peer, "%s", vl->peers[vl->head]);
-        vl->head = (vl->head + 1) % VSW_BACKLOG;
-        vl->count--;
-    }
-    pthread_mutex_unlock(&v->lock);
 
-    if (farfd < 0) {
-        /* Nothing pending: drain stale wake bytes, then park on the listen
-         * pipe so a later dial wakes this accept. */
-        char drain[64];
-        while (read(lfd, drain, sizeof drain) > 0)
-            ;
+    if (vl) {
+        struct vswitch *v = nd->vsw;
+        pthread_mutex_lock(&v->lock);
+        if (vl->count > 0) {
+            newfd = vl->fds[vl->head];
+            snprintf(peer, sizeof peer, "%s", vl->peers[vl->head]);
+            vl->head = (vl->head + 1) % VSW_BACKLOG;
+            vl->count--;
+        }
+        pthread_mutex_unlock(&v->lock);
+        if (newfd >= 0) {
+            char one;
+            ssize_t rd = read(wake_fd, &one, 1);        /* consume one byte */
+            (void)rd;
+        }
+    }
+
+    if (newfd < 0 && real_fd >= 0) {
+        struct sockaddr_in sa;
+        socklen_t sl = sizeof sa;
+        int a = accept(real_fd, (struct sockaddr *)&sa, &sl);
+        if (a >= 0) {
+            set_nosigpipe(a);
+            fcntl(a, F_SETFL, fcntl(a, F_GETFL, 0) | O_NONBLOCK);
+            newfd = a;
+            uint32_t ip = ntohl(sa.sin_addr.s_addr);
+            snprintf(peer, sizeof peer, "%u.%u.%u.%u!%u",
+                     (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff,
+                     ip & 0xff, (unsigned)ntohs(sa.sin_port));
+        }
+    }
+
+    if (newfd < 0) {
+        /* Nothing pending: drain stale in-host wake bytes and park on whichever
+         * sources this listener has, so a later dial or inbound wakes it. */
+        if (wake_fd >= 0) {
+            char drain[64];
+            while (read(wake_fd, drain, sizeof drain) > 0)
+                ;
+        }
         pthread_mutex_lock(&nd->lock);
         c = conn_of(nd, chan->handle);
-        if (c)
-            poller_arm(nd, c, NET_WANT_READ);
+        if (c) {
+            poller_arm_fd(nd, c->fd, &c->in_poll, NET_WANT_READ);
+            if (c->lfd >= 0)
+                poller_arm_fd(nd, c->lfd, &c->lfd_in_poll, NET_WANT_READ);
+        }
         pthread_mutex_unlock(&nd->lock);
         reply(chan, NET_EAGAIN, 0);
         return;
     }
 
-    char one;
-    ssize_t rd = read(lfd, &one, 1);   /* consume one wake byte */
-    (void)rd;
-
     pthread_mutex_lock(&nd->lock);
     int handle = alloc_conn(nd);
     if (handle >= 0) {
-        nd->conns[handle].fd = farfd;
+        nd->conns[handle].fd = newfd;
         nd->conns[handle].proto = NET_PROTO_TCP;
-        nd->conns[handle].in_poll = 0;
-        nd->conns[handle].is_listener = 0;
-        nd->conns[handle].vl = NULL;
         snprintf(nd->conns[handle].peer, sizeof nd->conns[handle].peer,
                  "%s", peer[0] ? peer : "-");
     }
     pthread_mutex_unlock(&nd->lock);
     if (handle < 0) {
-        close(farfd);
+        close(newfd);
         reply(chan, NET_ENORES, 0);
         return;
     }
@@ -1070,8 +1203,10 @@ net_init(struct jotun_net *chan, void (*wake)(void *ctx), void *wake_ctx,
     if (!nd)
         return NULL;
 
-    for (int i = 0; i < NET_MAXCONN; i++)
+    for (int i = 0; i < NET_MAXCONN; i++) {
         nd->conns[i].fd = -1;
+        nd->conns[i].lfd = -1;
+    }
     nd->chan = chan;
     nd->wake = wake;
     nd->wake_ctx = wake_ctx;
@@ -1127,6 +1262,8 @@ net_shutdown(struct netdev *nd)
             free_listener(nd->vsw, nd->conns[i].vl);
         if (nd->conns[i].fd >= 0)
             close(nd->conns[i].fd);
+        if (nd->conns[i].lfd >= 0)
+            close(nd->conns[i].lfd);
     }
     poller_destroy(nd);
     free(nd);

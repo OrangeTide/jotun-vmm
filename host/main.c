@@ -272,19 +272,25 @@ build_net_rule(const struct manifest_net *mn, struct net_rule *r)
 {
     char cidr[64];
     snprintf(cidr, sizeof cidr, "%s", mn->cidr);
-    char *slash = strchr(cidr, '/');
-    int prefix = 32;
-    if (slash) {
-        *slash = '\0';
-        prefix = (int)strtol(slash + 1, NULL, 10);
-        if (prefix < 0 || prefix > 32)
+
+    if (strcmp(cidr, "*") == 0) {
+        r->addr = 0;                /* match any address */
+        r->mask = 0;
+    } else {
+        char *slash = strchr(cidr, '/');
+        int prefix = 32;
+        if (slash) {
+            *slash = '\0';
+            prefix = (int)strtol(slash + 1, NULL, 10);
+            if (prefix < 0 || prefix > 32)
+                return -1;
+        }
+        struct in_addr in;
+        if (inet_pton(AF_INET, cidr, &in) != 1)
             return -1;
+        r->addr = ntohl(in.s_addr);
+        r->mask = prefix == 0 ? 0u : (0xffffffffu << (32 - prefix));
     }
-    struct in_addr in;
-    if (inet_pton(AF_INET, cidr, &in) != 1)
-        return -1;
-    r->addr = ntohl(in.s_addr);
-    r->mask = prefix == 0 ? 0u : (0xffffffffu << (32 - prefix));
 
     if (strcmp(mn->ports, "*") == 0) {
         r->port_lo = 0;
