@@ -1113,10 +1113,19 @@ Cross-cutting decisions, independent of the tiers above:
   and drag, such as a shell or a text field, needs this wired through the
   existing event path. It is bounded work, deferrable when the first hosted
   guest is click-driven.
-- Frame efficiency. The PNG encoder (`host/png.c`) emits stored, uncompressed
-  DEFLATE blocks, so a pixel-heavy guest such as the rasterizer produces large
-  base64 frames over the socket. Fine for a demo; interactive pixel content
-  would want real DEFLATE or a binary tile-delta in place of PNG-in-SVG.
+- Frame efficiency. The draw path was exercised end to end for the first time
+  (beyond the SVG-dump): a live guest on `JOTUN_DRAW_PORT` reached over a real
+  WebSocket, framed and input-driven, and the same path through a Caddy TLS
+  reverse proxy over `wss:`, with no host code change. That run showed frames
+  were the cost, so `host/png.c` gained adaptive PNG row filtering (it already
+  had hash-chain LZ77 with fixed Huffman, despite an old comment to the
+  contrary): each row picks the None/Sub/Up/Average/Paeth filter with the
+  smallest residual, which cut a rasterizer frame about 2.5x (a 256x192 frame
+  from roughly 51 KB to 21 KB), losslessly and with no protocol change. Further
+  levers if needed: dynamic Huffman (or the vendored miniz deflate) over the
+  fixed one, a guest that sends `DOP_IMAGE_DAMAGE` partial updates instead of
+  re-basing the whole framebuffer (the triton demo re-bases, so every frame is
+  a full image), and a binary tile-delta in place of PNG-in-SVG.
 
 Open decision, to settle before building: is the MVP one shared public session
 or per-user sessions? The first is M15.1 alone, close to zero new code. The
