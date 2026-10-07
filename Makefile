@@ -304,8 +304,16 @@ web: $(TARGET) libos.elf
 	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root JOTUN_DRAW_PORT=9230 \
 	    ./$(TARGET) libos.elf webterm
 
+## Smoke-test the web path end to end. The test binary spawns the webterm guest
+## with the draw server, drives it over a WebSocket, and checks the shell
+## round-trip. Needs a bundle: make bundle BUNDLE_ARCHS=$(ARCH)
+build/websmoke: tools/websmoke.c | build
+	$(CC) $(CFLAGS) -o $@ $<
+web-smoke: $(TARGET) libos.elf build/websmoke
+	./build/websmoke ./$(TARGET) $(BUNDLE_DEPOT)
+
 clean:
 	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool jbundle
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web
+.PHONY: all clean bundle macsyntax web web-smoke

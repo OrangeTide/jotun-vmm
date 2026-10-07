@@ -44,6 +44,13 @@ output appears both in the browser and on the host console. Paste is supported.
 Keyboard input travels as `DEV_TEXT` and `DEV_PASTE` draw events; a single event
 value is capped near 63 bytes, so a long paste is split into chunks.
 
+## Smoke test
+
+`make web-smoke` checks the whole path without a browser: it spawns the webterm
+guest with the draw server, connects a WebSocket, types a command as input
+events, and confirms the output comes back rendered. It needs a bundle built
+first (`make bundle BUNDLE_ARCHS=<arch>`).
+
 ## Security model
 
 The host binds the draw server to loopback only and has no TLS and no
