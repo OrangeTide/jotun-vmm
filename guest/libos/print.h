@@ -10,6 +10,14 @@
 #include "arch.h"
 #include "fmt.h"
 
+/* Write one byte to the console: always to the arch raw sink, and also to a
+ * registered sink, if any. Defined in print.c. */
+void con_putc(char c);
+
+/* Register (or clear, with NULL) a sink that receives a copy of every console
+ * byte. A guest terminal uses it to mirror console output on screen. */
+void con_set_sink(void (*fn)(char));
+
 static inline void
 con_puts(const char *s)
 {

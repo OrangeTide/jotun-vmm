@@ -24,7 +24,7 @@ inb(unsigned short port)
 }
 
 void
-con_putc(char c)
+con_raw_putc(char c)
 {
     while (!(inb(COM1 + 5) & LSR_THRE))
         ;

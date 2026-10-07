@@ -19,6 +19,7 @@
 #include "task.h"
 #include "threads.h"
 #include "triton.h"
+#include "webterm.h"
 
 /* The heap lives in .bss. Guest RAM is zero-filled by the host before entry,
  * so no explicit clearing is needed before meminit lays down the first block. */
@@ -862,6 +863,8 @@ init_task(void)
         threads_demo();
     } else if (script[0] == 't' && script[1] == 'r') {  /* "triton" */
         triton_demo();
+    } else if (script[0] == 'w' && script[1] == 'e') {  /* "webterm" */
+        webterm();
     } else {
         con_puts("init: running script /");
         con_puts(script);

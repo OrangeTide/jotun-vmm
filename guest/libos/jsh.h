@@ -11,4 +11,9 @@
  * 9P root to be mounted already. */
 void jsh_run(const char *script_path);
 
+/* Run one command line, tokenizing it in place (so line must be writable). The
+ * same executor jsh_run uses per line, exposed for an interactive caller such
+ * as the web terminal. Output goes to the console. */
+void jsh_exec_line(char *line);
+
 #endif /* LIBOS_JSH_H */

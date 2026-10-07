@@ -8,8 +8,10 @@
 
 #include <stddef.h>
 
-/* Write one byte to the console, blocking until the device accepts it. */
-void con_putc(char c);
+/* Write one byte to the console device, blocking until it accepts the byte.
+ * This is the raw arch sink; the portable con_putc (print.h) funnels through
+ * it and also feeds any sink registered with con_set_sink. */
+void con_raw_putc(char c);
 
 /* Stop the vcpu for good. Does not return. On x86-64 this is HLT; on arm64 it
  * is a store to the poweroff register. */

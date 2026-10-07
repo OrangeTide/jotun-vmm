@@ -14,7 +14,7 @@
 #define POWEROFF    0x09010000ull
 
 void
-con_putc(char c)
+con_raw_putc(char c)
 {
     volatile unsigned int *fr = (volatile unsigned int *)UART_FR;
     volatile unsigned int *dr = (volatile unsigned int *)UART_DR;

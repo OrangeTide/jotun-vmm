@@ -147,6 +147,12 @@ exec_line(char *line)
 }
 
 void
+jsh_exec_line(char *line)
+{
+    exec_line(line);
+}
+
+void
 jsh_run(const char *script_path)
 {
     char *buf = kmalloc(SCRIPT_MAX);
