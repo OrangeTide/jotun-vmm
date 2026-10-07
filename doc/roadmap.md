@@ -1054,6 +1054,76 @@ What landed:
 
 Deferred: rate limits.
 
+## M15: web hosting (planned)
+
+Goal: let a user reach a guest from a browser over the public internet, not just
+the loopback display on the developer's own machine.
+
+Most of what this sounds like already exists. The display path is a web stack,
+not a raw pixel channel: M6.3 built the host WebSocket front end
+(`host/drawws.c`) with an embedded JavaScript client, and M7/M10 added the pixel
+path and compositing. So the browser client, the live SVG-plus-delta streaming,
+the PNG pixel transport, and the click/close/scroll/xy input return path are all
+done. M15 is not a client project; it is the hosting layer around that server.
+
+What already exists (do not rebuild):
+- The embedded client page and the HTTP-then-WebSocket server on
+  `JOTUN_DRAW_PORT` (default 9230), including the WebSocket handshake and
+  framing, hand-rolled in `host/drawws.c`.
+- Host-authored SVG with a line-oriented delta language, pixels carried as
+  base64 PNG inside `<image>`, and the per-process left-to-right compositing of
+  up to eight guests (M10).
+- The inbound event path: browser events to a per-guest ring to the guest's
+  `draw_next_event`, rate-limited and guest-namespaced.
+
+This confirms, rather than revisits, the auth decision already locked in M10:
+the host stays loopback-only and single-browser, and a reverse proxy owns TLS
+and authentication off-box, so the host gains no auth code. M15 is the off-box
+layer that decision points to.
+
+What is needed:
+- M15.1: TLS and public reachability. The listener binds `127.0.0.1` only and
+  speaks plain HTTP, while a browser over the internet needs `wss:`. There is no
+  TLS library in tree (the vendored monocypher does signing, not TLS), so the
+  MVP terminates TLS at a reverse proxy (for example Caddy for automatic certs,
+  or nginx) that forwards to the loopback port, as M10 already decided. This is
+  mostly configuration, not new host code. On its own it puts a single shared
+  session on the web; the single-browser behaviour (a new connection replaces
+  the old) is acceptable for one user.
+- M15.2: a session broker. Today one host process is one front end serving one
+  browser. For independent users, one `jotun` process (or guest group) runs per
+  session: the broker accepts a connection, starts a process with a chosen
+  bundle, assigns it a port, routes the WebSocket to it, and tears it down on
+  disconnect. This is the one substantial new component, and the natural place
+  for per-session limits on RAM, CPU, and wall-clock time. Because each user
+  gets a private process, the single-browser-per-process limit stops mattering.
+- M15.3: admission and auth, which is the off-box authentication M10 delegated
+  to the proxy, made concrete. The broker is the trust boundary that decides who
+  may start a guest and which bundle they get; the draw port keeps no auth of
+  its own. This fits the section 9.2 split cleanly: the host stays trusted, the
+  guest stays sandboxed, and the web gateway is an explicit new front, not a
+  hole in the existing model.
+- M15.4: per-session bundle delivery. Reuse the signed pull (M8) so the broker
+  pins the right bundle for a session rather than baking one in.
+
+Cross-cutting decisions, independent of the tiers above:
+- Keyboard and text input. `DEV_TEXT` and `DEV_PASTE` are in the draw ABI
+  (`abi/jotun_draw.h`) but unimplemented on both ends: the client has no
+  keydown or paste handler and the host never emits them. Anything past click
+  and drag, such as a shell or a text field, needs this wired through the
+  existing event path. It is bounded work, deferrable when the first hosted
+  guest is click-driven.
+- Frame efficiency. The PNG encoder (`host/png.c`) emits stored, uncompressed
+  DEFLATE blocks, so a pixel-heavy guest such as the rasterizer produces large
+  base64 frames over the socket. Fine for a demo; interactive pixel content
+  would want real DEFLATE or a binary tile-delta in place of PNG-in-SVG.
+
+Open decision, to settle before building: is the MVP one shared public session
+or per-user sessions? The first is M15.1 alone, close to zero new code. The
+second needs the M15.2 broker and is the real work. A click-driven first guest
+can defer M15 keyboard input and frame-encoding, so the minimal real MVP is
+M15.1 plus M15.2.
+
 ## Cross-cutting concerns
 
 - The per-guest manifest is the sandbox's control surface. It appears at M3,
