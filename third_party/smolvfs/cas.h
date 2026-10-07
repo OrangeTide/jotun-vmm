@@ -156,10 +156,19 @@ struct cas_file {
  ****************************************************************/
 
 /** Create a new CAS rooted at basedir (e.g. "depot").
+ *  Takes an exclusive depot lock, so only one writable handle exists at a time.
  *  Returns NULL on alloc failure.
  */
 struct cas *
 cas_new(const char *basedir);
+
+/** Open a CAS read-only, taking a shared depot lock instead of an exclusive
+ *  one. Several read-only handles can serve the same depot at once (one per
+ *  hosted session); a writer (cas_new) then waits for them to drain. The
+ *  handle must not be used for writes. Returns NULL on failure.
+ */
+struct cas *
+cas_new_ro(const char *basedir);
 
 /** Destroy a CAS handle and free memory. */
 void

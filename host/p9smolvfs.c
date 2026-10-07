@@ -248,7 +248,7 @@ p9smolvfs_open(const char *depot, const char *ref, const char *subtree,
     if (!c)
         return NULL;
 
-    c->store = cas_new(depot);
+    c->store = cas_new_ro(depot);       /* serving is read-only; shared lock */
     if (!c->store) {
         free(c);
         return NULL;

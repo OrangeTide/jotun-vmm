@@ -468,13 +468,16 @@ build_dir(const struct cas *store, const char *hash,
  * Locking
  ****************************************************************/
 
-/** Acquire an exclusive lock on the depot.
- *  Opens .lock file in basedir and locks it with fcntl.
+/** Acquire a lock on the depot.
+ *  Opens .lock file in basedir and locks it with fcntl. A read-only store
+ *  takes a shared lock so several readers can serve the same depot at once
+ *  (process-per-session hosting relies on this); a writable store takes an
+ *  exclusive lock, which waits for the readers to drain.
  *  Returns the open fd on success, or -1 on failure.
  *  The lock is held until cas_unlock_depot() or process exit.
  */
 static int
-cas_lock_depot(const char *basedir)
+cas_lock_depot(const char *basedir, int readonly)
 {
     char lockpath[CAS_PATH_MAX];
     int n = snprintf(lockpath, sizeof(lockpath), "%s/.lock", basedir);
@@ -482,13 +485,15 @@ cas_lock_depot(const char *basedir)
     if (n < 0 || (size_t)n >= sizeof(lockpath))
         return -1;
 
-    int fd = open(lockpath, O_WRONLY | O_CREAT, 0644);
+    /* O_RDWR so the fd is valid for F_RDLCK (which needs read access) and
+     * F_WRLCK alike. */
+    int fd = open(lockpath, O_RDWR | O_CREAT, 0644);
 
     if (fd < 0)
         return -1;
 
     struct flock lock = {
-        .l_type = F_WRLCK,     /* exclusive write lock */
+        .l_type = readonly ? F_RDLCK : F_WRLCK,
         .l_whence = SEEK_SET,
         .l_start = 0,
         .l_len = 0,            /* lock entire file */
@@ -520,8 +525,8 @@ cas_unlock_depot(int lock_fd)
  * Lifecycle
  ****************************************************************/
 
-struct cas *
-cas_new(const char *basedir)
+static struct cas *
+cas_new_mode(const char *basedir, int readonly)
 {
     struct cas *store = calloc(1, sizeof(*store));
 
@@ -544,7 +549,7 @@ cas_new(const char *basedir)
      * lazily on first write; the depot-wide lock now forces it here. */
     mkdir(store->basedir, 0755);
 
-    store->lock_fd = cas_lock_depot(store->basedir);
+    store->lock_fd = cas_lock_depot(store->basedir, readonly);
     if (store->lock_fd < 0) {
         free(store->basedir);
         free(store);
@@ -558,6 +563,18 @@ cas_new(const char *basedir)
         store->pack = cas_pack_open(packpath);
 
     return store;
+}
+
+struct cas *
+cas_new(const char *basedir)
+{
+    return cas_new_mode(basedir, 0);
+}
+
+struct cas *
+cas_new_ro(const char *basedir)
+{
+    return cas_new_mode(basedir, 1);
 }
 
 void
