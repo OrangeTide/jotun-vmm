@@ -289,8 +289,8 @@ Decisions (made): the guest-facing API is a hybrid. A socket-like client
 shape as the 9P channel: a shared request/response buffer and a synchronous
 doorbell. `/net` itself is a read-only information tree served through the
 existing 9P backend (`/net/policy`, `/net/conn/...`), for naming and
-observability, not for byte transfer. Scope is outbound TCP connect and UDP
-datagrams; listen/accept is deferred.
+observability, not for byte transfer. Scope here is outbound TCP connect and
+UDP datagrams; listen/accept and inter-guest links landed later in M14.
 
 The host provider opens real host sockets (that is the NAT) and keeps them
 non-blocking. A host poll thread is event-driven, not periodic: it blocks in
@@ -931,12 +931,37 @@ Independent of the milestones above, tracked so they are not lost:
 - libc-lite (M9): a `<threads.h>` shim (`thrd_*`/`mtx_*`/`cnd_*`) over `task.c`,
   deferred until a bundle program needs the standard API so a real consumer
   shapes it. M9.1 through M9.4 are done.
-- Inter-guest network link (follows M10): an in-host virtual switch that splices
-  one guest's connection to another guest's service without touching the real
-  network, so the trusted host stays the only bridge. Deferred because it needs
-  a net listen/accept or rendezvous primitive the net layer does not have yet
-  (design section 8). The shared read-only mount is the sharing feature that
-  does land, in M10.4.
+- Inter-guest network link: landed in M14.
+
+## M14: the net name service, listen/accept, and inter-guest links (done)
+
+Goal: let guests offer and reach services, and let one guest reach another
+without touching the real network, with the same address form as an external
+connection.
+
+What landed:
+- Plan 9 dial strings. A connection is named `network!host!port` (`tcp` or
+  `udp`), replacing the separate proto field, so the network is part of the
+  address and external and inter-guest links share one form.
+- A host name service. One process-wide switch (`vswitch` in `host/net.c`),
+  shared by every guest's provider, holds the guest network names (a new
+  manifest `name` field) and the registered services. The host field of a dial
+  string resolves through it: a co-running guest's name is an in-host link, any
+  other name resolves externally through DNS.
+- listen/accept. `net_listen("tcp!*!port")` registers a service in-host under
+  the guest's name; `net_accept` blocks the task until a peer connects. The
+  listener's wake pipe doubles as its readiness fd, so accept parks on it like
+  any socket.
+- Inter-guest links over a socketpair. A dial to a guest makes a socketpair,
+  keeps one end as the dialer's connection, and queues the other on the
+  target's accept backlog, poking its wake pipe. Send, recv, readiness, and
+  close are then the ordinary socket path, so inter-guest traffic never touches
+  the real network and the host stays the only bridge. The trust model is flat
+  and host-mediated: any co-running guest may offer or reach any name.
+
+Deferred: binding a real external port (listen serves in-host only for now),
+inter-guest UDP, policy over inter-guest links, rate limits, and a dial retry
+for the startup race where a client dials before the server has listened.
 
 ## Cross-cutting concerns
 

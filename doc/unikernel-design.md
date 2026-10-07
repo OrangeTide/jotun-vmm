@@ -282,8 +282,26 @@ epoll poll thread wakes it when the socket is ready. Policy is manifest
 `net allow <cidr> <ports> [proto]` rules matched against the resolved address,
 default-allow with no rules and default-deny with any. `/net` itself is a
 read-only 9P tree (`/net/policy`, `/net/conn`) overlaid on the bundle, for
-naming and observability rather than byte transfer. Rate limits and TCP
-listen/accept are not yet implemented.
+naming and observability rather than byte transfer.
+
+A connection is named by a Plan 9 dial string, `network!host!port` (the network
+is `tcp` or `udp`). The host runs one name service over the host field, so the
+same address form reaches either a real host or another guest. Each guest has a
+network name, assigned by the manifest `name` field. A name that belongs to a
+co-running guest resolves to an in-host link; any other name resolves
+externally through DNS. An in-host link is a socketpair: on a dial to a guest
+the host makes a socketpair, keeps one end as the dialer's connection, and
+queues the other on the target's accept backlog, so inter-guest traffic never
+touches the real network and the host stays the only bridge. From there send,
+recv, readiness, and close are the ordinary socket path, so external and
+inter-guest connections differ only in how the name resolved.
+
+A guest offers a service with `net_listen`/`net_accept`. `net_listen("tcp!*!
+port")` registers the service in-host under the guest's own name, so a peer
+reaches it by dialing `tcp!<thatguest>!port`; accept blocks the calling task
+until a peer connects and returns an ordinary connection. Binding a real
+external port, inter-guest UDP, policy over inter-guest links, and rate limits
+are not yet implemented.
 
 ## 9. Display subsystem
 

@@ -4,6 +4,12 @@ ref root
 subtree /
 init rc
 
+# The guest's network name. Another co-running guest reaches this one's
+# services by dialing "tcp!<name>!<port>"; the guest offers a service with
+# net_listen("tcp!*!<port>"). An external host is dialed the same way, by its
+# own name, which the host's name service resolves through DNS instead.
+# name web
+
 # Network policy: "net allow <cidr> <ports> [tcp|udp]". With no net rule the
 # guest may dial anywhere; with one or more, only matching targets are allowed
 # and everything else is refused. ports is a single port, a "lo-hi" range, or
