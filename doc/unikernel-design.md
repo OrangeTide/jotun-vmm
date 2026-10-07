@@ -306,8 +306,15 @@ default-deny: with no rules a listen is in-host only, and a real bind needs a
 `net allow` rule naming the port, since offering a port to the outside is more
 sensitive than dialing out. A named guest that binds is reachable both ways at
 once, and accept takes a pending in-host peer before a real inbound connection.
-Inter-guest UDP, policy over inter-guest links, and rate limits are not yet
-implemented.
+
+Dialing a co-running guest is a rendezvous, so bring-up order does not matter.
+If the target has not listened yet, the dial reports a retryable status and the
+dialing task parks the way a recv or accept does; a listen then wakes the parked
+dials, which retry and connect. Every guest name is registered in the name
+service before any guest runs, so a dial to a peer that boots later still
+resolves in-host and waits for it, rather than resolving the name externally and
+failing. Inter-guest UDP, policy over inter-guest links, and rate limits are not
+yet implemented.
 
 ## 9. Display subsystem
 

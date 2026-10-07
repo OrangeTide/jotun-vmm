@@ -965,10 +965,15 @@ What landed:
   close are then the ordinary socket path, so inter-guest traffic never touches
   the real network and the host stays the only bridge. The trust model is flat
   and host-mediated: any co-running guest may offer or reach any name.
+- Startup-race rendezvous. A dial to a co-running guest that has not listened
+  yet reports NET_EAGAIN rather than failing. The dialing task parks and retries
+  the way a recv or accept does, and a listen wakes every guest so the parked
+  dials retry and connect. All guest names are registered in the name service
+  before any guest runs, so a dial to a peer that boots later still resolves
+  in-host and parks instead of resolving the name externally. A client that
+  starts before its server therefore connects regardless of bring-up order.
 
-Deferred: inter-guest UDP, policy over inter-guest links, rate limits, and a
-dial retry for the startup race where a client dials before the server has
-listened.
+Deferred: inter-guest UDP, policy over inter-guest links, and rate limits.
 
 ## Cross-cutting concerns
 
