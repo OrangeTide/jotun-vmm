@@ -100,6 +100,8 @@ struct vswitch {
     pthread_mutex_t lock;
     char names[VSW_MAXNAME][64];
     int nnames;
+    struct netdev *members[VSW_MAXNAME];    /* every provider, for wake-all */
+    int nmembers;
     struct vlistener listeners[VSW_MAXLISTEN];
 };
 
@@ -113,7 +115,7 @@ vswitch_new(void)
 }
 
 /* Register a guest's name so the name service can resolve it. Idempotent. */
-static void
+void
 vsw_register_name(struct vswitch *v, const char *name)
 {
     if (!v || !name || !name[0])
@@ -127,6 +129,38 @@ vsw_register_name(struct vswitch *v, const char *name)
     if (v->nnames < VSW_MAXNAME)
         snprintf(v->names[v->nnames++], sizeof v->names[0], "%s", name);
     pthread_mutex_unlock(&v->lock);
+}
+
+/* Record a guest's provider so a listen can wake every dialer parked on the
+ * startup race. Called once per guest from net_init. */
+static void
+vsw_add_member(struct vswitch *v, struct netdev *nd)
+{
+    if (!v || !nd)
+        return;
+    pthread_mutex_lock(&v->lock);
+    if (v->nmembers < VSW_MAXNAME)
+        v->members[v->nmembers++] = nd;
+    pthread_mutex_unlock(&v->lock);
+}
+
+/* Poke every guest so any task parked on a dial retries. A dial to a guest
+ * that has not listened yet returns NET_EAGAIN and parks; a later listen does
+ * not know which guests are waiting for it, so this broadcasts. Listens are
+ * rare, and a guest with nothing parked just clears its flag and moves on. */
+static void
+vsw_wake_all(struct vswitch *v)
+{
+    struct netdev *m[VSW_MAXNAME];
+    int n = 0;
+    pthread_mutex_lock(&v->lock);
+    for (int i = 0; i < v->nmembers; i++)
+        m[n++] = v->members[i];
+    pthread_mutex_unlock(&v->lock);
+    for (int i = 0; i < n; i++) {
+        __atomic_store_n(&m[i]->chan->evt, 1, __ATOMIC_SEQ_CST);
+        m[i]->wake(m[i]->wake_ctx);
+    }
 }
 
 /* Whether a name belongs to a co-running guest (caller holds no lock). */
@@ -480,8 +514,32 @@ do_dial_inhost(struct netdev *nd, struct jotun_net *chan, const char *host,
         return;
     }
 
+    /* Resolve the listener first, before committing any resources. The guest
+     * may exist but not have called net_listen yet (the startup race): that is
+     * not a refusal, it is "not ready", so the dial parks and retries until a
+     * listen wakes it. A backlog that is genuinely full is a hard refusal. */
+    pthread_mutex_lock(&v->lock);
+    struct vlistener *vl = NULL;
+    for (int i = 0; i < VSW_MAXLISTEN; i++)
+        if (v->listeners[i].used && v->listeners[i].port == port
+            && strcmp(v->listeners[i].name, host) == 0) {
+            vl = &v->listeners[i];
+            break;
+        }
+    if (!vl) {
+        pthread_mutex_unlock(&v->lock);
+        reply(chan, NET_EAGAIN, 0);
+        return;
+    }
+    if (vl->count >= VSW_BACKLOG) {
+        pthread_mutex_unlock(&v->lock);
+        reply(chan, NET_ECONN, 0);
+        return;
+    }
+
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        pthread_mutex_unlock(&v->lock);
         reply(chan, NET_ECONN, 0);
         return;
     }
@@ -501,43 +559,21 @@ do_dial_inhost(struct netdev *nd, struct jotun_net *chan, const char *host,
     }
     pthread_mutex_unlock(&nd->lock);
     if (handle < 0) {
+        pthread_mutex_unlock(&v->lock);
         close(sv[0]);
         close(sv[1]);
         reply(chan, NET_ENORES, 0);
         return;
     }
 
-    pthread_mutex_lock(&v->lock);
-    struct vlistener *vl = NULL;
-    for (int i = 0; i < VSW_MAXLISTEN; i++)
-        if (v->listeners[i].used && v->listeners[i].port == port
-            && strcmp(v->listeners[i].name, host) == 0) {
-            vl = &v->listeners[i];
-            break;
-        }
-    int ok = vl && vl->count < VSW_BACKLOG;
-    if (ok) {
-        int slot = (vl->head + vl->count) % VSW_BACKLOG;
-        vl->fds[slot] = sv[1];
-        snprintf(vl->peers[slot], sizeof vl->peers[0], "%s", nd->name);
-        vl->count++;
-        char b = 'x';
-        ssize_t wr = write(vl->wake_wr, &b, 1);
-        (void)wr;
-    }
+    int slot = (vl->head + vl->count) % VSW_BACKLOG;
+    vl->fds[slot] = sv[1];
+    snprintf(vl->peers[slot], sizeof vl->peers[0], "%s", nd->name);
+    vl->count++;
+    char b = 'x';
+    ssize_t wr = write(vl->wake_wr, &b, 1);
+    (void)wr;
     pthread_mutex_unlock(&v->lock);
-
-    if (!ok) {
-        /* The guest exists but is not listening on that port (or its backlog is
-         * full): roll the dialer slot back and refuse. */
-        pthread_mutex_lock(&nd->lock);
-        nd->conns[handle].fd = -1;
-        pthread_mutex_unlock(&nd->lock);
-        close(sv[0]);
-        close(sv[1]);
-        reply(chan, NET_ECONN, 0);
-        return;
-    }
 
     reply(chan, handle, 0);
 }
@@ -1060,6 +1096,11 @@ do_listen(struct netdev *nd, struct jotun_net *chan)
         return;
     }
 
+    /* A new in-host service may have been racing ahead of a dialer that parked
+     * on NET_EAGAIN; wake every guest so those dials retry and find it now. */
+    if (want_inhost)
+        vsw_wake_all(v);
+
     reply(chan, handle, 0);
 }
 
@@ -1215,6 +1256,7 @@ net_init(struct jotun_net *chan, void (*wake)(void *ctx), void *wake_ctx,
     if (name)
         snprintf(nd->name, sizeof nd->name, "%s", name);
     vsw_register_name(vsw, nd->name);
+    vsw_add_member(vsw, nd);
     pthread_mutex_init(&nd->lock, NULL);
 
     if (poller_create(nd) != 0) {

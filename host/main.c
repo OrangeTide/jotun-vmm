@@ -803,6 +803,17 @@ main(int argc, char **argv)
 
     nguests = nmanifests > 0 ? nmanifests : 1;
 
+    /* Populate the name service with every guest's name before any guest runs.
+     * Bring-up starts each guest's vcpus before the next guest's net_init, so
+     * without this a guest that dials a later peer would not yet see that peer
+     * as a co-running guest and would resolve the name externally instead of
+     * taking the in-host rendezvous that retries until the peer listens. */
+    for (int gi = 0; gi < nmanifests; gi++) {
+        struct manifest m;
+        if (manifest_load(manifests[gi], &m) == 0 && m.name[0])
+            vsw_register_name(g_vswitch, m.name);
+    }
+
     for (int gi = 0; gi < nguests; gi++) {
         const char *mpath = nmanifests > 0 ? manifests[gi]
                                            : getenv("JOTUN_MANIFEST");

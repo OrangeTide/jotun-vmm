@@ -19,6 +19,13 @@ struct netdev;
 struct vswitch;
 struct vswitch *vswitch_new(void);
 
+/* Pre-register a guest's network name before bring-up, so a dial to a peer
+ * resolves in-host even if the dialer runs before the peer's net_init. Names
+ * are also registered by net_init; this is idempotent. Names must all be known
+ * up front, or the startup-race dial retry (an in-host rendezvous) would
+ * instead resolve the unregistered peer externally and fail. */
+void vsw_register_name(struct vswitch *v, const char *name);
+
 #define NET_MAXRULES 16
 
 /* One network-policy rule: an IPv4 CIDR, an inclusive port range, and a

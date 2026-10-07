@@ -321,6 +321,23 @@ link_demo(void)
     con_puts("link: done\n");
 }
 
+/* Startup-race self-test: spawn the client first so it dials before the server
+ * has listened. The dial should park on NET_EAGAIN rather than fail, then
+ * connect once the server's listen wakes it. Run like link, as JOTUN_NAME=self
+ * with init "race tcp!self!9". */
+static void
+race_demo(void)
+{
+    task_spawn("cli", link_client);
+    task_yield();       /* let the client dial first and park on the race */
+    task_spawn("srv", serve_inhost9);
+
+    char status[64];
+    while (task_await(status, sizeof status) >= 0)
+        ;
+    con_puts("race: done\n");
+}
+
 /* UDP demo: open a datagram socket, send one datagram to a target, and print
  * the reply with its source address. The recvfrom blocks the task until a
  * datagram arrives. */
@@ -634,6 +651,8 @@ init_task(void)
         serve_demo();
     } else if (script[0] == 'l' && script[1] == 'i') {  /* "link" */
         link_demo();
+    } else if (script[0] == 'r' && script[1] == 'a') {  /* "race" */
+        race_demo();
     } else if (script[0] == 'u' && script[1] == 'd') {  /* "udp" */
         udp_demo();
     } else if (script[0] == 'd' && script[1] == 'r') {  /* "draw" */

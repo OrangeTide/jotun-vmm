@@ -73,15 +73,11 @@ net_init(void)
     task_add_event_hook(net_wake_waiters);
 }
 
-int
-net_dial(const char *target)
+/* One non-blocking dial RPC. Returns a connection handle, NET_EAGAIN, or an
+ * error. */
+static int
+dial_once(const char *target, unsigned long len)
 {
-    unsigned long len = 0;
-    while (target[len] != '\0')
-        len++;
-    if (len > JOTUN_NET_MSIZE)
-        return NET_EINVAL;
-
     unsigned long f = lock_chan();
     struct jotun_net *c = chan();
     c->op = NET_OP_DIAL;
@@ -91,6 +87,32 @@ net_dial(const char *target)
     int st = c->status;
     unlock_chan(f);
     return st;
+}
+
+/* Dial a service and return a connection handle, or a negative error. A dial to
+ * a co-running guest that has not listened yet reports NET_EAGAIN; the task
+ * parks and retries so a client that starts before its server still connects
+ * once the server listens (the startup race). An external dial never parks. */
+int
+net_dial(const char *target)
+{
+    unsigned long len = 0;
+    while (target[len] != '\0')
+        len++;
+    if (len > JOTUN_NET_MSIZE)
+        return NET_EINVAL;
+
+    int me = task_self();
+    __atomic_store_n(&net_waiting[me], 1, __ATOMIC_SEQ_CST);
+    for (;;) {
+        int st = dial_once(target, len);
+        if (st == NET_EAGAIN) {
+            task_block();
+            continue;
+        }
+        __atomic_store_n(&net_waiting[me], 0, __ATOMIC_SEQ_CST);
+        return st;
+    }
 }
 
 /* Bind/register a dial string and return a listening handle, or a negative
