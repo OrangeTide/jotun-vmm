@@ -1132,6 +1132,31 @@ What is needed:
     (a fixed bundle per connection), which already gives working multi-user
     hosting, then lift policy into the broker guest over the control channel.
     Designing the channel up front makes the second step additive, not a rewrite.
+  - Host mechanism, step one (done 2026-10-07). Shipped as a process-per-session
+    supervisor, `host/brokerd.c` (new binary `brokerd`), chosen over the in-process
+    spawn/bind primitives above because in-process add and remove would need
+    trusted-core surgery the proven single-guest stack does not: no forced vcpu
+    stop, a dangling `fe->sinks[gid]` after `draw_shutdown`, no vswitch deregister,
+    no 9P chain free, and a single-browser `drawws`. Process-per-session sidesteps
+    all of it. Each browser session is a separate `jotun` child (the ordinary
+    single-guest stack with its own loopback draw port); brokerd proxies the
+    browser's bytes to the child's draw port rather than reading its RAM, so the
+    isolation is at the address-space level and teardown is kill-and-reap. A
+    `jsess` cookie ties a browser's page GET and its `/ws` to one child (302
+    Set-Cookie on a cookieless GET, then a transparent splice). The policy is
+    trivial and inline, a fixed bundle and guest per session, configured by
+    environment. Quotas are a hard `max` (503 when full), per-child `setrlimit`
+    (address space, CPU, open files), and an idle sweep; `SIGCHLD` reaping frees
+    slots, and `SIGINT`/`SIGTERM` kills every child so a shutdown orphans nothing.
+    `jotun` itself is unchanged. One enabler was required in the storage layer:
+    the depot lock was always exclusive, so a second concurrent `jotun` reading
+    the same bundle blocked forever. Serving is read-only, so `cas_new_ro` now
+    takes a shared lock (several readers serve one depot at once) while writers
+    keep the exclusive lock. Run with `make web-multi`, front it with the same
+    Caddy recipe, and check it headless with `make broker-smoke` (two independent
+    sessions, each sees only its own token, no cross-leak, then teardown). The
+    broker-guest control channel (step two) is still to come; it will drive
+    fork and kill in place of the inline policy.
 - M15.3: admission and auth. With the M15.2 split this lives in the broker guest
   as policy: it authenticates the request and decides who may start a guest and
   which bundle they get, off the box behind the TLS proxy as M10 decided. The
@@ -1176,11 +1201,13 @@ Cross-cutting decisions, independent of the tiers above:
   gets the saving for free. Remaining lever if a smooth high-rate pixel stream
   ever needs it: a binary tile-delta in place of PNG-in-SVG.
 
-Status: the single-session MVP is live. M15.1 (the hosting recipe), keyboard and
-text input, and the webterm jsh terminal all shipped, so one shared session is
-hostable and usable today. The remaining step is per-user hosting, the M15.2
-broker, now designed as the host-mechanism / broker-guest split above and ready
-to build when wanted.
+Status: multi-user hosting works. M15.1 (the hosting recipe), keyboard and text
+input, and the webterm jsh terminal shipped the single-session MVP, and the
+M15.2 host mechanism now ships as the `brokerd` process-per-session supervisor:
+independent browsers each get their own sandboxed `jotun` child, spawned on
+demand with inline policy and torn down on exit or idle. The remaining M15.2 work
+is lifting policy into a sandboxed broker guest over the control channel, which
+is additive on top of the shipped mechanism.
 
 ## Cross-cutting concerns
 

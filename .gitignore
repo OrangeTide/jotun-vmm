@@ -5,6 +5,7 @@ libos.elf
 hello.elf
 castool
 jbundle
+brokerd
 bundle-depot
 image-depot
 bundle-staging

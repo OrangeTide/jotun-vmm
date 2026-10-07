@@ -312,8 +312,26 @@ build/websmoke: tools/websmoke.c | build
 web-smoke: $(TARGET) libos.elf build/websmoke
 	./build/websmoke ./$(TARGET) $(BUNDLE_DEPOT)
 
+## brokerd: the process-per-session web hosting supervisor (M15.2 host
+## mechanism). It forks one jotun child per browser session and proxies to it.
+brokerd: host/brokerd.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+## Multi-user web hosting: run the supervisor, front it with Caddy for TLS the
+## same way as make web. Needs a bundle: make bundle BUNDLE_ARCHS=$(ARCH)
+web-multi: brokerd $(TARGET) libos.elf
+	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./brokerd
+
+## Multi-session smoke test: brokerd opens two independent sessions and checks
+## they get separate guests and tear down. Needs a bundle.
+build/brokersmoke: tools/brokersmoke.c | build
+	$(CC) $(CFLAGS) -o $@ $<
+broker-smoke: brokerd $(TARGET) libos.elf build/brokersmoke
+	./build/brokersmoke ./brokerd ./$(TARGET) $(BUNDLE_DEPOT)
+
 clean:
-	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool jbundle
+	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool jbundle \
+	    brokerd
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke
+.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke
