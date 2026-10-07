@@ -313,7 +313,18 @@ dialing task parks the way a recv or accept does; a listen then wakes the parked
 dials, which retry and connect. Every guest name is registered in the name
 service before any guest runs, so a dial to a peer that boots later still
 resolves in-host and waits for it, rather than resolving the name externally and
-failing. Inter-guest UDP, policy over inter-guest links, and rate limits are not
+failing.
+
+UDP uses the same name service. A datagram addressed to a co-running guest's
+name is routed through the switch and never touches the real network; any other
+name resolves externally. A guest makes itself reachable by binding a UDP port
+under its name (`net_bind` with `udp!*!port`), which parallels `net_listen` for
+TCP but needs no accept. A socket that sends before it binds is given an
+ephemeral in-host source port, the way a kernel UDP socket auto-binds on its
+first send, so the receiver can always reply. In-host delivery is a small
+bounded per-endpoint queue drained by recvfrom and woken through the usual event
+path; a datagram to an unbound name, or to an endpoint whose queue is full, is
+dropped, as UDP is lossy. Policy over inter-guest links and rate limits are not
 yet implemented.
 
 ## 9. Display subsystem

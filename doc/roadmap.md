@@ -972,8 +972,15 @@ What landed:
   before any guest runs, so a dial to a peer that boots later still resolves
   in-host and parks instead of resolving the name externally. A client that
   starts before its server therefore connects regardless of bring-up order.
+- Inter-guest UDP over the same name service. A datagram addressed to a
+  co-running guest's name is routed through the switch and never touches the
+  real network, like a dial. A guest binds a UDP port under its name with
+  net_bind ("udp!*!port"); a socket that sends before it binds gets an ephemeral
+  in-host source port, so a receiver can always reply. Delivery is a bounded
+  per-endpoint datagram queue woken through the usual event path, and an
+  over-full queue or an unbound target drops the datagram, matching UDP.
 
-Deferred: inter-guest UDP, policy over inter-guest links, and rate limits.
+Deferred: policy over inter-guest links and rate limits.
 
 ## Cross-cutting concerns
 
