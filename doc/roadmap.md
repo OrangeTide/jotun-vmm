@@ -1121,11 +1121,18 @@ Cross-cutting decisions, independent of the tiers above:
   had hash-chain LZ77 with fixed Huffman, despite an old comment to the
   contrary): each row picks the None/Sub/Up/Average/Paeth filter with the
   smallest residual, which cut a rasterizer frame about 2.5x (a 256x192 frame
-  from roughly 51 KB to 21 KB), losslessly and with no protocol change. Further
-  levers if needed: dynamic Huffman (or the vendored miniz deflate) over the
-  fixed one, a guest that sends `DOP_IMAGE_DAMAGE` partial updates instead of
-  re-basing the whole framebuffer (the triton demo re-bases, so every frame is
-  a full image), and a binary tile-delta in place of PNG-in-SVG.
+  from roughly 51 KB to 21 KB), losslessly and with no protocol change. The
+  fixed Huffman was then replaced with a dynamic one (per-frame code trees
+  length-limited to 15 bits), another 13% (to about 18 KB), for 2.8x below the
+  original encoder overall, and verified lossless against a strict libpng
+  decoder over adversarial inputs (solid color, a single rare literal, noise,
+  1px stripes, 1x1). The partial-update path was found already wired end to end:
+  a guest that sends `DOP_IMAGE_DAMAGE` makes the host encode and send only the
+  damaged sub-rectangle (confirmed with the drawpixel demo: a 32x32 patch is a
+  234-byte delta, not a full frame). The triton demo cannot use it because the
+  whole frame changes as the cube spins, but any guest that updates a region
+  gets the saving for free. Remaining lever if a smooth high-rate pixel stream
+  ever needs it: a binary tile-delta in place of PNG-in-SVG.
 
 Open decision, to settle before building: is the MVP one shared public session
 or per-user sessions? The first is M15.1 alone, close to zero new code. The
