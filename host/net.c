@@ -44,6 +44,15 @@
 
 struct vlistener;
 
+/* One datagram queued for in-host delivery to a UDP endpoint. The payload is
+ * heap-allocated to its exact length, so an idle endpoint costs nothing. */
+#define UDP_BACKLOG 8
+struct udp_dgram {
+    char src[64];           /* sender's "name!port" */
+    uint32_t len;
+    uint8_t *data;          /* len bytes, or NULL for an empty datagram */
+};
+
 struct net_conn {
     int fd;                 /* host socket, -1 if the slot is free */
     int proto;
@@ -52,6 +61,9 @@ struct net_conn {
     struct vlistener *vl;   /* the in-host listener registration, if any */
     int lfd;                /* a listener's real listening socket, or -1 */
     int lfd_in_poll;        /* lfd is registered with the poller */
+    uint16_t uport;         /* in-host UDP port bound under the guest name, 0 none */
+    struct udp_dgram uq[UDP_BACKLOG];   /* in-host datagrams waiting to be read */
+    int uq_head, uq_count;
     char peer[64];          /* "host!port" for a dial, "-" for a UDP socket */
 };
 
@@ -84,6 +96,17 @@ struct netdev {
 #define VSW_MAXNAME    16
 #define VSW_MAXLISTEN  32
 #define VSW_BACKLOG    8
+#define VSW_MAXUDP     32
+
+/* A UDP port bound under a guest's name, so a datagram addressed to
+ * "name!port" can be routed to the owning endpoint. */
+struct vudp {
+    int used;
+    char name[64];
+    uint16_t port;
+    struct netdev *owner;
+    int32_t handle;
+};
 
 struct vlistener {
     int used;
@@ -103,6 +126,8 @@ struct vswitch {
     struct netdev *members[VSW_MAXNAME];    /* every provider, for wake-all */
     int nmembers;
     struct vlistener listeners[VSW_MAXLISTEN];
+    struct vudp udps[VSW_MAXUDP];
+    uint16_t next_ephem;                    /* next in-host UDP ephemeral port */
 };
 
 struct vswitch *
@@ -178,6 +203,71 @@ vsw_is_guest(struct vswitch *v, const char *name)
         }
     pthread_mutex_unlock(&v->lock);
     return found;
+}
+
+/* Find the UDP binding for "name!port" (caller holds v->lock). */
+static struct vudp *
+vudp_find(struct vswitch *v, const char *name, uint16_t port)
+{
+    for (int i = 0; i < VSW_MAXUDP; i++)
+        if (v->udps[i].used && v->udps[i].port == port
+            && strcmp(v->udps[i].name, name) == 0)
+            return &v->udps[i];
+    return NULL;
+}
+
+/* Register a UDP port under a guest's name (caller holds v->lock). Returns 0,
+ * -1 if the port is already bound for that name, or -2 if the table is full. */
+static int
+vudp_register(struct vswitch *v, const char *name, uint16_t port,
+              struct netdev *owner, int32_t handle)
+{
+    if (vudp_find(v, name, port))
+        return -1;
+    for (int i = 0; i < VSW_MAXUDP; i++)
+        if (!v->udps[i].used) {
+            v->udps[i].used = 1;
+            snprintf(v->udps[i].name, sizeof v->udps[i].name, "%s", name);
+            v->udps[i].port = port;
+            v->udps[i].owner = owner;
+            v->udps[i].handle = handle;
+            return 0;
+        }
+    return -2;
+}
+
+/* Assign and register an unused in-host ephemeral port for a guest's UDP
+ * endpoint (caller holds v->lock), so a datagram it sends has a source address
+ * peers can reply to. Returns the port, or 0 if none could be assigned. */
+static uint16_t
+vudp_autoport(struct vswitch *v, const char *name, struct netdev *owner,
+              int32_t handle)
+{
+    for (int tries = 0; tries < 32768; tries++) {
+        if (v->next_ephem < 32768)
+            v->next_ephem = 32768;
+        uint16_t port = v->next_ephem++;
+        if (v->next_ephem == 0)
+            v->next_ephem = 32768;
+        if (!vudp_find(v, name, port)
+            && vudp_register(v, name, port, owner, handle) == 0)
+            return port;
+    }
+    return 0;
+}
+
+/* Drop a UDP binding owned by a given endpoint (takes v->lock). */
+static void
+vudp_unbind(struct vswitch *v, struct netdev *owner, int32_t handle)
+{
+    if (!v)
+        return;
+    pthread_mutex_lock(&v->lock);
+    for (int i = 0; i < VSW_MAXUDP; i++)
+        if (v->udps[i].used && v->udps[i].owner == owner
+            && v->udps[i].handle == handle)
+            v->udps[i].used = 0;
+    pthread_mutex_unlock(&v->lock);
 }
 
 /* Suppress SIGPIPE on a socket where the platform needs a per-socket option
@@ -483,6 +573,9 @@ alloc_conn(struct netdev *nd)
             c->vl = NULL;
             c->lfd = -1;
             c->lfd_in_poll = 0;
+            c->uport = 0;
+            c->uq_head = 0;
+            c->uq_count = 0;
             return i;
         }
     return -1;
@@ -781,6 +874,89 @@ do_udp(struct netdev *nd, struct jotun_net *chan)
     reply(chan, handle, 0);
 }
 
+/* Queue a datagram for an in-host UDP endpoint and wake its owner. The caller
+ * holds the switch lock so the binding stays valid; this takes the target's nd
+ * lock to enqueue. Returns 1 if queued, 0 if dropped (endpoint gone or its
+ * queue full), matching UDP's lossy delivery. */
+static int
+udp_deliver(struct netdev *dst, int32_t handle, const char *src,
+            const uint8_t *data, uint32_t len)
+{
+    int queued = 0;
+    pthread_mutex_lock(&dst->lock);
+    struct net_conn *c = conn_of(dst, handle);
+    if (c && c->proto == NET_PROTO_UDP && c->uq_count < UDP_BACKLOG) {
+        uint8_t *copy = NULL;
+        if (len > 0 && (copy = malloc(len)) == NULL)
+            goto out;               /* out of memory: drop the datagram */
+        if (len > 0)
+            memcpy(copy, data, len);
+        struct udp_dgram *d = &c->uq[(c->uq_head + c->uq_count) % UDP_BACKLOG];
+        d->data = copy;
+        d->len = len;
+        snprintf(d->src, sizeof d->src, "%s", src);
+        c->uq_count++;
+        queued = 1;
+    }
+out:
+    pthread_mutex_unlock(&dst->lock);
+    if (queued) {
+        __atomic_store_n(&dst->chan->evt, 1, __ATOMIC_SEQ_CST);
+        dst->wake(dst->wake_ctx);
+    }
+    return queued;
+}
+
+/* Send a datagram to a co-running guest by name. The datagram is routed through
+ * the switch and never touches the real network. If the sender has no in-host
+ * source port yet, one is assigned so the receiver can reply. A datagram to a
+ * name that is not bound is dropped, as UDP is lossy. */
+static void
+do_sendto_inhost(struct netdev *nd, struct jotun_net *chan, const char *host,
+                 const char *portstr)
+{
+    struct vswitch *v = nd->vsw;
+    uint16_t port = parse_port(portstr);
+    if (!v || port == 0) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+
+    uint32_t len = chan->len;
+    if (len > JOTUN_NET_MSIZE)
+        len = JOTUN_NET_MSIZE;
+
+    pthread_mutex_lock(&v->lock);
+
+    /* Give the sender a source identity (its own in-host port) if it has none,
+     * so a reply can find it, the way a kernel socket auto-binds on first send. */
+    uint16_t sport = 0;
+    pthread_mutex_lock(&nd->lock);
+    struct net_conn *sc = conn_of(nd, chan->handle);
+    if (!sc || sc->proto != NET_PROTO_UDP) {
+        pthread_mutex_unlock(&nd->lock);
+        pthread_mutex_unlock(&v->lock);
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+    if (sc->uport == 0 && nd->name[0])
+        sc->uport = vudp_autoport(v, nd->name, nd, chan->handle);
+    sport = sc->uport;
+    pthread_mutex_unlock(&nd->lock);
+
+    char src[96];
+    snprintf(src, sizeof src, "%s!%u", nd->name[0] ? nd->name : "?",
+             (unsigned)sport);
+
+    struct vudp *tgt = vudp_find(v, host, port);
+    if (tgt)
+        udp_deliver(tgt->owner, tgt->handle, src, chan->data, len);
+    pthread_mutex_unlock(&v->lock);
+
+    /* Report the datagram as sent whether or not anyone was listening. */
+    reply(chan, (int32_t)len, 0);
+}
+
 static void
 do_sendto(struct netdev *nd, struct jotun_net *chan)
 {
@@ -802,6 +978,12 @@ do_sendto(struct netdev *nd, struct jotun_net *chan)
     *bang = '\0';
     const char *host = target;
     const char *port = bang + 1;
+
+    /* A datagram to a co-running guest's name is routed in-host, like a dial. */
+    if (vsw_is_guest(nd->vsw, host)) {
+        do_sendto_inhost(nd, chan, host, port);
+        return;
+    }
 
     struct addrinfo hints = { 0 };
     hints.ai_family = AF_INET;
@@ -861,6 +1043,28 @@ do_recvfrom(struct netdev *nd, struct jotun_net *chan)
     uint32_t max = chan->maxlen;
     if (max > JOTUN_NET_MSIZE)
         max = JOTUN_NET_MSIZE;
+
+    /* An in-host datagram waiting in the queue is delivered before anything the
+     * real socket may hold, with its source reported as the sender's name. */
+    if (c->uq_count > 0) {
+        struct udp_dgram *d = &c->uq[c->uq_head];
+        uint32_t n = d->len < max ? d->len : max;
+        if (n > 0)
+            memcpy(chan->data, d->data, n);
+        uint32_t sn = (uint32_t)strlen(d->src);
+        if (sn > JOTUN_NET_ADDRMAX - 1)
+            sn = JOTUN_NET_ADDRMAX - 1;
+        memcpy(chan->addr, d->src, sn);
+        chan->addrlen = sn;
+        free(d->data);
+        d->data = NULL;
+        c->uq_head = (c->uq_head + 1) % UDP_BACKLOG;
+        c->uq_count--;
+        pthread_mutex_unlock(&nd->lock);
+        reply(chan, (int32_t)n, n);
+        return;
+    }
+
     struct sockaddr_storage src;
     socklen_t srclen = sizeof src;
     ssize_t r = recvfrom(c->fd, chan->data, max, 0, (struct sockaddr *)&src,
@@ -892,6 +1096,75 @@ do_recvfrom(struct netdev *nd, struct jotun_net *chan)
     reply(chan, NET_ECONN, 0);
 }
 
+/* Bind a UDP handle to a port under this guest's name ("udp!*!port"), so peers
+ * can reach it by name. Parallels net_listen for TCP, but a UDP socket needs no
+ * accept: the bound port just routes datagrams to this endpoint. */
+static void
+do_udpbind(struct netdev *nd, struct jotun_net *chan)
+{
+    char target[256];
+    uint32_t n = chan->len;
+    if (n >= sizeof target) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+    memcpy(target, chan->data, n);
+    target[n] = '\0';
+
+    char *net_bang = strchr(target, '!');
+    if (!net_bang) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+    *net_bang = '\0';
+    char *rest = net_bang + 1;
+    char *bang = strchr(rest, '!');
+    if (!bang) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+    *bang = '\0';
+    const char *network = target;
+    const char *host = rest;
+    const char *portstr = bang + 1;
+
+    if (strcmp(network, "udp") != 0 || strcmp(host, "*") != 0) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+    uint16_t port = parse_port(portstr);
+    if (port == 0) {
+        reply(chan, NET_EINVAL, 0);
+        return;
+    }
+
+    struct vswitch *v = nd->vsw;
+    if (!v || !nd->name[0]) {
+        reply(chan, NET_EPERM, 0);      /* an unnamed guest cannot be addressed */
+        return;
+    }
+
+    pthread_mutex_lock(&v->lock);
+    pthread_mutex_lock(&nd->lock);
+    struct net_conn *c = conn_of(nd, chan->handle);
+    if (!c || c->proto != NET_PROTO_UDP || c->uport != 0) {
+        pthread_mutex_unlock(&nd->lock);
+        pthread_mutex_unlock(&v->lock);
+        reply(chan, NET_EINVAL, 0);     /* not a UDP socket, or already bound */
+        return;
+    }
+    int rc = vudp_register(v, nd->name, port, nd, chan->handle);
+    if (rc == 0) {
+        c->uport = port;
+        snprintf(c->peer, sizeof c->peer, "udp %.32s!%u", nd->name,
+                 (unsigned)port);
+    }
+    pthread_mutex_unlock(&nd->lock);
+    pthread_mutex_unlock(&v->lock);
+
+    reply(chan, rc == 0 ? 0 : (rc == -1 ? NET_ECONN : NET_ENORES), 0);
+}
+
 /* Free a listener's switch registration: close its wake pipe and any unaccepted
  * backlog ends, and release the slot. */
 static void
@@ -913,10 +1186,18 @@ do_close(struct netdev *nd, struct jotun_net *chan)
     pthread_mutex_lock(&nd->lock);
     struct net_conn *c = conn_of(nd, chan->handle);
     struct vlistener *vl = NULL;
+    int was_udp = 0;
     if (c) {
         poller_del(nd, c);
         if (c->is_listener)
             vl = c->vl;
+        was_udp = c->proto == NET_PROTO_UDP;
+        while (c->uq_count > 0) {        /* drop any undelivered datagrams */
+            free(c->uq[c->uq_head].data);
+            c->uq[c->uq_head].data = NULL;
+            c->uq_head = (c->uq_head + 1) % UDP_BACKLOG;
+            c->uq_count--;
+        }
         close(c->fd);
         c->fd = -1;
         if (c->lfd >= 0) {
@@ -925,10 +1206,13 @@ do_close(struct netdev *nd, struct jotun_net *chan)
         }
         c->is_listener = 0;
         c->vl = NULL;
+        c->uport = 0;
     }
     pthread_mutex_unlock(&nd->lock);
     if (vl)
         free_listener(nd->vsw, vl);
+    if (was_udp)
+        vudp_unbind(nd->vsw, nd, chan->handle);
     reply(chan, 0, 0);
 }
 
@@ -1212,6 +1496,7 @@ net_handle(struct netdev *nd, struct jotun_net *chan)
     case NET_OP_RECVFROM: do_recvfrom(nd, chan); break;
     case NET_OP_LISTEN:   do_listen(nd, chan);   break;
     case NET_OP_ACCEPT:   do_accept(nd, chan);   break;
+    case NET_OP_UDPBIND:  do_udpbind(nd, chan);  break;
     default:              reply(chan, NET_EINVAL, 0); break;
     }
 }
@@ -1300,12 +1585,21 @@ net_shutdown(struct netdev *nd)
     pthread_join(nd->poll_thread, NULL);
 
     for (int i = 0; i < NET_MAXCONN; i++) {
-        if (nd->conns[i].is_listener && nd->conns[i].vl)
-            free_listener(nd->vsw, nd->conns[i].vl);
-        if (nd->conns[i].fd >= 0)
-            close(nd->conns[i].fd);
-        if (nd->conns[i].lfd >= 0)
-            close(nd->conns[i].lfd);
+        struct net_conn *c = &nd->conns[i];
+        if (c->is_listener && c->vl)
+            free_listener(nd->vsw, c->vl);
+        if (c->proto == NET_PROTO_UDP && c->fd >= 0)
+            vudp_unbind(nd->vsw, nd, i);
+        while (c->uq_count > 0) {
+            free(c->uq[c->uq_head].data);
+            c->uq[c->uq_head].data = NULL;
+            c->uq_head = (c->uq_head + 1) % UDP_BACKLOG;
+            c->uq_count--;
+        }
+        if (c->fd >= 0)
+            close(c->fd);
+        if (c->lfd >= 0)
+            close(c->lfd);
     }
     poller_destroy(nd);
     free(nd);

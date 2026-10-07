@@ -41,6 +41,8 @@ enum {
     NET_OP_ACCEPT   = 9,    /* accept one connection on a listening handle, the
                                new connection's handle in status, the peer in
                                addr[] */
+    NET_OP_UDPBIND  = 10,   /* bind a UDP handle to the dial string in data[]
+                               ("udp!*!port") so peers can reach it by name */
 };
 
 /* A dial string is a Plan 9 style "network!host!port":
@@ -53,6 +55,13 @@ enum {
  * identical to a real socket, and the external and inter-guest cases differ
  * only in how the name resolved. There is no path to the real network except
  * through the host.
+ *
+ * UDP uses the same name service. A datagram sent to a co-running guest's name
+ * (SENDTO addr[] "host!port") is routed in-host and never touches the real
+ * network; any other name resolves externally. To receive by name a guest
+ * binds its UDP handle to a port with NET_OP_UDPBIND; a datagram sent before
+ * that gets an ephemeral in-host port so replies can find their way back, the
+ * way a kernel UDP socket auto-binds a source port on its first send.
  *
  * NET_PROTO_* classify a live connection for the /net information tree and the
  * policy rules. */

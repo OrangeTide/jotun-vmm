@@ -41,8 +41,15 @@ long net_read(int handle, void *buf, unsigned long max);
  * Use net_sendto/net_recvfrom with it; close it with net_close. */
 int net_udp(void);
 
+/* Bind a UDP handle to a port under this guest's name ("udp!*!port"), so a peer
+ * can send to it by dialing "<thisguest>!port". A socket that sends before it
+ * binds still gets an ephemeral in-host source port, so one-shot clients need
+ * not bind. Returns 0, or a negative NET_* error. */
+int net_bind(int handle, const char *spec);
+
 /* Send one datagram of n bytes to dst ("host!port"), blocking if the socket is
- * momentarily full. Returns the byte count, or a negative NET_* error. */
+ * momentarily full. A dst whose host is a co-running guest's name is routed
+ * in-host. Returns the byte count, or a negative NET_* error. */
 long net_sendto(int handle, const char *dst, const void *buf, unsigned long n);
 
 /* Receive one datagram, up to max bytes, blocking until one arrives. The

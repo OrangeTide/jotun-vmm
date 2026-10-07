@@ -277,6 +277,29 @@ net_udp(void)
     return st;
 }
 
+/* Bind a UDP handle to a port under this guest's name so peers can reach it by
+ * name. spec is "udp!*!port". Returns 0, or a negative NET_* error. */
+int
+net_bind(int handle, const char *spec)
+{
+    unsigned long len = 0;
+    while (spec[len] != '\0')
+        len++;
+    if (len > JOTUN_NET_MSIZE)
+        return NET_EINVAL;
+
+    unsigned long f = lock_chan();
+    struct jotun_net *c = chan();
+    c->op = NET_OP_UDPBIND;
+    c->handle = handle;
+    c->len = (uint32_t)len;
+    memcpy(c->data, spec, len);
+    doorbell();
+    int st = c->status;
+    unlock_chan(f);
+    return st;
+}
+
 /* One non-blocking sendto RPC. */
 static long
 sendto_once(int handle, const char *dst, const void *buf, unsigned long n)

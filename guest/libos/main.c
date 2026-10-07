@@ -389,6 +389,93 @@ udp_demo(void)
     con_puts("udp: done\n");
 }
 
+/* The UDP self-test's server binds the in-host port 9 under this guest's name,
+ * receives one datagram, and echoes it back to the sender. */
+static void
+userve(void)
+{
+    int h = net_udp();
+    if (h < 0 || net_bind(h, "udp!*!9") < 0) {
+        con_puts("userve: bind failed\n");
+        return;
+    }
+    con_puts("userve: bound udp!*!9\n");
+
+    char src[64];
+    char buf[256];
+    long r = net_recvfrom(h, src, sizeof src, buf, sizeof buf - 1);
+    if (r > 0) {
+        buf[r] = '\0';
+        con_puts("userve: got ");
+        con_puts(buf);
+        if (buf[r - 1] != '\n')
+            con_putc('\n');
+        con_puts("userve: from ");
+        con_puts(src);
+        con_putc('\n');
+        net_sendto(h, src, buf, (unsigned long)r);       /* echo it back */
+    }
+    net_close(h);
+    con_puts("userve: done\n");
+}
+
+/* The UDP self-test's client sends one datagram to a target and waits for the
+ * echo. The target defaults to this guest's own name (the single-guest test)
+ * but may be given so a second guest can reach a peer by name. */
+static void
+uclient_to(const char *target)
+{
+    int h = net_udp();
+    if (h < 0) {
+        con_puts("uclient: open failed\n");
+        return;
+    }
+    const char *msg = "ping\n";
+    long w = net_sendto(h, target, msg, 5);
+    if (w < 0) {
+        con_puts("uclient: send failed\n");
+        net_close(h);
+        return;
+    }
+    char src[64];
+    char buf[256];
+    long r = net_recvfrom(h, src, sizeof src, buf, sizeof buf - 1);
+    if (r >= 0) {
+        buf[r] = '\0';
+        con_puts("uclient: reply ");
+        con_puts(buf);
+        if (r == 0 || buf[r - 1] != '\n')
+            con_putc('\n');
+        con_puts("uclient: from ");
+        con_puts(src);
+        con_putc('\n');
+    }
+    net_close(h);
+    con_puts("uclient: done\n");
+}
+
+static void
+uclient(void)
+{
+    uclient_to((boot_argc() > 1) ? boot_argv(1) : "self!9");
+}
+
+/* UDP in-host self-test: one guest sends a datagram to itself by name over the
+ * switch. The server binds port 9 first, then the client sends to "self!9" and
+ * reads the echo. Run as JOTUN_NAME=self with init "ulink". */
+static void
+ulink_demo(void)
+{
+    task_spawn("usrv", userve);
+    task_yield();       /* let the server bind before the client sends */
+    task_spawn("ucli", uclient);
+
+    char status[64];
+    while (task_await(status, sizeof status) >= 0)
+        ;
+    con_puts("ulink: done\n");
+}
+
 /* Draw demo: build a tiny scene with one clickable rectangle, submit it, then
  * block on the first input event. With JOTUN_DRAW_TEST set on the host, the
  * sink feeds back a synthetic click on that rectangle, so the submit, park, and
@@ -653,6 +740,12 @@ init_task(void)
         link_demo();
     } else if (script[0] == 'r' && script[1] == 'a') {  /* "race" */
         race_demo();
+    } else if (script[0] == 'u' && script[1] == 'l') {  /* "ulink" */
+        ulink_demo();
+    } else if (script[0] == 'u' && script[1] == 's') {  /* "userve" */
+        userve();
+    } else if (script[0] == 'u' && script[1] == 'c') {  /* "uclient <target>" */
+        uclient();
     } else if (script[0] == 'u' && script[1] == 'd') {  /* "udp" */
         udp_demo();
     } else if (script[0] == 'd' && script[1] == 'r') {  /* "draw" */
