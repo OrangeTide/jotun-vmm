@@ -1,11 +1,13 @@
-/* triton.h : a minimal guest-side software 3D rasterizer.
+/* triton.h : a guest-side software 3D rasterizer.
  *
- * A small subset of a Glide-style immediate-mode API: gouraud-shaded,
- * z-buffered triangles rendered into an RGBA8888 framebuffer in guest RAM. The
- * rasterizer runs entirely inside the guest; the host only ever receives the
- * resulting pixels, through the draw pixel path. This is the raster side of the
- * security split in the design doc (section 9.2): no rendering command stream
- * and no rasterizer cross into the trusted host.
+ * A subset of a Glide-style immediate-mode API: gouraud-shaded, z-buffered
+ * triangles rendered into an RGBA8888 framebuffer in guest RAM, with
+ * perspective-correct texturing, the Glide color-combine modes, point and
+ * bilinear filtering, mip-mapped (trilinear) textures, and source-over alpha
+ * blending. The rasterizer runs entirely inside the guest; the host only ever
+ * receives the resulting pixels, through the draw pixel path. This is the raster
+ * side of the security split in the design doc (section 9.2): no rendering
+ * command stream and no rasterizer cross into the trusted host.
  *
  * This translation unit uses floating point, so it is built with the FPU
  * enabled, unlike the integer-only rest of the library OS. See arch_fpu_init.
@@ -18,22 +20,44 @@
 /* A vertex in window space: x and y are pixel coordinates with the origin at
  * the top left, z is depth in 0..1 (smaller is nearer), r, g, b are color
  * components in 0..1, u, v are texture coordinates in 0..1, and a is alpha in
- * 0..1. All of these are interpolated across the triangle (gouraud for color,
- * affine for the texture coordinates, which is exact under the orthographic
- * projection this core uses). */
+ * 0..1. w is the clip-space w the projection divided x and y by; the rasterizer
+ * uses it to interpolate the texture coordinates perspective-correctly. Set w
+ * to 1 for an orthographic vertex, where the result is the same as affine.
+ * Color and alpha interpolate affinely (gouraud). */
 struct tr_vertex {
-    float x, y, z;
+    float x, y, z, w;
     float r, g, b;
     float u, v;
     float a;
 };
 
-/* A source texture: RGBA8888 texels, w*h, row-major and tightly packed. Point
- * (nearest) sampled, coordinates clamped to the edge. */
-struct tr_texture {
-    const uint8_t *texels;
-    int w, h;
+/* Texture filtering. Point takes the nearest texel; bilinear blends the four
+ * surrounding texels. With more than one mip level the two bracketing levels
+ * are each sampled this way and blended by the level-of-detail fraction
+ * (trilinear). */
+enum tr_filter {
+    TR_FILTER_POINT = 0,
+    TR_FILTER_BILINEAR,
 };
+
+/* A source texture: a mip chain of RGBA8888 images, row-major and tightly
+ * packed. level[0] is the base at (w, h); level i is level 0 halved i times,
+ * floored at 1 in each axis. nlevels is 1 for a texture with no mips.
+ * tr_build_mips fills the chain. Coordinates are clamped to the edge. */
+#define TR_MAXMIP 12
+struct tr_texture {
+    const uint8_t *level[TR_MAXMIP];
+    int w, h;                       /* base (level 0) dimensions */
+    int nlevels;
+};
+
+/* Build a mip chain for a base image by repeated 2x2 box filtering, down to
+ * 1x1. level[0] aliases `base` (not copied); levels 1.. are written into `buf`,
+ * which must hold at least (w*h*4)/3 + w*h bytes (a safe upper bound is
+ * 2*w*h*4). w and h should be powers of two for clean halving. Returns the
+ * number of levels. */
+int tr_build_mips(struct tr_texture *t, const uint8_t *base, int w, int h,
+                  uint8_t *buf, int bufcap);
 
 /* How the texture color combines with the iterated (gouraud) color, named after
  * the Glide color-combine modes this core implements. Alpha combines the same
@@ -60,6 +84,7 @@ struct tr_target {
     const struct tr_texture *tex;
     int      combine;           /* enum tr_combine */
     int      blend;             /* 0 = opaque, 1 = source-over alpha blend */
+    int      filter;            /* enum tr_filter */
 };
 
 /* Clear the color buffer to (r,g,b) and the depth buffer to the far plane. */
@@ -69,6 +94,7 @@ void tr_clear(struct tr_target *t, uint8_t r, uint8_t g, uint8_t b);
 void tr_tex_source(struct tr_target *t, const struct tr_texture *tex);
 void tr_color_combine(struct tr_target *t, int mode);
 void tr_blend(struct tr_target *t, int enable);
+void tr_tex_filter(struct tr_target *t, int filter);
 
 /* Rasterize one triangle with a less-or-equal depth test, applying the target's
  * texture, combine mode, and blend state. An opaque triangle writes depth; a
