@@ -540,9 +540,16 @@ Goal: raster content where vector does not fit.
   (`tr_clear`, `tr_triangle`). It renders entirely in the guest; the host still
   only receives pixels through the pixel path, so the section 9.2 boundary holds.
   The `triton` guest demo spins a shaded cube (incremental rotation with no
-  sin/cos routine, re-based through the pixel path each frame). This is the
-  minimal core named in the design doc, textures, combine units, and blend are
-  not included.
+  sin/cos routine, re-based through the pixel path each frame). The fuller
+  subset named in the design doc landed on top of this core: point-sampled
+  (nearest) texturing with per-vertex texture coordinates, the Glide-style
+  color-combine modes (iterated, texture/decal, modulate, add), and source-over
+  alpha blending (a blended triangle depth-tests but does not write depth). The
+  texture coordinates interpolate affinely, which is exact under the demo's
+  orthographic projection; perspective-correct texturing would add a per-pixel
+  divide and is left until a perspective projection needs it. The demo now draws
+  a checker-textured, gouraud-modulated cube behind a translucent panel, so all
+  three paths run each frame.
   Enabling it meant turning on the guest FPU, since the rasterizer uses floating
   point. The FPU is enabled per cpu at boot (`arch_fpu_init`: CR0/CR4 for SSE on
   x86-64, CPACR_EL1 for FP/SIMD on arm64). The rest of the guest stays
@@ -922,8 +929,9 @@ the wrapper) left until a need appears.
 
 Independent of the milestones above, tracked so they are not lost:
 
-- Guest rasterizer (M7.4) beyond the minimal 3D core: point-sampled texturing,
-  the Glide combine units, alpha blend, and the fuller subset.
+- Guest rasterizer (M7.4): point-sampled texturing, the Glide combine units, and
+  alpha blend landed on the minimal 3D core (see M7.4). Still beyond it:
+  perspective-correct texturing, bilinear filtering, and mip-mapping.
 - Pull transport (M8): the pack byte-range transport (fetch only the changed
   extents of a packfile), key rotation, and multi-arch bundles.
 - Display input: text and paste, which need a text-input primitive the

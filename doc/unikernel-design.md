@@ -378,8 +378,11 @@ the guest produces pixels itself and the host simply delivers them.
 
 - The guest renders into a framebuffer in its own RAM. A guest app that wants a
   3D API can link a software rasterizer for this; Triton
-  (Triton), a subset of the 3Dfx Glide 3.0 API, is a ready
-  candidate. The rasterizer runs entirely inside the guest.
+  (Triton), a subset of the 3Dfx Glide 3.0 API, is the one in tree
+  (`guest/libos/triton.c`). It rasterizes gouraud-shaded, z-buffered triangles
+  with point-sampled texturing, the Glide color-combine modes (iterated,
+  texture, modulate, add), and source-over alpha blending. The rasterizer runs
+  entirely inside the guest.
 - The framebuffer lives in a shared-memory region. The guest marks dirty
   rectangles and signals the host.
 - The host validates the region geometry (width, height, stride, and bytes per
