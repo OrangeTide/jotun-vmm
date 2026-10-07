@@ -34,4 +34,13 @@ int http_url_parse(const char *url, struct http_url *out);
  * complete response, or -1 on a transport or protocol error. */
 int http_get(const struct http_url *origin, const char *rel, struct http_buf *buf);
 
+/* GET a byte range of `rel`. With off >= 0 the range is [off, off+len); with
+ * off < 0 it is the last `len` bytes (a suffix range). The body is placed in
+ * `buf`. A range-honouring server replies 206; when total_out is non-NULL it
+ * receives the resource's full size from the Content-Range header (or -1 if the
+ * server did not send one, e.g. it answered 200 with the whole body). Returns
+ * the HTTP status code, or -1 on a transport or protocol error. */
+int http_get_range(const struct http_url *origin, const char *rel, long off,
+                   long len, struct http_buf *buf, long *total_out);
+
 #endif /* HTTP_H */

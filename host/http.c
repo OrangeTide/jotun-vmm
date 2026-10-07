@@ -194,12 +194,19 @@ dechunk(const char *p, const char *end, struct http_buf *buf)
     return 0;
 }
 
-int
-http_get(const struct http_url *origin, const char *rel, struct http_buf *buf)
+/* Issue one GET, optionally with a Range header (range may be "" for none), and
+ * return the status code with the body in buf. When total_out is non-NULL and
+ * the response carries a Content-Range, *total_out receives the resource's full
+ * size. */
+static int
+do_get(const struct http_url *origin, const char *rel, const char *range,
+       struct http_buf *buf, long *total_out)
 {
     buf->len = 0;
     if (buf->data)
         buf->data[0] = '\0';
+    if (total_out)
+        *total_out = -1;
 
     int fd = dial(origin->host, origin->port);
     if (fd < 0)
@@ -208,8 +215,8 @@ http_get(const struct http_url *origin, const char *rel, struct http_buf *buf)
     char req[2048];
     int n = snprintf(req, sizeof req,
                      "GET %s/%s HTTP/1.1\r\nHost: %s\r\n"
-                     "User-Agent: jotun/0\r\nConnection: close\r\n\r\n",
-                     origin->path, rel, origin->host);
+                     "User-Agent: jotun/0\r\n%sConnection: close\r\n\r\n",
+                     origin->path, rel, origin->host, range);
     if (n <= 0 || n >= (int)sizeof req || send_all(fd, req, (size_t)n) < 0) {
         close(fd);
         return -1;
@@ -248,7 +255,8 @@ http_get(const struct http_url *origin, const char *rel, struct http_buf *buf)
     const char *body = split + 4;
     const char *end = raw.data + raw.len;
 
-    /* Detect chunked transfer in the header block. */
+    /* Detect chunked transfer, and read the full resource size off a
+     * Content-Range ("bytes START-END/TOTAL") when the caller wants it. */
     int chunked = 0;
     for (const char *h = raw.data; h < split; ) {
         const char *nl = memchr(h, '\n', (size_t)(split - h));
@@ -256,6 +264,12 @@ http_get(const struct http_url *origin, const char *rel, struct http_buf *buf)
         if (linelen >= 17 && strncasecmp(h, "transfer-encoding", 17) == 0
             && memmem(h, linelen, "chunked", 7))
             chunked = 1;
+        if (total_out && linelen >= 13
+            && strncasecmp(h, "content-range", 13) == 0) {
+            const char *slash = memchr(h, '/', linelen);
+            if (slash)
+                *total_out = strtol(slash + 1, NULL, 10);
+        }
         if (!nl)
             break;
         h = nl + 1;
@@ -269,4 +283,23 @@ http_get(const struct http_url *origin, const char *rel, struct http_buf *buf)
 
     http_buf_free(&raw);
     return rc == 0 ? code : -1;
+}
+
+int
+http_get(const struct http_url *origin, const char *rel, struct http_buf *buf)
+{
+    return do_get(origin, rel, "", buf, NULL);
+}
+
+int
+http_get_range(const struct http_url *origin, const char *rel, long off,
+               long len, struct http_buf *buf, long *total_out)
+{
+    char range[64];
+    if (off < 0)                        /* suffix: the last `len` bytes */
+        snprintf(range, sizeof range, "Range: bytes=-%ld\r\n", len);
+    else
+        snprintf(range, sizeof range, "Range: bytes=%ld-%ld\r\n",
+                 off, off + len - 1);
+    return do_get(origin, rel, range, buf, total_out);
 }
