@@ -979,8 +979,16 @@ What landed:
   in-host source port, so a receiver can always reply. Delivery is a bounded
   per-endpoint datagram queue woken through the usual event path, and an
   over-full queue or an unbound target drops the datagram, matching UDP.
+- Policy over inter-guest links. The manifest "net allow <who> ..." rule now
+  takes a co-running guest's name in the <who> field, beside a CIDR or "*", so
+  one rule set gates a guest's whole outbound reach. Like external dialing it is
+  default-allow: with no rules a guest reaches any peer; with rules, a by-name
+  dial or datagram must match a name rule or "*". A CIDR rule authorises only
+  external addresses and a name rule only that guest, so external and in-host
+  targets never authorise each other. What a guest may offer in-host is not
+  gated, keeping the flat trust model.
 
-Deferred: policy over inter-guest links and rate limits.
+Deferred: rate limits.
 
 ## Cross-cutting concerns
 

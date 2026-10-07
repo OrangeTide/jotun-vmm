@@ -324,8 +324,18 @@ ephemeral in-host source port, the way a kernel UDP socket auto-binds on its
 first send, so the receiver can always reply. In-host delivery is a small
 bounded per-endpoint queue drained by recvfrom and woken through the usual event
 path; a datagram to an unbound name, or to an endpoint whose queue is full, is
-dropped, as UDP is lossy. Policy over inter-guest links and rate limits are not
-yet implemented.
+dropped, as UDP is lossy.
+
+Network policy gates a guest's outbound reach uniformly. A manifest rule, `net
+allow <who> <ports> [proto]`, takes `<who>` as an IPv4 CIDR (matched against the
+resolved address of an external target), a co-running guest's name, or `*` for
+any target. With no rules a guest may reach anywhere; with rules the default
+flips to deny, and an external dial, a by-name dial, or a by-name datagram must
+match a rule. A CIDR rule authorises only external addresses and a name rule
+only that one guest, so external and in-host targets cannot authorise each
+other. The rules gate reach, not what a guest offers in-host, which keeps the
+flat trust model; external binding stays separately opt-in and default-deny.
+Rate limits are not yet implemented.
 
 ## 9. Display subsystem
 
