@@ -97,6 +97,9 @@ child draw port, default 9300), `JOTUN_BROKER_MAX` (concurrent sessions, default
 idle session is reclaimed, default 300), and `JOTUN_BROKER_GUEST` (the guest to
 run, default `webterm`). Each child also runs under `setrlimit` caps on address
 space, CPU time, and open files. A broker shutdown (Ctrl-C) kills every child.
+Sending brokerd `SIGUSR1` (`kill -USR1 <pid>`) dumps the live session table
+(user, pid, port, and idle age) to its stderr, for debugging admission and
+quotas without exposing a network surface.
 
 `make broker-smoke` checks this headless: it starts brokerd, opens two
 independent sessions, types a different token into each webterm, and asserts each

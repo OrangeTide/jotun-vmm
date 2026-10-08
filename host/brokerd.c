@@ -52,6 +52,7 @@ static struct session sess[SESS_MAX];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int sigchld_pipe[2];
 static volatile sig_atomic_t quitting;
+static volatile sig_atomic_t dump_req;  /* SIGUSR1: dump the session table */
 
 /* Configuration, resolved once at startup from the environment. */
 static const char *cfg_jotun;
@@ -619,6 +620,36 @@ on_quit(int sig)
     quitting = 1;
 }
 
+static void
+on_usr1(int sig)
+{
+    (void)sig;
+    dump_req = 1;                       /* the loop dumps; the handler must not */
+}
+
+/* Print the live session table to stderr, for debugging admission and quotas
+ * without a network surface. Triggered by SIGUSR1 (`kill -USR1 <brokerd pid>`),
+ * but run from the main loop, not the handler, since it locks and uses stdio. */
+static void
+dump_sessions(void)
+{
+    time_t now = time(NULL);
+    pthread_mutex_lock(&lock);
+    int n = 0;
+    fprintf(stderr, "[broker] session table:\n");
+    for (int i = 0; i < SESS_MAX; i++) {
+        if (!sess[i].inuse)
+            continue;
+        fprintf(stderr, "  user=%-16s pid=%-7d port=%-5d idle=%lds\n",
+                sess[i].user[0] ? sess[i].user : "-", (int)sess[i].pid,
+                sess[i].port, (long)(now - sess[i].last_active));
+        n++;
+    }
+    fprintf(stderr, "[broker] %d session(s), max=%d, per-user default=%d\n",
+            n, cfg_max, cfg_user_max);
+    pthread_mutex_unlock(&lock);
+}
+
 /* Kill every live child so a shutdown orphans nothing. */
 static void
 kill_all_children(void)
@@ -679,6 +710,9 @@ main(void)
     sq.sa_handler = on_quit;              /* no SA_RESTART: break the poll */
     sigaction(SIGINT, &sq, NULL);
     sigaction(SIGTERM, &sq, NULL);
+    struct sigaction su = { 0 };
+    su.sa_handler = on_usr1;              /* no SA_RESTART: break the poll */
+    sigaction(SIGUSR1, &su, NULL);
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) {
@@ -716,6 +750,10 @@ main(void)
         }
         if (quitting)
             break;
+        if (dump_req) {
+            dump_req = 0;
+            dump_sessions();
+        }
         if (fds[1].revents & POLLIN) {
             char drain[64];
             while (read(sigchld_pipe[0], drain, sizeof drain) > 0)
