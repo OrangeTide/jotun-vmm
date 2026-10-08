@@ -74,7 +74,7 @@ else
         GUEST_SRC = guest/test_guest_x86.c
         LIBOS_ARCH = guest/libos/arch/x86_64.c guest/libos/arch/x86_64_ctx.S \
             guest/libos/arch/x86_64_isr.S guest/libos/arch/x86_64_boot.S \
-            guest/libos/arch/x86_64_linuxsys.S
+            guest/libos/arch/x86_64_linuxsys.S guest/libos/arch/x86_64_fault.S
         GUEST_CC = $(CC)
         GUEST_TEXT = 0x100000
     endif
@@ -236,7 +236,7 @@ AFLAGS_x86_64  :=
 AFLAGS_aarch64 := -mno-outline-atomics
 ASRC_x86_64  := guest/libos/arch/x86_64.c guest/libos/arch/x86_64_ctx.S \
     guest/libos/arch/x86_64_isr.S guest/libos/arch/x86_64_boot.S \
-    guest/libos/arch/x86_64_linuxsys.S
+    guest/libos/arch/x86_64_linuxsys.S guest/libos/arch/x86_64_fault.S
 ASRC_aarch64 := guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
     guest/libos/arch/arm64_boot.S
 

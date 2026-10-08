@@ -3,6 +3,7 @@
  * The host runs this guest in long mode and emulates a 16550 UART on COM1, so
  * the console is port I/O. Halt is HLT, which the host sees as a HLT exit. */
 #include "arch.h"
+#include "print.h"
 
 #include <stdint.h>
 
@@ -90,6 +91,79 @@ struct desc_ptr {
 
 extern void isr_event(void);        /* arch/x86_64_isr.S */
 
+/* The 32 CPU-exception stub entry points, from arch/x86_64_fault.S. */
+extern void (*exc_stub_table[32])(void);
+
+/* The register and trap frame fault_report receives, matching the push order
+ * in exc_common (GP registers first, then the vector and error code the stub
+ * added, then the CPU's own trap frame). */
+struct faultframe {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    uint64_t vec, err;
+    uint64_t rip, cs, rflags, rsp, ss;
+};
+
+static const char *const exc_names[32] = {
+    "#DE divide error", "#DB debug", "NMI", "#BP breakpoint",
+    "#OF overflow", "#BR bound range", "#UD invalid opcode",
+    "#NM device not available", "#DF double fault", "coprocessor overrun",
+    "#TS invalid TSS", "#NP segment not present", "#SS stack fault",
+    "#GP general protection", "#PF page fault", "reserved",
+    "#MF x87 fp", "#AC alignment check", "#MC machine check",
+    "#XM SIMD fp", "#VE virtualization", "#CP control protection",
+    "reserved", "reserved", "reserved", "reserved", "reserved", "reserved",
+    "#HV hypervisor", "#VC vmm communication", "#SX security", "reserved",
+};
+
+/* Print the fault and halt. Entered only on a CPU exception, which a healthy
+ * guest never takes; it exists so a foreign Linux binary that faults leaves a
+ * readable trail instead of a silent triple fault. */
+void
+fault_report(struct faultframe *f)
+{
+    uint64_t cr2;
+    __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+
+    con_puts("\n*** CPU exception ");
+    con_putu(f->vec);
+    if (f->vec < 32) {
+        con_puts(" (");
+        con_puts(exc_names[f->vec]);
+        con_puts(")");
+    }
+    con_puts(" ***\n  err=");
+    con_puthex(f->err);
+    con_puts(" rip=");
+    con_puthex(f->rip);
+    con_puts(" cs=");
+    con_puthex(f->cs);
+    con_puts(" rflags=");
+    con_puthex(f->rflags);
+    con_puts("\n  rsp=");
+    con_puthex(f->rsp);
+    con_puts(" rbp=");
+    con_puthex(f->rbp);
+    con_puts(" cr2=");
+    con_puthex(cr2);
+    con_puts("\n  rax=");
+    con_puthex(f->rax);
+    con_puts(" rbx=");
+    con_puthex(f->rbx);
+    con_puts(" rcx=");
+    con_puthex(f->rcx);
+    con_puts(" rdx=");
+    con_puthex(f->rdx);
+    con_puts("\n  rsi=");
+    con_puthex(f->rsi);
+    con_puts(" rdi=");
+    con_puthex(f->rdi);
+    con_puts("\nhalted\n");
+
+    for (;;)
+        __asm__ volatile ("cli; hlt");
+}
+
 static void
 idt_set(int vec, void (*handler)(void))
 {
@@ -108,6 +182,11 @@ arch_traps_init(void)
 {
     struct desc_ptr gp = { sizeof gdt - 1, (uint64_t)(uintptr_t)gdt };
     __asm__ volatile ("lgdt %0" : : "m"(gp));
+
+    /* CPU exception vectors first, so a fault during bring-up is reported
+     * rather than escalating to a silent triple fault. */
+    for (int v = 0; v < 32; v++)
+        idt_set(v, exc_stub_table[v]);
 
     idt_set(0x20, isr_event);       /* JOTUN_EVENT_VECTOR */
     struct desc_ptr ip = { sizeof idt - 1, (uint64_t)(uintptr_t)idt };
