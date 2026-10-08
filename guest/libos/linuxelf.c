@@ -38,6 +38,7 @@
 #define SYS_fstat           5
 #define SYS_lstat           6
 #define SYS_lseek           8
+#define SYS_pipe            22
 #define SYS_ioctl           16
 #define SYS_writev          20
 #define SYS_dup             32
@@ -54,6 +55,7 @@
 #define SYS_readlinkat      267
 #define SYS_set_robust_list 273
 #define SYS_dup3            292
+#define SYS_pipe2           293
 #define SYS_rseq            334
 
 #define ARCH_SET_FS 0x1002
@@ -190,17 +192,35 @@ struct linux_dirent64 {
     char     d_name[];
 };
 
-#define LINUX_NFD 32
+#define LINUX_NFD   32
+#define LINUX_NPIPE 4
+#define PIPE_CAP    4096
 
 struct lfd {
     int      used;
     int      isdir;
+    int      ispipe;            /* this fd is a pipe end */
+    int      pidx;              /* pipe pool index when ispipe */
+    int      wr;                /* pipe write end when set, else read end */
     uint32_t p9fid;             /* backing 9P fid, 0 for the console fds */
     uint64_t pos;               /* read cursor (file) or 9P dir offset */
     uint64_t size;
 };
 
+/* A unidirectional in-memory pipe: a byte ring with a reader and writer end
+ * count. Single-threaded and non-blocking, which is enough for a program that
+ * writes then reads; a read on an empty pipe returns 0 (end of data). */
+struct lpipe {
+    int      used;
+    int      readers;
+    int      writers;
+    uint32_t head;              /* next byte to read */
+    uint32_t count;             /* bytes buffered */
+    uint8_t  buf[PIPE_CAP];
+};
+
 static struct lfd fds[LINUX_NFD];
+static struct lpipe pipes[LINUX_NPIPE];
 
 /* A reference count per backing 9P fid, indexed by (p9fid - LINUX_FID_BASE),
  * so dup can share a fid and it is clunked only when the last fd closes. */
@@ -229,7 +249,77 @@ fds_init(void)
 {
     memset(fds, 0, sizeof fds);
     memset(fidref, 0, sizeof fidref);
+    memset(pipes, 0, sizeof pipes);
     fds[0].used = fds[1].used = fds[2].used = 1;    /* stdin/out/err */
+}
+
+/* Create a pipe: a reader fd in pfd[0] and a writer fd in pfd[1]. */
+static long
+do_pipe2(int *pfd)
+{
+    int pidx = -1;
+    for (int i = 0; i < LINUX_NPIPE; i++)
+        if (!pipes[i].used) {
+            pidx = i;
+            break;
+        }
+    if (pidx < 0)
+        return -LERR_NOMEM;
+
+    int rfd = fd_alloc();
+    if (rfd < 0)
+        return -LERR_NOMEM;
+    fds[rfd].used = 1;                   /* reserve so the writer gets a new slot */
+    int wfd = fd_alloc();
+    if (wfd < 0) {
+        fds[rfd].used = 0;
+        return -LERR_NOMEM;
+    }
+
+    memset(&pipes[pidx], 0, sizeof pipes[pidx]);
+    pipes[pidx].used = 1;
+    pipes[pidx].readers = 1;
+    pipes[pidx].writers = 1;
+
+    memset(&fds[rfd], 0, sizeof fds[rfd]);
+    memset(&fds[wfd], 0, sizeof fds[wfd]);
+    fds[rfd].used = fds[wfd].used = 1;
+    fds[rfd].ispipe = fds[wfd].ispipe = 1;
+    fds[rfd].pidx = fds[wfd].pidx = pidx;
+    fds[rfd].wr = 0;
+    fds[wfd].wr = 1;
+
+    pfd[0] = rfd;
+    pfd[1] = wfd;
+    return 0;
+}
+
+static long
+pipe_read(struct lpipe *p, void *buf, unsigned long count)
+{
+    uint8_t *out = buf;
+    unsigned long n = 0;
+
+    while (n < count && p->count > 0) {
+        out[n++] = p->buf[p->head];
+        p->head = (p->head + 1) % PIPE_CAP;
+        p->count--;
+    }
+    return (long)n;                     /* 0 when empty: no blocking here */
+}
+
+static long
+pipe_write(struct lpipe *p, const void *buf, unsigned long count)
+{
+    const uint8_t *in = buf;
+    unsigned long n = 0;
+
+    while (n < count && p->count < PIPE_CAP) {
+        uint32_t tail = (p->head + p->count) % PIPE_CAP;
+        p->buf[tail] = in[n++];
+        p->count++;
+    }
+    return (long)n;                     /* short write when the ring fills */
 }
 
 /* Strip leading slashes: bundle paths are relative to the 9P root, and musl
@@ -245,11 +335,16 @@ bundle_path(const char *p)
 static long
 do_write(long fd, const char *buf, unsigned long len)
 {
-    if (fd != 1 && fd != 2)
-        return -LERR_BADF;              /* the bundle is read-only */
-    for (unsigned long i = 0; i < len; i++)
-        con_putc(buf[i]);
-    return (long)len;
+    struct lfd *f = fd_get(fd);
+
+    if (fd == 1 || fd == 2) {           /* console */
+        for (unsigned long i = 0; i < len; i++)
+            con_putc(buf[i]);
+        return (long)len;
+    }
+    if (f && f->ispipe && f->wr)
+        return pipe_write(&pipes[f->pidx], buf, len);
+    return -LERR_BADF;                  /* the bundle is read-only */
 }
 
 static long
@@ -316,6 +411,8 @@ do_read(long fd, void *buf, unsigned long count)
 
     if (!f || fd < 3)
         return -LERR_BADF;              /* no stdin source */
+    if (f->ispipe)
+        return f->wr ? -LERR_BADF : pipe_read(&pipes[f->pidx], buf, count);
     if (f->isdir)
         return -LERR_INVAL;
     long n = p9_read(f->p9fid, f->pos, buf, (uint32_t)count);
@@ -334,6 +431,17 @@ do_close(long fd)
         return -LERR_BADF;
     if (fd < 3)
         return 0;                       /* keep the console open */
+    if (f->ispipe) {
+        struct lpipe *p = &pipes[f->pidx];
+        if (f->wr && p->writers > 0)
+            p->writers--;
+        else if (!f->wr && p->readers > 0)
+            p->readers--;
+        if (p->readers == 0 && p->writers == 0)
+            p->used = 0;
+        f->used = 0;
+        return 0;
+    }
     uint32_t slot = f->p9fid - LINUX_FID_BASE;
     if (fidref[slot] && --fidref[slot] == 0)
         p9_clunk(f->p9fid);             /* last reference: release the fid */
@@ -495,6 +603,10 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_fstat(a1, (struct linux_stat *)a2);
     case SYS_getdents64:
         return do_getdents64(a1, (void *)a2, (unsigned long)a3);
+    case SYS_pipe:
+        return do_pipe2((int *)a1);
+    case SYS_pipe2:
+        return do_pipe2((int *)a1);     /* flags (O_CLOEXEC/O_NONBLOCK) ignored */
     case SYS_dup: {
         struct lfd *f = fd_get(a1);
         if (!f || a1 < 3)
