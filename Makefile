@@ -425,9 +425,20 @@ build/fmttest: tools/fmttest.c build/host_fmt.o build/host_fmtfloat.o | build
 fmt-test: build/fmttest
 	./build/fmttest
 
+## Broker control-channel ABI check (M15.2 step two, defined ahead of wiring).
+## Drives the host-side mock (host/brokerctl.c) over the shared struct the way a
+## broker guest would: spawn/bind/destroy and lifecycle-event draining, with the
+## quota and error paths. A pure host unit test, no VM.
+build/brokerctl.o: host/brokerctl.c host/brokerctl.h abi/jotun_broker.h | build
+	$(CC) $(CFLAGS) -Ihost -c -o $@ $<
+build/brokerctltest: tools/brokerctltest.c build/brokerctl.o host/brokerctl.h abi/jotun_broker.h | build
+	$(CC) $(CFLAGS) -Ihost -o $@ tools/brokerctltest.c build/brokerctl.o
+brokerctl-test: build/brokerctltest
+	./build/brokerctltest
+
 clean:
 	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool jbundle \
 	    brokerd authd jmint
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke
+.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test
