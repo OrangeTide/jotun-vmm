@@ -400,6 +400,17 @@ build/authsmoke: tools/authsmoke.c | build
 auth-smoke: brokerd authd jmint $(TARGET) libos.elf build/authsmoke
 	./build/authsmoke ./brokerd ./authd ./jmint ./$(TARGET) $(BUNDLE_DEPOT)
 
+## End-to-end auth check through Caddy: runs brokerd + authd + Caddy with
+## example/web/Caddyfile-auth and drives the real forward_auth chain with curl
+## (no token 401, bearer 302, /login sets the cookie, cookie 302, bad token 401),
+## so it guards the Caddyfile wiring that auth-smoke only simulates. Needs caddy
+## and curl on the PATH and a bundle.
+build/cauthsmoke: tools/cauthsmoke.c | build
+	$(CC) $(CFLAGS) -o $@ $<
+caddy-auth-smoke: brokerd authd jmint $(TARGET) libos.elf build/cauthsmoke
+	./build/cauthsmoke ./brokerd ./authd ./jmint ./$(TARGET) $(BUNDLE_DEPOT) \
+	    example/web/Caddyfile-auth
+
 ## Host check of the guest format engine against literal expectations. The
 ## formatter is portable C, so it is built for the host with snprintf renamed to
 ## jsnprintf (so it sits beside the host libc) and checked byte for byte.
@@ -419,4 +430,4 @@ clean:
 	    brokerd authd jmint
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke
+.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke
