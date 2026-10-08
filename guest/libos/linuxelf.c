@@ -16,11 +16,12 @@
 
 #if defined(__x86_64__)
 
+#include "boot.h"
 #include "elfload.h"
 #include "ns.h"
 #include "p9.h"
 #include "string.h"
-#include "jotun_svc.h"       /* JOTUN_PROG_BASE / JOTUN_PROG_SIZE */
+#include "jotun_svc.h"       /* JOTUN_PROG_BASE */
 
 #include <stdint.h>
 
@@ -29,11 +30,30 @@
 #define LINUX_FID      12u
 #define LINUX_FID_BASE 32u          /* open files use fids 32..32+LINUX_NFD */
 
+/* The Linux program's address space, independent of the native program window.
+ * A static non-PIE binary is linked at 0x400000; the load window runs to 8 MiB,
+ * which holds a 2 MiB-ish glibc image. Above that is the heap: brk grows up from
+ * LINUX_HEAP_BASE and anonymous mmap grows down from the top of RAM, less a
+ * reservation that matches the host's per-vcpu stacks (MAX_VCPUS * STACK_SLOT =
+ * 8 * 512 KiB in host/main.c). They meet in the middle and fail there. */
+#define LINUX_PROG_BASE    0x400000ULL
+#define LINUX_PROG_LIMIT   0x800000ULL
+#define LINUX_HEAP_BASE    0x800000ULL
+#define LINUX_STACK_RESERVE 0x400000ULL
+#define PAGE_SIZE          0x1000ULL
+
+/* mmap flags and failure value. */
+#define MAP_ANONYMOUS 0x20
+#define MMAP_FAILED   (-LERR_NOMEM)
+
 /* Linux syscall numbers (x86-64) we recognise. */
 #define SYS_read            0
 #define SYS_write           1
 #define SYS_open            2
 #define SYS_close           3
+#define SYS_mmap            9
+#define SYS_munmap          11
+#define SYS_brk             12
 #define SYS_stat            4
 #define SYS_fstat           5
 #define SYS_lstat           6
@@ -45,6 +65,11 @@
 #define SYS_dup2            33
 #define SYS_fcntl           72
 #define SYS_getcwd          79
+#define SYS_getuid          102
+#define SYS_getgid          104
+#define SYS_geteuid         107
+#define SYS_getegid         108
+#define SYS_prctl           157
 #define SYS_exit            60
 #define SYS_mprotect        10
 #define SYS_clock_gettime   228
@@ -226,6 +251,51 @@ struct lpipe {
 static struct lfd fds[LINUX_NFD];
 static struct lpipe pipes[LINUX_NPIPE];
 
+/* The program heap arena. brk_cur grows up from LINUX_HEAP_BASE; mmap_cur grows
+ * down from mmap_top (set from RAM size at startup). A bump allocator: munmap
+ * does not reclaim, which is fine for a program that runs once and exits. */
+static uint64_t brk_cur;
+static uint64_t mmap_cur;
+static uint64_t mmap_top;
+
+static void
+arena_init(void)
+{
+    uint64_t ram = boot_ram_size();
+
+    brk_cur = LINUX_HEAP_BASE;
+    if (ram > LINUX_STACK_RESERVE + LINUX_HEAP_BASE)
+        mmap_top = (ram - LINUX_STACK_RESERVE) & ~(PAGE_SIZE - 1);
+    else
+        mmap_top = LINUX_HEAP_BASE;     /* no arena: allocations will fail */
+    mmap_cur = mmap_top;
+}
+
+static long
+do_brk(uint64_t want)
+{
+    if (want == 0)
+        return (long)brk_cur;
+    if (want < LINUX_HEAP_BASE || want > mmap_cur)
+        return (long)brk_cur;           /* refuse; caller falls back to mmap */
+    brk_cur = want;
+    return (long)brk_cur;
+}
+
+static long
+do_mmap(uint64_t addr, uint64_t len, uint64_t flags, long fd)
+{
+    (void)addr;
+    if (!(flags & MAP_ANONYMOUS) && fd >= 0)
+        return MMAP_FAILED;             /* file-backed mmap unsupported */
+    uint64_t n = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (n == 0 || mmap_cur - n < brk_cur)
+        return MMAP_FAILED;
+    mmap_cur -= n;
+    memset((void *)(uintptr_t)mmap_cur, 0, n);  /* anonymous memory reads as zero */
+    return (long)mmap_cur;
+}
+
 /* A reference count per backing 9P fid, indexed by (p9fid - LINUX_FID_BASE),
  * so dup can share a fid and it is clunked only when the last fd closes. */
 static uint8_t fidref[LINUX_NFD];
@@ -246,6 +316,24 @@ fd_alloc(void)
         if (!fds[i].used)
             return i;
     return -1;
+}
+
+/* Copy src into fd slot dst, taking a reference on whatever backs it so a later
+ * close releases it exactly once. Used by dup/dup2/dup3. */
+static void
+clone_fd(int dst, struct lfd *src)
+{
+    fds[dst] = *src;
+    fds[dst].used = 1;
+    if (src->ispipe) {
+        struct lpipe *p = &pipes[src->pidx];
+        if (src->wr)
+            p->writers++;
+        else
+            p->readers++;
+    } else {
+        fidref[src->p9fid - LINUX_FID_BASE]++;
+    }
 }
 
 static void
@@ -580,6 +668,12 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return 0;                       /* accept and ignore */
     case SYS_mprotect:
         return 0;                       /* flat RW map, nothing to enforce */
+    case SYS_brk:
+        return do_brk((uint64_t)a1);
+    case SYS_mmap:
+        return do_mmap((uint64_t)a1, (uint64_t)a2, (uint64_t)a4, a5);
+    case SYS_munmap:
+        return 0;                       /* bump arena: no reclaim */
     case SYS_clock_gettime: {
         /* No real clock: synthesise a monotonic time from the cycle counter,
          * assuming roughly 1 GHz. Good enough to keep libc startup happy. */
@@ -653,10 +747,30 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         int nfd = fd_alloc();
         if (nfd < 0)
             return -LERR_NOMEM;
-        fds[nfd] = *f;                  /* shares the backing 9P fid */
-        fidref[f->p9fid - LINUX_FID_BASE]++;
+        clone_fd(nfd, f);
         return nfd;
     }
+    case SYS_dup2:
+    case SYS_dup3: {
+        struct lfd *f = fd_get(a1);
+        if (!f || a1 < 3)
+            return -LERR_BADF;
+        if (a2 < 0 || a2 >= LINUX_NFD || a2 < 3)
+            return -LERR_BADF;
+        if (a1 == a2)
+            return (nr == SYS_dup3) ? -LERR_INVAL : a2;
+        if (fds[a2].used)
+            do_close(a2);
+        clone_fd((int)a2, f);
+        return a2;
+    }
+    case SYS_getuid:
+    case SYS_geteuid:
+    case SYS_getgid:
+    case SYS_getegid:
+        return 0;                       /* a single root-ish identity */
+    case SYS_prctl:
+        return 0;                       /* accept and ignore */
     case SYS_getcwd: {
         char *ubuf = (char *)a1;
         if (a2 < 2)
@@ -754,8 +868,7 @@ linux_elf_run(const char *file)
         con_puts("[bin] open failed\n");
         return;
     }
-    uint64_t entry = elf_load_fid(LINUX_FID, JOTUN_PROG_BASE,
-                                  JOTUN_PROG_BASE + JOTUN_PROG_SIZE);
+    uint64_t entry = elf_load_fid(LINUX_FID, LINUX_PROG_BASE, LINUX_PROG_LIMIT);
     p9_clunk(LINUX_FID);
     if (entry == 0) {
         con_puts("[bin] load failed (not ET_EXEC at 0x400000?)\n");
@@ -766,6 +879,7 @@ linux_elf_run(const char *file)
     con_putc('\n');
 
     fds_init();
+    arena_init();
     syscall_arm();
     con_puts("[bin] syscall armed\n");
     uint64_t rsp = build_stack(file);

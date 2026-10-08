@@ -40,9 +40,11 @@
 /* The path a bootable kernel is lifted from inside an image's arch root. */
 #define JOTUN_KERNEL_PATH "boot/kernel"
 
-/* Guest physical RAM mapped at address 0. 8 MiB is ample for the test guest
- * plus per-vcpu stacks. */
-#define GUEST_RAM_SIZE (8u * 1024 * 1024)
+/* Guest physical RAM mapped at address 0. 8 MiB is ample for the native demo
+ * guests, but a Linux binary-compat guest (M16) needs a real heap for the
+ * foreign program's malloc arenas, so the floor is higher. 32 MiB leaves ~20
+ * MiB of mmap/brk arena above the program window and below the vcpu stacks. */
+#define GUEST_RAM_SIZE (32u * 1024 * 1024)
 
 /* Each vcpu gets its own 512 KiB stack, carved from the top of RAM downward, so
  * vcpus sharing one guest image do not clobber each other's stacks. */
