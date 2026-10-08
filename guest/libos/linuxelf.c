@@ -89,6 +89,10 @@
 #define SYS_rt_sigprocmask  14
 #define SYS_gettid          186
 #define SYS_uname           63
+#define SYS_futex           202
+#define SYS_sched_yield     24
+#define SYS_tgkill          234
+#define SYS_madvise         28
 #define SYS_mprotect        10
 #define SYS_time            201
 #define SYS_clock_gettime   228
@@ -305,6 +309,28 @@ static struct lpipe pipes[LINUX_NPIPE];
  * SYSCALL assembly saves the user registers here on entry and restores them on
  * return, and fork copies the frame into the child so it resumes at the same
  * instruction with rax = 0. The checks below catch any layout drift. */
+/* Process state shared by the threads of one process: the address space, file
+ * table, and heap arena. fork makes a new one (a private copy); a thread
+ * (clone with CLONE_VM) shares its parent's by pointer. refs counts the live
+ * threads holding it; the address space and files are freed when refs hits 0. */
+struct lshared {
+    int      used;
+    int      refs;              /* live threads sharing this process */
+    vmspace_t vmspace;
+    int      pid;
+    int      parent;            /* pid of the parent, or 0 for the first process */
+    int      main_task;         /* libOS task of the main thread, for wait4 reap */
+    int      exited;            /* the process has terminated; status is set */
+    long     exit_status;
+    struct lfd fdtab[LINUX_NFD];
+    /* The heap arena. heap_brk grows up from LINUX_HEAP_BASE; heap_mmap grows
+     * down from heap_mmaptop. A bump allocator; munmap does not reclaim. */
+    uint64_t heap_brk, heap_mmap, heap_mmaptop;
+};
+
+/* A thread: one schedulable context. Its trapframe is first so the SYSCALL
+ * assembly reaches it by the TF_* offsets (checked below), with lproc_cur the
+ * running thread. Everything it shares with its peers lives in sh. */
 struct lproc {
     uint64_t tf_rax;        /* 0 */
     uint64_t tf_rbx;        /* 8 */
@@ -322,22 +348,18 @@ struct lproc {
     uint64_t tf_r14;        /* 104 */
     uint64_t tf_r15;        /* 112 */
     uint64_t tf_rsp;        /* 120 user rsp */
-    uint64_t kstack_top;    /* 128 top of the per-process syscall handler stack */
+    uint64_t kstack_top;    /* 128 top of the per-thread syscall handler stack */
     /* --- fields below are never touched by the assembly --- */
-    vmspace_t vmspace;
+    struct lshared *sh;     /* the process this thread belongs to */
     unsigned char *kstack;  /* kmalloc base of the handler stack */
     int used;
-    int pid;
-    int parent;             /* pid of the parent, or 0 for the first process */
-    int task_id;            /* libOS task running this process */
+    int tid;                /* thread id; for the main thread, equals sh->pid */
+    int ismain;             /* the process's first thread */
+    int task_id;            /* libOS task running this thread */
     int exited;
     long exit_status;
     uint64_t fs_base;       /* FS base MSR (TLS), restored on a context switch */
-    struct lfd fdtab[LINUX_NFD];
-    /* The heap arena. heap_brk grows up from LINUX_HEAP_BASE; heap_mmap grows
-     * down from heap_mmaptop. A bump allocator; munmap does not reclaim. The
-     * helpers reach these through the fds/brk_cur/mmap_* macros below. */
-    uint64_t heap_brk, heap_mmap, heap_mmaptop;
+    uint64_t clear_ctid;    /* CLONE_CHILD_CLEARTID: zero + futex-wake on exit */
 };
 
 _Static_assert(__builtin_offsetof(struct lproc, tf_rax) == 0, "TF_RAX");
@@ -346,20 +368,19 @@ _Static_assert(__builtin_offsetof(struct lproc, tf_r15) == 112, "TF_R15");
 _Static_assert(__builtin_offsetof(struct lproc, tf_rsp) == 120, "TF_RSP");
 _Static_assert(__builtin_offsetof(struct lproc, kstack_top) == 128, "TF_KSTACK");
 
+static struct lshared shareds[LINUX_NPROC];
 static struct lproc procs[LINUX_NPROC];
 
-/* The running process. Set by the resume hook before the scheduler runs a
- * process task, and read by the assembly as lproc_cur. All the do_* syscall
- * helpers reach their file table and arena through it. */
+/* The running thread. Set by the resume hook before the scheduler runs a thread
+ * task, and read by the assembly as lproc_cur. All the do_* syscall helpers
+ * reach their file table and arena through it. */
 struct lproc *lproc_cur;
 
-/* Reach the running process's state by the bare names the helpers already use.
- * The struct members are spelled differently so that explicit member access
- * elsewhere (child->fdtab, parent->heap_brk) does not trip these macros. */
-#define fds       (lproc_cur->fdtab)
-#define brk_cur   (lproc_cur->heap_brk)
-#define mmap_cur  (lproc_cur->heap_mmap)
-#define mmap_top  (lproc_cur->heap_mmaptop)
+/* Reach the running process's shared state by the bare names the helpers use. */
+#define fds       (lproc_cur->sh->fdtab)
+#define brk_cur   (lproc_cur->sh->heap_brk)
+#define mmap_cur  (lproc_cur->sh->heap_mmap)
+#define mmap_top  (lproc_cur->sh->heap_mmaptop)
 
 static long do_execve(const char *path, const char *const *argv,
                       const char *const *envp);
@@ -464,7 +485,7 @@ clone_fd(int dst, struct lfd *src)
 static void
 fds_init(void)
 {
-    memset(fds, 0, sizeof(lproc_cur->fdtab));
+    memset(fds, 0, sizeof(lproc_cur->sh->fdtab));
     for (int i = 0; i < 3; i++)                     /* stdin/out/err: console */
         fds[i].used = fds[i].iscon = 1;
 }
@@ -1031,26 +1052,71 @@ do_getdents64(long fd, void *buf, unsigned long count)
  * syscall blocks (on a pipe, or in wait4).
  ****************************************************************/
 
-/* The task function for a forked child. Its trapframe was copied from the
- * parent with rax = 0, so it resumes right after fork(), returning 0. */
+/* clone flags we care about. */
+#define CLONE_CHILD_CLEARTID 0x00200000u
+#define CLONE_CHILD_SETTID   0x01000000u
+#define CLONE_PARENT_SETTID  0x00100000u
+#define CLONE_SETTLS         0x00080000u
+
+static int next_pid = 1;
+static int next_tid = 1;
+
+/* The task function for a new thread or forked child: its trapframe was set so
+ * it resumes with rax = 0 (fork/clone return 0 in the child). */
 static void
 process_entry(void)
 {
     linux_resume(lproc_cur);            /* lproc_cur set by the resume hook */
 }
 
-/* Switch the active address space and TLS into p before its task runs
+/* Switch the active address space and TLS into the thread before its task runs
  * (registered with the scheduler as the resume hook). */
 static void
 linux_on_resume(void *vp)
 {
     lproc_cur = (struct lproc *)vp;
-    vmspace_switch(lproc_cur->vmspace);
+    vmspace_switch(lproc_cur->sh->vmspace);
     wrmsr(MSR_FS_BASE, lproc_cur->fs_base);
 }
 
+/* Threads that have exited but still hold a libOS task slot and kstack. They
+ * cannot free their own kstack (they run on it), so another thread drains them:
+ * reap the task, free the stack, release the slot. */
+static struct lproc *zombie_thr[LINUX_NPROC];
+static int n_zombie_thr;
+
+static void
+reap_zombie_threads(void)
+{
+    int kept = 0;
+    for (int i = 0; i < n_zombie_thr; i++) {
+        struct lproc *t = zombie_thr[i];
+        if (task_reap(t->task_id) == 0) {   /* was a zombie: now reaped */
+            if (t->kstack)
+                kfree(t->kstack);
+            t->used = 0;
+        } else {
+            zombie_thr[kept++] = t;         /* not finished yet; keep it */
+        }
+    }
+    n_zombie_thr = kept;
+}
+
+static struct lshared *
+sh_alloc(void)
+{
+    for (int i = 0; i < LINUX_NPROC; i++) {
+        if (shareds[i].used)
+            continue;
+        memset(&shareds[i], 0, sizeof shareds[i]);
+        shareds[i].used = 1;
+        return &shareds[i];
+    }
+    return NULL;
+}
+
 static struct lproc *
-proc_alloc(void)
+thr_alloc(void)
 {
     for (int i = 0; i < LINUX_NPROC; i++) {
         if (procs[i].used)
@@ -1063,20 +1129,39 @@ proc_alloc(void)
         p->kstack_top = ((uint64_t)(uintptr_t)p->kstack + LINUX_KSTACK)
                         & ~(uint64_t)15;
         p->used = 1;
-        p->pid = i + 1;                 /* slot 0 is pid 1, the first process */
         return p;
     }
     return NULL;
 }
 
-/* Release p's open descriptors, dropping the shared pipe and 9P references so a
- * reader sees EOF once every writer is gone. Called on exit and on a failed
- * fork. */
+/* A new process: a fresh shared block and its main thread (no address space
+ * yet; the caller clones or builds one). */
+static struct lproc *
+proc_new(void)
+{
+    struct lshared *sh = sh_alloc();
+    if (!sh)
+        return NULL;
+    struct lproc *t = thr_alloc();
+    if (!t) {
+        sh->used = 0;
+        return NULL;
+    }
+    sh->refs = 1;
+    sh->pid = next_pid++;
+    t->sh = sh;
+    t->tid = sh->pid;                   /* main thread: tid == pid */
+    t->ismain = 1;
+    return t;
+}
+
+/* Release a process's open descriptors, dropping the shared pipe and 9P
+ * references so a reader sees EOF once every writer is gone. */
 static void
-proc_release_fds(struct lproc *p)
+release_fds(struct lshared *sh)
 {
     for (int i = 0; i < LINUX_NFD; i++) {
-        struct lfd *f = &p->fdtab[i];
+        struct lfd *f = &sh->fdtab[i];
         if (!f->used || f->iscon)
             continue;
         if (f->ispipe) {
@@ -1096,47 +1181,92 @@ proc_release_fds(struct lproc *p)
     }
 }
 
-static void
-proc_free(struct lproc *p)
+/* Futex: a small wait queue keyed by (process, user address). Enough for the
+ * pthread primitives (mutex, cond, join), which use private futexes. */
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
+
+struct fwaiter {
+    int             used;
+    struct lshared *sh;
+    uint64_t        uaddr;
+    int             task_id;
+};
+static struct fwaiter fwaiters[LINUX_NPROC * 2];
+
+static long
+futex_wake(uint64_t uaddr, int n)
 {
-    if (p->vmspace)
-        vmspace_destroy(p->vmspace);
-    if (p->kstack)
-        kfree(p->kstack);
-    p->used = 0;
+    int woke = 0;
+    for (int i = 0; i < (int)(sizeof fwaiters / sizeof fwaiters[0]) && woke < n;
+         i++) {
+        struct fwaiter *w = &fwaiters[i];
+        if (w->used && w->sh == lproc_cur->sh && w->uaddr == uaddr) {
+            w->used = 0;
+            task_wake(w->task_id);
+            woke++;
+        }
+    }
+    return woke;
 }
 
-/* fork: a child process that is a copy of the caller. The child's address space
- * is an eager copy, its trapframe is the parent's with rax = 0, and its open
- * descriptors are the same objects (shared pipe buffers and 9P fids). */
+static long
+do_futex(uint64_t uaddr, int op, int val)
+{
+    int cmd = op & 0x7f;                /* strip PRIVATE and CLOCK_REALTIME */
+
+    if (cmd == FUTEX_WAIT) {
+        if (*(volatile int *)(uintptr_t)uaddr != val)
+            return -LERR_AGAIN;         /* value changed: do not block */
+        int slot = -1;
+        for (int i = 0; i < (int)(sizeof fwaiters / sizeof fwaiters[0]); i++)
+            if (!fwaiters[i].used) {
+                slot = i;
+                break;
+            }
+        if (slot < 0)
+            return -LERR_AGAIN;
+        fwaiters[slot].used = 1;
+        fwaiters[slot].sh = lproc_cur->sh;
+        fwaiters[slot].uaddr = uaddr;
+        fwaiters[slot].task_id = lproc_cur->task_id;
+        task_block();                   /* woken by futex_wake or thread exit */
+        fwaiters[slot].used = 0;
+        return 0;
+    }
+    if (cmd == FUTEX_WAKE)
+        return futex_wake(uaddr, val);
+    return -LERR_NOSYS;
+}
+
+/* fork: a child process that is a copy of the caller. The address space is an
+ * eager copy; the main thread's trapframe is the parent's with rax = 0; the
+ * open descriptors are the same objects (shared pipe buffers and 9P fids). */
 static long
 do_fork(void)
 {
     struct lproc *parent = lproc_cur;
-    struct lproc *child = proc_alloc();
+    struct lproc *child = proc_new();
 
     if (!child)
         return -LERR_NOMEM;
-    child->vmspace = vmspace_clone(parent->vmspace);
-    if (!child->vmspace) {
-        proc_free(child);
+    struct lshared *csh = child->sh;
+    csh->vmspace = vmspace_clone(parent->sh->vmspace);
+    if (!csh->vmspace) {
+        kfree(child->kstack);
+        child->used = 0;
+        csh->used = 0;
         return -LERR_NOMEM;
     }
-
-    /* Copy the trapframe (the first 16 words), then override rax so the child
-     * returns 0. kstack_top at offset 128 and the rest stay the child's own. */
-    memcpy(child, parent, 16 * sizeof(uint64_t));
-    child->tf_rax = 0;
-    child->fs_base = parent->fs_base;
-    child->parent = parent->pid;
-    memcpy(child->fdtab, parent->fdtab, sizeof child->fdtab);
-    child->heap_brk = parent->heap_brk;
-    child->heap_mmap = parent->heap_mmap;
-    child->heap_mmaptop = parent->heap_mmaptop;
+    csh->parent = parent->sh->pid;
+    memcpy(csh->fdtab, parent->sh->fdtab, sizeof csh->fdtab);
+    csh->heap_brk = parent->sh->heap_brk;
+    csh->heap_mmap = parent->sh->heap_mmap;
+    csh->heap_mmaptop = parent->sh->heap_mmaptop;
 
     /* Account for the inherited descriptors (the child shares them). */
     for (int i = 0; i < LINUX_NFD; i++) {
-        struct lfd *f = &child->fdtab[i];
+        struct lfd *f = &csh->fdtab[i];
         if (!f->used || f->iscon)
             continue;
         if (f->ispipe) {
@@ -1148,38 +1278,89 @@ do_fork(void)
             gfidref[f->p9fid - LINUX_FID_BASE]++;
     }
 
+    /* The main thread resumes at the fork() site on the cloned stack, rax = 0. */
+    memcpy(child, parent, 16 * sizeof(uint64_t));
+    child->tf_rax = 0;
+    child->fs_base = parent->fs_base;
+
     int tid = task_spawn_proc("linux", process_entry, child);
     if (tid < 0) {
-        proc_release_fds(child);
-        proc_free(child);
+        release_fds(csh);
+        vmspace_destroy(csh->vmspace);
+        kfree(child->kstack);
+        child->used = 0;
+        csh->used = 0;
         return -LERR_NOMEM;
     }
     child->task_id = tid;
-    return child->pid;                  /* the parent gets the child's pid */
+    csh->main_task = tid;
+    return csh->pid;                    /* the parent gets the child's pid */
 }
 
-/* wait4: reap a child. Returns its pid and writes an exit-encoded status. With
- * cooperative tasks, yield while children still run so they can finish. */
+/* clone for a thread (CLONE_VM): a new thread in the caller's process, sharing
+ * the address space and files, running on child_stack with its own TLS. */
+static long
+do_clone_thread(uint64_t flags, uint64_t child_stack, uint64_t ptid,
+                uint64_t ctid, uint64_t tls)
+{
+    struct lproc *parent = lproc_cur;
+    struct lshared *sh = parent->sh;
+    struct lproc *t = thr_alloc();
+
+    if (!t)
+        return -LERR_NOMEM;
+    sh->refs++;
+    t->sh = sh;
+    t->tid = next_tid++;
+    t->ismain = 0;
+
+    /* Resume at the clone() site (rax = 0) on the new stack. */
+    memcpy(t, parent, 16 * sizeof(uint64_t));
+    t->tf_rax = 0;
+    t->tf_rsp = child_stack;
+    t->fs_base = (flags & CLONE_SETTLS) ? tls : parent->fs_base;
+    if (flags & CLONE_CHILD_SETTID)
+        *(int *)(uintptr_t)ctid = t->tid;
+    if (flags & CLONE_PARENT_SETTID)
+        *(int *)(uintptr_t)ptid = t->tid;
+    t->clear_ctid = (flags & CLONE_CHILD_CLEARTID) ? ctid : 0;
+
+    int tsk = task_spawn_proc("thread", process_entry, t);
+    if (tsk < 0) {
+        sh->refs--;
+        kfree(t->kstack);
+        t->used = 0;
+        return -LERR_NOMEM;
+    }
+    t->task_id = tsk;
+    return t->tid;                      /* the parent gets the child tid */
+}
+
+/* wait4: reap a child process. Returns its pid and writes an exit-encoded
+ * status. Yields while children still run so they can finish. */
 static long
 do_wait4(long pid, int *status)
 {
-    struct lproc *me = lproc_cur;
+    struct lshared *mysh = lproc_cur->sh;
 
     for (;;) {
         int haskid = 0;
+        reap_zombie_threads();
         for (int i = 0; i < LINUX_NPROC; i++) {
-            struct lproc *c = &procs[i];
-            if (!c->used || c->parent != me->pid)
+            struct lshared *c = &shareds[i];
+            if (!c->used || c->parent != mysh->pid)
                 continue;
             if (pid > 0 && c->pid != pid)
                 continue;
             haskid = 1;
-            if (c->exited) {
+            if (c->exited && c->refs == 0) {
                 int rpid = c->pid;
                 if (status)
                     *status = (int)((c->exit_status & 0xff) << 8);  /* WIFEXITED */
-                task_reap(c->task_id);  /* release the libOS task slot too */
-                proc_free(c);
+                task_reap(c->main_task);
+                if (c->vmspace)         /* safe here: we run under our own CR3 */
+                    vmspace_destroy(c->vmspace);
+                c->used = 0;
                 return rpid;
             }
         }
@@ -1189,22 +1370,48 @@ do_wait4(long pid, int *status)
     }
 }
 
-/* exit: record the status, close descriptors (so pipe readers see EOF), and end
- * the task. The slot lingers as a zombie until the parent's wait4 reaps it. */
+/* exit a thread, or the whole process when group is set. The last thread to
+ * leave frees the address space and files and leaves the shared block as a
+ * zombie carrying the exit status for the parent's wait4. */
 static void __attribute__((noreturn))
-do_exit(long code)
+do_exit(long code, int group)
 {
-    struct lproc *p = lproc_cur;
+    struct lproc *t = lproc_cur;
+    struct lshared *sh = t->sh;
 
-    proc_release_fds(p);
-    p->exit_status = code;
-    p->exited = 1;
-    con_puts("[bin] pid ");
-    put_dec(p->pid);
-    con_puts(" exited, status=");
-    put_dec(code);
-    con_putc('\n');
-    task_exits(NULL);                   /* status kept in the lproc for wait4 */
+    /* A joined thread clears its tid word and wakes whoever waits on it. */
+    if (t->clear_ctid) {
+        *(volatile int *)(uintptr_t)t->clear_ctid = 0;
+        futex_wake(t->clear_ctid, 1);
+    }
+    t->exited = 1;
+    if (group) {
+        sh->exited = 1;
+        sh->exit_status = code;
+    }
+
+    if (--sh->refs == 0) {
+        if (!sh->exited) {
+            sh->exited = 1;
+            sh->exit_status = code;
+        }
+        release_fds(sh);
+        con_puts("[bin] pid ");
+        put_dec(sh->pid);
+        con_puts(" exited, status=");
+        put_dec(sh->exit_status);
+        con_putc('\n');
+        /* Do not free the address space here: we are still running on it (CR3
+         * points at these page tables). The parent's wait4, running under its
+         * own CR3, destroys it; with no parent it is left until shutdown. The
+         * slot lingers (used, exited) carrying the status for wait4. */
+    }
+
+    /* This thread cannot free its own kstack (it runs on it); hand it to the
+     * zombie-thread drainer, which another thread reaps. */
+    if (n_zombie_thr < LINUX_NPROC)
+        zombie_thr[n_zombie_thr++] = t;
+    task_exits(NULL);
 }
 
 /* The C half of the SYSCALL handler. Return value goes back in rax. */
@@ -1213,6 +1420,7 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
 {
     (void)a4;
     (void)a5;
+    reap_zombie_threads();              /* free the slots of any exited threads */
     switch (nr) {
     case SYS_arch_prctl:
         if (a1 == ARCH_SET_FS) {
@@ -1222,11 +1430,13 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         }
         return -LERR_NOSYS;
     case SYS_set_tid_address:
-        return 1;                       /* a plausible tid */
+        lproc_cur->clear_ctid = (uint64_t)a1;   /* cleared and woken on exit */
+        return lproc_cur->tid;
     case SYS_set_robust_list:
     case SYS_rseq:
         return 0;                       /* accept and ignore */
     case SYS_mprotect:
+    case SYS_madvise:
         return 0;                       /* flat RW map, nothing to enforce */
     case SYS_brk:
         return do_brk((uint64_t)a1);
@@ -1362,19 +1572,27 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_vfork:
         return do_fork();
     case SYS_clone:
-        /* glibc/musl fork() is clone with SIGCHLD and no CLONE_VM. A thread
-         * (CLONE_VM) is not supported yet; the futex path comes later. */
+        /* A thread shares the address space (CLONE_VM); otherwise clone is the
+         * fork path (glibc/musl fork() is clone with SIGCHLD, no CLONE_VM). */
         if ((uint64_t)a1 & CLONE_VM)
-            return -LERR_NOSYS;
+            return do_clone_thread((uint64_t)a1, (uint64_t)a2, (uint64_t)a3,
+                                   (uint64_t)a4, (uint64_t)a5);
         return do_fork();
     case SYS_wait4:
         return do_wait4(a1, (int *)a2);
+    case SYS_futex:
+        return do_futex((uint64_t)a1, (int)a2, (int)a3);
+    case SYS_sched_yield:
+        task_yield();
+        return 0;
     case SYS_getpid:
-        return lproc_cur->pid;
+        return lproc_cur->sh->pid;
     case SYS_getppid:
-        return lproc_cur->parent;
+        return lproc_cur->sh->parent;
     case SYS_gettid:
-        return lproc_cur->pid;          /* single thread: tid == pid */
+        return lproc_cur->tid;
+    case SYS_tgkill:
+        return 0;                       /* no signal delivery: accept and ignore */
     case SYS_rt_sigaction:
     case SYS_rt_sigprocmask:
         return 0;                       /* no signal delivery: accept and ignore */
@@ -1396,8 +1614,9 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return 0;
     }
     case SYS_exit:
+        do_exit(a1, 0);                 /* this thread only; does not return */
     case SYS_exit_group:
-        do_exit(a1);                    /* does not return */
+        do_exit(a1, 1);                 /* the whole process; does not return */
     default:
         con_puts("[bin] unhandled syscall ");
         put_dec(nr);
@@ -1547,7 +1766,7 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     }
 
     /* A fresh address space for the new image, replacing the old one. */
-    vmspace_t old = lproc_cur->vmspace;
+    vmspace_t old = lproc_cur->sh->vmspace;
     vmspace_t as = linux_vmspace_setup();
     if (!as) {
         p9_clunk(LINUX_FID);
@@ -1565,7 +1784,7 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
         return -LERR_NOENT;
     }
 
-    lproc_cur->vmspace = as;            /* the resume hook now restores this one */
+    lproc_cur->sh->vmspace = as;        /* the resume hook now restores this one */
     brk_cur = LINUX_HEAP_BASE;          /* fresh heap for the new image */
     mmap_cur = mmap_top;
     uint64_t rsp = build_stack_vec(na, argc, ne, envc);
@@ -1629,22 +1848,23 @@ linux_elf_run(const char *file)
     linux_phys_init();
     task_set_resume_hook(linux_on_resume);
 
-    /* The first process. It runs on the current task (init); forked children
-     * become their own tasks. */
-    struct lproc *p = proc_alloc();
+    /* The first process and its main thread. It runs on the current task
+     * (init); forked children and threads become their own tasks. */
+    struct lproc *p = proc_new();
     if (!p) {
         con_puts("[bin] no process slot\n");
         return;
     }
-    p->vmspace = linux_vmspace_setup();
-    if (!p->vmspace) {
+    p->sh->vmspace = linux_vmspace_setup();
+    if (!p->sh->vmspace) {
         con_puts("[bin] no memory for the address space\n");
-        proc_free(p);
         return;
     }
+    p->task_id = task_self();
+    p->sh->main_task = p->task_id;
     task_set_proc(p);                   /* so the resume hook restores it later */
     lproc_cur = p;
-    vmspace_switch(p->vmspace);         /* user window now demand-maps on fault */
+    vmspace_switch(p->sh->vmspace);     /* user window now demand-maps on fault */
 
     if (ns_walk(file, LINUX_FID) != 0) {
         con_puts("[bin] not found in bundle\n");
