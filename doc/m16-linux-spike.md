@@ -97,3 +97,50 @@ a silent triple fault. The larger risks (`mmap` with lazy commit, `futex`,
 static-PIE relocation) are all still ahead and unchanged by this result; none of
 them block the busybox step. The experimental module can stay as the seed of the
 real loader, or be rewritten once the shape of M16.2 is clear.
+
+## M16.2: VFS and process syscalls
+
+Follow-on work broadened the syscall surface, driven by self-contained musl test
+programs rather than an external binary. New pieces:
+
+- A diagnostic handler on the CPU exception vectors (`x86_64_fault.S`,
+  `fault_report` in `x86_64.c`). A fault now prints the vector, error code,
+  faulting RIP, CR2, and the GP registers, then halts, instead of a silent
+  triple fault. This was the prerequisite the go/no-go called for, and it paid
+  off immediately during bring-up.
+- A file-descriptor table over the read-only 9P bundle (`linuxelf.c`):
+  `openat`/`open`, `close`, `read`, `lseek`, `stat`/`lstat`/`newfstatat`,
+  `fstat`, and `getdents64`; `dup` with a per-fid refcount; in-memory
+  `pipe`/`pipe2`; and the universal startup syscalls `mprotect` (a no-op on the
+  flat map), `clock_gettime`, `getrandom`, and `prlimit64`. Writes to the bundle
+  return `-EROFS`.
+- Committed musl tests, run with `make linux-spike SPIKE_PROG=<name>`:
+  `linuxcat` (open/read/fstat/stat), `linuxls` (getdents64), and `linuxpipe`
+  (pipe/read/write). All run clean with no unhandled syscalls:
+
+```
+hello.txt (30 bytes): hello from the smolvfs bundle
+entries in /: boot/ hello hello.txt ... motd rc net/
+read back: data through a pipe
+```
+
+### What the glibc busybox smoke showed
+
+The system `/usr/bin/busybox` is a glibc static `ET_EXEC`, a deliberately harder
+target than musl and run only as a manual probe (its make target would need an
+external path, so it is not committed). Its startup surface, in order, is
+`prlimit64`, `getrandom`, `clock_gettime`, `mmap`/`brk`, then `mprotect` for
+RELRO. With the cheap syscalls now handled it gets past the first four, then
+glibc applies RELRO and, when `mprotect` is a no-op, keeps going. Two things
+still block it, both already their own milestones:
+
+- Its LOAD segments reach about `0x60d000`, past the 2 MiB program window the
+  native loader shares (`JOTUN_PROG_SIZE`). A Linux program needs a larger,
+  separate window, not a change to the shared constant.
+- It needs real `mmap`/`brk` with an arena, not the throwaway bump allocator the
+  probe used. glibc's static malloc reserves and grows heap through them, and
+  the 8 MiB identity map has no room for a realistic arena. This is M16.5 work.
+
+So glibc busybox is not a near-term target; the musl path is. The committed
+surface is enough for self-contained musl file and pipe programs, and the
+busybox probe mapped the road to the heavier binaries without committing to it.

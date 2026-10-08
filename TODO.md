@@ -81,10 +81,17 @@ Milestones, smallest first, each with its own acceptance test:
       in `host/vmm_kvm.c`), without which KVM refuses the `EFER.SCE` write. This
       is a spike, x86-64 only; before M16.2, add a `#GP`/`#PF` diagnostic
       handler (a bad guest instruction currently triple-faults silently).
-- [ ] M16.2: broaden the VFS and process syscalls (`getdents64`, `readlinkat`,
-      `stat` family, `pipe2`, `dup`, `fcntl`, `ioctl`). Acceptance: a static
-      `busybox` runs its common applets (`ls`, `cat`, `echo`, `sh`), which fans
-      out across the VFS surface cheaply.
+- [~] M16.2: broaden the VFS and process syscalls. Done for musl: a
+      file-descriptor table over the read-only 9P bundle with
+      openat/open/close/read/lseek/stat family/fstat/getdents64, dup (refcounted
+      fid), in-memory pipe/pipe2, and the startup syscalls mprotect/clock_gettime/
+      getrandom/prlimit64; plus a CPU-exception diagnostic handler. Committed
+      musl tests cover it (example/linuxcat.c, linuxls.c, linuxpipe.c; see
+      doc/m16-linux-spike.md). The glibc static busybox was probed only (manual,
+      not committed): it now gets through startup but is blocked on a larger,
+      Linux-specific program window and real mmap/brk with an arena, which is
+      M16.5. The original busybox-applet acceptance waits on that; the committed
+      acceptance is the musl VFS tests.
 - [ ] M16.3: static-PIE self-relocation. Apply the `R_*_RELATIVE` entries a
       static-PIE binary carries in its own `PT_DYNAMIC`, with no interpreter.
       Acceptance: a stock Alpine static binary (built static-PIE by default)
