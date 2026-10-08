@@ -46,6 +46,8 @@
 #define SYS_fcntl           72
 #define SYS_getcwd          79
 #define SYS_exit            60
+#define SYS_mprotect        10
+#define SYS_clock_gettime   228
 #define SYS_arch_prctl      158
 #define SYS_getdents64      217
 #define SYS_set_tid_address 218
@@ -56,6 +58,8 @@
 #define SYS_set_robust_list 273
 #define SYS_dup3            292
 #define SYS_pipe2           293
+#define SYS_prlimit64       302
+#define SYS_getrandom       318
 #define SYS_rseq            334
 
 #define ARCH_SET_FS 0x1002
@@ -574,6 +578,41 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_set_robust_list:
     case SYS_rseq:
         return 0;                       /* accept and ignore */
+    case SYS_mprotect:
+        return 0;                       /* flat RW map, nothing to enforce */
+    case SYS_clock_gettime: {
+        /* No real clock: synthesise a monotonic time from the cycle counter,
+         * assuming roughly 1 GHz. Good enough to keep libc startup happy. */
+        uint32_t lo, hi;
+        __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+        uint64_t t = ((uint64_t)hi << 32) | lo;
+        uint64_t *ts = (uint64_t *)a2;    /* struct timespec { sec; nsec; } */
+        if (ts) {
+            ts[0] = t / 1000000000ULL;
+            ts[1] = t % 1000000000ULL;
+        }
+        return 0;
+    }
+    case SYS_getrandom: {
+        uint8_t *buf = (uint8_t *)a1;
+        unsigned long len = (unsigned long)a2;
+        uint32_t lo, hi;
+        __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+        uint64_t s = ((uint64_t)hi << 32) | lo;
+        for (unsigned long i = 0; i < len; i++) {
+            buf[i] = (uint8_t)s;
+            s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        }
+        return (long)len;               /* not cryptographic; a startup seed */
+    }
+    case SYS_prlimit64: {
+        uint64_t *old = (uint64_t *)a4;   /* old_limit: {rlim_cur, rlim_max} */
+        if (old) {
+            old[0] = ~0ULL;               /* RLIM_INFINITY */
+            old[1] = ~0ULL;
+        }
+        return 0;
+    }
     case SYS_ioctl:
         return -LERR_NOTTY;             /* no tty: musl falls back */
     case SYS_read:
