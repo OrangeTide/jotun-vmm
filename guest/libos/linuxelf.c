@@ -76,6 +76,7 @@
 #define SYS_prctl           157
 #define SYS_exit            60
 #define SYS_mprotect        10
+#define SYS_time            201
 #define SYS_clock_gettime   228
 #define SYS_arch_prctl      158
 #define SYS_getdents64      217
@@ -87,6 +88,7 @@
 #define SYS_set_robust_list 273
 #define SYS_dup3            292
 #define SYS_pipe2           293
+#define SYS_statx           332
 #define SYS_prlimit64       302
 #define SYS_getrandom       318
 #define SYS_rseq            334
@@ -711,29 +713,123 @@ fill_stat(struct linux_stat *s, int isdir, uint64_t size, uint64_t ino)
     s->st_ino = ino;
 }
 
-/* stat a path (stat/lstat/newfstatat with AT_FDCWD). Uses a scratch fid. */
+/* Resolve a path's metadata (a ramfs file shadows the bundle, else 9P). Returns
+ * 0 and fills the out-params, or a negative errno. */
 static long
-do_stat_path(const char *path, struct linux_stat *out)
+meta_path(const char *path, int *isdir, uint64_t *size, uint64_t *ino)
 {
     const char *rel = bundle_path(path);
-    uint32_t fid = LINUX_FID_BASE + LINUX_NFD;      /* scratch, above the pool */
 
-    int ri = ramfs_find(rel);           /* a ramfs file shadows the bundle */
+    int ri = ramfs_find(rel);
     if (ri >= 0) {
-        fill_stat(out, 0, ramfs[ri].len, (uint64_t)(0x10000 + ri));
+        *isdir = 0;
+        *size = ramfs[ri].len;
+        *ino = (uint64_t)(0x10000 + ri);
         return 0;
     }
+    uint32_t fid = LINUX_FID_BASE + LINUX_NFD;      /* scratch, above the pool */
     if (ns_walk(rel, fid) != 0)
         return -LERR_NOENT;
     struct p9_stat st;
     int ok = p9_stat(fid, &st) == 0;
-    long rc = -LERR_NOENT;
     if (ok) {
-        fill_stat(out, (st.qid.type & P9_QTDIR) != 0, st.length, st.qid.path);
-        rc = 0;
+        *isdir = (st.qid.type & P9_QTDIR) != 0;
+        *size = st.length;
+        *ino = st.qid.path;
     }
     p9_clunk(fid);
+    return ok ? 0 : -LERR_NOENT;
+}
+
+/* stat a path (stat/lstat/newfstatat with AT_FDCWD). */
+static long
+do_stat_path(const char *path, struct linux_stat *out)
+{
+    int isdir = 0;
+    uint64_t size = 0, ino = 1;
+    long rc = meta_path(path, &isdir, &size, &ino);
+
+    if (rc == 0)
+        fill_stat(out, isdir, size, ino);
     return rc;
+}
+
+/* The subset of struct statx the basic-stats mask needs, padded to the kernel's
+ * 256-byte record. glibc's stat/ls go through statx on current systems. */
+struct statx_ts {
+    int64_t  tv_sec;
+    uint32_t tv_nsec;
+    int32_t  __reserved;
+};
+
+struct linux_statx {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t __spare0;
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    struct statx_ts stx_atime;
+    struct statx_ts stx_btime;
+    struct statx_ts stx_ctime;
+    struct statx_ts stx_mtime;
+    uint32_t stx_rdev_major, stx_rdev_minor;
+    uint32_t stx_dev_major, stx_dev_minor;
+    uint64_t stx_mnt_id;
+    uint64_t __spare2[13];
+};
+
+#define STATX_BASIC_STATS 0x000007ffu
+#define AT_EMPTY_PATH     0x1000
+
+static void
+fill_statx(struct linux_statx *s, int isdir, uint64_t size, uint64_t ino)
+{
+    memset(s, 0, sizeof *s);
+    s->stx_mask = STATX_BASIC_STATS;
+    s->stx_blksize = 4096;
+    s->stx_nlink = 1;
+    s->stx_mode = (uint16_t)(isdir ? (S_IFDIR | 0755) : (S_IFREG | 0644));
+    s->stx_ino = ino;
+    s->stx_size = size;
+    s->stx_blocks = (size + 511) / 512;
+}
+
+/* statx(dirfd, path, flags, mask, buf). An empty path with AT_EMPTY_PATH stats
+ * the dirfd itself; otherwise the path (ramfs or bundle) is resolved. */
+static long
+do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
+{
+    int isdir = 0;
+    uint64_t size = 0, ino = 1;
+
+    if (path && path[0]) {
+        long rc = meta_path(path, &isdir, &size, &ino);
+        if (rc != 0)
+            return rc;
+    } else if (flags & AT_EMPTY_PATH) {
+        struct lfd *f = fd_get(dirfd);
+        if (!f)
+            return -LERR_BADF;
+        if (f->isram) {
+            size = ramfs[f->ridx].len;
+            ino = (uint64_t)(0x10000 + f->ridx);
+        } else {
+            isdir = f->isdir;
+            size = f->size;
+            ino = f->p9fid;
+        }
+    } else {
+        return -LERR_NOENT;
+    }
+    fill_statx(out, isdir, size, ino);
+    return 0;
 }
 
 static long
@@ -826,6 +922,14 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_mmap((uint64_t)a1, (uint64_t)a2, (uint64_t)a4, a5);
     case SYS_munmap:
         return 0;                       /* bump arena: no reclaim */
+    case SYS_time: {
+        uint32_t lo, hi;
+        __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+        int64_t t = (int64_t)((((uint64_t)hi << 32) | lo) / 1000000000ULL);
+        if (a1)
+            *(int64_t *)a1 = t;
+        return (long)t;
+    }
     case SYS_clock_gettime: {
         /* No real clock: synthesise a monotonic time from the cycle counter,
          * assuming roughly 1 GHz. Good enough to keep libc startup happy. */
@@ -870,8 +974,8 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_open:
         return do_open((const char *)a1, a2);
     case SYS_openat:
-        if (a1 != AT_FDCWD)
-            return -LERR_NOSYS;         /* only cwd-relative/absolute for now */
+        /* dirfd is ignored: the namespace is effectively rooted, so paths
+         * resolve from the 9P root (or absolute). Fine for the flat bundle. */
         return do_open((const char *)a2, a3);
     case SYS_close:
         return do_close(a1);
@@ -881,11 +985,15 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_lstat:
         return do_stat_path((const char *)a1, (struct linux_stat *)a2);
     case SYS_newfstatat:
-        if (a1 != AT_FDCWD)
-            return -LERR_NOSYS;
+        /* dirfd ignored (see openat). An empty path with AT_EMPTY_PATH means
+         * the dirfd itself, which maps to fstat. */
+        if (((const char *)a2)[0] == 0 && (a4 & AT_EMPTY_PATH))
+            return do_fstat(a1, (struct linux_stat *)a3);
         return do_stat_path((const char *)a2, (struct linux_stat *)a3);
     case SYS_fstat:
         return do_fstat(a1, (struct linux_stat *)a2);
+    case SYS_statx:
+        return do_statx(a1, (const char *)a2, a3, (struct linux_statx *)a5);
     case SYS_getdents64:
         return do_getdents64(a1, (void *)a2, (unsigned long)a3);
     case SYS_pipe:
