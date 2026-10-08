@@ -107,6 +107,15 @@ tf_set_sp(struct trapframe *tf, uint64_t sp)
     tf->rsp = sp;
 }
 
+/* On x86-64 the TLS base lives in lproc->tls and is loaded by the resume hook
+ * (arch_load_tls), not in the trapframe, so recording it here is a no-op. */
+static inline void
+tf_set_tls(struct trapframe *tf, uint64_t tls)
+{
+    (void)tf;
+    (void)tls;
+}
+
 /* x86-64 MSRs for the SYSCALL path. */
 #define MSR_EFER     0xC0000080u
 #define MSR_STAR     0xC0000081u

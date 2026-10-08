@@ -53,7 +53,8 @@ ifeq ($(OS), Darwin)
     GUEST = test_guest.elf echo.elf libos.elf
     GUEST_SRC = guest/test_guest_arm64.c
     LIBOS_ARCH = guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
-        guest/libos/arch/arm64_boot.S
+        guest/libos/arch/arm64_boot.S guest/libos/arch/arm64_linuxsys.S \
+        guest/libos/arch/arm64_vmspace.c
     # Keep atomic builtins inline (LL/SC or LSE) rather than calling the libgcc
     # outline-atomic helpers, which are absent under -nostdlib.
     GUEST_CFLAGS += -mno-outline-atomics
@@ -84,7 +85,8 @@ else
         GUEST = test_guest.elf echo.elf libos.elf
         GUEST_SRC = guest/test_guest_arm64.c
         LIBOS_ARCH = guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
-            guest/libos/arch/arm64_boot.S
+            guest/libos/arch/arm64_boot.S guest/libos/arch/arm64_linuxsys.S \
+            guest/libos/arch/arm64_vmspace.c
         # Inline atomics, not the libgcc outline helpers (absent, -nostdlib).
         GUEST_CFLAGS += -mno-outline-atomics
         GUEST_CC = $(CC)
@@ -248,7 +250,8 @@ ASRC_x86_64  := guest/libos/arch/x86_64.c guest/libos/arch/x86_64_ctx.S \
     guest/libos/arch/x86_64_linuxsys.S guest/libos/arch/x86_64_fault.S \
             guest/libos/arch/x86_64_vmspace.c
 ASRC_aarch64 := guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
-    guest/libos/arch/arm64_boot.S
+    guest/libos/arch/arm64_boot.S guest/libos/arch/arm64_linuxsys.S \
+    guest/libos/arch/arm64_vmspace.c
 
 # Generate the cross-build rules for one arch: the kernel (libos) and the hello
 # program, under build/img/<arch>/. Used only for arches other than this host's.
@@ -328,23 +331,29 @@ malloc-test: $(TARGET) libos.elf build/malloctest
 	$(MAKE) bundle BUNDLE_ARCHS=$(ARCH) EXTRA_BUNDLE_FILES="build/malloctest build/mtrun"
 	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./$(TARGET) libos.elf mtrun
 
-## Experimental M16 Linux binary-compat spike: build the static x86-64 musl test
-## programs (example/linux*.c), stage them into a single-arch bundle, and run one
-## under the libOS SYSCALL trap (the `bin` guest). x86-64 host only; needs
-## musl-gcc on PATH. SPIKE_PROG selects which to run (default linuxhello); e.g.
-## make linux-spike SPIKE_PROG=linuxcat. See guest/libos/linuxelf.c and
-## doc/m16-linux-spike.md.
+## Experimental M16 Linux binary-compat spike: build the static musl test
+## programs (example/linux*.c) for this host's arch, stage them into a
+## single-arch bundle, and run one under the libOS trap (the `bin` guest).
+## Runs natively, so on x86-64 (KVM) and on macos/arm64 (HVF). The compiler is
+## a static musl toolchain, picked by arch and overridable with SPIKE_CC
+## (x86-64: musl-gcc; aarch64: aarch64-linux-musl-gcc). SPIKE_PROG selects which
+## program to run (default linuxhello); e.g. make linux-spike SPIKE_PROG=linuxcat.
+## See guest/libos/linuxelf.c and doc/m16-linux-spike.md.
 LINUX_SPIKE_SRCS := $(wildcard example/linux*.c)
 LINUX_SPIKE_BINS := $(patsubst example/%.c,build/%,$(LINUX_SPIKE_SRCS))
 SPIKE_PROG ?= linuxhello
+SPIKE_CC_x86_64  ?= musl-gcc
+SPIKE_CC_aarch64 ?= aarch64-linux-musl-gcc
+SPIKE_CC ?= $(SPIKE_CC_$(ARCH))
 linux-spike: $(TARGET) libos.elf
-	@test "$(ARCH)" = x86_64 || { echo "linux-spike is x86-64 only"; exit 1; }
-	@command -v musl-gcc >/dev/null 2>&1 || \
-	    { echo "linux-spike needs musl-gcc on PATH"; exit 1; }
+	@test -n "$(SPIKE_CC)" || \
+	    { echo "linux-spike: no musl compiler known for $(ARCH); set SPIKE_CC="; exit 1; }
+	@command -v $(SPIKE_CC) >/dev/null 2>&1 || \
+	    { echo "linux-spike needs $(SPIKE_CC) on PATH (override with SPIKE_CC=)"; exit 1; }
 	for s in $(LINUX_SPIKE_SRCS); do \
-	    musl-gcc -static -no-pie -O2 -o build/`basename $$s .c` $$s || exit 1; \
+	    $(SPIKE_CC) -static -no-pie -O2 -o build/`basename $$s .c` $$s || exit 1; \
 	done
-	$(MAKE) bundle BUNDLE_ARCHS=x86_64 EXTRA_BUNDLE_FILES="$(LINUX_SPIKE_BINS)"
+	$(MAKE) bundle BUNDLE_ARCHS=$(ARCH) EXTRA_BUNDLE_FILES="$(LINUX_SPIKE_BINS)"
 	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./$(TARGET) libos.elf bin $(SPIKE_PROG)
 
 # macsyntax: syntax-check the macOS-only net path from a Linux dev box, so the

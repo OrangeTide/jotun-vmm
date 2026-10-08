@@ -190,3 +190,40 @@ Not yet: `busybox ls /` wants `statx` (332), the glibc stat variant, which we do
 not service. Applets that fork/exec (a shell pipeline) need `clone`/`execve`
 (M16.4 and beyond). The ramfs is per-run and single trust domain, not a real
 filesystem; it is the shortcut its name implies.
+
+## AArch64 port (M16.6, minimal PoC)
+
+The spike was ported to AArch64 so the concept can be checked on a non-Linux
+host (macos/arm64, HVF) with a Linux-like guest. The scope is one process: MMU
+enable, per-process TTBR0 paging with demand faults, the SVC trap, and the
+shared VFS and heap. fork, pipes, and threads are not part of this first cut.
+
+The arch-specific logic lives behind two neutral front doors so `linuxelf.c` is
+shared unchanged:
+
+- `vmspace.h` -> `arch/<arch>_vmspace.{h,c}`: the per-process page tables. The
+  AArch64 backend uses ARMv8 translation tables (39-bit VA, 4 KiB granule,
+  L1/L2/L3). The guest boots with the MMU off, so the first `vmspace_switch`
+  turns it on with that process's L1 in `TTBR0_EL1`; later switches reload
+  `TTBR0` and flush. MMIO (the UART and the doorbells at and above
+  `0x08000000`) is mapped Device-nGnRE so stores still trap to the host; RAM is
+  Normal. The layout matches x86: kernel and MMIO identity-mapped, a private
+  user window at `[0x400000, 0x1C00000)` filled on demand, and a physmap of all
+  RAM at 1 GiB so the kernel can reach any frame by physical address.
+- `linux_arch.h` -> `arch/<arch>_linuxabi.h` and `arch/<arch>_linuxsys.S`: the
+  ABI and trap. The AArch64 numbers are the asm-generic set (openat/fstatat/
+  pipe2/dup3/clone, no open/stat/pipe/fork); the x86-only names are negative
+  sentinels so the shared dispatcher still compiles. The program runs at EL1t
+  (EL1 with `SPSel=0`, so it uses `SP_EL0`), the same exception level as the
+  libOS, so an `svc #0` is not a privilege transition; it returns with `eret`.
+  Because the program runs on `SP_EL0`, any exception switches the CPU to
+  `SP_EL1`, which `linux_jump`/`linux_resume` point at the process's private
+  handler stack, so a fault on a bad user stack still has a good stack (the
+  AArch64 analogue of the x86 IST). `arch_traps_init` installs the exception
+  vectors in `VBAR_EL1` at boot. A translation fault in the user window is
+  demand-mapped by `pf_handle`; anything else is reported by
+  `arm64_fault_report` and halts.
+
+Run it with `make linux-spike` on macos/arm64 (HVF). It needs a static musl
+AArch64 toolchain; the default is `aarch64-linux-musl-gcc`, overridable with
+`SPIKE_CC=`. `SPIKE_PROG` selects the program (default `linuxhello`).

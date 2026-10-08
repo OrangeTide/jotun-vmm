@@ -4,6 +4,7 @@
  * PL011-style UART. Halt is a store to the poweroff register, which the host
  * sees as an MMIO exit that stops the run. */
 #include "arch.h"
+#include "print.h"
 
 #include <stdint.h>
 
@@ -49,15 +50,44 @@ stack_init(void *stack, size_t size, void (*entry)(void))
     return sp;
 }
 
-/* arm64 preemption is deferred: injecting IRQs without a vGIC (KVM) and the
- * HVF path both need hardware to validate, and the guest runs at EL1 with DAIF
- * masked. The trap table (VBAR_EL1 exception vectors) is set up when that work
- * lands. The mask helpers below still work, so the scheduler's critical-region
- * guards are correct, they simply never see an asynchronous interrupt yet. */
+/* The exception vector table (arch/arm64_linuxsys.S). Installing it lets the
+ * Linux-compat guest take SVC traps and demand-map faults; for other guests it
+ * only means a stray fault is reported instead of silently escaping. */
+extern char arm64_vectors[];
+
+/* Print an unrecoverable fault and halt. Entered from the exception vectors on a
+ * fault that is not a demand-mappable page or on an SError; a healthy guest
+ * never gets here. It exists so a foreign Linux binary that faults leaves a
+ * readable trail instead of vanishing. */
+void
+arm64_fault_report(uint64_t far, uint64_t esr, uint64_t elr)
+{
+    con_puts("\n*** EL1 fault ***\n  esr=");
+    con_puthex(esr);
+    con_puts(" ec=");
+    con_puthex((esr >> 26) & 0x3f);
+    con_puts(" far=");
+    con_puthex(far);
+    con_puts("\n  elr=");
+    con_puthex(elr);
+    con_puts("\nhalted\n");
+
+    arch_halt();
+    for (;;)
+        ;
+}
+
+/* arm64 preemption is deferred: injecting IRQs without a vGIC (KVM) and the HVF
+ * path both need hardware to validate, and the guest runs at EL1 with DAIF
+ * masked. So the vectors handle only synchronous exceptions (SVC and faults);
+ * IRQ/FIQ slots just hang. The mask helpers below still work, so the scheduler's
+ * critical-region guards are correct, they simply never see an asynchronous
+ * interrupt yet. */
 void
 arch_traps_init(unsigned long id)
 {
     (void)id;
+    __asm__ volatile ("msr vbar_el1, %0; isb" : : "r"(arm64_vectors));
 }
 
 /* Enable FP/SIMD at EL1: set CPACR_EL1.FPEN to 0b11 so FP and Advanced SIMD

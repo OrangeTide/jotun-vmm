@@ -1211,6 +1211,7 @@ do_clone_thread(uint64_t flags, uint64_t child_stack, uint64_t ptid,
     tf_set_ret0(&t->tf);
     tf_set_sp(&t->tf, child_stack);
     t->tls = (flags & CLONE_SETTLS) ? tls : parent->tls;
+    tf_set_tls(&t->tf, t->tls);         /* where the arch keeps TLS in the frame */
     if (flags & CLONE_CHILD_SETTID)
         *(int *)(uintptr_t)ctid = t->tid;
     if (flags & CLONE_PARENT_SETTID)
