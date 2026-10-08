@@ -1,20 +1,19 @@
-/* linuxelf.c : run a static Linux x86-64 binary under a SYSCALL trap (M16.1).
+/* linuxelf.c : run unmodified static Linux binaries under a syscall trap (M16).
  *
- * The spike: load a static, non-PIE musl ELF (ET_EXEC linked at 0x400000, the
- * same window the native programs use) with the existing elf_load_fid, build a
- * System V initial stack (argc/argv/envp/auxv), arm the SYSCALL machinery, and
- * jump in. A small dispatcher services the syscalls a musl "hello" issues:
- * arch_prctl(ARCH_SET_FS), set_tid_address, ioctl(TIOCGWINSZ), write/writev,
- * and exit/exit_group. Everything else returns -ENOSYS, which is enough to
- * learn where the real work is. The console is the guest's con_putc.
- *
- * x86-64 only. The SYSCALL trap and the kernel<->program handoff live in
- * arch/x86_64_linuxsys.S. On other targets linux_elf_run is a stub. */
+ * This is the arch-neutral core. It loads a static, non-PIE ELF (ET_EXEC linked
+ * at 0x400000, the window the native programs use), builds a System V initial
+ * stack (argc/argv/envp/auxv), gives each process a private address space, and
+ * services the syscalls real musl and glibc programs issue: a file table over
+ * the 9P bundle and a writable ramfs, a heap arena, fork/clone/wait4, pipes,
+ * threads, and a futex. The machine-specific parts (the syscall numbers, the
+ * user trapframe, entering user code, the thread pointer, arming the trap) come
+ * from the per-arch backend selected by linux_arch.h; the page tables come from
+ * vmspace.h. On an unsupported arch linux_elf_run is a stub. */
 #include "linuxelf.h"
 
 #include "print.h"
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__aarch64__)
 
 #include "boot.h"
 #include "elfload.h"
@@ -24,7 +23,8 @@
 #include "string.h"
 #include "task.h"
 #include "jotun_svc.h"       /* JOTUN_PROG_BASE */
-#include "arch/x86_64_vmspace.h"
+#include "vmspace.h"
+#include "linux_arch.h"
 
 #include <stdint.h>
 
@@ -52,66 +52,6 @@
 
 /* The most argv entries delivered to a Linux program. */
 #define LINUX_MAX_ARGS 32
-
-/* Linux syscall numbers (x86-64) we recognise. */
-#define SYS_read            0
-#define SYS_write           1
-#define SYS_open            2
-#define SYS_close           3
-#define SYS_mmap            9
-#define SYS_munmap          11
-#define SYS_brk             12
-#define SYS_stat            4
-#define SYS_fstat           5
-#define SYS_lstat           6
-#define SYS_lseek           8
-#define SYS_pipe            22
-#define SYS_ioctl           16
-#define SYS_writev          20
-#define SYS_dup             32
-#define SYS_dup2            33
-#define SYS_fcntl           72
-#define SYS_getcwd          79
-#define SYS_getuid          102
-#define SYS_getgid          104
-#define SYS_geteuid         107
-#define SYS_getegid         108
-#define SYS_prctl           157
-#define SYS_exit            60
-#define SYS_execve          59
-#define SYS_clone           56
-#define SYS_fork            57
-#define SYS_vfork           58
-#define SYS_wait4           61
-#define SYS_getpid          39
-#define SYS_getppid         110
-#define SYS_rt_sigaction    13
-#define SYS_rt_sigprocmask  14
-#define SYS_gettid          186
-#define SYS_uname           63
-#define SYS_futex           202
-#define SYS_sched_yield     24
-#define SYS_tgkill          234
-#define SYS_madvise         28
-#define SYS_mprotect        10
-#define SYS_time            201
-#define SYS_clock_gettime   228
-#define SYS_arch_prctl      158
-#define SYS_getdents64      217
-#define SYS_set_tid_address 218
-#define SYS_exit_group      231
-#define SYS_openat          257
-#define SYS_newfstatat      262
-#define SYS_readlinkat      267
-#define SYS_set_robust_list 273
-#define SYS_dup3            292
-#define SYS_pipe2           293
-#define SYS_statx           332
-#define SYS_prlimit64       302
-#define SYS_getrandom       318
-#define SYS_rseq            334
-
-#define ARCH_SET_FS 0x1002
 
 #define AT_FDCWD (-100)
 
@@ -150,16 +90,6 @@
 #define LERR_CHILD  10          /* ECHILD: wait with no children */
 #define LERR_AGAIN  11          /* EAGAIN */
 
-/* x86-64 MSRs for the SYSCALL path. */
-#define MSR_EFER     0xC0000080u
-#define MSR_STAR     0xC0000081u
-#define MSR_LSTAR    0xC0000082u
-#define MSR_SFMASK   0xC0000084u
-#define MSR_FS_BASE  0xC0000100u
-
-/* The handoff and trap, from x86_64_linuxsys.S. */
-extern void linux_syscall_entry(void);
-
 /* ELF auxv entry tags. */
 #define AT_NULL   0
 #define AT_PAGESZ 6
@@ -167,28 +97,6 @@ extern void linux_syscall_entry(void);
 
 /* The program stack lives at the top of the per-process user window, its pages
  * pre-mapped so growth never faults (which would fault on the stack itself). */
-
-static inline void
-wrmsr(uint32_t msr, uint64_t val)
-{
-    __asm__ volatile ("wrmsr"
-                      : : "c"(msr), "a"((uint32_t)val),
-                          "d"((uint32_t)(val >> 32)));
-}
-
-static inline uint64_t
-read_efer(void)
-{
-    uint32_t lo, hi;
-    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(MSR_EFER));
-    return ((uint64_t)hi << 32) | lo;
-}
-
-static inline void
-sti(void)
-{
-    __asm__ volatile ("sti" ::: "memory");
-}
 
 /* Print a signed decimal, since con_printf's specifier set is not relied on. */
 static void
@@ -328,27 +236,13 @@ struct lshared {
     uint64_t heap_brk, heap_mmap, heap_mmaptop;
 };
 
-/* A thread: one schedulable context. Its trapframe is first so the SYSCALL
- * assembly reaches it by the TF_* offsets (checked below), with lproc_cur the
+/* A thread: one schedulable context. Its trapframe (the arch's user register
+ * set) is first so the trap assembly reaches it by fixed offsets, with the
+ * kstack_top right after it (the assembly's TF_KSTACK), and lproc_cur the
  * running thread. Everything it shares with its peers lives in sh. */
 struct lproc {
-    uint64_t tf_rax;        /* 0 */
-    uint64_t tf_rbx;        /* 8 */
-    uint64_t tf_rcx;        /* 16  user rip (SYSCALL return address) */
-    uint64_t tf_rdx;        /* 24 */
-    uint64_t tf_rsi;        /* 32 */
-    uint64_t tf_rdi;        /* 40 */
-    uint64_t tf_rbp;        /* 48 */
-    uint64_t tf_r8;         /* 56 */
-    uint64_t tf_r9;         /* 64 */
-    uint64_t tf_r10;        /* 72 */
-    uint64_t tf_r11;        /* 80  user rflags */
-    uint64_t tf_r12;        /* 88 */
-    uint64_t tf_r13;        /* 96 */
-    uint64_t tf_r14;        /* 104 */
-    uint64_t tf_r15;        /* 112 */
-    uint64_t tf_rsp;        /* 120 user rsp */
-    uint64_t kstack_top;    /* 128 top of the per-thread syscall handler stack */
+    struct trapframe tf;    /* arch backend; offset 0, size feeds TF_KSTACK */
+    uint64_t kstack_top;    /* top of the per-thread syscall handler stack */
     /* --- fields below are never touched by the assembly --- */
     struct lshared *sh;     /* the process this thread belongs to */
     unsigned char *kstack;  /* kmalloc base of the handler stack */
@@ -358,15 +252,13 @@ struct lproc {
     int task_id;            /* libOS task running this thread */
     int exited;
     long exit_status;
-    uint64_t fs_base;       /* FS base MSR (TLS), restored on a context switch */
+    uint64_t tls;           /* thread pointer (FS base / TPIDR), restored on switch */
     uint64_t clear_ctid;    /* CLONE_CHILD_CLEARTID: zero + futex-wake on exit */
 };
 
-_Static_assert(__builtin_offsetof(struct lproc, tf_rax) == 0, "TF_RAX");
-_Static_assert(__builtin_offsetof(struct lproc, tf_r11) == 80, "TF_R11");
-_Static_assert(__builtin_offsetof(struct lproc, tf_r15) == 112, "TF_R15");
-_Static_assert(__builtin_offsetof(struct lproc, tf_rsp) == 120, "TF_RSP");
-_Static_assert(__builtin_offsetof(struct lproc, kstack_top) == 128, "TF_KSTACK");
+_Static_assert(__builtin_offsetof(struct lproc, tf) == 0, "trapframe first");
+_Static_assert(__builtin_offsetof(struct lproc, kstack_top) == sizeof(struct trapframe),
+               "kstack_top follows the trapframe (the assembly's TF_KSTACK)");
 
 static struct lshared shareds[LINUX_NPROC];
 static struct lproc procs[LINUX_NPROC];
@@ -385,8 +277,8 @@ struct lproc *lproc_cur;
 static long do_execve(const char *path, const char *const *argv,
                       const char *const *envp);
 static vmspace_t linux_vmspace_setup(void);
-extern void linux_jump(uint64_t entry, uint64_t user_rsp)
-    __attribute__((noreturn));
+/* linux_jump is declared by the arch backend (linux_arch.h); linux_resume takes
+ * struct lproc, which is defined here, so it is declared here. */
 extern void linux_resume(struct lproc *p) __attribute__((noreturn));
 
 static void
@@ -1076,7 +968,7 @@ linux_on_resume(void *vp)
 {
     lproc_cur = (struct lproc *)vp;
     vmspace_switch(lproc_cur->sh->vmspace);
-    wrmsr(MSR_FS_BASE, lproc_cur->fs_base);
+    arch_load_tls(lproc_cur->tls);
 }
 
 /* Threads that have exited but still hold a libOS task slot and kstack. They
@@ -1279,9 +1171,9 @@ do_fork(void)
     }
 
     /* The main thread resumes at the fork() site on the cloned stack, rax = 0. */
-    memcpy(child, parent, 16 * sizeof(uint64_t));
-    child->tf_rax = 0;
-    child->fs_base = parent->fs_base;
+    child->tf = parent->tf;
+    tf_set_ret0(&child->tf);
+    child->tls = parent->tls;
 
     int tid = task_spawn_proc("linux", process_entry, child);
     if (tid < 0) {
@@ -1315,10 +1207,10 @@ do_clone_thread(uint64_t flags, uint64_t child_stack, uint64_t ptid,
     t->ismain = 0;
 
     /* Resume at the clone() site (rax = 0) on the new stack. */
-    memcpy(t, parent, 16 * sizeof(uint64_t));
-    t->tf_rax = 0;
-    t->tf_rsp = child_stack;
-    t->fs_base = (flags & CLONE_SETTLS) ? tls : parent->fs_base;
+    t->tf = parent->tf;
+    tf_set_ret0(&t->tf);
+    tf_set_sp(&t->tf, child_stack);
+    t->tls = (flags & CLONE_SETTLS) ? tls : parent->tls;
     if (flags & CLONE_CHILD_SETTID)
         *(int *)(uintptr_t)ctid = t->tid;
     if (flags & CLONE_PARENT_SETTID)
@@ -1424,8 +1316,8 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     switch (nr) {
     case SYS_arch_prctl:
         if (a1 == ARCH_SET_FS) {
-            lproc_cur->fs_base = (uint64_t)a2;      /* restored on a switch */
-            wrmsr(MSR_FS_BASE, (uint64_t)a2);
+            lproc_cur->tls = (uint64_t)a2;          /* restored on a switch */
+            arch_load_tls((uint64_t)a2);
             return 0;
         }
         return -LERR_NOSYS;
@@ -1445,9 +1337,7 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_munmap:
         return 0;                       /* bump arena: no reclaim */
     case SYS_time: {
-        uint32_t lo, hi;
-        __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
-        int64_t t = (int64_t)((((uint64_t)hi << 32) | lo) / 1000000000ULL);
+        int64_t t = (int64_t)(arch_cycles() / 1000000000ULL);
         if (a1)
             *(int64_t *)a1 = t;
         return (long)t;
@@ -1455,9 +1345,7 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_clock_gettime: {
         /* No real clock: synthesise a monotonic time from the cycle counter,
          * assuming roughly 1 GHz. Good enough to keep libc startup happy. */
-        uint32_t lo, hi;
-        __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
-        uint64_t t = ((uint64_t)hi << 32) | lo;
+        uint64_t t = arch_cycles();
         uint64_t *ts = (uint64_t *)a2;    /* struct timespec { sec; nsec; } */
         if (ts) {
             ts[0] = t / 1000000000ULL;
@@ -1468,9 +1356,7 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_getrandom: {
         uint8_t *buf = (uint8_t *)a1;
         unsigned long len = (unsigned long)a2;
-        uint32_t lo, hi;
-        __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
-        uint64_t s = ((uint64_t)hi << 32) | lo;
+        uint64_t s = arch_cycles();
         for (unsigned long i = 0; i < len; i++) {
             buf[i] = (uint8_t)s;
             s = s * 6364136223846793005ULL + 1442695040888963407ULL;
@@ -1661,9 +1547,7 @@ build_stack_vec(const char *const *argv, int argc,
     /* 16 bytes for AT_RANDOM, seeded from the cycle counter, below the strings. */
     sp -= 16;
     uint8_t *rnd = sp;
-    uint32_t lo, hi;
-    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
-    uint64_t seed = ((uint64_t)hi << 32) | lo;
+    uint64_t seed = arch_cycles();
     for (int k = 0; k < 16; k++) {
         rnd[k] = (uint8_t)seed;
         seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
@@ -1794,18 +1678,6 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     linux_jump(entry, rsp);             /* enter the new image; does not return */
 }
 
-/* Turn on SYSCALL and point LSTAR at our handler. Our ring-0 CS is 0x08 and SS
- * is 0x10, so STAR's SYSCALL selector field is 0x08 (SYSCALL loads CS=0x08,
- * SS=0x10). SYSRET is unused (we return by jmp), so its field stays 0. */
-static void
-syscall_arm(void)
-{
-    wrmsr(MSR_EFER, read_efer() | 1u);          /* EFER.SCE */
-    wrmsr(MSR_STAR, (uint64_t)0x08u << 32);
-    wrmsr(MSR_LSTAR, (uint64_t)(uintptr_t)linux_syscall_entry);
-    wrmsr(MSR_SFMASK, 0x600u);                  /* mask IF and DF on entry */
-}
-
 /* One-time frame-pool init: the free RAM between the kernel image and the vcpu
  * stacks backs every process's private pages and page tables. */
 static int phys_ready;
@@ -1887,7 +1759,7 @@ linux_elf_run(const char *file)
 
     fds_init();
     arena_init();
-    syscall_arm();
+    linux_trap_init();
     con_puts("[bin] syscall armed\n");
     uint64_t rsp = build_stack(file);
     con_puts("[bin] stack built\n");
@@ -1896,13 +1768,13 @@ linux_elf_run(const char *file)
     linux_jump(entry, rsp);             /* enter the program; exit ends the task */
 }
 
-#else  /* !__x86_64__ */
+#else  /* unsupported architecture */
 
 void
 linux_elf_run(const char *file)
 {
     (void)file;
-    con_puts("[bin] the Linux binary-compat spike is x86-64 only\n");
+    con_puts("[bin] the Linux binary-compat guest needs x86-64 or arm64\n");
 }
 
 #endif
