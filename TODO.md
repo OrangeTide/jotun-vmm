@@ -110,3 +110,24 @@ and two TLS mechanisms; `epoll` emulation over the vswitch is new; the monotonic
 clock may want a vDSO, though Go and musl both fall back to the syscall. The
 cheapest proof that the whole idea holds is M16.1 alone: a ring-0 `SYSCALL` trap,
 about a dozen startup syscalls, and a static musl hello world exiting cleanly.
+
+## Investigations (unscheduled, feasibility unknown)
+
+Research items captured so they are not lost. Each needs a feasibility pass
+before it becomes real work.
+
+- Single-buffer / front-buffer rendering with dirty-line tracking in the shader.
+  The pixel path double-buffers and the frame-efficiency work sends only damaged
+  sub-rectangles (see the frame-efficiency note in `doc/roadmap.md`). The question
+  is whether the rasterizer could render straight to the front buffer and track
+  dirty scanlines itself, so only changed lines are re-encoded and sent, cutting
+  the per-frame cost further. May not be feasible given tearing and the way the
+  rasterizer overwrites whole regions; find out before committing to it.
+
+- Guest-side font loading for rendered text. Today the web terminal renders text
+  as browser-drawn SVG, so the guest loads no fonts. If the guest ever draws
+  glyphs itself (the pixel path), it needs a font format to load. The obvious
+  fits are bitmap fonts, which need no rasterizer: `.pcf` (X11) and `.psf` /
+  `.psfu` (PC Screen Font, the `.psfu` variant carrying a Unicode table). An
+  alternative is extracting embedded bitmap strikes in the style of OpenType
+  `sbix`. Investigate which is simplest to parse and license-clean to ship.
