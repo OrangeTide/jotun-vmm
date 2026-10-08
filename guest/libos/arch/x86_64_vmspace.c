@@ -8,6 +8,9 @@
 static uint64_t free_head;              /* 0 means empty */
 static int      physmap_on;             /* phys_to_virt uses the physmap once set */
 
+/* The address space the page-fault handler maps into (the running process). */
+vmspace_t cur_vmspace;
+
 void *
 phys_to_virt(uint64_t p)
 {
@@ -79,13 +82,14 @@ vmspace_new(void)
     tbl(pdpt)[0] = pd_low | VM_P | VM_W | VM_U;     /* [0, 1 GiB) */
     tbl(pdpt)[1] = pd_phys | VM_P | VM_W;           /* [1 GiB, 2 GiB): physmap */
 
-    /* Low identity [0, 0x400000) and the vcpu-stack band [0x1C00000, 0x2000000)
-     * as 2 MiB pages. The user window between them is left unmapped. */
+    /* Everything in [0, 1 GiB) outside the user window is shared identity as
+     * 2 MiB pages: the kernel, page tables, vcpu stacks, and the device MMIO
+     * band (the 9P and SMP doorbells near 0x0a000000). Only the user window
+     * [0x400000, 0x1C00000) is left unmapped, to be demand-paged per process. */
     uint64_t *pdl = tbl(pd_low);
     for (uint64_t i = 0; i < 512; i++) {
         uint64_t base = i << 21;
-        if (base < VM_USER_LO ||
-            (base >= VM_USER_HI && base < 0x2000000ULL))
+        if (base < VM_USER_LO || base >= VM_USER_HI)
             pdl[i] = base | VM_P | VM_W | VM_PS;
     }
 
@@ -150,6 +154,30 @@ vmspace_switch(vmspace_t as)
 {
     __asm__ volatile ("mov %0, %%cr3" : : "r"(as) : "memory");
     physmap_on = 1;
+    cur_vmspace = as;
+}
+
+/* The page-fault handler's C half (called from pf_isr). A not-present fault in
+ * the running process's user window is demand-paged: allocate a zeroed frame,
+ * map it, and report success so the instruction retries. Anything else is
+ * fatal and reported by the caller. */
+int
+pf_handle(uint64_t cr2, uint64_t err)
+{
+    if (!cur_vmspace || (err & VM_P))           /* protection fault: not ours */
+        return 0;
+    if (cr2 < VM_USER_LO || cr2 >= VM_USER_HI)
+        return 0;
+
+    uint64_t f = phys_alloc();
+    if (!f)
+        return 0;
+    if (vmspace_map(cur_vmspace, cr2 & ~0xFFFULL, f, VM_W | VM_U) != 0) {
+        phys_free(f);
+        return 0;
+    }
+    __asm__ volatile ("invlpg (%0)" : : "r"(cr2) : "memory");
+    return 1;
 }
 
 /* Visit every present user-window PT entry, calling fn(vaddr, entry-ptr). */

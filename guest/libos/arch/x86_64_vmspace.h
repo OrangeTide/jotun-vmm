@@ -33,6 +33,10 @@
 
 typedef uint64_t vmspace_t;                 /* physical address of the PML4 */
 
+/* The active address space (the running process), tracked by vmspace_switch
+ * and consulted by the page-fault handler. */
+extern vmspace_t cur_vmspace;
+
 /* Thread the physical frames in [lo, hi) onto the free list. Called once. */
 void phys_init(uint64_t lo, uint64_t hi);
 

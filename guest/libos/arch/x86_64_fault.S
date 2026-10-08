@@ -93,6 +93,61 @@ exc_common:
     hlt
     jmp 1b
 
+/* Page-fault handler (vector 14). Tries to demand-map the faulting page via
+ * pf_handle; on success it retries the instruction, otherwise it falls through
+ * to the same report-and-halt path as the other exceptions. The CPU has pushed
+ * an error code; we push the vector so the fatal path matches struct faultframe
+ * exactly (vec, err, rip, ...). */
+    .global pf_isr
+pf_isr:
+    pushq $14                  /* vec, below the CPU's error code */
+    push %rax
+    push %rbx
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %rbp
+    push %r8
+    push %r9
+    push %r10
+    push %r11
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+
+    cld
+    mov %cr2, %rdi             /* arg1: faulting address */
+    mov 128(%rsp), %rsi        /* arg2: error code (15 regs + vec above it) */
+    call pf_handle
+    test %rax, %rax
+    jz 2f                      /* 0: not handled, report and halt */
+
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rbp
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rbx
+    pop %rax
+    add $16, %rsp              /* discard vec and the error code */
+    iretq
+
+2:  mov %rsp, %rdi             /* struct faultframe * */
+    call fault_report
+3:  cli
+    hlt
+    jmp 3b
+
     .data
     .align 8
     .global exc_stub_table

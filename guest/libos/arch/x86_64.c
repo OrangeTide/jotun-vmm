@@ -94,6 +94,9 @@ extern void isr_event(void);        /* arch/x86_64_isr.S */
 /* The 32 CPU-exception stub entry points, from arch/x86_64_fault.S. */
 extern void (*exc_stub_table[32])(void);
 
+/* The page-fault handler entry (arch/x86_64_fault.S). */
+extern void pf_isr(void);
+
 /* The register and trap frame fault_report receives, matching the push order
  * in exc_common (GP registers first, then the vector and error code the stub
  * added, then the CPU's own trap frame). */
@@ -187,6 +190,10 @@ arch_traps_init(void)
      * rather than escalating to a silent triple fault. */
     for (int v = 0; v < 32; v++)
         idt_set(v, exc_stub_table[v]);
+
+    /* Page faults get a handler that demand-maps the Linux user window (and
+     * reports anything else), replacing the bare diagnostic stub. */
+    idt_set(14, pf_isr);
 
     idt_set(0x20, isr_event);       /* JOTUN_EVENT_VECTOR */
     struct desc_ptr ip = { sizeof idt - 1, (uint64_t)(uintptr_t)idt };

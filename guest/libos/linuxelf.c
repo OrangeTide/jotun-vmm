@@ -23,6 +23,7 @@
 #include "p9.h"
 #include "string.h"
 #include "jotun_svc.h"       /* JOTUN_PROG_BASE */
+#include "arch/x86_64_vmspace.h"
 
 #include <stdint.h>
 
@@ -40,7 +41,8 @@
 #define LINUX_PROG_BASE    0x400000ULL
 #define LINUX_PROG_LIMIT   0x800000ULL
 #define LINUX_HEAP_BASE    0x800000ULL
-#define LINUX_STACK_RESERVE 0x400000ULL
+#define LINUX_USTACK_SIZE  (256u * 1024)
+#define LINUX_USTACK_TOP   VM_USER_HI       /* top of the user window */
 #define PAGE_SIZE          0x1000ULL
 
 /* mmap flags and failure value. */
@@ -146,9 +148,8 @@ extern void linux_exit(long code) __attribute__((noreturn));
 #define AT_PAGESZ 6
 #define AT_RANDOM 25
 
-/* The program's stack. 128 KiB is ample for a hello and keeps us well clear of
- * the loaded image at 0x400000 and the vcpu stacks at the top of RAM. */
-static uint8_t linux_ustack[128 * 1024] __attribute__((aligned(16)));
+/* The program stack lives at the top of the per-process user window, its pages
+ * pre-mapped so growth never faults (which would fault on the stack itself). */
 
 static inline void
 wrmsr(uint32_t msr, uint64_t val)
@@ -298,17 +299,16 @@ static uint64_t exec_rsp;
 
 static long do_execve(const char *path, const char *const *argv,
                       const char *const *envp);
+static vmspace_t linux_vmspace_setup(void);
 
 static void
 arena_init(void)
 {
-    uint64_t ram = boot_ram_size();
-
+    /* brk grows up from the heap base; anonymous mmap grows down from just below
+     * the user stack at the top of the window. Pages in between fault in on
+     * demand, so the arena is lazily backed. */
     brk_cur = LINUX_HEAP_BASE;
-    if (ram > LINUX_STACK_RESERVE + LINUX_HEAP_BASE)
-        mmap_top = (ram - LINUX_STACK_RESERVE) & ~(PAGE_SIZE - 1);
-    else
-        mmap_top = LINUX_HEAP_BASE;     /* no arena: allocations will fail */
+    mmap_top = (LINUX_USTACK_TOP - LINUX_USTACK_SIZE) & ~(PAGE_SIZE - 1);
     mmap_cur = mmap_top;
 }
 
@@ -333,7 +333,8 @@ do_mmap(uint64_t addr, uint64_t len, uint64_t flags, long fd)
     if (n == 0 || mmap_cur - n < brk_cur)
         return MMAP_FAILED;
     mmap_cur -= n;
-    memset((void *)(uintptr_t)mmap_cur, 0, n);  /* anonymous memory reads as zero */
+    /* The pages fault in zeroed on first touch (phys_alloc clears frames), so
+     * anonymous memory reads as zero without eager mapping. */
     return (long)mmap_cur;
 }
 
@@ -1072,8 +1073,10 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
  * Stack and SYSCALL setup.
  ****************************************************************/
 
-/* Build a System V initial stack in linux_ustack from explicit argv and envp
- * vectors and return the rsp to enter with: argc, argv[], NULL, envp[], NULL,
+/* Build a System V initial stack at the top of the user window from explicit
+ * argv and envp vectors (the stack pages must already be mapped and this
+ * process's CR3 active) and return the rsp to enter with: argc, argv[], NULL,
+ * envp[], NULL,
  * auxv (AT_PAGESZ, AT_RANDOM, AT_NULL), with the strings and 16 random bytes
  * placed above it. The argv/envp string pointers must stay valid during the
  * build (they come from boot data or an execve snapshot, never live user mem
@@ -1082,7 +1085,7 @@ static uint64_t
 build_stack_vec(const char *const *argv, int argc,
                 const char *const *envp, int envc)
 {
-    uint8_t *sp = linux_ustack + sizeof linux_ustack;
+    uint8_t *sp = (uint8_t *)(uintptr_t)LINUX_USTACK_TOP;
     char *argp[LINUX_MAX_ARGS];
     char *envpp[LINUX_MAX_ARGS];
 
@@ -1206,11 +1209,23 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
         argc = 1;
     }
 
+    /* A fresh address space for the new image, replacing the old one. */
+    vmspace_t old = cur_vmspace;
+    vmspace_t as = linux_vmspace_setup();
+    if (!as) {
+        p9_clunk(LINUX_FID);
+        kfree(sbuf);
+        return -LERR_NOMEM;
+    }
+    vmspace_switch(as);
+
     uint64_t entry = elf_load_fid(LINUX_FID, LINUX_PROG_BASE, LINUX_PROG_LIMIT);
     p9_clunk(LINUX_FID);
     if (entry == 0) {
+        vmspace_switch(old);            /* keep the old image on failure */
+        vmspace_destroy(as);
         kfree(sbuf);
-        return -LERR_NOENT;             /* image gone, but nothing else ran it */
+        return -LERR_NOENT;
     }
 
     brk_cur = LINUX_HEAP_BASE;          /* fresh heap for the new image */
@@ -1219,6 +1234,7 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     exec_entry = entry;
     exec_pending = 1;
     kfree(sbuf);
+    vmspace_destroy(old);               /* release the replaced image's frames */
 
     linux_exit(0);                      /* back to the linux_elf_run loop */
     return 0;                           /* unreached */
@@ -1236,12 +1252,52 @@ syscall_arm(void)
     wrmsr(MSR_SFMASK, 0x600u);                  /* mask IF and DF on entry */
 }
 
+/* One-time frame-pool init: the free RAM between the kernel image and the vcpu
+ * stacks backs every process's private pages and page tables. */
+static int phys_ready;
+
+static void
+linux_phys_init(void)
+{
+    if (!phys_ready) {
+        phys_init(LINUX_PROG_BASE, VM_USER_HI);
+        phys_ready = 1;
+    }
+}
+
+/* Build a fresh address space with the user stack pre-mapped (so stack growth
+ * never faults on the stack page itself). Returns the vmspace, or 0. */
+static vmspace_t
+linux_vmspace_setup(void)
+{
+    vmspace_t as = vmspace_new();
+    if (!as)
+        return 0;
+    for (uint64_t v = LINUX_USTACK_TOP - LINUX_USTACK_SIZE;
+         v < LINUX_USTACK_TOP; v += VM_PAGE) {
+        uint64_t f = phys_alloc();
+        if (!f || vmspace_map(as, v, f, VM_W | VM_U) != 0) {
+            vmspace_destroy(as);
+            return 0;
+        }
+    }
+    return as;
+}
+
 void
 linux_elf_run(const char *file)
 {
     con_puts("[bin] loading ");
     con_puts(file);
     con_putc('\n');
+
+    linux_phys_init();
+    vmspace_t as = linux_vmspace_setup();
+    if (!as) {
+        con_puts("[bin] no memory for the address space\n");
+        return;
+    }
+    vmspace_switch(as);                 /* user window now demand-maps on fault */
 
     if (ns_walk(file, LINUX_FID) != 0) {
         con_puts("[bin] not found in bundle\n");
