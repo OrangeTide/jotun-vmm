@@ -35,10 +35,19 @@ linux_syscall_entry:
     movq %rsp, le_user_rsp(%rip)
     movq le_sc_kstack(%rip), %rsp
 
-    /* Preserve the SYSCALL-clobbered return state across the C call. rcx and
-     * r11 are now free to use as scratch for the argument marshal. */
+    /* The Linux syscall ABI preserves every register across a syscall except
+     * rax (the return value), rcx, and r11. Our C dispatcher follows SysV and
+     * may clobber rdi, rsi, rdx, r10, r8, r9, so save the user's originals and
+     * restore them after the call; otherwise the program resumes with its
+     * registers trashed. rcx and r11 carry the return RIP and RFLAGS. */
     pushq %rcx                 /* user RIP */
     pushq %r11                 /* user RFLAGS */
+    pushq %rdi
+    pushq %rsi
+    pushq %rdx
+    pushq %r10
+    pushq %r8
+    pushq %r9
 
     /* Linux puts the call number in rax and args in rdi, rsi, rdx, r10, r8, r9.
      * The C dispatcher wants (nr, a1, a2, a3, a4, a5) in the SysV registers
@@ -54,7 +63,14 @@ linux_syscall_entry:
     movq %rax, %rdi
     call linux_sys_dispatch
 
-    /* rax holds the return value. Restore the user return state and resume. */
+    /* rax holds the return value. Restore the user's argument registers and the
+     * return state, then resume after the SYSCALL. */
+    popq %r9
+    popq %r8
+    popq %r10
+    popq %rdx
+    popq %rsi
+    popq %rdi
     popq %r11                  /* user RFLAGS */
     popq %rcx                  /* user RIP */
     movq le_user_rsp(%rip), %rsp
