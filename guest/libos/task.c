@@ -60,7 +60,12 @@ struct task {
     char                notes[NNOTES][NOTE_MAX];
     int                 note_head;
     int                 note_tail;
+    void                *proc;        /* opaque per-process state for the hook */
 };
+
+/* Called with t->proc before the scheduler runs a task that has one, so a
+ * subsystem can switch the active address space into that process. */
+static void (*resume_hook)(void *proc);
 
 /* Per-cpu state, reached through arch_get_percpu. self lets a caller that
  * holds a struct percpu * recover the pointer the arch register hands back. */
@@ -210,6 +215,7 @@ task_spawn(const char *name, task_fn fn)
         t->note_head = t->note_tail = 0;
         t->parked = 0;
         t->wake_pending = 0;
+        t->proc = NULL;
         t->state = TASK_READY;
         enqueue(t);
         id = i;
@@ -220,6 +226,32 @@ task_spawn(const char *name, task_fn fn)
     if (id >= 0)
         smp_wake_all();     /* new work: rouse any cpu sitting idle */
     return id;
+}
+
+int
+task_spawn_proc(const char *name, task_fn fn, void *proc)
+{
+    int id = task_spawn(name, fn);
+    if (id >= 0) {
+        unsigned long f = lock_irq();
+        tasks[id].proc = proc;
+        unlock_irq(f);
+    }
+    return id;
+}
+
+void
+task_set_proc(void *proc)
+{
+    unsigned long f = lock_irq();
+    this_cpu()->cur->proc = proc;
+    unlock_irq(f);
+}
+
+void
+task_set_resume_hook(void (*fn)(void *proc))
+{
+    resume_hook = fn;
 }
 
 int
@@ -288,6 +320,13 @@ sched_start(void)
         running_count++;
         pc->cur = t;
         unlock_irq(f);
+
+        /* Switch the active address space into this process (if it is one)
+         * before running it, so its private user window and trapframe are live.
+         * The hook touches only shared kernel mappings, so it is safe under
+         * whatever CR3 the previous task left. */
+        if (t->proc && resume_hook)
+            resume_hook(t->proc);
 
         /* Save this cpu's scheduler context and run the task. Control returns
          * here, on the same cpu, when the task yields, exec's, or exits. */
@@ -462,6 +501,20 @@ task_await(char *buf, int nbuf)
             return -1;
         task_yield();       /* let the children make progress */
     }
+}
+
+int
+task_reap(int id)
+{
+    if (id < 0 || id >= MAX_TASKS)
+        return -1;
+    unsigned long f = lock_irq();
+    struct task *t = &tasks[id];
+    int ok = (t->state == TASK_ZOMBIE);
+    if (ok)
+        t->state = TASK_FREE;
+    unlock_irq(f);
+    return ok ? 0 : -1;
 }
 
 int

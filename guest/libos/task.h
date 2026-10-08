@@ -31,6 +31,20 @@ void cpu_init(unsigned long id);
  * the table is full or a stack cannot be allocated. */
 int task_spawn(const char *name, task_fn fn);
 
+/* Like task_spawn, but attach an opaque per-process pointer. Before the
+ * scheduler runs a task whose proc is non-NULL, it calls the resume hook with
+ * that pointer, so a subsystem can switch address spaces (CR3) into the right
+ * process. Used by the Linux-compat guest for fork. */
+int task_spawn_proc(const char *name, task_fn fn, void *proc);
+
+/* Attach proc to the current task (see task_spawn_proc). Lets a task that
+ * started as an ordinary task become a process the resume hook recognises. */
+void task_set_proc(void *proc);
+
+/* Register the hook the scheduler calls with t->proc before running a task
+ * that has one. Only one hook; a later call replaces it. */
+void task_set_resume_hook(void (*fn)(void *proc));
+
 /* Replace the current task's program with fn, restarting on a fresh stack. The
  * task keeps its id, name, and parent. Does not return on success; returns -1
  * only if the stack cannot be reset. */
@@ -71,6 +85,11 @@ void task_exits(const char *status) __attribute__((noreturn));
  * and returns the child's id. Returns -1 at once if the caller has no
  * children. Yields while children are still running. */
 int task_await(char *buf, int nbuf);
+
+/* Reap a specific exited (zombie) task by id, freeing its slot. Returns 0 if it
+ * was reaped, -1 if the id is not a zombie. For a layer that tracks child
+ * lifetimes itself (the Linux guest reaps by process, not by task). */
+int task_reap(int id);
 
 /* Post a note to a task. Borrowed string, copied into the target's queue.
  * Returns 0, or -1 if the id is invalid or its note queue is full. */

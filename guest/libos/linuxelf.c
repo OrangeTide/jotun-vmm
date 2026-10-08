@@ -22,6 +22,7 @@
 #include "ns.h"
 #include "p9.h"
 #include "string.h"
+#include "task.h"
 #include "jotun_svc.h"       /* JOTUN_PROG_BASE */
 #include "arch/x86_64_vmspace.h"
 
@@ -78,6 +79,15 @@
 #define SYS_prctl           157
 #define SYS_exit            60
 #define SYS_execve          59
+#define SYS_clone           56
+#define SYS_fork            57
+#define SYS_vfork           58
+#define SYS_wait4           61
+#define SYS_getpid          39
+#define SYS_getppid         110
+#define SYS_rt_sigaction    13
+#define SYS_rt_sigprocmask  14
+#define SYS_gettid          186
 #define SYS_mprotect        10
 #define SYS_time            201
 #define SYS_clock_gettime   228
@@ -130,6 +140,9 @@
 #define LERR_NOSYS  38
 #define LERR_NOENT  2
 #define LERR_ROFS   30
+#define LERR_PIPE   32          /* EPIPE: write to a pipe with no readers */
+#define LERR_CHILD  10          /* ECHILD: wait with no children */
+#define LERR_AGAIN  11          /* EAGAIN */
 
 /* x86-64 MSRs for the SYSCALL path. */
 #define MSR_EFER     0xC0000080u
@@ -140,8 +153,6 @@
 
 /* The handoff and trap, from x86_64_linuxsys.S. */
 extern void linux_syscall_entry(void);
-extern long linux_enter(uint64_t entry, uint64_t user_rsp);
-extern void linux_exit(long code) __attribute__((noreturn));
 
 /* ELF auxv entry tags. */
 #define AT_NULL   0
@@ -280,26 +291,79 @@ struct lpipe {
     uint8_t  buf[PIPE_CAP];
 };
 
-static struct lfd fds[LINUX_NFD];
+/* The pipe pool is shared across processes: a pipe inherited across fork is the
+ * same buffer in parent and child. File tables and heaps are per process. */
+#define LINUX_NPROC  8
+#define LINUX_KSTACK (16u * 1024)       /* per-process syscall handler stack */
+#define CLONE_VM     0x00000100u        /* clone shares the address space (thread) */
 static struct lpipe pipes[LINUX_NPIPE];
 
-/* The program heap arena. brk_cur grows up from LINUX_HEAP_BASE; mmap_cur grows
- * down from mmap_top (set from RAM size at startup). A bump allocator: munmap
- * does not reclaim, which is fine for a program that runs once and exits. */
-static uint64_t brk_cur;
-static uint64_t mmap_cur;
-static uint64_t mmap_top;
+/* Trapframe field offsets, mirrored in arch/x86_64_linuxsys.S as TF_*. The
+ * SYSCALL assembly saves the user registers here on entry and restores them on
+ * return, and fork copies the frame into the child so it resumes at the same
+ * instruction with rax = 0. The checks below catch any layout drift. */
+struct lproc {
+    uint64_t tf_rax;        /* 0 */
+    uint64_t tf_rbx;        /* 8 */
+    uint64_t tf_rcx;        /* 16  user rip (SYSCALL return address) */
+    uint64_t tf_rdx;        /* 24 */
+    uint64_t tf_rsi;        /* 32 */
+    uint64_t tf_rdi;        /* 40 */
+    uint64_t tf_rbp;        /* 48 */
+    uint64_t tf_r8;         /* 56 */
+    uint64_t tf_r9;         /* 64 */
+    uint64_t tf_r10;        /* 72 */
+    uint64_t tf_r11;        /* 80  user rflags */
+    uint64_t tf_r12;        /* 88 */
+    uint64_t tf_r13;        /* 96 */
+    uint64_t tf_r14;        /* 104 */
+    uint64_t tf_r15;        /* 112 */
+    uint64_t tf_rsp;        /* 120 user rsp */
+    uint64_t kstack_top;    /* 128 top of the per-process syscall handler stack */
+    /* --- fields below are never touched by the assembly --- */
+    vmspace_t vmspace;
+    unsigned char *kstack;  /* kmalloc base of the handler stack */
+    int used;
+    int pid;
+    int parent;             /* pid of the parent, or 0 for the first process */
+    int task_id;            /* libOS task running this process */
+    int exited;
+    long exit_status;
+    uint64_t fs_base;       /* FS base MSR (TLS), restored on a context switch */
+    struct lfd fdtab[LINUX_NFD];
+    /* The heap arena. heap_brk grows up from LINUX_HEAP_BASE; heap_mmap grows
+     * down from heap_mmaptop. A bump allocator; munmap does not reclaim. The
+     * helpers reach these through the fds/brk_cur/mmap_* macros below. */
+    uint64_t heap_brk, heap_mmap, heap_mmaptop;
+};
 
-/* execve hands a new image back to the linux_elf_run loop rather than returning
- * through the syscall: do_execve loads the image, builds a fresh stack, sets
- * these, and longjmps out via linux_exit. */
-static int      exec_pending;
-static uint64_t exec_entry;
-static uint64_t exec_rsp;
+_Static_assert(__builtin_offsetof(struct lproc, tf_rax) == 0, "TF_RAX");
+_Static_assert(__builtin_offsetof(struct lproc, tf_r11) == 80, "TF_R11");
+_Static_assert(__builtin_offsetof(struct lproc, tf_r15) == 112, "TF_R15");
+_Static_assert(__builtin_offsetof(struct lproc, tf_rsp) == 120, "TF_RSP");
+_Static_assert(__builtin_offsetof(struct lproc, kstack_top) == 128, "TF_KSTACK");
+
+static struct lproc procs[LINUX_NPROC];
+
+/* The running process. Set by the resume hook before the scheduler runs a
+ * process task, and read by the assembly as lproc_cur. All the do_* syscall
+ * helpers reach their file table and arena through it. */
+struct lproc *lproc_cur;
+
+/* Reach the running process's state by the bare names the helpers already use.
+ * The struct members are spelled differently so that explicit member access
+ * elsewhere (child->fdtab, parent->heap_brk) does not trip these macros. */
+#define fds       (lproc_cur->fdtab)
+#define brk_cur   (lproc_cur->heap_brk)
+#define mmap_cur  (lproc_cur->heap_mmap)
+#define mmap_top  (lproc_cur->heap_mmaptop)
 
 static long do_execve(const char *path, const char *const *argv,
                       const char *const *envp);
 static vmspace_t linux_vmspace_setup(void);
+extern void linux_jump(uint64_t entry, uint64_t user_rsp)
+    __attribute__((noreturn));
+extern void linux_resume(struct lproc *p) __attribute__((noreturn));
 
 static void
 arena_init(void)
@@ -338,10 +402,6 @@ do_mmap(uint64_t addr, uint64_t len, uint64_t flags, long fd)
     return (long)mmap_cur;
 }
 
-/* A reference count per backing 9P fid, indexed by (p9fid - LINUX_FID_BASE),
- * so dup can share a fid and it is clunked only when the last fd closes. */
-static uint8_t fidref[LINUX_NFD];
-
 /* fds 0,1,2 are the console; higher fds are 9P-backed. */
 static struct lfd *
 fd_get(long fd)
@@ -360,6 +420,23 @@ fd_alloc(void)
     return -1;
 }
 
+/* Open bundle files draw a 9P fid from a single global pool, refcounted in
+ * gfidref so dup and fork can share one fid (one server-side file, hence one
+ * shared read offset, as fork semantics want) and it is clunked only when the
+ * last fd across all processes closes. Index into gfidref is (fid - FID_BASE). */
+#define GFID_MAX 64
+static uint8_t gfidref[GFID_MAX];
+
+/* A free pool fid (count 0), or 0 if the pool is exhausted. */
+static uint32_t
+fid_alloc(void)
+{
+    for (int i = 0; i < GFID_MAX; i++)
+        if (gfidref[i] == 0)
+            return LINUX_FID_BASE + (uint32_t)i;
+    return 0;
+}
+
 /* Copy src into fd slot dst, taking a reference on whatever backs it so a later
  * close releases it exactly once. Used by dup/dup2/dup3. */
 static void
@@ -376,16 +453,14 @@ clone_fd(int dst, struct lfd *src)
     } else if (src->isram) {
         /* the ramfile persists regardless of fd count: nothing to refcount */
     } else {
-        fidref[src->p9fid - LINUX_FID_BASE]++;
+        gfidref[src->p9fid - LINUX_FID_BASE]++;
     }
 }
 
 static void
 fds_init(void)
 {
-    memset(fds, 0, sizeof fds);
-    memset(fidref, 0, sizeof fidref);
-    memset(pipes, 0, sizeof pipes);
+    memset(fds, 0, sizeof(lproc_cur->fdtab));
     fds[0].used = fds[1].used = fds[2].used = 1;    /* stdin/out/err */
 }
 
@@ -533,8 +608,21 @@ do_write(long fd, const char *buf, unsigned long len)
             con_putc(buf[i]);
         return (long)len;
     }
-    if (f && f->ispipe && f->wr)
-        return pipe_write(&pipes[f->pidx], buf, len);
+    if (f && f->ispipe && f->wr) {
+        struct lpipe *p = &pipes[f->pidx];
+        unsigned long done = 0;
+        /* Write everything, yielding when the ring fills so a reader in another
+         * process can drain it. If every reader has closed, report EPIPE. */
+        while (done < len) {
+            if (p->readers == 0)
+                return done ? (long)done : -LERR_PIPE;
+            long n = pipe_write(p, (const uint8_t *)buf + done, len - done);
+            done += (unsigned long)n;
+            if (done < len)
+                task_yield();
+        }
+        return (long)done;
+    }
     if (f && f->isram) {
         struct ramfile *rf = &ramfs[f->ridx];
         uint64_t end = f->pos + len;
@@ -607,7 +695,9 @@ do_open(const char *path, long flags)
     int fd = fd_alloc();
     if (fd < 0)
         return -LERR_NOMEM;
-    uint32_t p9fid = LINUX_FID_BASE + (uint32_t)fd;
+    uint32_t p9fid = fid_alloc();
+    if (p9fid == 0)
+        return -LERR_NOMEM;
 
     if (ns_walk(rel, p9fid) != 0)
         return -LERR_NOENT;
@@ -634,7 +724,7 @@ do_open(const char *path, long flags)
     fds[fd].p9fid = p9fid;
     fds[fd].pos = 0;
     fds[fd].size = size;
-    fidref[p9fid - LINUX_FID_BASE] = 1;
+    gfidref[p9fid - LINUX_FID_BASE] = 1;
     return fd;
 }
 
@@ -645,8 +735,15 @@ do_read(long fd, void *buf, unsigned long count)
 
     if (!f || fd < 3)
         return -LERR_BADF;              /* no stdin source */
-    if (f->ispipe)
-        return f->wr ? -LERR_BADF : pipe_read(&pipes[f->pidx], buf, count);
+    if (f->ispipe) {
+        if (f->wr)
+            return -LERR_BADF;
+        struct lpipe *p = &pipes[f->pidx];
+        /* Block until data arrives or every writer has closed (then EOF = 0). */
+        while (p->count == 0 && p->writers > 0)
+            task_yield();
+        return pipe_read(p, buf, count);
+    }
     if (f->isram) {
         struct ramfile *rf = &ramfs[f->ridx];
         if (f->pos >= rf->len)
@@ -691,7 +788,7 @@ do_close(long fd)
         return 0;
     }
     uint32_t slot = f->p9fid - LINUX_FID_BASE;
-    if (fidref[slot] && --fidref[slot] == 0)
+    if (gfidref[slot] && --gfidref[slot] == 0)
         p9_clunk(f->p9fid);             /* last reference: release the fid */
     f->used = 0;
     return 0;
@@ -739,7 +836,7 @@ meta_path(const char *path, int *isdir, uint64_t *size, uint64_t *ino)
         *ino = (uint64_t)(0x10000 + ri);
         return 0;
     }
-    uint32_t fid = LINUX_FID_BASE + LINUX_NFD;      /* scratch, above the pool */
+    uint32_t fid = LINUX_FID_BASE + GFID_MAX;       /* scratch, above the pool */
     if (ns_walk(rel, fid) != 0)
         return -LERR_NOENT;
     struct p9_stat st;
@@ -908,6 +1005,188 @@ do_getdents64(long fd, void *buf, unsigned long count)
     return (long)used;
 }
 
+/****************************************************************
+ * Processes: fork, wait, exit. Each Linux process is a libOS task with its own
+ * address space and file table. They run cooperatively, switching only when a
+ * syscall blocks (on a pipe, or in wait4).
+ ****************************************************************/
+
+/* The task function for a forked child. Its trapframe was copied from the
+ * parent with rax = 0, so it resumes right after fork(), returning 0. */
+static void
+process_entry(void)
+{
+    linux_resume(lproc_cur);            /* lproc_cur set by the resume hook */
+}
+
+/* Switch the active address space and TLS into p before its task runs
+ * (registered with the scheduler as the resume hook). */
+static void
+linux_on_resume(void *vp)
+{
+    lproc_cur = (struct lproc *)vp;
+    vmspace_switch(lproc_cur->vmspace);
+    wrmsr(MSR_FS_BASE, lproc_cur->fs_base);
+}
+
+static struct lproc *
+proc_alloc(void)
+{
+    for (int i = 0; i < LINUX_NPROC; i++) {
+        if (procs[i].used)
+            continue;
+        struct lproc *p = &procs[i];
+        memset(p, 0, sizeof *p);
+        p->kstack = kmalloc(LINUX_KSTACK);
+        if (!p->kstack)
+            return NULL;
+        p->kstack_top = ((uint64_t)(uintptr_t)p->kstack + LINUX_KSTACK)
+                        & ~(uint64_t)15;
+        p->used = 1;
+        p->pid = i + 1;                 /* slot 0 is pid 1, the first process */
+        return p;
+    }
+    return NULL;
+}
+
+/* Release p's open descriptors, dropping the shared pipe and 9P references so a
+ * reader sees EOF once every writer is gone. Called on exit and on a failed
+ * fork. */
+static void
+proc_release_fds(struct lproc *p)
+{
+    for (int i = 3; i < LINUX_NFD; i++) {
+        struct lfd *f = &p->fdtab[i];
+        if (!f->used)
+            continue;
+        if (f->ispipe) {
+            struct lpipe *pp = &pipes[f->pidx];
+            if (f->wr && pp->writers > 0)
+                pp->writers--;
+            else if (!f->wr && pp->readers > 0)
+                pp->readers--;
+            if (pp->readers == 0 && pp->writers == 0)
+                pp->used = 0;
+        } else if (!f->isram && f->p9fid) {
+            uint32_t slot = f->p9fid - LINUX_FID_BASE;
+            if (gfidref[slot] && --gfidref[slot] == 0)
+                p9_clunk(f->p9fid);
+        }
+        f->used = 0;
+    }
+}
+
+static void
+proc_free(struct lproc *p)
+{
+    if (p->vmspace)
+        vmspace_destroy(p->vmspace);
+    if (p->kstack)
+        kfree(p->kstack);
+    p->used = 0;
+}
+
+/* fork: a child process that is a copy of the caller. The child's address space
+ * is an eager copy, its trapframe is the parent's with rax = 0, and its open
+ * descriptors are the same objects (shared pipe buffers and 9P fids). */
+static long
+do_fork(void)
+{
+    struct lproc *parent = lproc_cur;
+    struct lproc *child = proc_alloc();
+
+    if (!child)
+        return -LERR_NOMEM;
+    child->vmspace = vmspace_clone(parent->vmspace);
+    if (!child->vmspace) {
+        proc_free(child);
+        return -LERR_NOMEM;
+    }
+
+    /* Copy the trapframe (the first 16 words), then override rax so the child
+     * returns 0. kstack_top at offset 128 and the rest stay the child's own. */
+    memcpy(child, parent, 16 * sizeof(uint64_t));
+    child->tf_rax = 0;
+    child->fs_base = parent->fs_base;
+    child->parent = parent->pid;
+    memcpy(child->fdtab, parent->fdtab, sizeof child->fdtab);
+    child->heap_brk = parent->heap_brk;
+    child->heap_mmap = parent->heap_mmap;
+    child->heap_mmaptop = parent->heap_mmaptop;
+
+    /* Account for the inherited descriptors (the child shares them). */
+    for (int i = 3; i < LINUX_NFD; i++) {
+        struct lfd *f = &child->fdtab[i];
+        if (!f->used)
+            continue;
+        if (f->ispipe) {
+            if (f->wr)
+                pipes[f->pidx].writers++;
+            else
+                pipes[f->pidx].readers++;
+        } else if (!f->isram && f->p9fid)
+            gfidref[f->p9fid - LINUX_FID_BASE]++;
+    }
+
+    int tid = task_spawn_proc("linux", process_entry, child);
+    if (tid < 0) {
+        proc_release_fds(child);
+        proc_free(child);
+        return -LERR_NOMEM;
+    }
+    child->task_id = tid;
+    return child->pid;                  /* the parent gets the child's pid */
+}
+
+/* wait4: reap a child. Returns its pid and writes an exit-encoded status. With
+ * cooperative tasks, yield while children still run so they can finish. */
+static long
+do_wait4(long pid, int *status)
+{
+    struct lproc *me = lproc_cur;
+
+    for (;;) {
+        int haskid = 0;
+        for (int i = 0; i < LINUX_NPROC; i++) {
+            struct lproc *c = &procs[i];
+            if (!c->used || c->parent != me->pid)
+                continue;
+            if (pid > 0 && c->pid != pid)
+                continue;
+            haskid = 1;
+            if (c->exited) {
+                int rpid = c->pid;
+                if (status)
+                    *status = (int)((c->exit_status & 0xff) << 8);  /* WIFEXITED */
+                task_reap(c->task_id);  /* release the libOS task slot too */
+                proc_free(c);
+                return rpid;
+            }
+        }
+        if (!haskid)
+            return -LERR_CHILD;
+        task_yield();                   /* a child is still running: let it run */
+    }
+}
+
+/* exit: record the status, close descriptors (so pipe readers see EOF), and end
+ * the task. The slot lingers as a zombie until the parent's wait4 reaps it. */
+static void __attribute__((noreturn))
+do_exit(long code)
+{
+    struct lproc *p = lproc_cur;
+
+    proc_release_fds(p);
+    p->exit_status = code;
+    p->exited = 1;
+    con_puts("[bin] pid ");
+    put_dec(p->pid);
+    con_puts(" exited, status=");
+    put_dec(code);
+    con_putc('\n');
+    task_exits(NULL);                   /* status kept in the lproc for wait4 */
+}
+
 /* The C half of the SYSCALL handler. Return value goes back in rax. */
 long
 linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
@@ -917,6 +1196,7 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     switch (nr) {
     case SYS_arch_prctl:
         if (a1 == ARCH_SET_FS) {
+            lproc_cur->fs_base = (uint64_t)a2;      /* restored on a switch */
             wrmsr(MSR_FS_BASE, (uint64_t)a2);
             return 0;
         }
@@ -1058,9 +1338,29 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_execve:
         return do_execve((const char *)a1, (const char *const *)a2,
                          (const char *const *)a3);
+    case SYS_fork:
+    case SYS_vfork:
+        return do_fork();
+    case SYS_clone:
+        /* glibc/musl fork() is clone with SIGCHLD and no CLONE_VM. A thread
+         * (CLONE_VM) is not supported yet; the futex path comes later. */
+        if ((uint64_t)a1 & CLONE_VM)
+            return -LERR_NOSYS;
+        return do_fork();
+    case SYS_wait4:
+        return do_wait4(a1, (int *)a2);
+    case SYS_getpid:
+        return lproc_cur->pid;
+    case SYS_getppid:
+        return lproc_cur->parent;
+    case SYS_gettid:
+        return lproc_cur->pid;          /* single thread: tid == pid */
+    case SYS_rt_sigaction:
+    case SYS_rt_sigprocmask:
+        return 0;                       /* no signal delivery: accept and ignore */
     case SYS_exit:
     case SYS_exit_group:
-        linux_exit(a1);                 /* does not return */
+        do_exit(a1);                    /* does not return */
     default:
         con_puts("[bin] unhandled syscall ");
         put_dec(nr);
@@ -1210,7 +1510,7 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     }
 
     /* A fresh address space for the new image, replacing the old one. */
-    vmspace_t old = cur_vmspace;
+    vmspace_t old = lproc_cur->vmspace;
     vmspace_t as = linux_vmspace_setup();
     if (!as) {
         p9_clunk(LINUX_FID);
@@ -1228,16 +1528,14 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
         return -LERR_NOENT;
     }
 
+    lproc_cur->vmspace = as;            /* the resume hook now restores this one */
     brk_cur = LINUX_HEAP_BASE;          /* fresh heap for the new image */
     mmap_cur = mmap_top;
-    exec_rsp = build_stack_vec(na, argc, ne, envc);
-    exec_entry = entry;
-    exec_pending = 1;
+    uint64_t rsp = build_stack_vec(na, argc, ne, envc);
     kfree(sbuf);
     vmspace_destroy(old);               /* release the replaced image's frames */
 
-    linux_exit(0);                      /* back to the linux_elf_run loop */
-    return 0;                           /* unreached */
+    linux_jump(entry, rsp);             /* enter the new image; does not return */
 }
 
 /* Turn on SYSCALL and point LSTAR at our handler. Our ring-0 CS is 0x08 and SS
@@ -1292,12 +1590,24 @@ linux_elf_run(const char *file)
     con_putc('\n');
 
     linux_phys_init();
-    vmspace_t as = linux_vmspace_setup();
-    if (!as) {
-        con_puts("[bin] no memory for the address space\n");
+    task_set_resume_hook(linux_on_resume);
+
+    /* The first process. It runs on the current task (init); forked children
+     * become their own tasks. */
+    struct lproc *p = proc_alloc();
+    if (!p) {
+        con_puts("[bin] no process slot\n");
         return;
     }
-    vmspace_switch(as);                 /* user window now demand-maps on fault */
+    p->vmspace = linux_vmspace_setup();
+    if (!p->vmspace) {
+        con_puts("[bin] no memory for the address space\n");
+        proc_free(p);
+        return;
+    }
+    task_set_proc(p);                   /* so the resume hook restores it later */
+    lproc_cur = p;
+    vmspace_switch(p->vmspace);         /* user window now demand-maps on fault */
 
     if (ns_walk(file, LINUX_FID) != 0) {
         con_puts("[bin] not found in bundle\n");
@@ -1326,20 +1636,7 @@ linux_elf_run(const char *file)
     con_puts("[bin] stack built\n");
 
     con_puts("[bin] entering guest\n");
-    for (;;) {
-        long code = linux_enter(entry, rsp);
-        if (exec_pending) {             /* the program execve'd a new image */
-            exec_pending = 0;
-            entry = exec_entry;
-            rsp = exec_rsp;
-            continue;                   /* re-enter; linux_enter disables IRQs */
-        }
-        sti();                          /* linux_enter ran with interrupts off */
-        con_puts("[bin] exited, status=");
-        put_dec(code);
-        con_putc('\n');
-        break;
-    }
+    linux_jump(entry, rsp);             /* enter the program; exit ends the task */
 }
 
 #else  /* !__x86_64__ */

@@ -1,26 +1,50 @@
-/* x86_64_linuxsys.S : the SYSCALL trap and user entry for the Linux spike.
+/* x86_64_linuxsys.S : the SYSCALL trap and user entry for the Linux guest.
  *
- * The guest runs the loaded Linux binary in the same ring as the libOS (there
- * is no privilege boundary), so a SYSCALL does not change ring and we must not
- * return with SYSRET. The CPU still vectors SYSCALL to LSTAR with the caller's
- * return address in rcx and its RFLAGS in r11, masking the bits in SFMASK. We
- * save those, switch to a private kernel stack, call the C dispatcher with the
- * Linux argument registers, and resume the caller by restoring rcx/r11 and
- * jumping back (a plain `jmp *%rcx` with RFLAGS reloaded), not SYSRET.
+ * Each Linux process runs in the same ring as the libOS (no privilege
+ * boundary), so a SYSCALL does not change ring and we must not return with
+ * SYSRET. The CPU vectors SYSCALL to LSTAR with the caller's return address in
+ * rcx and its RFLAGS in r11, masking the bits in SFMASK.
  *
- *   void   linux_syscall_entry(void)   -- the LSTAR target, never called by C.
- *   long   linux_enter(uint64_t entry, uint64_t user_rsp)
- *       Save a resume context, set rsp to the SysV stack we built, and jump to
- *       the program entry. It "returns" only when the program exits, via
- *       linux_exit, yielding the exit code. Callee-saved state is preserved
- *       across the whole run because linux_exit restores it.
- *   void   linux_exit(long code)   -- restore the linux_enter context, so that
- *       linux_enter returns `code` to its caller. Does not return.
+ * Several processes run as libOS tasks that switch cooperatively, so the entry
+ * saves the full user register set into the running process's trapframe (so a
+ * blocking syscall can yield and later resume, and fork can copy the frame),
+ * runs the C dispatcher on that process's private handler stack, and returns by
+ * restoring the frame and jumping back (jmp *rcx), not SYSRET.
+ *
+ * The running process is lproc_cur (linuxelf.c), a struct whose first fields are
+ * the trapframe at the TF_* offsets below, then kstack_top. Those offsets are
+ * mirrored and checked with _Static_assert on the C side.
+ *
+ *   void linux_syscall_entry(void)         -- the LSTAR target, never called by C.
+ *   void linux_jump(uint64_t entry, uint64_t user_rsp)
+ *       Enter a freshly loaded image: interrupts off, rsp = the SysV stack,
+ *       jump to the entry. Does not return.
+ *   void linux_resume(struct lproc *p)
+ *       Resume a process from its trapframe (used for the first run of a forked
+ *       child, whose frame has rax = 0). Does not return.
  *
  * The C side (linuxelf.c) provides:
- *   long   linux_sys_dispatch(long nr, long a1, long a2, long a3,
- *                             long a4, long a5)
+ *   long linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
  */
+
+/* Trapframe field offsets within struct lproc (checked in linuxelf.c). */
+#define TF_RAX    0
+#define TF_RBX    8
+#define TF_RCX    16        /* user rip */
+#define TF_RDX    24
+#define TF_RSI    32
+#define TF_RDI    40
+#define TF_RBP    48
+#define TF_R8     56
+#define TF_R9     64
+#define TF_R10    72
+#define TF_R11    80        /* user rflags */
+#define TF_R12    88
+#define TF_R13    96
+#define TF_R14    104
+#define TF_R15    112
+#define TF_RSP    120       /* user rsp */
+#define TF_KSTACK 128       /* top of the handler stack */
 
     .text
 
@@ -29,118 +53,97 @@
  ****************************************************************/
     .global linux_syscall_entry
 linux_syscall_entry:
-    /* On entry rcx = user return RIP, r11 = user RFLAGS, and the user rsp is
-     * still live. Park the user rsp and switch to our own stack so a nested
-     * fault or a deep C call never runs on the program's stack. */
-    movq %rsp, le_user_rsp(%rip)
-    movq le_sc_kstack(%rip), %rsp
+    /* rcx = user rip, r11 = user rflags, user rsp still live, rax = call number,
+     * args in rdi, rsi, rdx, r10, r8, r9. Free r15 as a scratch (saved to a
+     * global slot) so we can reach the trapframe through lproc_cur. */
+    movq %r15, le_scratch(%rip)
+    movq lproc_cur(%rip), %r15
 
-    /* The Linux syscall ABI preserves every register across a syscall except
-     * rax (the return value), rcx, and r11. Our C dispatcher follows SysV and
-     * may clobber rdi, rsi, rdx, r10, r8, r9, so save the user's originals and
-     * restore them after the call; otherwise the program resumes with its
-     * registers trashed. rcx and r11 carry the return RIP and RFLAGS. */
-    pushq %rcx                 /* user RIP */
-    pushq %r11                 /* user RFLAGS */
-    pushq %rdi
-    pushq %rsi
-    pushq %rdx
-    pushq %r10
-    pushq %r8
-    pushq %r9
+    movq %rax, TF_RAX(%r15)
+    movq %rbx, TF_RBX(%r15)
+    movq %rcx, TF_RCX(%r15)         /* user rip */
+    movq %rdx, TF_RDX(%r15)
+    movq %rsi, TF_RSI(%r15)
+    movq %rdi, TF_RDI(%r15)
+    movq %rbp, TF_RBP(%r15)
+    movq %r8,  TF_R8(%r15)
+    movq %r9,  TF_R9(%r15)
+    movq %r10, TF_R10(%r15)
+    movq %r11, TF_R11(%r15)         /* user rflags */
+    movq %r12, TF_R12(%r15)
+    movq %r13, TF_R13(%r15)
+    movq %r14, TF_R14(%r15)
+    movq le_scratch(%rip), %rax     /* the original r15 */
+    movq %rax, TF_R15(%r15)
+    movq %rsp, TF_RSP(%r15)         /* user rsp */
 
-    /* Linux puts the call number in rax and args in rdi, rsi, rdx, r10, r8, r9.
-     * The C dispatcher wants (nr, a1, a2, a3, a4, a5) in the SysV registers
-     * rdi, rsi, rdx, rcx, r8, r9. Shuffle in an order that reads each source
-     * before it is overwritten:
-     *   a5 = arg5 (r8->r9), a4 = arg4 (r10->r8), a3 = arg3 (rdx->rcx),
-     *   a2 = arg2 (rsi->rdx), a1 = arg1 (rdi->rsi), nr = rax->rdi. */
-    movq %r8,  %r9
-    movq %r10, %r8
-    movq %rdx, %rcx
-    movq %rsi, %rdx
-    movq %rdi, %rsi
-    movq %rax, %rdi
+    /* Switch to this process's private handler stack. */
+    movq TF_KSTACK(%r15), %rsp
+
+    /* Dispatch args: nr in rdi, a1..a5 in rsi, rdx, rcx, r8, r9. */
+    movq TF_RAX(%r15), %rdi         /* nr */
+    movq TF_RDI(%r15), %rsi         /* a1 */
+    movq TF_RSI(%r15), %rdx         /* a2 */
+    movq TF_RDX(%r15), %rcx         /* a3 */
+    movq TF_R10(%r15), %r8          /* a4 */
+    movq TF_R8(%r15),  %r9          /* a5 */
     call linux_sys_dispatch
 
-    /* rax holds the return value. Restore the user's argument registers and the
-     * return state, then resume after the SYSCALL. */
-    popq %r9
-    popq %r8
-    popq %r10
-    popq %rdx
-    popq %rsi
-    popq %rdi
-    popq %r11                  /* user RFLAGS */
-    popq %rcx                  /* user RIP */
-    movq le_user_rsp(%rip), %rsp
+    /* A blocking syscall may have switched tasks and back, so reload lproc_cur.
+     * Store the return value, then restore the frame and resume the user. */
+    movq lproc_cur(%rip), %r15
+    movq %rax, TF_RAX(%r15)
+    jmp restore_tf
+
+/* Restore the user register set from the trapframe at %r15 and resume at the
+ * saved user rip. Shared by the syscall return and linux_resume. */
+restore_tf:
+    movq TF_RAX(%r15), %rax
+    movq TF_RBX(%r15), %rbx
+    movq TF_RDX(%r15), %rdx
+    movq TF_RSI(%r15), %rsi
+    movq TF_RBP(%r15), %rbp
+    movq TF_R8(%r15),  %r8
+    movq TF_R9(%r15),  %r9
+    movq TF_R10(%r15), %r10
+    movq TF_R12(%r15), %r12
+    movq TF_R13(%r15), %r13
+    movq TF_R14(%r15), %r14
+    movq TF_RCX(%r15), %rcx         /* user rip (jmp target) */
+    movq TF_R11(%r15), %r11         /* user rflags */
     pushq %r11
-    popfq                      /* reload RFLAGS (re-enables IF if it was set) */
-    jmp *%rcx                  /* return to the instruction after SYSCALL */
+    popfq                           /* restore rflags; IF stays off for the user */
+    movq TF_RDI(%r15), %rdi
+    movq TF_RSP(%r15), %rsp         /* back to the user stack */
+    movq TF_R15(%r15), %r15         /* finally user r15 (drops the frame pointer) */
+    jmp *%rcx
 
 /****************************************************************
- * linux_enter / linux_exit: kernel<->program handoff.
+ * linux_jump / linux_resume: enter user code.
  ****************************************************************/
-    .global linux_enter
-linux_enter:
-    /* rdi = program entry, rsi = user rsp. Save a full resume context so
-     * linux_exit can return to our caller with the exit code. */
-    movq (%rsp), %rax          /* return address of linux_enter */
-    movq %rax, le_rip(%rip)
-    leaq 8(%rsp), %rax         /* caller rsp after a normal return */
-    movq %rax, le_rsp(%rip)
-    movq %rbx, le_rbx(%rip)
-    movq %rbp, le_rbp(%rip)
-    movq %r12, le_r12(%rip)
-    movq %r13, le_r13(%rip)
-    movq %r14, le_r14(%rip)
-    movq %r15, le_r15(%rip)
-
-    /* Run the program with interrupts off for the spike: it is short, output is
-     * polled MMIO, and this keeps the cooperative scheduler's timer from firing
-     * on the program's stack. linux_elf_run re-enables them when we return. */
+    .global linux_jump
+linux_jump:
+    /* rdi = entry, rsi = user rsp. The SysV entry contract: rsp points at argc,
+     * rdx (an atexit function to register) is 0, rbp is 0. Interrupts off so the
+     * cooperative scheduler never preempts user code. */
     cli
-
-    /* Hand control to the program on its own stack. The SysV entry contract:
-     * rsp points at argc, and rdx (a function to register with atexit) is 0. */
     movq %rsi, %rsp
     xorq %rdx, %rdx
     xorq %rbp, %rbp
     jmp *%rdi
 
-    .global linux_exit
-linux_exit:
-    /* rdi = exit code. Restore the linux_enter context and return the code as
-     * if linux_enter had returned normally. */
-    movq %rdi, %rax            /* return value = exit code */
-    movq le_rbx(%rip), %rbx
-    movq le_rbp(%rip), %rbp
-    movq le_r12(%rip), %r12
-    movq le_r13(%rip), %r13
-    movq le_r14(%rip), %r14
-    movq le_r15(%rip), %r15
-    movq le_rsp(%rip), %rsp
-    jmp *le_rip(%rip)
+    .global linux_resume
+linux_resume:
+    /* rdi = struct lproc *. Resume from its trapframe. */
+    cli
+    movq %rdi, %r15
+    jmp restore_tf
 
 /****************************************************************
- * Private kernel stack for the SYSCALL handler, and saved state.
+ * Scratch slot for the entry path.
  ****************************************************************/
-    .bss
-    .align 16
-    .space 16384
-le_sc_kstack_top:
-
     .data
     .align 8
-le_sc_kstack:  .quad le_sc_kstack_top   /* top of the handler stack */
-le_user_rsp:   .quad 0
-le_rip:        .quad 0
-le_rsp:        .quad 0
-le_rbx:        .quad 0
-le_rbp:        .quad 0
-le_r12:        .quad 0
-le_r13:        .quad 0
-le_r14:        .quad 0
-le_r15:        .quad 0
+le_scratch:    .quad 0
 
     .section .note.GNU-stack, "", @progbits
