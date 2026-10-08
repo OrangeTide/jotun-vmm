@@ -26,3 +26,87 @@ checkout. Upstream projects are named, never cited by a filesystem path.
 Self-containment is complete. Relates to M8: the pull client vendors the
 remaining smolvfs sources (sign path, monocypher, and miniz for compressed
 depots) in-tree the same way.
+
+## M16 (prospective): Linux binary compatibility
+
+Scoped 2026-10-07 as a research milestone. Not scheduled, and no work has
+started. The question: can the libOS run unmodified static Linux binaries, so a
+session guest is any `CGO_ENABLED=0` Go program or any statically linked musl
+program rather than something compiled against our own `jlibc`? This turns the
+libOS into a small binary-compatible kernel, the pattern Hermitux, OSv, and
+Unikraft's syscall-shim already demonstrate. It is attractive here because the
+guest already is a single-address-space kernel with the subsystems such a layer
+sits on: an ELF loader, a scheduler with threads and a context-switch and
+interrupt path, a 9P-backed VFS, a net stack, memory management, timers, and a
+console. The missing piece is the Linux ABI veneer: let a foreign binary issue
+real syscalls and service them from those subsystems.
+
+Design decisions settled in discussion:
+
+- Ring-0 collapse, not a user/kernel split. The binary runs in the same ring as
+  the libOS, with `SYSCALL` trapped through `LSTAR` (x86-64) or `SVC` routed
+  through the exception vector (arm64). The VM (KVM/HVF) is already the security
+  boundary and the guest is one trust domain, so intra-guest memory protection
+  is not needed for host safety. A ring-3 split stays possible later if we ever
+  want to protect the libOS from a buggy app, at the cost of a user GDT/TSS,
+  `SYSCALL`/`SYSRET` stacks, user page bits, and argument copy-in and copy-out.
+- Static binaries only. A fully static binary needs no dynamic linker. The moment
+  a program wants `dlopen` or NSS it needs `ld.so`, which is a far larger project
+  and out of scope.
+- Dual ABI. Keep the native `jlibc` program type and add a second "Linux static
+  ELF" type, selected by the manifest or the ELF OS/ABI field. The two share one
+  syscall-dispatch layer.
+- The dispatch table forwards into existing subsystems: `read`/`write`/`openat`/
+  `close`/`fstat`/`lseek` to the 9P VFS; `mmap`/`munmap`/`mprotect`/`madvise`/
+  `brk` to `mem.c`; `socket`/`connect`/`bind`/`sendto`/`epoll_*` to the net stack
+  and vswitch; `clone`/`futex`/`set_tid_address` to the scheduler and threads;
+  `clock_gettime`/`nanosleep` to the timer; `arch_prctl(ARCH_SET_FS)` or
+  `TPIDR_EL0` to TLS; `getrandom`, `exit_group`, `ioctl(TCGETS)`,
+  `rt_sigaction`/`sigaltstack` as small or near-no-op stubs at first.
+
+Non-goals: dynamic linking and `ld.so`; glibc static binaries (NSS, dlopen, TLS
+quirks); CGO; `fork`+`exec` of external programs; full syscall coverage at
+gVisor scale. The target is the common static core, not every Linux feature.
+
+Milestones, smallest first, each with its own acceptance test:
+
+- [ ] M16.1: a Linux static-ELF loader and the syscall entry path. Load `PT_LOAD`
+      segments and build the initial stack with `argc`/`argv`/`envp` and the auxv
+      (`AT_PAGESZ`, `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`, `AT_ENTRY`, `AT_HWCAP`,
+      `AT_RANDOM`). Trap `SYSCALL`/`SVC` into a dispatch table. Implement the
+      startup syscalls a thin libc needs. Acceptance: a `musl-gcc -no-pie -static`
+      hello world reaches `exit_group(0)` and prints to the console. musl is the
+      first target because its startup is calm: no GC, no arena reservations, no
+      preemption signals, and `AT_RANDOM` is only a canary seed rather than a
+      hard requirement.
+- [ ] M16.2: broaden the VFS and process syscalls (`getdents64`, `readlinkat`,
+      `stat` family, `pipe2`, `dup`, `fcntl`, `ioctl`). Acceptance: a static
+      `busybox` runs its common applets (`ls`, `cat`, `echo`, `sh`), which fans
+      out across the VFS surface cheaply.
+- [ ] M16.3: static-PIE self-relocation. Apply the `R_*_RELATIVE` entries a
+      static-PIE binary carries in its own `PT_DYNAMIC`, with no interpreter.
+      Acceptance: a stock Alpine static binary (built static-PIE by default)
+      loads and runs.
+- [ ] M16.4: threads. Implement `clone` (address-space-sharing task), `futex`,
+      and `set_tid_address`, mapping onto the existing scheduler. Acceptance: a
+      multi-threaded musl pthreads program runs correctly (1:1 threads, simpler
+      than an M:N runtime).
+- [ ] M16.5: the Go runtime. Satisfy its sharper demands: `AT_RANDOM` is
+      mandatory, large lazily committed `mmap` arenas, `futex` at scale, and TLS.
+      Acceptance: a `CGO_ENABLED=0` Go hello world runs with
+      `GODEBUG=asyncpreemptoff=1` (cooperative preemption only).
+- [ ] M16.6: the network poller. Nonblocking sockets and an `epoll` emulation
+      over the vswitch. Acceptance: a Go or musl TCP echo server is reachable
+      through the net name service.
+- [ ] M16.7 (stretch): asynchronous preemption. Deliver `SIGURG` and set up
+      `sigaltstack` so the Go scheduler can preempt tight loops, dropping the
+      `asyncpreemptoff` workaround. This is the first real signal-delivery work;
+      everything before it avoids signals.
+
+Open questions and risks: `mmap` must tolerate large sparse reservations with
+lazy commit on fault, which Go's heap init depends on; `futex` and `clone`
+semantics are the unforgiving long tail; two architectures mean two syscall ABIs
+and two TLS mechanisms; `epoll` emulation over the vswitch is new; the monotonic
+clock may want a vDSO, though Go and musl both fall back to the syscall. The
+cheapest proof that the whole idea holds is M16.1 alone: a ring-0 `SYSCALL` trap,
+about a dozen startup syscalls, and a static musl hello world exiting cleanly.
