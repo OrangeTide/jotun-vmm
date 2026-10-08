@@ -103,6 +103,11 @@ independent sessions, types a different token into each webterm, and asserts eac
 session sees only its own token before tearing everything down. Like
 `make web-smoke` it needs a bundle built first.
 
+`make caddy-smoke` checks the TLS front end: it runs brokerd behind Caddy (the
+`make web-multi` recipe) and reaches the site over TLS with `openssl s_client`,
+confirming two cookieless requests each come back `302` from brokerd through the
+proxy with their own `jsess` cookie. It needs `caddy` on the PATH and a bundle.
+
 Several sessions serve the same read-only depot at once, which the depot's
 shared read lock allows (`cas_new_ro`); a bundle rebuild, which needs the
 exclusive write lock, waits for the serving processes to exit first.

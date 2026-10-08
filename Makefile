@@ -329,9 +329,17 @@ build/brokersmoke: tools/brokersmoke.c | build
 broker-smoke: brokerd $(TARGET) libos.elf build/brokersmoke
 	./build/brokersmoke ./brokerd ./$(TARGET) $(BUNDLE_DEPOT)
 
+## TLS front-end smoke test: run brokerd behind Caddy (the make web-multi recipe)
+## and reach it over TLS with openssl s_client, checking two sessions get routed
+## through the proxy. Needs caddy on PATH and a bundle: make bundle BUNDLE_ARCHS=$(ARCH)
+build/caddysmoke: tools/caddysmoke.c | build
+	$(CC) $(CFLAGS) -o $@ $<
+caddy-smoke: brokerd $(TARGET) libos.elf build/caddysmoke
+	./build/caddysmoke ./$(TARGET) $(BUNDLE_DEPOT) example/web/Caddyfile
+
 clean:
 	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool jbundle \
 	    brokerd
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke
+.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke
