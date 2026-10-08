@@ -46,6 +46,9 @@
 #define MAP_ANONYMOUS 0x20
 #define MMAP_FAILED   (-LERR_NOMEM)
 
+/* The most argv entries delivered to a Linux program. */
+#define LINUX_MAX_ARGS 32
+
 /* Linux syscall numbers (x86-64) we recognise. */
 #define SYS_read            0
 #define SYS_write           1
@@ -800,23 +803,35 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
 
 /* Build a System V initial stack in linux_ustack and return the rsp to enter
  * with: argc, argv[], NULL, envp[]=NULL, auxv, with the argv strings and 16
- * random bytes placed above it. argc is 1 (the program name). */
+ * random bytes placed above it.
+ *
+ * The program argv is argv0 (the loaded file) followed by the boot arguments
+ * after it: `./jotun libos.elf bin <file> <args...>` gives boot_argv(1)=<file>
+ * as argv[0] and boot_argv(2..) as the rest, so a multi-call binary like
+ * busybox can select and drive an applet. */
 static uint64_t
 build_stack(const char *argv0)
 {
-    uint8_t *top = linux_ustack + sizeof linux_ustack;
+    uint8_t *sp = linux_ustack + sizeof linux_ustack;
 
-    /* Copy the program name string near the top. */
-    char *name = (char *)(top - 64);
-    int i = 0;
-    while (argv0[i] && i < 48) {
-        name[i] = argv0[i];
-        i++;
+    const char *args[LINUX_MAX_ARGS];
+    int argc = 0;
+    args[argc++] = argv0;
+    for (int i = 2; i < boot_argc() && argc < LINUX_MAX_ARGS; i++)
+        args[argc++] = boot_argv(i);
+
+    /* Copy the arg strings high-to-low and record each pointer. */
+    char *argp[LINUX_MAX_ARGS];
+    for (int i = argc - 1; i >= 0; i--) {
+        size_t len = strlen(args[i]) + 1;
+        sp -= len;
+        memcpy(sp, args[i], len);
+        argp[i] = (char *)sp;
     }
-    name[i] = 0;
 
-    /* 16 bytes for AT_RANDOM, seeded from the cycle counter. */
-    uint8_t *rnd = (uint8_t *)(top - 96);
+    /* 16 bytes for AT_RANDOM, seeded from the cycle counter, below the strings. */
+    sp -= 16;
+    uint8_t *rnd = sp;
     uint32_t lo, hi;
     __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
     uint64_t seed = ((uint64_t)hi << 32) | lo;
@@ -825,12 +840,17 @@ build_stack(const char *argv0)
         seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
     }
 
-    /* The control block, 16-byte aligned, below the strings. Layout:
-     *   argc, argv[0], NULL(argv end), NULL(envp end), auxv..., AT_NULL */
-    uint64_t *blk = (uint64_t *)((uintptr_t)(top - 256) & ~(uintptr_t)0xF);
+    /* The control block below that. Words: argc, argv[0..], NULL, envp NULL,
+     * auxv (AT_PAGESZ, AT_RANDOM, AT_NULL). The SysV entry contract wants rsp
+     * (pointing at argc) 16-byte aligned, so size the block and align down. */
+    int nwords = 1 + argc + 1 + 1 + 6;
+    uint64_t *blk = (uint64_t *)((uintptr_t)sp - (uintptr_t)nwords * 8);
+    blk = (uint64_t *)((uintptr_t)blk & ~(uintptr_t)0xF);
+
     int w = 0;
-    blk[w++] = 1;                       /* argc */
-    blk[w++] = (uintptr_t)name;         /* argv[0] */
+    blk[w++] = (uint64_t)argc;
+    for (int i = 0; i < argc; i++)
+        blk[w++] = (uintptr_t)argp[i];
     blk[w++] = 0;                       /* argv terminator */
     blk[w++] = 0;                       /* envp terminator (no env) */
     blk[w++] = AT_PAGESZ; blk[w++] = 4096;
