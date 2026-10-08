@@ -143,12 +143,17 @@ LIBOS_SRC = $(LIBOS_SRC_COMMON) $(LIBOS_ARCH)
 # enables the FPU at boot and preserves FP state across task switches, so this
 # object's floating point is safe to run.
 GUEST_FP_CFLAGS = $(filter-out -mgeneral-regs-only -Wl%,$(GUEST_CFLAGS))
-LIBOS_FP_OBJ = build/triton.o
+LIBOS_FP_OBJ = build/triton.o build/fmtfloat.o
 
 build:
 	mkdir -p build
 
 build/triton.o: guest/libos/triton.c guest/libos/triton.h | build
+	$(GUEST_CC) $(GUEST_FP_CFLAGS) -Iguest/libos -c -o $@ $<
+
+# fmtfloat.c is the format engine's floating-point unit, built with the FPU on
+# for the same reason as triton.o and linked into the integer-only formatter.
+build/fmtfloat.o: guest/libos/fmtfloat.c guest/libos/fmtfloat.h | build
 	$(GUEST_CC) $(GUEST_FP_CFLAGS) -Iguest/libos -c -o $@ $<
 
 libos.elf: $(LIBOS_SRC) $(LIBOS_FP_OBJ)
@@ -161,13 +166,17 @@ libos.elf: $(LIBOS_SRC) $(LIBOS_FP_OBJ)
 # function into its own section and linking with --gc-sections drops whatever a
 # given program does not use, so unused library code costs it nothing.
 PROG_INC = -Iguest/prog/libc -Iguest/prog -Iguest/libos -Iabi
-PROG_LIBC_OBJS = build/libc_fmt.o build/libc_string.o build/libc_io.o \
-    build/libc_stdlib.o
+PROG_LIBC_OBJS = build/libc_fmt.o build/libc_fmtfloat.o build/libc_string.o \
+    build/libc_io.o build/libc_stdlib.o
 GUEST_COBJ_CFLAGS = $(filter-out -Wl%,$(GUEST_CFLAGS)) \
     -ffunction-sections -fdata-sections
+# The float unit needs the FPU, so it drops -mgeneral-regs-only like triton.o.
+GUEST_COBJ_FP_CFLAGS = $(filter-out -mgeneral-regs-only,$(GUEST_COBJ_CFLAGS))
 
 build/libc_fmt.o: guest/libos/fmt.c | build
 	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
+build/libc_fmtfloat.o: guest/libos/fmtfloat.c | build
+	$(GUEST_CC) $(GUEST_COBJ_FP_CFLAGS) $(PROG_INC) -c -o $@ $<
 build/libc_string.o: guest/libos/string.c | build
 	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
 build/libc_io.o: guest/prog/libc/progio.c | build
@@ -215,6 +224,7 @@ GUEST_BASE = -ffreestanding -fno-pic -fno-pie -nostdlib -fno-builtin -Iabi \
 GUEST_BASE_FP = $(filter-out -mgeneral-regs-only,$(GUEST_BASE))
 GUEST_BASE_OBJ = $(filter-out -Wl%,$(GUEST_BASE)) -ffunction-sections \
     -fdata-sections
+GUEST_BASE_OBJ_FP = $(filter-out -mgeneral-regs-only,$(GUEST_BASE_OBJ))
 
 CROSSCC_x86_64  ?= clang --target=x86_64-unknown-none-elf -fuse-ld=lld
 CROSSCC_aarch64 ?= clang --target=aarch64-unknown-none-elf -fuse-ld=lld
@@ -234,11 +244,15 @@ build/img/$(1):
 	mkdir -p build/img/$(1)
 build/img/$(1)/triton.o: guest/libos/triton.c guest/libos/triton.h | build/img/$(1)
 	$(2) $$(GUEST_BASE_FP) $(4) -Iguest/libos -c -o $$@ $$<
-build/img/$(1)/kernel: $$(LIBOS_SRC_COMMON) $(5) build/img/$(1)/triton.o | build/img/$(1)
+build/img/$(1)/fmtfloat.o: guest/libos/fmtfloat.c guest/libos/fmtfloat.h | build/img/$(1)
+	$(2) $$(GUEST_BASE_FP) $(4) -Iguest/libos -c -o $$@ $$<
+build/img/$(1)/kernel: $$(LIBOS_SRC_COMMON) $(5) build/img/$(1)/triton.o build/img/$(1)/fmtfloat.o | build/img/$(1)
 	$(2) $$(GUEST_BASE) $(4) -Iguest/libos -Wl,-Ttext=$(3) -o $$@ \
-	    $$(LIBOS_SRC_COMMON) $(5) build/img/$(1)/triton.o
+	    $$(LIBOS_SRC_COMMON) $(5) build/img/$(1)/triton.o build/img/$(1)/fmtfloat.o
 build/img/$(1)/libc_fmt.o: guest/libos/fmt.c | build/img/$(1)
 	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
+build/img/$(1)/libc_fmtfloat.o: guest/libos/fmtfloat.c | build/img/$(1)
+	$(2) $$(GUEST_BASE_OBJ_FP) $(4) $$(PROG_INC) -c -o $$@ $$<
 build/img/$(1)/libc_string.o: guest/libos/string.c | build/img/$(1)
 	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
 build/img/$(1)/libc_io.o: guest/prog/libc/progio.c | build/img/$(1)
@@ -246,11 +260,12 @@ build/img/$(1)/libc_io.o: guest/prog/libc/progio.c | build/img/$(1)
 build/img/$(1)/libc_stdlib.o: guest/prog/libc/progstdlib.c | build/img/$(1)
 	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
 build/img/$(1)/hello: guest/prog/hello.c build/img/$(1)/libc_fmt.o \
-    build/img/$(1)/libc_string.o build/img/$(1)/libc_io.o \
-    build/img/$(1)/libc_stdlib.o | build/img/$(1)
+    build/img/$(1)/libc_fmtfloat.o build/img/$(1)/libc_string.o \
+    build/img/$(1)/libc_io.o build/img/$(1)/libc_stdlib.o | build/img/$(1)
 	$(2) $$(GUEST_BASE) $(4) -Wl,--gc-sections $$(PROG_INC) \
 	    -Wl,-Ttext=$$(PROG_TEXT) -o $$@ guest/prog/hello.c \
-	    build/img/$(1)/libc_fmt.o build/img/$(1)/libc_string.o \
+	    build/img/$(1)/libc_fmt.o build/img/$(1)/libc_fmtfloat.o \
+	    build/img/$(1)/libc_string.o \
 	    build/img/$(1)/libc_io.o build/img/$(1)/libc_stdlib.o
 endef
 
@@ -337,9 +352,23 @@ build/caddysmoke: tools/caddysmoke.c | build
 caddy-smoke: brokerd $(TARGET) libos.elf build/caddysmoke
 	./build/caddysmoke ./$(TARGET) $(BUNDLE_DEPOT) example/web/Caddyfile
 
+## Host check of the guest format engine against literal expectations. The
+## formatter is portable C, so it is built for the host with snprintf renamed to
+## jsnprintf (so it sits beside the host libc) and checked byte for byte.
+build/host_fmt.o: guest/libos/fmt.c guest/libos/fmt.h guest/libos/fmtfloat.h | build
+	$(CC) -std=c11 -Wall -Wextra -Iguest/libos \
+	    -Dsnprintf=jsnprintf -Dvsnprintf=jvsnprintf -c -o $@ $<
+build/host_fmtfloat.o: guest/libos/fmtfloat.c guest/libos/fmtfloat.h | build
+	$(CC) -std=c11 -Wall -Wextra -Iguest/libos -c -o $@ $<
+build/fmttest: tools/fmttest.c build/host_fmt.o build/host_fmtfloat.o | build
+	$(CC) -std=c11 -Wall -Wextra -o $@ tools/fmttest.c \
+	    build/host_fmt.o build/host_fmtfloat.o
+fmt-test: build/fmttest
+	./build/fmttest
+
 clean:
 	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool jbundle \
 	    brokerd
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke
+.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test
