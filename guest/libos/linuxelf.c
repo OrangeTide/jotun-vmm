@@ -18,6 +18,7 @@
 
 #include "boot.h"
 #include "elfload.h"
+#include "mem.h"
 #include "ns.h"
 #include "p9.h"
 #include "string.h"
@@ -94,9 +95,13 @@
 
 #define AT_FDCWD (-100)
 
-/* open() flags we care about (the read-only bundle rejects writes). */
+/* open() flags we care about. The 9P bundle is read-only; writable files live
+ * in the in-memory ramfs, reached by a write intent or O_CREAT. */
 #define O_WRONLY    0x0001
 #define O_RDWR      0x0002
+#define O_CREAT     0x0040
+#define O_TRUNC     0x0200
+#define O_APPEND    0x0400
 #define O_DIRECTORY 0x10000
 
 /* lseek whence. */
@@ -232,12 +237,32 @@ struct lfd {
     int      used;
     int      isdir;
     int      ispipe;            /* this fd is a pipe end */
+    int      isram;             /* this fd is a ramfs file */
     int      pidx;              /* pipe pool index when ispipe */
+    int      ridx;              /* ramfs index when isram */
     int      wr;                /* pipe write end when set, else read end */
     uint32_t p9fid;             /* backing 9P fid, 0 for the console fds */
     uint64_t pos;               /* read cursor (file) or 9P dir offset */
     uint64_t size;
 };
+
+/* A writable in-memory file. The read-only 9P bundle cannot hold new files, so
+ * anything created or written goes here, keyed by its bundle-relative path. The
+ * buffer grows on write and lives for the program's run (close keeps it, so a
+ * file written early can be reopened and read later). */
+#define RAMFS_MAX     16
+#define RAMFS_NAME    64
+#define RAMFS_FILE_MAX (1024u * 1024u)      /* per-file cap */
+
+struct ramfile {
+    int      used;
+    char     name[RAMFS_NAME];
+    uint8_t *data;
+    uint32_t len;
+    uint32_t cap;
+};
+
+static struct ramfile ramfs[RAMFS_MAX];
 
 /* A unidirectional in-memory pipe: a byte ring with a reader and writer end
  * count. Single-threaded and non-blocking, which is enough for a program that
@@ -334,6 +359,8 @@ clone_fd(int dst, struct lfd *src)
             p->writers++;
         else
             p->readers++;
+    } else if (src->isram) {
+        /* the ramfile persists regardless of fd count: nothing to refcount */
     } else {
         fidref[src->p9fid - LINUX_FID_BASE]++;
     }
@@ -346,6 +373,61 @@ fds_init(void)
     memset(fidref, 0, sizeof fidref);
     memset(pipes, 0, sizeof pipes);
     fds[0].used = fds[1].used = fds[2].used = 1;    /* stdin/out/err */
+}
+
+static int
+ramfs_find(const char *name)
+{
+    for (int i = 0; i < RAMFS_MAX; i++)
+        if (ramfs[i].used && strcmp(ramfs[i].name, name) == 0)
+            return i;
+    return -1;
+}
+
+static int
+ramfs_create(const char *name)
+{
+    for (int i = 0; i < RAMFS_MAX; i++) {
+        if (!ramfs[i].used) {
+            size_t n = 0;
+            while (name[n] && n < RAMFS_NAME - 1) {
+                ramfs[i].name[n] = name[n];
+                n++;
+            }
+            ramfs[i].name[n] = 0;
+            ramfs[i].used = 1;
+            ramfs[i].data = NULL;
+            ramfs[i].len = 0;
+            ramfs[i].cap = 0;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Ensure a ramfile's buffer holds at least `need` bytes, doubling as needed. */
+static int
+ramfs_grow(struct ramfile *rf, uint32_t need)
+{
+    if (need <= rf->cap)
+        return 0;
+    if (need > RAMFS_FILE_MAX)
+        return -1;
+    uint32_t ncap = rf->cap ? rf->cap : 256;
+    while (ncap < need)
+        ncap *= 2;
+    if (ncap > RAMFS_FILE_MAX)
+        ncap = RAMFS_FILE_MAX;
+    uint8_t *nd = kmalloc(ncap);
+    if (!nd)
+        return -1;
+    if (rf->len)
+        memcpy(nd, rf->data, rf->len);
+    if (rf->data)
+        kfree(rf->data);
+    rf->data = nd;
+    rf->cap = ncap;
+    return 0;
 }
 
 /* Create a pipe: a reader fd in pfd[0] and a writer fd in pfd[1]. */
@@ -439,6 +521,17 @@ do_write(long fd, const char *buf, unsigned long len)
     }
     if (f && f->ispipe && f->wr)
         return pipe_write(&pipes[f->pidx], buf, len);
+    if (f && f->isram) {
+        struct ramfile *rf = &ramfs[f->ridx];
+        uint64_t end = f->pos + len;
+        if (end > RAMFS_FILE_MAX || ramfs_grow(rf, (uint32_t)end) < 0)
+            return -LERR_NOMEM;
+        memcpy(rf->data + f->pos, buf, len);
+        f->pos += len;
+        if (f->pos > rf->len)
+            rf->len = (uint32_t)f->pos;
+        return (long)len;
+    }
     return -LERR_BADF;                  /* the bundle is read-only */
 }
 
@@ -447,24 +540,55 @@ do_writev(long fd, const struct iovec *iov, long cnt)
 {
     long total = 0;
 
-    if (fd != 1 && fd != 2)
-        return -LERR_BADF;
     for (long i = 0; i < cnt; i++) {
         long n = do_write(fd, iov[i].base, iov[i].len);
         if (n < 0)
-            return n;
+            return total ? total : n;
         total += n;
     }
     return total;
+}
+
+/* Bind a free fd to ramfile ri, positioned per O_APPEND. */
+static long
+open_ram(int ri, long flags)
+{
+    int fd = fd_alloc();
+    if (fd < 0)
+        return -LERR_NOMEM;
+    memset(&fds[fd], 0, sizeof fds[fd]);
+    fds[fd].used = 1;
+    fds[fd].isram = 1;
+    fds[fd].ridx = ri;
+    fds[fd].pos = (flags & O_APPEND) ? ramfs[ri].len : 0;
+    return fd;
 }
 
 static long
 do_open(const char *path, long flags)
 {
     const char *rel = bundle_path(path);
+    int writing = (flags & (O_WRONLY | O_RDWR)) != 0;
 
-    if (flags & (O_WRONLY | O_RDWR))
-        return -LERR_ROFS;              /* read-only bundle */
+    /* Writable or newly created paths live in the ramfs. */
+    if (writing || (flags & O_CREAT)) {
+        int ri = ramfs_find(rel);
+        if (ri < 0) {
+            if (!(flags & O_CREAT))
+                return -LERR_ROFS;      /* writing an existing RO bundle file */
+            ri = ramfs_create(rel);
+            if (ri < 0)
+                return -LERR_NOMEM;
+        }
+        if (flags & O_TRUNC)
+            ramfs[ri].len = 0;
+        return open_ram(ri, flags);
+    }
+
+    /* Read-only: a ramfs file shadows the bundle; else fall back to 9P. */
+    int ri = ramfs_find(rel);
+    if (ri >= 0)
+        return open_ram(ri, flags);
 
     int fd = fd_alloc();
     if (fd < 0)
@@ -490,6 +614,7 @@ do_open(const char *path, long flags)
         return -LERR_ACCES;
     }
 
+    memset(&fds[fd], 0, sizeof fds[fd]);
     fds[fd].used = 1;
     fds[fd].isdir = isdir;
     fds[fd].p9fid = p9fid;
@@ -508,6 +633,16 @@ do_read(long fd, void *buf, unsigned long count)
         return -LERR_BADF;              /* no stdin source */
     if (f->ispipe)
         return f->wr ? -LERR_BADF : pipe_read(&pipes[f->pidx], buf, count);
+    if (f->isram) {
+        struct ramfile *rf = &ramfs[f->ridx];
+        if (f->pos >= rf->len)
+            return 0;
+        uint32_t avail = rf->len - (uint32_t)f->pos;
+        uint32_t n = count < avail ? (uint32_t)count : avail;
+        memcpy(buf, rf->data + f->pos, n);
+        f->pos += n;
+        return n;
+    }
     if (f->isdir)
         return -LERR_INVAL;
     long n = p9_read(f->p9fid, f->pos, buf, (uint32_t)count);
@@ -526,6 +661,10 @@ do_close(long fd)
         return -LERR_BADF;
     if (fd < 3)
         return 0;                       /* keep the console open */
+    if (f->isram) {
+        f->used = 0;                    /* the ramfile persists for the run */
+        return 0;
+    }
     if (f->ispipe) {
         struct lpipe *p = &pipes[f->pidx];
         if (f->wr && p->writers > 0)
@@ -551,10 +690,11 @@ do_lseek(long fd, long off, long whence)
 
     if (!f || fd < 3)
         return -LERR_BADF;
-    uint64_t base = (whence == SEEK_CUR) ? f->pos :
-                    (whence == SEEK_END) ? f->size : 0;
     if (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END)
         return -LERR_INVAL;
+    uint64_t end = f->isram ? ramfs[f->ridx].len : f->size;
+    uint64_t base = (whence == SEEK_CUR) ? f->pos :
+                    (whence == SEEK_END) ? end : 0;
     f->pos = base + (uint64_t)off;
     return (long)f->pos;
 }
@@ -578,6 +718,11 @@ do_stat_path(const char *path, struct linux_stat *out)
     const char *rel = bundle_path(path);
     uint32_t fid = LINUX_FID_BASE + LINUX_NFD;      /* scratch, above the pool */
 
+    int ri = ramfs_find(rel);           /* a ramfs file shadows the bundle */
+    if (ri >= 0) {
+        fill_stat(out, 0, ramfs[ri].len, (uint64_t)(0x10000 + ri));
+        return 0;
+    }
     if (ns_walk(rel, fid) != 0)
         return -LERR_NOENT;
     struct p9_stat st;
@@ -600,6 +745,10 @@ do_fstat(long fd, struct linux_stat *out)
         return -LERR_BADF;
     if (fd < 3) {
         fill_stat(out, 0, 0, (uint64_t)fd);         /* console: a char device-ish reg */
+        return 0;
+    }
+    if (f->isram) {
+        fill_stat(out, 0, ramfs[f->ridx].len, (uint64_t)(0x10000 + f->ridx));
         return 0;
     }
     fill_stat(out, f->isdir, f->size, f->p9fid);
