@@ -75,6 +75,7 @@
 #define SYS_getegid         108
 #define SYS_prctl           157
 #define SYS_exit            60
+#define SYS_execve          59
 #define SYS_mprotect        10
 #define SYS_time            201
 #define SYS_clock_gettime   228
@@ -287,6 +288,16 @@ static struct lpipe pipes[LINUX_NPIPE];
 static uint64_t brk_cur;
 static uint64_t mmap_cur;
 static uint64_t mmap_top;
+
+/* execve hands a new image back to the linux_elf_run loop rather than returning
+ * through the syscall: do_execve loads the image, builds a fresh stack, sets
+ * these, and longjmps out via linux_exit. */
+static int      exec_pending;
+static uint64_t exec_entry;
+static uint64_t exec_rsp;
+
+static long do_execve(const char *path, const char *const *argv,
+                      const char *const *envp);
 
 static void
 arena_init(void)
@@ -1043,6 +1054,9 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return -LERR_INVAL;             /* nothing in the bundle is a symlink */
     case SYS_fcntl:
         return 0;                       /* minimal: accept F_SETFD/F_SETFL */
+    case SYS_execve:
+        return do_execve((const char *)a1, (const char *const *)a2,
+                         (const char *const *)a3);
     case SYS_exit:
     case SYS_exit_group:
         linux_exit(a1);                 /* does not return */
@@ -1058,31 +1072,30 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
  * Stack and SYSCALL setup.
  ****************************************************************/
 
-/* Build a System V initial stack in linux_ustack and return the rsp to enter
- * with: argc, argv[], NULL, envp[]=NULL, auxv, with the argv strings and 16
- * random bytes placed above it.
- *
- * The program argv is argv0 (the loaded file) followed by the boot arguments
- * after it: `./jotun libos.elf bin <file> <args...>` gives boot_argv(1)=<file>
- * as argv[0] and boot_argv(2..) as the rest, so a multi-call binary like
- * busybox can select and drive an applet. */
+/* Build a System V initial stack in linux_ustack from explicit argv and envp
+ * vectors and return the rsp to enter with: argc, argv[], NULL, envp[], NULL,
+ * auxv (AT_PAGESZ, AT_RANDOM, AT_NULL), with the strings and 16 random bytes
+ * placed above it. The argv/envp string pointers must stay valid during the
+ * build (they come from boot data or an execve snapshot, never live user mem
+ * that this overwrites). */
 static uint64_t
-build_stack(const char *argv0)
+build_stack_vec(const char *const *argv, int argc,
+                const char *const *envp, int envc)
 {
     uint8_t *sp = linux_ustack + sizeof linux_ustack;
-
-    const char *args[LINUX_MAX_ARGS];
-    int argc = 0;
-    args[argc++] = argv0;
-    for (int i = 2; i < boot_argc() && argc < LINUX_MAX_ARGS; i++)
-        args[argc++] = boot_argv(i);
-
-    /* Copy the arg strings high-to-low and record each pointer. */
     char *argp[LINUX_MAX_ARGS];
-    for (int i = argc - 1; i >= 0; i--) {
-        size_t len = strlen(args[i]) + 1;
+    char *envpp[LINUX_MAX_ARGS];
+
+    for (int i = envc - 1; i >= 0; i--) {
+        size_t len = strlen(envp[i]) + 1;
         sp -= len;
-        memcpy(sp, args[i], len);
+        memcpy(sp, envp[i], len);
+        envpp[i] = (char *)sp;
+    }
+    for (int i = argc - 1; i >= 0; i--) {
+        size_t len = strlen(argv[i]) + 1;
+        sp -= len;
+        memcpy(sp, argv[i], len);
         argp[i] = (char *)sp;
     }
 
@@ -1097,10 +1110,10 @@ build_stack(const char *argv0)
         seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
     }
 
-    /* The control block below that. Words: argc, argv[0..], NULL, envp NULL,
-     * auxv (AT_PAGESZ, AT_RANDOM, AT_NULL). The SysV entry contract wants rsp
-     * (pointing at argc) 16-byte aligned, so size the block and align down. */
-    int nwords = 1 + argc + 1 + 1 + 6;
+    /* The control block below that, 16-byte aligned as the entry contract wants
+     * rsp (pointing at argc) to be. Words: argc, argv[0..], NULL, envp[0..],
+     * NULL, three auxv pairs. */
+    int nwords = 1 + argc + 1 + envc + 1 + 6;
     uint64_t *blk = (uint64_t *)((uintptr_t)sp - (uintptr_t)nwords * 8);
     blk = (uint64_t *)((uintptr_t)blk & ~(uintptr_t)0xF);
 
@@ -1109,12 +1122,106 @@ build_stack(const char *argv0)
     for (int i = 0; i < argc; i++)
         blk[w++] = (uintptr_t)argp[i];
     blk[w++] = 0;                       /* argv terminator */
-    blk[w++] = 0;                       /* envp terminator (no env) */
+    for (int i = 0; i < envc; i++)
+        blk[w++] = (uintptr_t)envpp[i];
+    blk[w++] = 0;                       /* envp terminator */
     blk[w++] = AT_PAGESZ; blk[w++] = 4096;
     blk[w++] = AT_RANDOM; blk[w++] = (uintptr_t)rnd;
     blk[w++] = AT_NULL;   blk[w++] = 0;
 
     return (uint64_t)(uintptr_t)blk;
+}
+
+/* The initial program stack: argv is the loaded file (argv0) followed by the
+ * boot arguments after it, no environment. `./jotun libos.elf bin <file>
+ * <args...>` thus reaches the program as <file> <args...>. */
+static uint64_t
+build_stack(const char *argv0)
+{
+    const char *args[LINUX_MAX_ARGS];
+    int argc = 0;
+
+    args[argc++] = argv0;
+    for (int i = 2; i < boot_argc() && argc < LINUX_MAX_ARGS; i++)
+        args[argc++] = boot_argv(i);
+    return build_stack_vec(args, argc, NULL, 0);
+}
+
+/* Copy a NULL-terminated user vector of string pointers into out[] with the
+ * strings packed into buf. Returns the count. Snapshotting the strings lets
+ * execve overwrite the old image (where argv may live) before building the new
+ * stack from them. */
+static int
+copy_uvec(const char *const *uvec, const char **out, char *buf, size_t buflen)
+{
+    int n = 0;
+    size_t off = 0;
+
+    if (!uvec)
+        return 0;
+    while (uvec[n] && n < LINUX_MAX_ARGS - 1) {
+        const char *s = uvec[n];
+        size_t len = strlen(s) + 1;
+        if (off + len > buflen)
+            break;
+        memcpy(buf + off, s, len);
+        out[n] = buf + off;
+        off += len;
+        n++;
+    }
+    return n;
+}
+
+#define EXEC_STR_MAX 8192
+
+/* execve: replace the running image with a bundle program. The new argv/envp
+ * are snapshotted into kernel memory first (they may point into the image we
+ * are about to overwrite), then the ELF is loaded over the program window, the
+ * heap reset, and a fresh stack built. Control returns to the linux_elf_run
+ * loop via linux_exit, which re-enters the new entry. fds and the ramfs persist
+ * across the exec, as on Linux. Only bundle files are exec'able for now. */
+static long
+do_execve(const char *path, const char *const *argv, const char *const *envp)
+{
+    const char *rel = bundle_path(path);
+
+    if (ns_walk(rel, LINUX_FID) != 0)
+        return -LERR_NOENT;
+    if (p9_open(LINUX_FID) != 0) {
+        p9_clunk(LINUX_FID);
+        return -LERR_ACCES;
+    }
+
+    static const char *na[LINUX_MAX_ARGS];
+    static const char *ne[LINUX_MAX_ARGS];
+    char *sbuf = kmalloc(EXEC_STR_MAX);
+    if (!sbuf) {
+        p9_clunk(LINUX_FID);
+        return -LERR_NOMEM;
+    }
+    int argc = copy_uvec(argv, na, sbuf, EXEC_STR_MAX / 2);
+    int envc = copy_uvec(envp, ne, sbuf + EXEC_STR_MAX / 2, EXEC_STR_MAX / 2);
+    if (argc == 0) {                    /* execve needs at least argv[0] */
+        na[0] = rel;
+        argc = 1;
+    }
+
+    uint64_t entry = elf_load_fid(LINUX_FID, LINUX_PROG_BASE, LINUX_PROG_LIMIT);
+    p9_clunk(LINUX_FID);
+    if (entry == 0) {
+        kfree(sbuf);
+        return -LERR_NOENT;             /* image gone, but nothing else ran it */
+    }
+
+    brk_cur = LINUX_HEAP_BASE;          /* fresh heap for the new image */
+    mmap_cur = mmap_top;
+    exec_rsp = build_stack_vec(na, argc, ne, envc);
+    exec_entry = entry;
+    exec_pending = 1;
+    kfree(sbuf);
+
+    linux_exit(0);                      /* back to the linux_elf_run loop */
+    return 0;                           /* unreached */
 }
 
 /* Turn on SYSCALL and point LSTAR at our handler. Our ring-0 CS is 0x08 and SS
@@ -1163,12 +1270,20 @@ linux_elf_run(const char *file)
     con_puts("[bin] stack built\n");
 
     con_puts("[bin] entering guest\n");
-    long code = linux_enter(entry, rsp);
-    sti();                              /* linux_enter ran with interrupts off */
-
-    con_puts("[bin] exited, status=");
-    put_dec(code);
-    con_putc('\n');
+    for (;;) {
+        long code = linux_enter(entry, rsp);
+        if (exec_pending) {             /* the program execve'd a new image */
+            exec_pending = 0;
+            entry = exec_entry;
+            rsp = exec_rsp;
+            continue;                   /* re-enter; linux_enter disables IRQs */
+        }
+        sti();                          /* linux_enter ran with interrupts off */
+        con_puts("[bin] exited, status=");
+        put_dec(code);
+        con_putc('\n');
+        break;
+    }
 }
 
 #else  /* !__x86_64__ */
