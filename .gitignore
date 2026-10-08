@@ -6,6 +6,9 @@ hello.elf
 castool
 jbundle
 brokerd
+authd
+jmint
+tokens
 bundle-depot
 image-depot
 bundle-staging

@@ -1157,14 +1157,28 @@ What is needed:
     sessions, each sees only its own token, no cross-leak, then teardown). The
     broker-guest control channel (step two) is still to come; it will drive
     fork and kill in place of the inline policy.
-- M15.3: admission and auth. With the M15.2 split this lives in the broker guest
-  as policy: it authenticates the request and decides who may start a guest and
-  which bundle they get, off the box behind the TLS proxy as M10 decided. The
-  host contributes only mechanism, the per-request quotas on the control channel
-  and the token binding that ties a browser's draw stream to the guest the broker
-  spawned. The draw port still keeps no auth of its own. This fits the section
-  9.2 split: the host stays trusted and minimal, the session guests stay
-  sandboxed, and the broker guest is an explicit, bounded-privilege front.
+- M15.3: admission and auth. Authentication stays off the box in the reverse
+  proxy, as M10 decided; the host contributes only the admission mechanism. This
+  fits the section 9.2 split: the host stays trusted and minimal, the session
+  guests stay sandboxed, and the authenticating front is explicit.
+  - Step one (done 2026-10-07, proxy auth + host admission): a bearer-token gate
+    in front of brokerd, with no token ever reaching the host. `authd` is a small
+    loopback validator Caddy delegates to with `forward_auth`; it maps a token to
+    a user and a per-user cap from a `token user [cap]` store (minted by
+    `jmint`), and returns `X-Jotun-Auth: <secret> <user> <cap>` which Caddy copies
+    onto the request. brokerd (when `JOTUN_BROKER_AUTH_SECRET` is set) trusts only
+    the line carrying that shared secret, so the identity cannot be forged; it
+    enforces the per-user session cap, refuses an unidentified request (403), and
+    binds a `jsess` cookie to its owning user so one user's cookie cannot attach
+    to another's session. A client sends the token as an `Authorization: Bearer`
+    header or, for a browser (whose WebSocket takes no custom header), as the
+    `jauth` cookie obtained once from `/login?token=`. Run with
+    `make web-auth JOTUN_BROKER_AUTH_SECRET=<secret>` behind
+    `example/web/Caddyfile-auth`; `make auth-smoke` checks it headless. With the
+    secret unset brokerd is unchanged, so `make web-multi` still runs open.
+  - Still to come: when the broker guest (M15.2 step two) exists, the admission
+    policy can move into it over the control channel, with the host keeping the
+    per-request quota and the token binding. Per-user bundle selection is M15.4.
 - M15.4: per-session bundle delivery. The broker guest names the bundle in its
   spawn request and the host resolves it through the signed pull (M8), so a
   session's image is pinned per request rather than baked in.

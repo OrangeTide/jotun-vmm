@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -36,9 +37,12 @@
 #define RLIM_CPU_SECS   3600            /* 1 hour of CPU per child */
 #define RLIM_NOFILE     256
 
+#define USER_MAX        64              /* authenticated user name, with NUL */
+
 struct session {
     int    inuse;
     char   token[33];                   /* 32 hex digits + NUL */
+    char   user[USER_MAX];              /* owning user when auth is on, else "" */
     pid_t  pid;
     int    port;
     time_t last_active;
@@ -59,6 +63,8 @@ static int cfg_listen_port;
 static int cfg_port_base;
 static int cfg_max;
 static int cfg_idle;
+static const char *cfg_auth_secret;     /* shared secret with authd; "" = off */
+static int cfg_user_max;                /* default per-user session cap */
 static int urandom_fd = -1;
 
 /****************************************************************
@@ -176,6 +182,17 @@ session_count(void)
     return n;
 }
 
+/* Count live sessions owned by one user (called under lock). */
+static int
+user_session_count(const char *user)
+{
+    int n = 0;
+    for (int i = 0; i < SESS_MAX; i++)
+        if (sess[i].inuse && strcmp(sess[i].user, user) == 0)
+            n++;
+    return n;
+}
+
 extern char **environ;
 
 /* Build the child's environment array: the parent's, minus the keys we set per
@@ -215,15 +232,24 @@ build_child_env(char *const overrides[], int noverride)
     return out;
 }
 
-/* Fork a jotun child serving one session on a free port, and record it.
- * Returns the token in out (33 bytes) or -1 if full / spawn failed. */
+/* Fork a jotun child serving one session on a free port, and record it. user is
+ * the owning identity ("" when auth is off) and cap its per-user session limit
+ * (<= 0 to use the default). Returns the token in out (33 bytes), or -1 if the
+ * global or the per-user cap is reached or the spawn failed. */
 static int
-spawn_session(char out[33])
+spawn_session(const char *user, int cap, char out[33])
 {
     pthread_mutex_lock(&lock);
     if (session_count() >= cfg_max) {
         pthread_mutex_unlock(&lock);
         return -1;
+    }
+    if (cfg_auth_secret[0]) {
+        int limit = cap > 0 ? cap : cfg_user_max;
+        if (user_session_count(user) >= limit) {
+            pthread_mutex_unlock(&lock);
+            return -1;
+        }
     }
     int port = -1;
     for (int p = cfg_port_base; p < cfg_port_base + cfg_max; p++) {
@@ -247,6 +273,7 @@ spawn_session(char out[33])
     sess[slot].pid = 0;
     sess[slot].port = port;
     sess[slot].last_active = time(NULL);
+    snprintf(sess[slot].user, sizeof sess[slot].user, "%s", user);
     make_token(sess[slot].token);
     memcpy(out, sess[slot].token, 33);
     pthread_mutex_unlock(&lock);
@@ -400,6 +427,45 @@ parse_cookie(const char *head, int len, char out[33])
     return 0;
 }
 
+/* Read the trusted identity header authd set and Caddy copied onto the request:
+ *     X-Jotun-Auth: <secret> <user> <cap>
+ * The leading token is the shared secret only authd and brokerd know, so a
+ * client cannot forge the identity: only a line whose first token equals our
+ * secret is trusted. On a match, fills user and *cap (-1 if the field is "-")
+ * and returns 1. Scans every such header, so a spurious client-sent one is
+ * ignored. */
+static int
+parse_identity(const char *head, int len, char user_out[USER_MAX], int *cap_out)
+{
+    const char *p = head, *e = head + len;
+    while (p < e) {
+        if ((size_t)(e - p) >= 13 && strncasecmp(p, "X-Jotun-Auth:", 13) == 0) {
+            const char *v = p + 13;
+            const char *le = v;
+            while (le < e && *le != '\r' && *le != '\n')
+                le++;
+            char line[256];
+            int n = (int)(le - v);
+            if (n > 0 && n < (int)sizeof line) {
+                memcpy(line, v, (size_t)n);
+                line[n] = '\0';
+                char sec[160], usr[USER_MAX], capf[16];
+                int got = sscanf(line, "%159s %63s %15s", sec, usr, capf);
+                if (got >= 2 && strcmp(sec, cfg_auth_secret) == 0) {
+                    snprintf(user_out, USER_MAX, "%s", usr);
+                    *cap_out = (got >= 3 && capf[0] != '-') ? atoi(capf) : -1;
+                    return 1;
+                }
+            }
+        }
+        while (p < e && *p != '\n')
+            p++;
+        if (p < e)
+            p++;
+    }
+    return 0;
+}
+
 /* Is this request for the WebSocket endpoint? */
 static int
 is_ws_path(const char *head, int len)
@@ -464,13 +530,30 @@ handle_conn(void *arg)
         return NULL;
     }
 
+    /* Admission: when auth is on, every request must carry the identity authd
+     * vouched for (Caddy copies it from forward_auth). No identity, no entry. */
+    char auth_user[USER_MAX] = "";
+    int auth_cap = -1;
+    int auth_on = cfg_auth_secret[0] != '\0';
+    if (auth_on && !parse_identity(head, hlen, auth_user, &auth_cap)) {
+        static const char deny[] =
+            "HTTP/1.1 403 Forbidden\r\n"
+            "Connection: close\r\nContent-Length: 0\r\n\r\n";
+        write_all(cfd, deny, sizeof deny - 1);
+        close(cfd);
+        return NULL;
+    }
+
     char token[33];
     int have_cookie = parse_cookie(head, hlen, token);
     int port = -1;
     if (have_cookie) {
         pthread_mutex_lock(&lock);
         int i = find_token(token);
-        if (i >= 0 && sess[i].pid > 0)
+        /* A cookie is honoured only for its owner, so one user's token cannot
+         * attach to another's session even if the cookie value leaks. */
+        if (i >= 0 && sess[i].pid > 0 &&
+            (!auth_on || strcmp(sess[i].user, auth_user) == 0))
             port = sess[i].port;
         pthread_mutex_unlock(&lock);
     }
@@ -496,7 +579,7 @@ handle_conn(void *arg)
     }
 
     char t[33];
-    if (spawn_session(t) != 0) {
+    if (spawn_session(auth_user, auth_cap, t) != 0) {
         static const char busy[] =
             "HTTP/1.1 503 Service Unavailable\r\n"
             "Connection: close\r\nContent-Length: 21\r\n\r\n"
@@ -573,10 +656,14 @@ main(void)
     cfg_port_base = env_int("JOTUN_BROKER_PORTBASE", 9300);
     cfg_max = env_int("JOTUN_BROKER_MAX", 16);
     cfg_idle = env_int("JOTUN_BROKER_IDLE", 300);
+    cfg_auth_secret = env_str("JOTUN_BROKER_AUTH_SECRET", "");
+    cfg_user_max = env_int("JOTUN_BROKER_USER_MAX", 3);
     if (cfg_max < 1)
         cfg_max = 1;
     if (cfg_max > SESS_MAX)
         cfg_max = SESS_MAX;
+    if (cfg_user_max < 1)
+        cfg_user_max = 1;
 
     urandom_fd = open("/dev/urandom", O_RDONLY);
     signal(SIGPIPE, SIG_IGN);            /* writes to closed peers return EPIPE */
@@ -613,8 +700,9 @@ main(void)
         return 1;
     }
     fprintf(stderr, "[broker] listening on http://127.0.0.1:%d/ "
-            "(front with Caddy for TLS); guest=%s bundle=%s max=%d\n",
-            cfg_listen_port, cfg_guest, cfg_bundle, cfg_max);
+            "(front with Caddy for TLS); guest=%s bundle=%s max=%d auth=%s\n",
+            cfg_listen_port, cfg_guest, cfg_bundle, cfg_max,
+            cfg_auth_secret[0] ? "on" : "off");
 
     while (!quitting) {
         struct pollfd fds[2] = {

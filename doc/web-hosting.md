@@ -115,3 +115,38 @@ exclusive write lock, waits for the serving processes to exit first.
 This is the M15.2 host mechanism. The next step, tracked in `doc/roadmap.md`,
 moves the admission and bundle-selection policy out of brokerd and into a
 sandboxed broker guest over a host control channel.
+
+## Authentication and per-user admission
+
+Authentication stays off the box in the reverse proxy, as M10 decided. For a
+multi-user deployment the M15.3 pieces add a bearer-token gate in front and a
+per-user session cap in brokerd, without the host learning any tokens.
+
+- `authd` is a small loopback validator Caddy delegates to with `forward_auth`.
+  It maps a bearer token to a user and a per-user cap, read from a token store
+  file (`token user [cap]` lines, path in `JOTUN_AUTH_TOKENS`). On a valid token
+  it returns `X-Jotun-Auth: <secret> <user> <cap>`, which Caddy copies onto the
+  request to brokerd.
+- brokerd, when `JOTUN_BROKER_AUTH_SECRET` is set, trusts only the `X-Jotun-Auth`
+  line whose first token is that shared secret, so a client cannot forge the
+  identity. It enforces the per-user cap (the header's value, or
+  `JOTUN_BROKER_USER_MAX`, default 3), refuses a request with no valid identity
+  (`403`), and honours a `jsess` cookie only for its owner, so one user's cookie
+  cannot attach to another's session. With the secret unset, brokerd behaves as
+  before (open), so `make web-multi` is unchanged.
+- A client presents its token as `Authorization: Bearer <token>` on every
+  request (programmatic clients), or as the `jauth` cookie a browser obtains once
+  by visiting `/login?token=<token>`. The cookie is how a browser carries the
+  token to the WebSocket, which cannot take a custom header.
+
+Mint a token with `./jmint <user> [cap]` (it appends to `JOTUN_AUTH_TOKENS` and
+prints the token once). Run the pair with
+`make web-auth JOTUN_BROKER_AUTH_SECRET=<secret>` and front it with
+`example/web/Caddyfile-auth`. `make auth-smoke` checks it headless: authd's token
+validation (header, cookie, and `/login`), and brokerd's per-user caps and
+identity gate.
+
+The box itself stays trusted: brokerd binds loopback and trusts the identity
+header because only Caddy, through authd, can produce the shared secret. Tokens
+are bearer secrets, carried over TLS only; keep the store file readable only by
+the operator.

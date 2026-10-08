@@ -337,6 +337,24 @@ brokerd: host/brokerd.c
 web-multi: brokerd $(TARGET) libos.elf
 	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./brokerd
 
+## authd: the bearer-token validator Caddy delegates to (forward_auth), and
+## jmint: the tool that mints a token into the store authd reads (M15.3).
+authd: host/authd.c
+	$(CC) $(CFLAGS) -o $@ $<
+jmint: host/jmint.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+## Authenticated multi-user hosting: brokerd + authd behind Caddy, with a shared
+## secret so brokerd trusts only the identity authd vouches for. Mint tokens with
+## ./jmint <user> [cap]; front with example/web/Caddyfile-auth. Needs a bundle.
+web-auth: brokerd authd $(TARGET) libos.elf
+	@test -n "$(JOTUN_BROKER_AUTH_SECRET)" || \
+	    { echo "set JOTUN_BROKER_AUTH_SECRET (shared with authd)"; exit 1; }
+	JOTUN_BROKER_AUTH_SECRET=$(JOTUN_BROKER_AUTH_SECRET) \
+	    JOTUN_AUTH_TOKENS=$(JOTUN_AUTH_TOKENS) ./authd & \
+	JOTUN_BROKER_AUTH_SECRET=$(JOTUN_BROKER_AUTH_SECRET) \
+	    JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./brokerd; kill %1 2>/dev/null
+
 ## Multi-session smoke test: brokerd opens two independent sessions and checks
 ## they get separate guests and tear down. Needs a bundle.
 build/brokersmoke: tools/brokersmoke.c | build
@@ -351,6 +369,14 @@ build/caddysmoke: tools/caddysmoke.c | build
 	$(CC) $(CFLAGS) -o $@ $<
 caddy-smoke: brokerd $(TARGET) libos.elf build/caddysmoke
 	./build/caddysmoke ./$(TARGET) $(BUNDLE_DEPOT) example/web/Caddyfile
+
+## Admission + auth smoke test: mints two users, starts authd and brokerd with a
+## shared secret, checks authd's token validation and brokerd's per-user session
+## caps and identity gate. Needs a bundle: make bundle BUNDLE_ARCHS=$(ARCH)
+build/authsmoke: tools/authsmoke.c | build
+	$(CC) $(CFLAGS) -o $@ $<
+auth-smoke: brokerd authd jmint $(TARGET) libos.elf build/authsmoke
+	./build/authsmoke ./brokerd ./authd ./jmint ./$(TARGET) $(BUNDLE_DEPOT)
 
 ## Host check of the guest format engine against literal expectations. The
 ## formatter is portable C, so it is built for the host with snprintf renamed to
@@ -368,7 +394,7 @@ fmt-test: build/fmttest
 
 clean:
 	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool jbundle \
-	    brokerd
+	    brokerd authd jmint
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test
+.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth auth-smoke

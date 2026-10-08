@@ -1,0 +1,42 @@
+# Authenticated multi-user front end for brokerd (M15.3). Caddy owns TLS and
+# delegates authentication to authd with forward_auth; brokerd itself holds no
+# auth code and trusts only the identity authd vouches for. Run the pair with
+# `make web-auth JOTUN_BROKER_AUTH_SECRET=<secret>` (authd and brokerd must share
+# that secret), mint tokens with `./jmint <user> [cap]`, then
+# `caddy run --config example/web/Caddyfile-auth`. See doc/web-hosting.md.
+#
+# A client presents its bearer token one of two ways:
+#   - Authorization: Bearer <token>   on every request (programmatic clients).
+#   - the jauth cookie                 set once by visiting /login?token=<token>,
+#                                      which rides every later request, /ws too
+#                                      (a browser cannot set headers on a
+#                                      WebSocket, so the cookie is how it carries
+#                                      the token to the live stream).
+{
+	admin off
+	auto_https disable_redirects
+}
+
+https://localhost:8443 {
+	tls internal
+
+	# One-time token exchange: authd validates ?token=, sets the jauth cookie,
+	# and redirects to /. Deliberately not behind forward_auth, so the bare
+	# token is accepted at exactly this one endpoint.
+	handle /login {
+		reverse_proxy 127.0.0.1:9231
+	}
+
+	# Everything else: authd checks the token (Authorization header or jauth
+	# cookie) and, on success, returns X-Jotun-Auth: <secret> <user> <cap>, which
+	# Caddy copies onto the request to brokerd. brokerd trusts only the line whose
+	# first token is the shared secret, so a client-forged X-Jotun-Auth is
+	# ignored and no header stripping is needed here.
+	handle {
+		forward_auth 127.0.0.1:9231 {
+			uri /auth
+			copy_headers X-Jotun-Auth
+		}
+		reverse_proxy 127.0.0.1:9230
+	}
+}
