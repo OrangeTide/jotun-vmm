@@ -866,8 +866,8 @@ init_task(void)
         triton_demo();
     } else if (script[0] == 'w' && script[1] == 'e') {  /* "webterm" */
         webterm();
-    } else if (script[0] == 'b' && script[1] == 'i') {  /* "bin" (M16.1 spike) */
-        linux_elf_run("linuxhello");
+    } else if (script[0] == 'b' && script[1] == 'i') {  /* "bin <prog>" (M16) */
+        linux_elf_run((boot_argc() > 1) ? boot_argv(1) : "linuxhello");
     } else {
         con_puts("init: running script /");
         con_puts(script);

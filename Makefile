@@ -304,17 +304,24 @@ bundle: castool jbundle $(BUNDLE_DEPS)
 	./jbundle -d $(BUNDLE_DEPOT) --ref root --name jotun-demo $$args
 	./castool -d $(BUNDLE_DEPOT) pack
 
-## Experimental M16.1 Linux binary-compat spike: build a static x86-64 musl
-## program, stage it into a single-arch bundle, and run it under the libOS
-## SYSCALL trap (the `bin` guest). x86-64 host only; needs musl-gcc on PATH.
-## See guest/libos/linuxelf.c and doc/roadmap.md (M16).
+## Experimental M16 Linux binary-compat spike: build the static x86-64 musl test
+## programs (example/linux*.c), stage them into a single-arch bundle, and run one
+## under the libOS SYSCALL trap (the `bin` guest). x86-64 host only; needs
+## musl-gcc on PATH. SPIKE_PROG selects which to run (default linuxhello); e.g.
+## make linux-spike SPIKE_PROG=linuxcat. See guest/libos/linuxelf.c and
+## doc/m16-linux-spike.md.
+LINUX_SPIKE_SRCS := $(wildcard example/linux*.c)
+LINUX_SPIKE_BINS := $(patsubst example/%.c,build/%,$(LINUX_SPIKE_SRCS))
+SPIKE_PROG ?= linuxhello
 linux-spike: $(TARGET) libos.elf
 	@test "$(ARCH)" = x86_64 || { echo "linux-spike is x86-64 only"; exit 1; }
 	@command -v musl-gcc >/dev/null 2>&1 || \
 	    { echo "linux-spike needs musl-gcc on PATH"; exit 1; }
-	musl-gcc -static -no-pie -O2 -o build/linuxhello example/linuxhello.c
-	$(MAKE) bundle BUNDLE_ARCHS=x86_64 EXTRA_BUNDLE_FILES=build/linuxhello
-	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./$(TARGET) libos.elf bin
+	for s in $(LINUX_SPIKE_SRCS); do \
+	    musl-gcc -static -no-pie -O2 -o build/`basename $$s .c` $$s || exit 1; \
+	done
+	$(MAKE) bundle BUNDLE_ARCHS=x86_64 EXTRA_BUNDLE_FILES="$(LINUX_SPIKE_BINS)"
+	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./$(TARGET) libos.elf bin $(SPIKE_PROG)
 
 # macsyntax: syntax-check the macOS-only net path from a Linux dev box, so the
 # kqueue backend does not rot between real macOS builds. It compiles host/net.c

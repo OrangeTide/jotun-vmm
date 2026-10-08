@@ -19,29 +19,73 @@
 #include "elfload.h"
 #include "ns.h"
 #include "p9.h"
+#include "string.h"
 #include "jotun_svc.h"       /* JOTUN_PROG_BASE / JOTUN_PROG_SIZE */
 
 #include <stdint.h>
 
-/* A distinct 9P fid, so loading a Linux program never collides with the native
- * program loader's fid (prog.c uses 10). */
-#define LINUX_FID 12u
+/* The 9P fid used to load the program ELF, distinct from the native loader's
+ * (prog.c uses 10), and the pool of fids backing open file descriptors. */
+#define LINUX_FID      12u
+#define LINUX_FID_BASE 32u          /* open files use fids 32..32+LINUX_NFD */
 
 /* Linux syscall numbers (x86-64) we recognise. */
-#define SYS_write          1
-#define SYS_ioctl          16
-#define SYS_writev         20
-#define SYS_exit           60
-#define SYS_arch_prctl     158
+#define SYS_read            0
+#define SYS_write           1
+#define SYS_open            2
+#define SYS_close           3
+#define SYS_stat            4
+#define SYS_fstat           5
+#define SYS_lstat           6
+#define SYS_lseek           8
+#define SYS_ioctl           16
+#define SYS_writev          20
+#define SYS_dup             32
+#define SYS_dup2            33
+#define SYS_fcntl           72
+#define SYS_getcwd          79
+#define SYS_exit            60
+#define SYS_arch_prctl      158
+#define SYS_getdents64      217
 #define SYS_set_tid_address 218
-#define SYS_exit_group     231
+#define SYS_exit_group      231
+#define SYS_openat          257
+#define SYS_newfstatat      262
+#define SYS_readlinkat      267
+#define SYS_set_robust_list 273
+#define SYS_dup3            292
+#define SYS_rseq            334
 
 #define ARCH_SET_FS 0x1002
 
+#define AT_FDCWD (-100)
+
+/* open() flags we care about (the read-only bundle rejects writes). */
+#define O_WRONLY    0x0001
+#define O_RDWR      0x0002
+#define O_DIRECTORY 0x10000
+
+/* lseek whence. */
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+
+/* Linux st_mode type bits and dirent types. */
+#define S_IFDIR 0040000
+#define S_IFREG 0100000
+#define DT_DIR  4
+#define DT_REG  8
+
 /* A few errnos, returned as negatives in rax the way the kernel does. */
 #define LERR_BADF   9
+#define LERR_NOMEM  12
+#define LERR_ACCES  13
+#define LERR_NOTDIR 20
+#define LERR_INVAL  22
 #define LERR_NOTTY  25
 #define LERR_NOSYS  38
+#define LERR_NOENT  2
+#define LERR_ROFS   30
 
 /* x86-64 MSRs for the SYSCALL path. */
 #define MSR_EFER     0xC0000080u
@@ -109,7 +153,7 @@ put_dec(long v)
 }
 
 /****************************************************************
- * Syscall servicing.
+ * File descriptors over the read-only 9P bundle.
  ****************************************************************/
 
 struct iovec {
@@ -117,11 +161,92 @@ struct iovec {
     unsigned long len;
 };
 
+/* The x86-64 Linux struct stat the stat/fstat/newfstatat syscalls fill. */
+struct linux_stat {
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint64_t st_nlink;
+    uint32_t st_mode;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint32_t __pad0;
+    uint64_t st_rdev;
+    int64_t  st_size;
+    int64_t  st_blksize;
+    int64_t  st_blocks;
+    uint64_t st_atime;  uint64_t st_atime_nsec;
+    uint64_t st_mtime;  uint64_t st_mtime_nsec;
+    uint64_t st_ctime;  uint64_t st_ctime_nsec;
+    int64_t  __unused[3];
+};
+
+/* The getdents64 record. d_name is NUL-terminated and the record is padded so
+ * d_reclen is 8-aligned. */
+struct linux_dirent64 {
+    uint64_t d_ino;
+    int64_t  d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    char     d_name[];
+};
+
+#define LINUX_NFD 32
+
+struct lfd {
+    int      used;
+    int      isdir;
+    uint32_t p9fid;             /* backing 9P fid, 0 for the console fds */
+    uint64_t pos;               /* read cursor (file) or 9P dir offset */
+    uint64_t size;
+};
+
+static struct lfd fds[LINUX_NFD];
+
+/* A reference count per backing 9P fid, indexed by (p9fid - LINUX_FID_BASE),
+ * so dup can share a fid and it is clunked only when the last fd closes. */
+static uint8_t fidref[LINUX_NFD];
+
+/* fds 0,1,2 are the console; higher fds are 9P-backed. */
+static struct lfd *
+fd_get(long fd)
+{
+    if (fd < 0 || fd >= LINUX_NFD || !fds[fd].used)
+        return NULL;
+    return &fds[fd];
+}
+
+static int
+fd_alloc(void)
+{
+    for (int i = 3; i < LINUX_NFD; i++)
+        if (!fds[i].used)
+            return i;
+    return -1;
+}
+
+static void
+fds_init(void)
+{
+    memset(fds, 0, sizeof fds);
+    memset(fidref, 0, sizeof fidref);
+    fds[0].used = fds[1].used = fds[2].used = 1;    /* stdin/out/err */
+}
+
+/* Strip leading slashes: bundle paths are relative to the 9P root, and musl
+ * passes absolute paths. An empty result means the root itself. */
+static const char *
+bundle_path(const char *p)
+{
+    while (*p == '/')
+        p++;
+    return p;
+}
+
 static long
 do_write(long fd, const char *buf, unsigned long len)
 {
     if (fd != 1 && fd != 2)
-        return -LERR_BADF;
+        return -LERR_BADF;              /* the bundle is read-only */
     for (unsigned long i = 0; i < len; i++)
         con_putc(buf[i]);
     return (long)len;
@@ -143,6 +268,186 @@ do_writev(long fd, const struct iovec *iov, long cnt)
     return total;
 }
 
+static long
+do_open(const char *path, long flags)
+{
+    const char *rel = bundle_path(path);
+
+    if (flags & (O_WRONLY | O_RDWR))
+        return -LERR_ROFS;              /* read-only bundle */
+
+    int fd = fd_alloc();
+    if (fd < 0)
+        return -LERR_NOMEM;
+    uint32_t p9fid = LINUX_FID_BASE + (uint32_t)fd;
+
+    if (ns_walk(rel, p9fid) != 0)
+        return -LERR_NOENT;
+
+    struct p9_stat st;
+    int isdir = 0;
+    uint64_t size = 0;
+    if (p9_stat(p9fid, &st) == 0) {
+        isdir = (st.qid.type & P9_QTDIR) != 0;
+        size = st.length;
+    }
+    if ((flags & O_DIRECTORY) && !isdir) {
+        p9_clunk(p9fid);
+        return -LERR_NOTDIR;
+    }
+    if (p9_open(p9fid) != 0) {
+        p9_clunk(p9fid);
+        return -LERR_ACCES;
+    }
+
+    fds[fd].used = 1;
+    fds[fd].isdir = isdir;
+    fds[fd].p9fid = p9fid;
+    fds[fd].pos = 0;
+    fds[fd].size = size;
+    fidref[p9fid - LINUX_FID_BASE] = 1;
+    return fd;
+}
+
+static long
+do_read(long fd, void *buf, unsigned long count)
+{
+    struct lfd *f = fd_get(fd);
+
+    if (!f || fd < 3)
+        return -LERR_BADF;              /* no stdin source */
+    if (f->isdir)
+        return -LERR_INVAL;
+    long n = p9_read(f->p9fid, f->pos, buf, (uint32_t)count);
+    if (n < 0)
+        return -LERR_INVAL;
+    f->pos += (uint64_t)n;
+    return n;
+}
+
+static long
+do_close(long fd)
+{
+    struct lfd *f = fd_get(fd);
+
+    if (!f)
+        return -LERR_BADF;
+    if (fd < 3)
+        return 0;                       /* keep the console open */
+    uint32_t slot = f->p9fid - LINUX_FID_BASE;
+    if (fidref[slot] && --fidref[slot] == 0)
+        p9_clunk(f->p9fid);             /* last reference: release the fid */
+    f->used = 0;
+    return 0;
+}
+
+static long
+do_lseek(long fd, long off, long whence)
+{
+    struct lfd *f = fd_get(fd);
+
+    if (!f || fd < 3)
+        return -LERR_BADF;
+    uint64_t base = (whence == SEEK_CUR) ? f->pos :
+                    (whence == SEEK_END) ? f->size : 0;
+    if (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END)
+        return -LERR_INVAL;
+    f->pos = base + (uint64_t)off;
+    return (long)f->pos;
+}
+
+static void
+fill_stat(struct linux_stat *s, int isdir, uint64_t size, uint64_t ino)
+{
+    memset(s, 0, sizeof *s);
+    s->st_mode = isdir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+    s->st_nlink = 1;
+    s->st_size = (int64_t)size;
+    s->st_blksize = 4096;
+    s->st_blocks = (int64_t)((size + 511) / 512);
+    s->st_ino = ino;
+}
+
+/* stat a path (stat/lstat/newfstatat with AT_FDCWD). Uses a scratch fid. */
+static long
+do_stat_path(const char *path, struct linux_stat *out)
+{
+    const char *rel = bundle_path(path);
+    uint32_t fid = LINUX_FID_BASE + LINUX_NFD;      /* scratch, above the pool */
+
+    if (ns_walk(rel, fid) != 0)
+        return -LERR_NOENT;
+    struct p9_stat st;
+    int ok = p9_stat(fid, &st) == 0;
+    long rc = -LERR_NOENT;
+    if (ok) {
+        fill_stat(out, (st.qid.type & P9_QTDIR) != 0, st.length, st.qid.path);
+        rc = 0;
+    }
+    p9_clunk(fid);
+    return rc;
+}
+
+static long
+do_fstat(long fd, struct linux_stat *out)
+{
+    struct lfd *f = fd_get(fd);
+
+    if (!f)
+        return -LERR_BADF;
+    if (fd < 3) {
+        fill_stat(out, 0, 0, (uint64_t)fd);         /* console: a char device-ish reg */
+        return 0;
+    }
+    fill_stat(out, f->isdir, f->size, f->p9fid);
+    return 0;
+}
+
+/* getdents64: read directory entries from the 9P stream at the fd's cursor and
+ * pack them as linux_dirent64 records into the user buffer. Advances the cursor
+ * only past the entries actually emitted, so the next call resumes correctly. */
+static long
+do_getdents64(long fd, void *buf, unsigned long count)
+{
+    struct lfd *f = fd_get(fd);
+
+    if (!f || fd < 3)
+        return -LERR_BADF;
+    if (!f->isdir)
+        return -LERR_NOTDIR;
+
+    uint8_t kbuf[4096];
+    uint32_t want = sizeof kbuf;
+    long got = p9_read(f->p9fid, f->pos, kbuf, want);
+    if (got <= 0)
+        return 0;                       /* end of directory */
+
+    uint8_t *out = buf;
+    unsigned long used = 0;
+    uint32_t off = 0, consumed = 0;
+    struct p9_stat e;
+
+    while (p9_dir_next(kbuf, (uint32_t)got, &off, &e)) {
+        unsigned long nlen = strlen(e.name);
+        unsigned long reclen = (19 + nlen + 1 + 7) & ~(unsigned long)7;
+        if (used + reclen > count)
+            break;                      /* no room: leave for the next call */
+        struct linux_dirent64 *d = (struct linux_dirent64 *)(out + used);
+        d->d_ino = e.qid.path ? e.qid.path : 1;
+        d->d_off = (int64_t)(f->pos + off);
+        d->d_reclen = (uint16_t)reclen;
+        d->d_type = (e.qid.type & P9_QTDIR) ? DT_DIR : DT_REG;
+        memcpy(d->d_name, e.name, nlen);
+        d->d_name[nlen] = 0;
+        used += reclen;
+        consumed = off;
+    }
+    if (used == 0 && off > 0)
+        return -LERR_INVAL;             /* a single entry too big for the buffer */
+    f->pos += consumed;
+    return (long)used;
+}
+
 /* The C half of the SYSCALL handler. Return value goes back in rax. */
 long
 linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
@@ -158,12 +463,61 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return -LERR_NOSYS;
     case SYS_set_tid_address:
         return 1;                       /* a plausible tid */
+    case SYS_set_robust_list:
+    case SYS_rseq:
+        return 0;                       /* accept and ignore */
     case SYS_ioctl:
         return -LERR_NOTTY;             /* no tty: musl falls back */
+    case SYS_read:
+        return do_read(a1, (void *)a2, (unsigned long)a3);
     case SYS_write:
         return do_write(a1, (const char *)a2, (unsigned long)a3);
     case SYS_writev:
         return do_writev(a1, (const struct iovec *)a2, a3);
+    case SYS_open:
+        return do_open((const char *)a1, a2);
+    case SYS_openat:
+        if (a1 != AT_FDCWD)
+            return -LERR_NOSYS;         /* only cwd-relative/absolute for now */
+        return do_open((const char *)a2, a3);
+    case SYS_close:
+        return do_close(a1);
+    case SYS_lseek:
+        return do_lseek(a1, a2, a3);
+    case SYS_stat:
+    case SYS_lstat:
+        return do_stat_path((const char *)a1, (struct linux_stat *)a2);
+    case SYS_newfstatat:
+        if (a1 != AT_FDCWD)
+            return -LERR_NOSYS;
+        return do_stat_path((const char *)a2, (struct linux_stat *)a3);
+    case SYS_fstat:
+        return do_fstat(a1, (struct linux_stat *)a2);
+    case SYS_getdents64:
+        return do_getdents64(a1, (void *)a2, (unsigned long)a3);
+    case SYS_dup: {
+        struct lfd *f = fd_get(a1);
+        if (!f || a1 < 3)
+            return -LERR_BADF;          /* console dup not needed here */
+        int nfd = fd_alloc();
+        if (nfd < 0)
+            return -LERR_NOMEM;
+        fds[nfd] = *f;                  /* shares the backing 9P fid */
+        fidref[f->p9fid - LINUX_FID_BASE]++;
+        return nfd;
+    }
+    case SYS_getcwd: {
+        char *ubuf = (char *)a1;
+        if (a2 < 2)
+            return -LERR_INVAL;
+        ubuf[0] = '/';
+        ubuf[1] = 0;
+        return 2;
+    }
+    case SYS_readlinkat:
+        return -LERR_INVAL;             /* nothing in the bundle is a symlink */
+    case SYS_fcntl:
+        return 0;                       /* minimal: accept F_SETFD/F_SETFL */
     case SYS_exit:
     case SYS_exit_group:
         linux_exit(a1);                 /* does not return */
@@ -260,6 +614,7 @@ linux_elf_run(const char *file)
     con_puthex(entry);
     con_putc('\n');
 
+    fds_init();
     syscall_arm();
     con_puts("[bin] syscall armed\n");
     uint64_t rsp = build_stack(file);
