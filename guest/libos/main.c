@@ -10,6 +10,7 @@
 #include "boot.h"
 #include "draw.h"
 #include "jsh.h"
+#include "linuxelf.h"
 #include "mem.h"
 #include "net.h"
 #include "ns.h"
@@ -865,6 +866,8 @@ init_task(void)
         triton_demo();
     } else if (script[0] == 'w' && script[1] == 'e') {  /* "webterm" */
         webterm();
+    } else if (script[0] == 'b' && script[1] == 'i') {  /* "bin" (M16.1 spike) */
+        linux_elf_run("linuxhello");
     } else {
         con_puts("init: running script /");
         con_puts(script);

@@ -73,7 +73,8 @@ else
         GUEST = test_guest.elf echo.elf libos.elf
         GUEST_SRC = guest/test_guest_x86.c
         LIBOS_ARCH = guest/libos/arch/x86_64.c guest/libos/arch/x86_64_ctx.S \
-            guest/libos/arch/x86_64_isr.S guest/libos/arch/x86_64_boot.S
+            guest/libos/arch/x86_64_isr.S guest/libos/arch/x86_64_boot.S \
+            guest/libos/arch/x86_64_linuxsys.S
         GUEST_CC = $(CC)
         GUEST_TEXT = 0x100000
     endif
@@ -133,7 +134,8 @@ LIBOS_SRC_COMMON = guest/libos/main.c guest/libos/mem.c guest/libos/task.c \
     guest/libos/boot.c guest/libos/p9.c guest/libos/elfload.c \
     guest/libos/prog.c guest/libos/jsh.c guest/libos/ns.c guest/libos/net.c \
     guest/libos/draw.c guest/libos/string.c guest/libos/fmt.c \
-    guest/libos/print.c guest/libos/webterm.c guest/libos/threads.c
+    guest/libos/print.c guest/libos/webterm.c guest/libos/threads.c \
+    guest/libos/linuxelf.c
 LIBOS_SRC = $(LIBOS_SRC_COMMON) $(LIBOS_ARCH)
 
 # triton.c is the only guest translation unit built with the FPU enabled: it is
@@ -233,7 +235,8 @@ TEXT_aarch64 := 0x200000
 AFLAGS_x86_64  :=
 AFLAGS_aarch64 := -mno-outline-atomics
 ASRC_x86_64  := guest/libos/arch/x86_64.c guest/libos/arch/x86_64_ctx.S \
-    guest/libos/arch/x86_64_isr.S guest/libos/arch/x86_64_boot.S
+    guest/libos/arch/x86_64_isr.S guest/libos/arch/x86_64_boot.S \
+    guest/libos/arch/x86_64_linuxsys.S
 ASRC_aarch64 := guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
     guest/libos/arch/arm64_boot.S
 
@@ -287,6 +290,7 @@ bundle: castool jbundle $(BUNDLE_DEPS)
 	    d=bundle-staging/$$a; \
 	    mkdir -p $$d/boot; \
 	    cp example/bundle/* $$d/; \
+	    [ -z "$(EXTRA_BUNDLE_FILES)" ] || cp $(EXTRA_BUNDLE_FILES) $$d/; \
 	    if [ "$$a" = "$(GUEST_ARCH)" ]; then \
 	        k=libos.elf; p=hello.elf; \
 	    else \
@@ -299,6 +303,18 @@ bundle: castool jbundle $(BUNDLE_DEPS)
 	done; \
 	./jbundle -d $(BUNDLE_DEPOT) --ref root --name jotun-demo $$args
 	./castool -d $(BUNDLE_DEPOT) pack
+
+## Experimental M16.1 Linux binary-compat spike: build a static x86-64 musl
+## program, stage it into a single-arch bundle, and run it under the libOS
+## SYSCALL trap (the `bin` guest). x86-64 host only; needs musl-gcc on PATH.
+## See guest/libos/linuxelf.c and doc/roadmap.md (M16).
+linux-spike: $(TARGET) libos.elf
+	@test "$(ARCH)" = x86_64 || { echo "linux-spike is x86-64 only"; exit 1; }
+	@command -v musl-gcc >/dev/null 2>&1 || \
+	    { echo "linux-spike needs musl-gcc on PATH"; exit 1; }
+	musl-gcc -static -no-pie -O2 -o build/linuxhello example/linuxhello.c
+	$(MAKE) bundle BUNDLE_ARCHS=x86_64 EXTRA_BUNDLE_FILES=build/linuxhello
+	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./$(TARGET) libos.elf bin
 
 # macsyntax: syntax-check the macOS-only net path from a Linux dev box, so the
 # kqueue backend does not rot between real macOS builds. It compiles host/net.c
@@ -441,4 +457,4 @@ clean:
 	    brokerd authd jmint
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test
+.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test linux-spike

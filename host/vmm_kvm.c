@@ -119,6 +119,25 @@ vmm_vcpu_t* vmm_vcpu_create(vmm_vm_t* vm) {
     // cache, so no GDT in guest memory is needed as long as the guest does not
     // reload the segment registers. Entry and stack are set later via
     // VMM_REG_PC / VMM_REG_SP.
+
+    // Advertise the host-supported CPUID to the guest. KVM refuses to set
+    // EFER.SCE (the SYSCALL enable) unless the guest CPUID reports the SYSCALL
+    // feature, which the Linux binary-compat path (M16.1) needs. The normal
+    // libOS never executes CPUID, so this only unblocks that path.
+    {
+        size_t sz = sizeof(struct kvm_cpuid2) +
+                    128 * sizeof(struct kvm_cpuid_entry2);
+        struct kvm_cpuid2 *cpuid = calloc(1, sz);
+        if (cpuid) {
+            cpuid->nent = 128;
+            if (ioctl(vcpu->kvm_fd, KVM_GET_SUPPORTED_CPUID, cpuid) < 0)
+                fprintf(stderr, "kvm: KVM_GET_SUPPORTED_CPUID failed\n");
+            else if (ioctl(vcpu->vcpu_fd, KVM_SET_CPUID2, cpuid) < 0)
+                fprintf(stderr, "kvm: KVM_SET_CPUID2 failed\n");
+            free(cpuid);
+        }
+    }
+
     struct kvm_sregs sregs;
     if (ioctl(vcpu->vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
         close(vcpu->vcpu_fd);

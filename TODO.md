@@ -70,15 +70,17 @@ gVisor scale. The target is the common static core, not every Linux feature.
 
 Milestones, smallest first, each with its own acceptance test:
 
-- [ ] M16.1: a Linux static-ELF loader and the syscall entry path. Load `PT_LOAD`
-      segments and build the initial stack with `argc`/`argv`/`envp` and the auxv
-      (`AT_PAGESZ`, `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`, `AT_ENTRY`, `AT_HWCAP`,
-      `AT_RANDOM`). Trap `SYSCALL`/`SVC` into a dispatch table. Implement the
-      startup syscalls a thin libc needs. Acceptance: a `musl-gcc -no-pie -static`
-      hello world reaches `exit_group(0)` and prints to the console. musl is the
-      first target because its startup is calm: no GC, no arena reservations, no
-      preemption signals, and `AT_RANDOM` is only a canary seed rather than a
-      hard requirement.
+- [x] M16.1 (spike): a Linux static-ELF loader and the syscall entry path. Load
+      `PT_LOAD` segments and build the initial stack with `argc`/`argv`/`envp`
+      and the auxv (`AT_PAGESZ`, `AT_RANDOM`). Trap `SYSCALL` into a dispatch
+      table. Implement the startup syscalls a thin libc needs. Done: a
+      `musl-gcc -no-pie -static` hello reaches `exit_group(0)` and prints to the
+      console. See `doc/m16-linux-spike.md`, `guest/libos/linuxelf.c`,
+      `guest/libos/arch/x86_64_linuxsys.S`, and `make linux-spike`. The one host
+      change needed was advertising the SYSCALL CPUID feature (`KVM_SET_CPUID2`
+      in `host/vmm_kvm.c`), without which KVM refuses the `EFER.SCE` write. This
+      is a spike, x86-64 only; before M16.2, add a `#GP`/`#PF` diagnostic
+      handler (a bad guest instruction currently triple-faults silently).
 - [ ] M16.2: broaden the VFS and process syscalls (`getdents64`, `readlinkat`,
       `stat` family, `pipe2`, `dup`, `fcntl`, `ioctl`). Acceptance: a static
       `busybox` runs its common applets (`ls`, `cat`, `echo`, `sh`), which fans
