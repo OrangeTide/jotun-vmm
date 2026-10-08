@@ -356,6 +356,22 @@ linux-spike: $(TARGET) libos.elf
 	$(MAKE) bundle BUNDLE_ARCHS=$(ARCH) EXTRA_BUNDLE_FILES="$(LINUX_SPIKE_BINS)"
 	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./$(TARGET) libos.elf bin $(SPIKE_PROG)
 
+## Run the spike from pre-built static musl binaries, no musl toolchain needed.
+## For a host that cannot cross-compile (e.g. macos/arm64 without a toolchain):
+## build the linux* binaries for this arch elsewhere, copy them into a directory,
+## and point SPIKE_BIN_DIR at it. The binaries must match this host's arch and be
+## static non-PIE ET_EXEC at 0x400000, as `make linux-spike` produces.
+SPIKE_BIN_DIR ?=
+linux-spike-prebuilt: $(TARGET) libos.elf
+	@test -n "$(SPIKE_BIN_DIR)" || \
+	    { echo "set SPIKE_BIN_DIR=<dir of pre-built linux* binaries>"; exit 1; }
+	mkdir -p build
+	for b in $(LINUX_SPIKE_BINS); do \
+	    cp "$(SPIKE_BIN_DIR)/`basename $$b`" "$$b" || exit 1; \
+	done
+	$(MAKE) bundle BUNDLE_ARCHS=$(ARCH) EXTRA_BUNDLE_FILES="$(LINUX_SPIKE_BINS)"
+	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./$(TARGET) libos.elf bin $(SPIKE_PROG)
+
 # macsyntax: syntax-check the macOS-only net path from a Linux dev box, so the
 # kqueue backend does not rot between real macOS builds. It compiles host/net.c
 # with the __APPLE__ branch selected against a minimal shim of the kqueue API
@@ -497,4 +513,4 @@ clean:
 	    brokerd authd jmint
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test linux-spike malloc-test
+.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test linux-spike linux-spike-prebuilt malloc-test
