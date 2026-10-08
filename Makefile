@@ -355,6 +355,28 @@ web-auth: brokerd authd $(TARGET) libos.elf
 	JOTUN_BROKER_AUTH_SECRET=$(JOTUN_BROKER_AUTH_SECRET) \
 	    JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./brokerd; kill %1 2>/dev/null
 
+## One-command authenticated demo: brokerd + authd + Caddy together, so the whole
+## chain is a single foreground command for local testing. Generates an ephemeral
+## shared secret if none is set, mints a `demo` token into build/demo.tokens on
+## first run and prints the login URL, keeps Caddy's CA under build/, and tears
+## all three down on exit (Ctrl-C). Needs caddy on PATH and a bundle.
+web-auth-demo: brokerd authd jmint $(TARGET) libos.elf
+	@mkdir -p build/caddy; \
+	secret=$${JOTUN_BROKER_AUTH_SECRET:-$$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')}; \
+	store=build/demo.tokens; \
+	if [ ! -s $$store ]; then \
+	    tok=$$(JOTUN_AUTH_TOKENS=$$store ./jmint demo 5); \
+	    echo "minted demo token: $$tok"; \
+	else tok=$$(awk 'NR==1{print $$1}' $$store); fi; \
+	echo "open in a browser: https://localhost:8443/login?token=$$tok"; \
+	echo "(accept the local CA once; Ctrl-C stops authd, brokerd, and Caddy)"; \
+	JOTUN_AUTH_TOKENS=$$store JOTUN_BROKER_AUTH_SECRET=$$secret ./authd & a=$$!; \
+	JOTUN_BROKER_AUTH_SECRET=$$secret JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
+	    ./brokerd & b=$$!; \
+	trap 'kill $$a $$b 2>/dev/null' INT TERM EXIT; \
+	XDG_DATA_HOME=build/caddy XDG_CONFIG_HOME=build/caddy \
+	    caddy run --config example/web/Caddyfile-auth
+
 ## Multi-session smoke test: brokerd opens two independent sessions and checks
 ## they get separate guests and tear down. Needs a bundle.
 build/brokersmoke: tools/brokersmoke.c | build
@@ -397,4 +419,4 @@ clean:
 	    brokerd authd jmint
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth auth-smoke
+.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke
