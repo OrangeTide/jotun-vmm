@@ -124,23 +124,46 @@ entries in /: boot/ hello hello.txt ... motd rc net/
 read back: data through a pipe
 ```
 
-### What the glibc busybox smoke showed
+## M16.5: a heap, and glibc busybox running
 
-The system `/usr/bin/busybox` is a glibc static `ET_EXEC`, a deliberately harder
-target than musl and run only as a manual probe (its make target would need an
-external path, so it is not committed). Its startup surface, in order, is
-`prlimit64`, `getrandom`, `clock_gettime`, `mmap`/`brk`, then `mprotect` for
-RELRO. With the cheap syscalls now handled it gets past the first four, then
-glibc applies RELRO and, when `mprotect` is a no-op, keeps going. Two things
-still block it, both already their own milestones:
+The spike then grew a real heap for the foreign libc, and found a register-ABI
+bug along the way.
 
-- Its LOAD segments reach about `0x60d000`, past the 2 MiB program window the
-  native loader shares (`JOTUN_PROG_SIZE`). A Linux program needs a larger,
-  separate window, not a change to the shared constant.
-- It needs real `mmap`/`brk` with an arena, not the throwaway bump allocator the
-  probe used. glibc's static malloc reserves and grows heap through them, and
-  the 8 MiB identity map has no room for a realistic arena. This is M16.5 work.
+- A Linux-specific address space (`linuxelf.c`), independent of the shared
+  native program window: the binary loads in `0x400000..0x800000`, `brk` grows
+  up from `0x800000`, and anonymous `mmap` grows down from the top of RAM less a
+  reservation matching the host's per-vcpu stacks. They meet in the middle and
+  fail there. `munmap` is accepted but does not reclaim (a bump arena is enough
+  for a run-once program). Guest RAM rose from 8 to 32 MiB so the arena is
+  ~20 MiB.
+- The **register-ABI fix**: the SYSCALL trampoline preserved only `rcx`/`r11`,
+  but the Linux ABI preserves every register except `rax`/`rcx`/`r11`. The SysV
+  C dispatcher clobbered `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9`, so a program resumed
+  from a syscall with those trashed. The musl hello survived it (each result was
+  used at once), but a libc malloc keeping live values across a syscall then
+  issued a follow-on syscall with a garbage number. The trampoline now saves and
+  restores the six argument registers.
+- More process syscalls: `dup2`/`dup3` (via a `clone_fd` helper that refcounts
+  files and pipes correctly), `getuid`/`geteuid`/`getgid`/`getegid`, `prctl`.
 
-So glibc busybox is not a near-term target; the musl path is. The committed
-surface is enough for self-contained musl file and pipe programs, and the
-busybox probe mapped the road to the heavier binaries without committing to it.
+A committed musl test (`linuxmem`) grows the break directly and allocates
+through malloc (musl's mallocng gets memory from anonymous `mmap`), writing and
+reading back 100 KiB plus 128 smaller blocks. The whole musl suite exits clean
+with no unhandled syscalls.
+
+The glibc static `/usr/bin/busybox`, a deliberately harder target run only as a
+manual probe (not committed, since its make target would need an external path),
+**now runs to `exit_group` and prints its full multi-call banner with zero
+unhandled syscalls** on a guest that previously could not get it past startup.
+That it executes at all, RELRO and TLS and heap and all, is the real evidence
+that the model scales past the musl hello. The musl path stays the committed
+one; busybox applets proper still want argv delivery and a broader VFS (M16.2
+onward), but the heap wall (M16.5) is down.
+
+## jlibc malloc (separate, native programs)
+
+Independently, vmm's native bundle programs gained an allocator: skjegg's
+boundary-tag malloc and its static-region sbrk, lifted into
+`guest/prog/libc/jmalloc.c` and `jsbrk.c` (CC0). This is unrelated to the Linux
+path, which serves the foreign binary's own malloc; it just fills a gap in the
+native `jlibc`. See `make malloc-test`.

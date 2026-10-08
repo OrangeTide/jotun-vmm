@@ -83,15 +83,16 @@ Milestones, smallest first, each with its own acceptance test:
       handler (a bad guest instruction currently triple-faults silently).
 - [~] M16.2: broaden the VFS and process syscalls. Done for musl: a
       file-descriptor table over the read-only 9P bundle with
-      openat/open/close/read/lseek/stat family/fstat/getdents64, dup (refcounted
-      fid), in-memory pipe/pipe2, and the startup syscalls mprotect/clock_gettime/
-      getrandom/prlimit64; plus a CPU-exception diagnostic handler. Committed
-      musl tests cover it (example/linuxcat.c, linuxls.c, linuxpipe.c; see
-      doc/m16-linux-spike.md). The glibc static busybox was probed only (manual,
-      not committed): it now gets through startup but is blocked on a larger,
-      Linux-specific program window and real mmap/brk with an arena, which is
-      M16.5. The original busybox-applet acceptance waits on that; the committed
-      acceptance is the musl VFS tests.
+      openat/open/close/read/lseek/stat family/fstat/getdents64, dup/dup2/dup3,
+      in-memory pipe/pipe2, and the process/startup syscalls mprotect/
+      clock_gettime/getrandom/prlimit64/getuid family/prctl; plus a
+      CPU-exception diagnostic handler and a register-ABI fix in the SYSCALL
+      trampoline. Committed musl tests cover it (example/linuxcat.c, linuxls.c,
+      linuxpipe.c, linuxmem.c; see doc/m16-linux-spike.md). The glibc static
+      busybox (manual probe, not committed) now runs to exit_group and prints
+      its full banner with zero unhandled syscalls. Remaining for busybox
+      applets proper: argv delivery to the guest and a broader/writable VFS. The
+      committed acceptance is the musl tests.
 - [ ] M16.3: static-PIE self-relocation. Apply the `R_*_RELATIVE` entries a
       static-PIE binary carries in its own `PT_DYNAMIC`, with no interpreter.
       Acceptance: a stock Alpine static binary (built static-PIE by default)
@@ -103,7 +104,11 @@ Milestones, smallest first, each with its own acceptance test:
 - [ ] M16.5: the Go runtime. Satisfy its sharper demands: `AT_RANDOM` is
       mandatory, large lazily committed `mmap` arenas, `futex` at scale, and TLS.
       Acceptance: a `CGO_ENABLED=0` Go hello world runs with
-      `GODEBUG=asyncpreemptoff=1` (cooperative preemption only).
+      `GODEBUG=asyncpreemptoff=1` (cooperative preemption only). A basic heap is
+      already in (brk + eager anonymous mmap over a ~20 MiB bump arena, guest RAM
+      at 32 MiB); the hard part left here is Go's large, lazily committed sparse
+      reservations, which the eager bump arena cannot satisfy and which need real
+      demand-paged mmap.
 - [ ] M16.6: the network poller. Nonblocking sockets and an `epoll` emulation
       over the vswitch. Acceptance: a Go or musl TCP echo server is reachable
       through the net name service.
