@@ -169,7 +169,7 @@ libos.elf: $(LIBOS_SRC) $(LIBOS_FP_OBJ)
 # given program does not use, so unused library code costs it nothing.
 PROG_INC = -Iguest/prog/libc -Iguest/prog -Iguest/libos -Iabi
 PROG_LIBC_OBJS = build/libc_fmt.o build/libc_fmtfloat.o build/libc_string.o \
-    build/libc_io.o build/libc_stdlib.o
+    build/libc_io.o build/libc_stdlib.o build/libc_malloc.o build/libc_sbrk.o
 GUEST_COBJ_CFLAGS = $(filter-out -Wl%,$(GUEST_CFLAGS)) \
     -ffunction-sections -fdata-sections
 # The float unit needs the FPU, so it drops -mgeneral-regs-only like triton.o.
@@ -185,12 +185,20 @@ build/libc_io.o: guest/prog/libc/progio.c | build
 	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
 build/libc_stdlib.o: guest/prog/libc/progstdlib.c | build
 	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
+build/libc_malloc.o: guest/prog/libc/jmalloc.c | build
+	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
+build/libc_sbrk.o: guest/prog/libc/jsbrk.c | build
+	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
 
 # Standalone programs, linked at the program base and loaded from the bundle,
 # with the program C library and dead-code elimination of its unused parts.
 hello.elf: guest/prog/hello.c $(PROG_LIBC_OBJS)
 	$(GUEST_CC) $(GUEST_CFLAGS) -Wl,--gc-sections $(PROG_INC) \
 	    -Wl,-Ttext=$(PROG_TEXT) -o $@ guest/prog/hello.c $(PROG_LIBC_OBJS)
+
+build/malloctest: guest/prog/malloctest.c $(PROG_LIBC_OBJS) | build
+	$(GUEST_CC) $(GUEST_CFLAGS) -Wl,--gc-sections $(PROG_INC) \
+	    -Wl,-Ttext=$(PROG_TEXT) -o $@ guest/prog/malloctest.c $(PROG_LIBC_OBJS)
 
 # Build a test bundle depot from example/bundle/ using castool, then run with
 # JOTUN_BUNDLE=bundle-depot ./jotun libos.elf. castool is built from the
@@ -262,14 +270,20 @@ build/img/$(1)/libc_io.o: guest/prog/libc/progio.c | build/img/$(1)
 	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
 build/img/$(1)/libc_stdlib.o: guest/prog/libc/progstdlib.c | build/img/$(1)
 	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
+build/img/$(1)/libc_malloc.o: guest/prog/libc/jmalloc.c | build/img/$(1)
+	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
+build/img/$(1)/libc_sbrk.o: guest/prog/libc/jsbrk.c | build/img/$(1)
+	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
 build/img/$(1)/hello: guest/prog/hello.c build/img/$(1)/libc_fmt.o \
     build/img/$(1)/libc_fmtfloat.o build/img/$(1)/libc_string.o \
-    build/img/$(1)/libc_io.o build/img/$(1)/libc_stdlib.o | build/img/$(1)
+    build/img/$(1)/libc_io.o build/img/$(1)/libc_stdlib.o \
+    build/img/$(1)/libc_malloc.o build/img/$(1)/libc_sbrk.o | build/img/$(1)
 	$(2) $$(GUEST_BASE) $(4) -Wl,--gc-sections $$(PROG_INC) \
 	    -Wl,-Ttext=$$(PROG_TEXT) -o $$@ guest/prog/hello.c \
 	    build/img/$(1)/libc_fmt.o build/img/$(1)/libc_fmtfloat.o \
 	    build/img/$(1)/libc_string.o \
-	    build/img/$(1)/libc_io.o build/img/$(1)/libc_stdlib.o
+	    build/img/$(1)/libc_io.o build/img/$(1)/libc_stdlib.o \
+	    build/img/$(1)/libc_malloc.o build/img/$(1)/libc_sbrk.o
 endef
 
 NONNATIVE_ARCHS := $(filter-out $(GUEST_ARCH),x86_64 aarch64)
@@ -303,6 +317,14 @@ bundle: castool jbundle $(BUNDLE_DEPS)
 	done; \
 	./jbundle -d $(BUNDLE_DEPOT) --ref root --name jotun-demo $$args
 	./castool -d $(BUNDLE_DEPOT) pack
+
+## Run the native malloc test program. Builds the test program, stages it plus a
+## one-line launcher script into the bundle, and runs it through jsh. Exercises
+## the bundle program allocator (guest/prog/libc/jmalloc.c + jsbrk.c).
+malloc-test: $(TARGET) libos.elf build/malloctest
+	printf 'malloctest\n' > build/mtrun
+	$(MAKE) bundle BUNDLE_ARCHS=$(ARCH) EXTRA_BUNDLE_FILES="build/malloctest build/mtrun"
+	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./$(TARGET) libos.elf mtrun
 
 ## Experimental M16 Linux binary-compat spike: build the static x86-64 musl test
 ## programs (example/linux*.c), stage them into a single-arch bundle, and run one
@@ -464,4 +486,4 @@ clean:
 	    brokerd authd jmint
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test linux-spike
+.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test linux-spike malloc-test

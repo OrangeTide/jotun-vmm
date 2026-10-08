@@ -28,4 +28,15 @@ int puts(const char *s);       /* writes s then a newline, like C puts */
 long strtol(const char *s, char **end, int base);
 int atoi(const char *s);
 
+/* Dynamic memory, over a reserved region in the program's own image (jsbrk.c).
+ * Standard semantics; malloc/calloc/realloc return NULL when the heap is
+ * exhausted. jmalloc_live/jmalloc_peak report the current and high-water bytes
+ * handed out, for leak hunting in tests. */
+void *malloc(size_t nbytes);
+void free(void *ap);
+void *calloc(size_t n, size_t size);
+void *realloc(void *ap, size_t nbytes);
+size_t jmalloc_live(void);
+size_t jmalloc_peak(void);
+
 #endif /* JOTUN_PROG_LIBC_H */
