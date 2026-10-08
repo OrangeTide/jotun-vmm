@@ -55,8 +55,9 @@ stack_init(void *stack, size_t size, void (*entry)(void))
  * lands. The mask helpers below still work, so the scheduler's critical-region
  * guards are correct, they simply never see an asynchronous interrupt yet. */
 void
-arch_traps_init(void)
+arch_traps_init(unsigned long id)
 {
+    (void)id;
 }
 
 /* Enable FP/SIMD at EL1: set CPACR_EL1.FPEN to 0b11 so FP and Advanced SIMD

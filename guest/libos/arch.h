@@ -30,8 +30,9 @@ void ctx_switch(void **oldsp, void *newsp);
 
 /* Install the trap tables (GDT and IDT on x86) and the event interrupt gate.
  * Must run before any task starts, since a task runs with interrupts enabled
- * and a tick could arrive. On arm64 this is a stub for now. */
-void arch_traps_init(void);
+ * and a tick could arrive. id is the calling cpu, used to pick its own TSS and
+ * interrupt-stack (IST) stacks. On arm64 this is a stub for now. */
+void arch_traps_init(unsigned long id);
 
 /* Enable the floating-point and SIMD unit on this cpu, so code built with the
  * FPU on (the guest rasterizer) can run. The rest of the library OS is built

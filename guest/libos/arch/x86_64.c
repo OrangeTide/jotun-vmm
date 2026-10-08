@@ -63,14 +63,61 @@ stack_init(void *stack, size_t size, void (*entry)(void))
  * event gate, and interrupt-mask helpers.
  ****************************************************************/
 
-/* GDT: null, 64-bit code (0x08), data (0x10). The vcpu already runs with these
- * cached from KVM; the table must exist in memory so an interrupt or iret can
- * reload the selectors without faulting. */
-static uint64_t gdt[3] __attribute__((aligned(16))) = {
+/* Up to this many vcpus get their own TSS slot in the GDT. Mirrors MAX_CPUS in
+ * task.c; the Linux-compat path runs single-vcpu, so this is headroom. */
+#define ARCH_MAX_CPUS 8
+
+/* GDT: null, 64-bit code (0x08), data (0x10), then two slots per cpu for that
+ * cpu's 64-bit TSS descriptor (filled at runtime). The vcpu already runs with
+ * the code/data selectors cached from KVM; the table must exist in memory so an
+ * interrupt or iret can reload the selectors without faulting, and the TSS
+ * descriptors give each cpu an interrupt-stack table for faults. */
+static uint64_t gdt[3 + 2 * ARCH_MAX_CPUS] __attribute__((aligned(16))) = {
     0x0000000000000000ull,          /* null */
     0x00af9a000000ffffull,          /* code: present, DPL0, L=1 */
     0x00cf92000000ffffull,          /* data: present, DPL0, DB=1 */
 };
+
+/* The GDT selector of cpu id's TSS descriptor. */
+#define TSS_SEL(id) ((uint16_t)((3 + 2 * (id)) * 8))
+
+/* The 64-bit task state segment. We never switch rings, so rsp0..2 are unused;
+ * what matters is the IST array, which gives chosen exception vectors their own
+ * stack so a fault taken while the current stack is unusable (a bad or unmapped
+ * rsp) still lands on solid ground instead of escalating to a triple fault. */
+struct tss {
+    uint32_t reserved0;
+    uint64_t rsp[3];
+    uint64_t reserved1;
+    uint64_t ist[7];                /* ist[0] is IST1, ist[6] is IST7 */
+    uint64_t reserved2;
+    uint16_t reserved3;
+    uint16_t iomap_base;
+} __attribute__((packed));
+
+/* IST stack indices used in the IDT gates. IST1 carries #PF so its handler can
+ * demand-map and return even when the faulting stack is the problem; IST2
+ * carries #DF so any other bad-stack fault is reported rather than tripled. */
+#define IST_PF 1
+#define IST_DF 2
+#define IST_STACK_SZ 8192
+
+static struct tss cpu_tss[ARCH_MAX_CPUS];
+static uint8_t ist_pf_stack[ARCH_MAX_CPUS][IST_STACK_SZ] __attribute__((aligned(16)));
+static uint8_t ist_df_stack[ARCH_MAX_CPUS][IST_STACK_SZ] __attribute__((aligned(16)));
+
+/* Write a 64-bit available-TSS descriptor (type 0x9, present, DPL0) into the
+ * two GDT slots at index `slot`. */
+static void
+set_tss_desc(int slot, uint64_t base, uint32_t limit)
+{
+    gdt[slot] = (limit & 0xffffULL)
+              | ((base & 0xffffffULL) << 16)
+              | (0x89ULL << 40)
+              | (((uint64_t)(limit >> 16) & 0xfULL) << 48)
+              | (((base >> 24) & 0xffULL) << 56);
+    gdt[slot + 1] = (base >> 32) & 0xffffffffULL;
+}
 
 struct idt_gate {
     uint16_t off_lo;
@@ -168,12 +215,12 @@ fault_report(struct faultframe *f)
 }
 
 static void
-idt_set(int vec, void (*handler)(void))
+idt_set(int vec, void (*handler)(void), int ist)
 {
     uintptr_t a = (uintptr_t)handler;
     idt[vec].off_lo = (uint16_t)a;
     idt[vec].sel = 0x08;            /* kernel code selector */
-    idt[vec].ist = 0;
+    idt[vec].ist = (uint8_t)(ist & 0x7);
     idt[vec].attr = 0x8e;           /* present, DPL0, 64-bit interrupt gate */
     idt[vec].off_mid = (uint16_t)(a >> 16);
     idt[vec].off_hi = (uint32_t)(a >> 32);
@@ -181,21 +228,40 @@ idt_set(int vec, void (*handler)(void))
 }
 
 void
-arch_traps_init(void)
+arch_traps_init(unsigned long id)
 {
     struct desc_ptr gp = { sizeof gdt - 1, (uint64_t)(uintptr_t)gdt };
     __asm__ volatile ("lgdt %0" : : "m"(gp));
 
+    /* This cpu's TSS: the IST slots point at its private fault stacks. rsp0..2
+     * stay zero (we never change rings). iomap_base past the limit means no I/O
+     * permission bitmap. */
+    if (id < ARCH_MAX_CPUS) {
+        struct tss *t = &cpu_tss[id];
+        for (unsigned i = 0; i < sizeof *t; i++)
+            ((uint8_t *)t)[i] = 0;
+        t->ist[IST_PF - 1] =
+            (uint64_t)(uintptr_t)(ist_pf_stack[id] + IST_STACK_SZ);
+        t->ist[IST_DF - 1] =
+            (uint64_t)(uintptr_t)(ist_df_stack[id] + IST_STACK_SZ);
+        t->iomap_base = (uint16_t)sizeof *t;
+        set_tss_desc(3 + 2 * (int)id, (uint64_t)(uintptr_t)t, sizeof *t - 1);
+        __asm__ volatile ("ltr %0" : : "r"(TSS_SEL(id)));
+    }
+
     /* CPU exception vectors first, so a fault during bring-up is reported
      * rather than escalating to a silent triple fault. */
     for (int v = 0; v < 32; v++)
-        idt_set(v, exc_stub_table[v]);
+        idt_set(v, exc_stub_table[v], 0);
 
     /* Page faults get a handler that demand-maps the Linux user window (and
-     * reports anything else), replacing the bare diagnostic stub. */
-    idt_set(14, pf_isr);
+     * reports anything else), on a private stack so a fault caused by a bad
+     * user rsp is still handled. Double faults get their own stack too, so any
+     * other bad-stack fault is reported instead of tripling. */
+    idt_set(14, pf_isr, IST_PF);
+    idt_set(8, exc_stub_table[8], IST_DF);
 
-    idt_set(0x20, isr_event);       /* JOTUN_EVENT_VECTOR */
+    idt_set(0x20, isr_event, 0);    /* JOTUN_EVENT_VECTOR */
     struct desc_ptr ip = { sizeof idt - 1, (uint64_t)(uintptr_t)idt };
     __asm__ volatile ("lidt %0" : : "m"(ip));
 }

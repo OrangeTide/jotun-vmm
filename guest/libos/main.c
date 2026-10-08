@@ -901,7 +901,7 @@ void
 kmain(unsigned long id)
 {
     cpu_init(id);
-    arch_traps_init();          /* each cpu loads its own trap tables */
+    arch_traps_init(id);        /* each cpu loads its own trap tables */
     arch_fpu_init();            /* enable FP/SIMD so the rasterizer can run */
 
     if (id == 0) {
