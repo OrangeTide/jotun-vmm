@@ -319,10 +319,10 @@ timer.
 
 Steps:
 
-- M5.1: the scheduler sleep/wake primitive. A `TASK_BLOCKED` state, `task_block`
-  and `task_wake`, a quiescence check that does not shut down while tasks are
-  blocked, and a re-ready pass when an idle cpu is woken. Self-tested in the
-  guest with no sockets.
+- M5.1 (done): the scheduler sleep/wake primitive. A `TASK_BLOCKED` state,
+  `task_block` and `task_wake`, a quiescence check that does not shut down while
+  tasks are blocked, and a re-ready pass when an idle cpu is woken. Self-tested in
+  the guest with no sockets.
 - M5.2 (done): the net channel ABI (`abi/jotun_net.h`), the host net provider
   (`host/net.c`: TCP connect, non-blocking sockets, an epoll poll thread,
   policy stubbed to allow-all), and the guest net client
@@ -711,10 +711,16 @@ Steps:
   console sink, so formatted output reaches con_putc without a trap (the guest
   has no syscalls). It is jotun-native, not copied, so it carries no third-party
   header. Flags `- 0 + space #`, numeric or `*` width and precision, length
-  `h hh l ll z t j`, and conversions `d i u o x X b c s p %`; no allocation. The
-  engine matches glibc snprintf across a case sweep, and compiles integer-only
-  on arm64 under -mgeneral-regs-only (no FP varargs, no 64-bit-divide helper).
-  Exposing it to bundle programs is M9.4.
+  `h hh l ll z t j L`, and conversions `d i u o x X b c s p %`; no allocation. The
+  integer engine compiles integer-only on arm64 under -mgeneral-regs-only (no
+  64-bit-divide helper) and matches glibc snprintf across a case sweep. The
+  floating conversions `f F e E g G` were added later (done 2026-10-07): because
+  even reading a double argument needs FP instructions the integer-only flag
+  forbids, they live in their own translation unit `guest/libos/fmtfloat.c`,
+  built with the FPU on like the rasterizer and called from the integer core.
+  They round half to even, cover infinity and NaN, and are checked against glibc
+  across a case sweep by `make fmt-test`. Exposing the formatter to bundle
+  programs is M9.4.
 - M9.4 (done): expose the library to bundle programs. The `jotun_svc` ABI stays
   minimal (putc/puts/exit); the convenience code is a small program C library
   linked into each program instead. `guest/prog/libc/` holds the umbrella header
@@ -989,8 +995,9 @@ Independent of the milestones above, tracked so they are not lost:
 - Pull transport (M8): the pack byte-range transport and key rotation landed
   (see M8). Still open: pack-aware resume granularity and a published multi-pack
   layout for very large origins.
-- Display input: text and paste, which need a text-input primitive the
-  restricted SVG vocabulary excludes today.
+- Display input: text and paste landed (see M15's keyboard-input note).
+  `DEV_TEXT` and `DEV_PASTE` carry keydown and paste from the client to the
+  guest, consumed by the `webterm` terminal.
 - libc-lite (M9): the `<threads.h>` shim landed (see M9). Still open: the timed
   variants (`mtx_timedlock`, `cnd_timedwait`) and precise `thrd_sleep`, which
   need a guest clock, and `tss_*` thread-specific storage. M9.1 through M9.4 are
@@ -1054,7 +1061,7 @@ What landed:
 
 Deferred: rate limits.
 
-## M15: web hosting (planned)
+## M15: web hosting (in progress)
 
 Goal: let a user reach a guest from a browser over the public internet, not just
 the loopback display on the developer's own machine.
@@ -1090,10 +1097,12 @@ What is needed:
   `example/web/Caddyfile` (Caddy with `tls internal` locally, a real domain in
   production), a `make web` target, and `doc/web-hosting.md`. On its own it puts
   a single shared session on the web; the single-browser behaviour (a new
-  connection replaces the old) is acceptable for one user.
-- M15.2: a session broker, split into host mechanism and a broker guest (design
-  decided 2026-10-07). Today one host process is one front end serving one
-  browser; independent users need one guest per session, spawned on demand.
+  connection replaces the old) is acceptable for one user. `make caddy-smoke`
+  checks the TLS chain end to end with `openssl s_client`.
+- M15.2 (step one done): a session broker, split into host mechanism and a
+  broker guest (design decided 2026-10-07). Today one host process is one front
+  end serving one browser; independent users need one guest per session, spawned
+  on demand.
   Rather than write the broker as trusted host C, keep the host to mechanism and
   put the policy in a guest, so the trusted base stays small and the broker's own
   logic is sandboxed and restartable. This is the mechanism/policy split applied
@@ -1157,10 +1166,10 @@ What is needed:
     sessions, each sees only its own token, no cross-leak, then teardown). The
     broker-guest control channel (step two) is still to come; it will drive
     fork and kill in place of the inline policy.
-- M15.3: admission and auth. Authentication stays off the box in the reverse
-  proxy, as M10 decided; the host contributes only the admission mechanism. This
-  fits the section 9.2 split: the host stays trusted and minimal, the session
-  guests stay sandboxed, and the authenticating front is explicit.
+- M15.3 (step one done): admission and auth. Authentication stays off the box in
+  the reverse proxy, as M10 decided; the host contributes only the admission
+  mechanism. This fits the section 9.2 split: the host stays trusted and minimal,
+  the session guests stay sandboxed, and the authenticating front is explicit.
   - Step one (done 2026-10-07, proxy auth + host admission): a bearer-token gate
     in front of brokerd, with no token ever reaching the host. `authd` is a small
     loopback validator Caddy delegates to with `forward_auth`; it maps a token to
@@ -1182,6 +1191,31 @@ What is needed:
 - M15.4: per-session bundle delivery. The broker guest names the bundle in its
   spawn request and the host resolves it through the signed pull (M8), so a
   session's image is pinned per request rather than baked in.
+
+Suggested intermediate steps (not scheduled, small, each smooths the path):
+
+- A one-command authenticated demo. `make web-auth` starts brokerd and authd but
+  leaves Caddy to a second terminal; a target that also brings up Caddy with
+  `example/web/Caddyfile-auth` (storage under `build/`, torn down together) makes
+  the whole authenticated chain a single command for local testing.
+- An end-to-end auth check through Caddy. `make auth-smoke` tests brokerd's
+  admission by simulating Caddy's injected header; a companion that drives the
+  real `forward_auth` chain with `curl` (no token 401, bearer 302, `/login` sets
+  the cookie, cookie 302) would guard the Caddyfile wiring itself, which the
+  current test does not.
+- Token store management. Revocation and listing are a manual file edit today;
+  small `jmint` subcommands to list and to revoke a user's tokens (rewrite the
+  store without those lines) would make operating a multi-user deployment
+  routine. authd already reloads the store on mtime, so a revoke takes effect
+  without a restart.
+- Session introspection. brokerd keeps a session table but exposes nothing; a
+  read-only status (sessions per user, ports, idle age) over a loopback endpoint
+  or a signal-triggered dump would make admission and quota behaviour debuggable
+  before the broker guest arrives.
+- Define the broker control-channel ABI first. Writing `abi/jotun_broker.h`
+  (spawn/destroy/bind and the connected/disconnected/exited events) with a
+  loopback host stub, ahead of the broker guest, keeps M15.2 step two additive
+  rather than a rewrite, exactly as the incremental-path note intends.
 
 Cross-cutting decisions, independent of the tiers above:
 - Keyboard and text input (done). `DEV_TEXT` and `DEV_PASTE` are now wired end
@@ -1215,13 +1249,16 @@ Cross-cutting decisions, independent of the tiers above:
   gets the saving for free. Remaining lever if a smooth high-rate pixel stream
   ever needs it: a binary tile-delta in place of PNG-in-SVG.
 
-Status: multi-user hosting works. M15.1 (the hosting recipe), keyboard and text
-input, and the webterm jsh terminal shipped the single-session MVP, and the
-M15.2 host mechanism now ships as the `brokerd` process-per-session supervisor:
-independent browsers each get their own sandboxed `jotun` child, spawned on
-demand with inline policy and torn down on exit or idle. The remaining M15.2 work
-is lifting policy into a sandboxed broker guest over the control channel, which
-is additive on top of the shipped mechanism.
+Status: authenticated multi-user hosting works. M15.1 (the hosting recipe),
+keyboard and text input, and the webterm jsh terminal shipped the single-session
+MVP; the M15.2 host mechanism ships as the `brokerd` process-per-session
+supervisor, where independent browsers each get their own sandboxed `jotun`
+child, spawned on demand and torn down on exit or idle; and M15.3 step one adds
+bearer-token admission in front (`authd` behind Caddy `forward_auth`, per-user
+session caps in brokerd), with no token reaching the host. Remaining: lifting
+policy into a sandboxed broker guest over a control channel (M15.2 step two,
+which M15.3's admission can then move into), and per-session bundle delivery
+(M15.4). Both are additive on top of what ships.
 
 ## Cross-cutting concerns
 
