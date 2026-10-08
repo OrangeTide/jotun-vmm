@@ -140,7 +140,9 @@ per-user session cap in brokerd, without the host learning any tokens.
   token to the WebSocket, which cannot take a custom header.
 
 Mint a token with `./jmint <user> [cap]` (it appends to `JOTUN_AUTH_TOKENS` and
-prints the token once). Run the pair with
+prints the token once). List the stored tokens, masked, with `./jmint -l`, and
+revoke a user's tokens with `./jmint -r <user>`; authd reloads the store on
+change, so a revoke takes effect without a restart. Run the pair with
 `make web-auth JOTUN_BROKER_AUTH_SECRET=<secret>` and front it with
 `example/web/Caddyfile-auth`. `make auth-smoke` checks it headless: authd's token
 validation (header, cookie, and `/login`), and brokerd's per-user caps and
