@@ -88,6 +88,7 @@
 #define SYS_rt_sigaction    13
 #define SYS_rt_sigprocmask  14
 #define SYS_gettid          186
+#define SYS_uname           63
 #define SYS_mprotect        10
 #define SYS_time            201
 #define SYS_clock_gettime   228
@@ -125,8 +126,9 @@
 #define SEEK_END 2
 
 /* Linux st_mode type bits and dirent types. */
-#define S_IFDIR 0040000
-#define S_IFREG 0100000
+#define S_IFDIR  0040000
+#define S_IFREG  0100000
+#define S_IFIFO  0010000
 #define DT_DIR  4
 #define DT_REG  8
 
@@ -250,6 +252,7 @@ struct linux_dirent64 {
 
 struct lfd {
     int      used;
+    int      iscon;             /* this fd is the console (stdin/out/err) */
     int      isdir;
     int      ispipe;            /* this fd is a pipe end */
     int      isram;             /* this fd is a ramfs file */
@@ -452,16 +455,18 @@ clone_fd(int dst, struct lfd *src)
             p->readers++;
     } else if (src->isram) {
         /* the ramfile persists regardless of fd count: nothing to refcount */
-    } else {
+    } else if (src->p9fid) {
         gfidref[src->p9fid - LINUX_FID_BASE]++;
     }
+    /* a bare console fd (no backing) needs no refcount */
 }
 
 static void
 fds_init(void)
 {
     memset(fds, 0, sizeof(lproc_cur->fdtab));
-    fds[0].used = fds[1].used = fds[2].used = 1;    /* stdin/out/err */
+    for (int i = 0; i < 3; i++)                     /* stdin/out/err: console */
+        fds[i].used = fds[i].iscon = 1;
 }
 
 static int
@@ -603,12 +608,14 @@ do_write(long fd, const char *buf, unsigned long len)
 {
     struct lfd *f = fd_get(fd);
 
-    if (fd == 1 || fd == 2) {           /* console */
+    if (!f)
+        return -LERR_BADF;
+    if (f->iscon) {                     /* console stdout/stderr */
         for (unsigned long i = 0; i < len; i++)
             con_putc(buf[i]);
         return (long)len;
     }
-    if (f && f->ispipe && f->wr) {
+    if (f->ispipe && f->wr) {
         struct lpipe *p = &pipes[f->pidx];
         unsigned long done = 0;
         /* Write everything, yielding when the ring fills so a reader in another
@@ -623,7 +630,7 @@ do_write(long fd, const char *buf, unsigned long len)
         }
         return (long)done;
     }
-    if (f && f->isram) {
+    if (f->isram) {
         struct ramfile *rf = &ramfs[f->ridx];
         uint64_t end = f->pos + len;
         if (end > RAMFS_FILE_MAX || ramfs_grow(rf, (uint32_t)end) < 0)
@@ -733,8 +740,10 @@ do_read(long fd, void *buf, unsigned long count)
 {
     struct lfd *f = fd_get(fd);
 
-    if (!f || fd < 3)
-        return -LERR_BADF;              /* no stdin source */
+    if (!f)
+        return -LERR_BADF;
+    if (f->iscon)
+        return 0;                       /* console stdin: EOF */
     if (f->ispipe) {
         if (f->wr)
             return -LERR_BADF;
@@ -770,8 +779,10 @@ do_close(long fd)
 
     if (!f)
         return -LERR_BADF;
-    if (fd < 3)
-        return 0;                       /* keep the console open */
+    if (f->iscon) {
+        f->used = 0;                    /* just drop this fd; the console stays */
+        return 0;
+    }
     if (f->isram) {
         f->used = 0;                    /* the ramfile persists for the run */
         return 0;
@@ -948,8 +959,17 @@ do_fstat(long fd, struct linux_stat *out)
 
     if (!f)
         return -LERR_BADF;
-    if (fd < 3) {
-        fill_stat(out, 0, 0, (uint64_t)fd);         /* console: a char device-ish reg */
+    if (f->ispipe) {
+        /* Report a FIFO so a tool copies with a read/write loop, not mmap. */
+        memset(out, 0, sizeof *out);
+        out->st_mode = S_IFIFO | 0644;
+        out->st_nlink = 1;
+        out->st_blksize = PIPE_CAP;
+        out->st_ino = (uint64_t)(0x20000 + f->pidx);
+        return 0;
+    }
+    if (f->iscon) {
+        fill_stat(out, 0, 0, (uint64_t)fd);         /* console: a plain reg */
         return 0;
     }
     if (f->isram) {
@@ -1055,9 +1075,9 @@ proc_alloc(void)
 static void
 proc_release_fds(struct lproc *p)
 {
-    for (int i = 3; i < LINUX_NFD; i++) {
+    for (int i = 0; i < LINUX_NFD; i++) {
         struct lfd *f = &p->fdtab[i];
-        if (!f->used)
+        if (!f->used || f->iscon)
             continue;
         if (f->ispipe) {
             struct lpipe *pp = &pipes[f->pidx];
@@ -1115,9 +1135,9 @@ do_fork(void)
     child->heap_mmaptop = parent->heap_mmaptop;
 
     /* Account for the inherited descriptors (the child shares them). */
-    for (int i = 3; i < LINUX_NFD; i++) {
+    for (int i = 0; i < LINUX_NFD; i++) {
         struct lfd *f = &child->fdtab[i];
-        if (!f->used)
+        if (!f->used || f->iscon)
             continue;
         if (f->ispipe) {
             if (f->wr)
@@ -1305,14 +1325,14 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_dup2:
     case SYS_dup3: {
         struct lfd *f = fd_get(a1);
-        if (!f || a1 < 3)
+        if (!f)
             return -LERR_BADF;
-        if (a2 < 0 || a2 >= LINUX_NFD || a2 < 3)
-            return -LERR_BADF;
+        if (a2 < 0 || a2 >= LINUX_NFD)
+            return -LERR_BADF;          /* a2 may be 0/1/2: a shell redirect */
         if (a1 == a2)
             return (nr == SYS_dup3) ? -LERR_INVAL : a2;
-        if (fds[a2].used)
-            do_close(a2);
+        if (a2 >= 3 && fds[a2].used)
+            do_close(a2);               /* release a real fd; std fds just rebind */
         clone_fd((int)a2, f);
         return a2;
     }
@@ -1358,6 +1378,23 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_rt_sigaction:
     case SYS_rt_sigprocmask:
         return 0;                       /* no signal delivery: accept and ignore */
+    case SYS_uname: {
+        /* struct utsname: six NUL-terminated 65-byte fields. */
+        char *u = (char *)a1;
+        if (!u)
+            return -LERR_INVAL;
+        static const char *const f[6] = {
+            "Linux", "jotun", "6.0.0-jotun", "#1 jotun", "x86_64", "(none)",
+        };
+        for (int i = 0; i < 6; i++) {
+            char *d = u + i * 65;
+            const char *s = f[i];
+            int j = 0;
+            while (s[j] && j < 64) { d[j] = s[j]; j++; }
+            d[j] = 0;
+        }
+        return 0;
+    }
     case SYS_exit:
     case SYS_exit_group:
         do_exit(a1);                    /* does not return */
