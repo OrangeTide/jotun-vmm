@@ -1192,30 +1192,28 @@ What is needed:
   spawn request and the host resolves it through the signed pull (M8), so a
   session's image is pinned per request rather than baked in.
 
-Suggested intermediate steps (not scheduled, small, each smooths the path):
+Intermediate steps that smooth the path (all done 2026-10-07):
 
-- A one-command authenticated demo. `make web-auth` starts brokerd and authd but
-  leaves Caddy to a second terminal; a target that also brings up Caddy with
-  `example/web/Caddyfile-auth` (storage under `build/`, torn down together) makes
-  the whole authenticated chain a single command for local testing.
-- An end-to-end auth check through Caddy. `make auth-smoke` tests brokerd's
-  admission by simulating Caddy's injected header; a companion that drives the
-  real `forward_auth` chain with `curl` (no token 401, bearer 302, `/login` sets
-  the cookie, cookie 302) would guard the Caddyfile wiring itself, which the
-  current test does not.
-- Token store management. Revocation and listing are a manual file edit today;
-  small `jmint` subcommands to list and to revoke a user's tokens (rewrite the
-  store without those lines) would make operating a multi-user deployment
-  routine. authd already reloads the store on mtime, so a revoke takes effect
-  without a restart.
-- Session introspection. brokerd keeps a session table but exposes nothing; a
-  read-only status (sessions per user, ports, idle age) over a loopback endpoint
-  or a signal-triggered dump would make admission and quota behaviour debuggable
-  before the broker guest arrives.
-- Define the broker control-channel ABI first. Writing `abi/jotun_broker.h`
-  (spawn/destroy/bind and the connected/disconnected/exited events) with a
-  loopback host stub, ahead of the broker guest, keeps M15.2 step two additive
-  rather than a rewrite, exactly as the incremental-path note intends.
+- A one-command authenticated demo (done). `make web-auth-demo` brings up
+  brokerd, authd, and Caddy together with `example/web/Caddyfile-auth` (storage
+  under `build/`, torn down together), generating an ephemeral secret and minting
+  a `demo` token on first run, so the whole authenticated chain is one command.
+  `make web-auth` stays as the no-Caddy pair.
+- An end-to-end auth check through Caddy (done). `make caddy-auth-smoke`
+  (`tools/cauthsmoke.c`) drives the real `forward_auth` chain with `curl` (no
+  token 401, bearer 302, `/login` sets the cookie, cookie 302, bad token 401),
+  guarding the Caddyfile wiring that `auth-smoke` only simulates.
+- Token store management (done). `jmint -l` lists the stored tokens (masked) and
+  `jmint -r <user>` revokes a user's tokens (atomic rewrite, comments and other
+  users preserved); authd reloads on change, so a revoke needs no restart.
+- Session introspection (done). `SIGUSR1` makes brokerd dump its live session
+  table (user, pid, port, idle age) to stderr, with no network surface to gate.
+- The broker control-channel ABI, defined ahead of step two (done).
+  `abi/jotun_broker.h` specifies spawn/destroy/bind and the
+  connected/disconnected/exited events in the doorbell-plus-shared-buffer shape;
+  `host/brokerctl.c` is a host-side mock of it and `make brokerctl-test` drives
+  the protocol. Nothing is wired into the trusted core yet, so step two stays
+  additive: the mock bodies become real spawn/route/reap behind the same ABI.
 
 Cross-cutting decisions, independent of the tiers above:
 - Keyboard and text input (done). `DEV_TEXT` and `DEV_PASTE` are now wired end
