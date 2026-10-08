@@ -90,9 +90,12 @@ Milestones, smallest first, each with its own acceptance test:
       trampoline. Committed musl tests cover it (example/linuxcat.c, linuxls.c,
       linuxpipe.c, linuxmem.c; see doc/m16-linux-spike.md). The glibc static
       busybox (manual probe, not committed) now runs to exit_group and prints
-      its full banner with zero unhandled syscalls. Remaining for busybox
-      applets proper: argv delivery to the guest and a broader/writable VFS. The
-      committed acceptance is the musl tests.
+      its full banner with zero unhandled syscalls. argv delivery is in (a
+      glibc busybox applet runs: `bin busybox echo hello world` prints it), and
+      a writable in-memory ramfs overlays the read-only bundle for files a
+      program creates or writes (example/linuxargs.c, linuxwrite.c). Remaining
+      for busybox applets proper: statx for `ls`, and clone/execve for shell
+      pipelines (M16.4+). The committed acceptance is the musl tests.
 - [ ] M16.3: static-PIE self-relocation. Apply the `R_*_RELATIVE` entries a
       static-PIE binary carries in its own `PT_DYNAMIC`, with no interpreter.
       Acceptance: a stock Alpine static binary (built static-PIE by default)

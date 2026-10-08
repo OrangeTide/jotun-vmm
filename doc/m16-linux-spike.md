@@ -167,3 +167,26 @@ boundary-tag malloc and its static-region sbrk, lifted into
 `guest/prog/libc/jmalloc.c` and `jsbrk.c` (CC0). This is unrelated to the Linux
 path, which serves the foreign binary's own malloc; it just fills a gap in the
 native `jlibc`. See `make malloc-test`.
+
+## argv delivery and a writable ramfs
+
+Two more pieces let a multi-call binary actually do something.
+
+- **argv**: `build_stack` now lays the full argv on the initial stack, the
+  loaded file as argv[0] followed by the boot arguments after it. So
+  `./jotun libos.elf bin busybox echo hello world` reaches busybox as
+  `busybox echo hello world`, and it prints `hello world`: a glibc busybox
+  applet running under the trap. The committed musl test `linuxargs` echoes its
+  argc/argv.
+- **ramfs**: the 9P bundle is read-only, so files a program creates or writes go
+  to a small in-memory overlay (`linuxelf.c`), keyed by path, buffers kmalloc'd
+  and grown by doubling. A write intent or `O_CREAT` opens the ramfs; a
+  read-only open checks the ramfs first, then the bundle, so a written file
+  reads back. `read`/`write`/`lseek`/`fstat`/`stat`/`dup`/`close` handle ramfs
+  fds; `O_TRUNC`/`O_APPEND` are honoured. The committed musl test `linuxwrite`
+  creates `/tmp/scratch.txt`, writes to it, stats it, and reads it back.
+
+Not yet: `busybox ls /` wants `statx` (332), the glibc stat variant, which we do
+not service. Applets that fork/exec (a shell pipeline) need `clone`/`execve`
+(M16.4 and beyond). The ramfs is per-run and single trust domain, not a real
+filesystem; it is the shortcut its name implies.
