@@ -484,6 +484,51 @@ there is no signal delivery, so the call is accepted and ignored). With those,
 gawk runs with zero unhandled syscalls. The manifest tokenizes `init` on spaces,
 so a multi-word program goes in a file read with `gawk -f`, not inline.
 
+## make, and posix_spawn
+
+The host's `make` running a real Makefile was the first tool that forks a child
+per recipe, and it exposed the one process primitive the spike had skipped:
+`posix_spawn`. glibc implements it with `clone3` (435) and the flags
+`CLONE_VM | CLONE_VFORK`, a sequence the earlier static musl make was rebuilt to
+avoid. The host binary cannot be rebuilt, so the primitive is now implemented.
+
+- `clone3` parses the `clone_args` struct and routes like `clone`:
+  `CLONE_VM | CLONE_VFORK` is a spawn, `CLONE_VM` alone a thread, otherwise fork.
+- A spawn (`do_spawn_vfork`) makes a new child process that borrows the parent's
+  address space, runs the spawn trampoline on the given stack (its fd setup,
+  then `execve`), while the parent is suspended. Scheduling is cooperative, so
+  the parent simply `task_block`s and the child wakes it. `execve` gives the
+  child its own address space and wakes the parent then; a child that exits
+  before `execve` (a failed exec) wakes it too. `execve` and `wait4` never
+  destroy a borrowed space, and the parent reclaims its own.
+- The child's startup also calls the credential and session syscalls
+  (`setresuid`, `setresgid`, `setsid`, `setpgid`, and the rest). The guest is a
+  single root identity, so a set to it returns success and there is nothing else
+  to become.
+
+One ABI bug surfaced here: `wait4`'s `pid` is a 32-bit `pid_t`, and glibc passed
+`-1` in the low 32 bits only. Treating it as a 64-bit value made `pid > 0` true,
+so the match skipped the real child and `wait4` returned `ECHILD`. `do_wait4`
+now sign-extends from 32 bits, so `-1` means any child again.
+
+```
+init bin make -f Makefile all
+mount lib64 host:/usr/lib/x86_64-linux-gnu
+mount lib   host:/usr/lib
+mount bin   host:/bin
+```
+
+```
+[cc] a
+[cc] b
+[all] done
+```
+
+The recipe shell is the host's `/bin/sh` (dash), grafted from the live `/bin`
+(a symlink to `/usr/bin`), running its own libc from the same mount. make, its
+shell, and the shells' three child processes all run with zero unhandled
+syscalls.
+
 ## The cut line
 
 Held against scope creep, and all deferred to later hardening milestones:

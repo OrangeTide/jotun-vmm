@@ -12,6 +12,7 @@
 
 /* AArch64 (asm-generic) syscall numbers the dispatcher handles. */
 #define SYS_getcwd          17
+#define SYS_chdir           49
 #define SYS_dup             23
 #define SYS_dup3            24
 #define SYS_fcntl           25
@@ -19,7 +20,16 @@
 #define SYS_statfs          43
 #define SYS_fstatfs         44
 #define SYS_sigaltstack     132
+#define SYS_setregid        143
+#define SYS_setgid          144
+#define SYS_setreuid        145
+#define SYS_setuid          146
+#define SYS_setresuid       147
+#define SYS_setresgid       149
+#define SYS_setpgid         154
+#define SYS_setsid          157
 #define SYS_getgroups       158
+#define SYS_setgroups       159
 #define SYS_mincore         232
 #define SYS_faccessat       48
 #define SYS_openat          56
@@ -65,6 +75,7 @@
 #define SYS_getrandom       278
 #define SYS_statx           291
 #define SYS_rseq            293
+#define SYS_clone3          435
 #define SYS_faccessat2      439
 
 /* Not present on AArch64: distinct sentinels so the shared cases never match a

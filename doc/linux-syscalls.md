@@ -26,7 +26,7 @@ Statuses used below:
 - **stub**: accepted and ignored (returns 0 or a fixed value) with no real
   effect; present so startup and common idioms do not fail.
 
-## Implemented (66 calls)
+## Implemented (77 calls)
 
 ### File and directory I/O
 
@@ -49,6 +49,7 @@ Statuses used below:
 | 33 | dup2 | full | targets 0/1/2 allowed (shell redirects) |
 | 72 | fcntl | partial | returns 0; does not honor F_DUPFD or report F_GETFL/F_GETFD |
 | 79 | getcwd | stub | always returns "/" |
+| 80 | chdir | stub | cwd is fixed at "/"; accepts the root or an existing directory so a tool restoring its cwd at exit succeeds |
 | 137 | statfs | stub | quiet ENOSYS; no real filesystem to describe (libselinux probes this) |
 | 138 | fstatfs | stub | quiet ENOSYS, as statfs |
 | 217 | getdents64 | full | packs 9P directory entries |
@@ -76,17 +77,27 @@ Statuses used below:
 
 | nr | name | status | notes |
 |----|------|--------|-------|
-| 56 | clone | full | CLONE_VM makes a thread; otherwise the fork path |
+| 56 | clone | full | CLONE_VM\|CLONE_VFORK is posix_spawn; CLONE_VM alone a thread; else the fork path |
+| 435 | clone3 | full | parses clone_args and routes like clone (posix_spawn, thread, or fork) |
 | 57 | fork | full | eager address-space copy, shared fds |
 | 58 | vfork | full | treated as fork |
-| 59 | execve | full | replaces the image from a bundle program |
+| 59 | execve | full | replaces the image; releases a vfork parent and keeps a borrowed space |
 | 60 | exit | full | ends the calling thread |
-| 61 | wait4 | partial | child processes only; rusage ignored |
+| 61 | wait4 | partial | child processes only; pid treated as 32-bit (so -1 matches any); rusage ignored |
 | 231 | exit_group | full | ends the process |
 | 39 | getpid | full | process pid |
 | 110 | getppid | full | parent pid |
 | 111 | getpgrp | stub | returns 1, a single process group |
+| 109 | setpgid | stub | returns 0, one process group |
+| 112 | setsid | stub | returns the pid as the session id |
 | 115 | getgroups | stub | returns 0, no supplementary groups |
+| 116 | setgroups | stub | returns 0, accepted and ignored |
+| 105 | setuid | stub | returns 0; one root identity, so a set to it succeeds |
+| 106 | setgid | stub | returns 0, as setuid |
+| 113 | setreuid | stub | returns 0, as setuid |
+| 114 | setregid | stub | returns 0, as setuid |
+| 117 | setresuid | stub | returns 0; posix_spawn's child sets ids before exec |
+| 119 | setresgid | stub | returns 0, as setresuid |
 | 131 | sigaltstack | stub | returns 0; no signal delivery, so accepted and ignored |
 | 186 | gettid | full | thread id |
 | 218 | set_tid_address | full | records the clear-on-exit tid address |

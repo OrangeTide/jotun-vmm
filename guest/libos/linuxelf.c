@@ -252,6 +252,13 @@ struct lshared {
     int      main_task;         /* libOS task of the main thread, for wait4 reap */
     int      exited;            /* the process has terminated; status is set */
     long     exit_status;
+    /* A posix_spawn child (clone with CLONE_VM|CLONE_VFORK) borrows its parent's
+     * address space until it execs its own, so execve and wait4 must not destroy
+     * it. While vforking, the parent is blocked on vfork_waiter and the child
+     * wakes it at exec or exit. */
+    int      vm_borrowed;
+    int      vforking;
+    int      vfork_waiter;      /* task id of the blocked parent */
     struct lfd fdtab[LINUX_NFD];
     /* The heap arena. heap_brk grows up from LINUX_HEAP_BASE; heap_mmap grows
      * down from heap_mmaptop. A bump allocator; munmap does not reclaim. */
@@ -1052,6 +1059,7 @@ do_getdents64(long fd, void *buf, unsigned long count)
  ****************************************************************/
 
 /* clone flags we care about. */
+#define CLONE_VFORK          0x00004000u    /* parent blocks until exec or exit */
 #define CLONE_CHILD_CLEARTID 0x00200000u
 #define CLONE_CHILD_SETTID   0x01000000u
 #define CLONE_PARENT_SETTID  0x00100000u
@@ -1336,12 +1344,113 @@ do_clone_thread(uint64_t flags, uint64_t child_stack, uint64_t ptid,
     return t->tid;                      /* the parent gets the child tid */
 }
 
+/* Refcount the descriptors a child inherits (shared pipe buffers and 9P fids). */
+static void
+inherit_fds(struct lshared *csh)
+{
+    for (int i = 0; i < LINUX_NFD; i++) {
+        struct lfd *f = &csh->fdtab[i];
+        if (!f->used || f->iscon)
+            continue;
+        if (f->ispipe) {
+            if (f->wr)
+                pipes[f->pidx].writers++;
+            else
+                pipes[f->pidx].readers++;
+        } else if (!f->isram && f->p9fid)
+            gfidref[f->p9fid - LINUX_FID_BASE]++;
+    }
+}
+
+/* clone with CLONE_VM|CLONE_VFORK: the posix_spawn path. The child is a new
+ * process that borrows the parent's address space, runs the spawn trampoline on
+ * the given stack (fd setup, then execve), and the parent is suspended until the
+ * child execs its own image or exits. Because scheduling is cooperative, the
+ * child runs first and the parent simply blocks until the child releases it. */
+static long
+do_spawn_vfork(uint64_t flags, uint64_t child_stack)
+{
+    (void)flags;
+    struct lproc *parent = lproc_cur;
+    struct lproc *child = proc_new();
+    if (!child)
+        return -LERR_NOMEM;
+    struct lshared *csh = child->sh;
+
+    /* Borrow the parent's address space; execve will give the child its own. */
+    csh->vmspace = parent->sh->vmspace;
+    csh->vm_borrowed = 1;
+    csh->parent = parent->sh->pid;
+
+    /* The child gets its own copy of the fd table (clone without CLONE_FILES),
+     * so its file_actions dup2/close touch only its descriptors. */
+    memcpy(csh->fdtab, parent->sh->fdtab, sizeof csh->fdtab);
+    inherit_fds(csh);
+    csh->heap_brk = parent->sh->heap_brk;
+    csh->heap_mmap = parent->sh->heap_mmap;
+    csh->heap_mmaptop = parent->sh->heap_mmaptop;
+
+    csh->vforking = 1;
+    csh->vfork_waiter = parent->task_id;
+
+    /* Resume at the clone site (rax = 0) on the spawn stack, sharing the VM. */
+    child->tf = parent->tf;
+    tf_set_ret0(&child->tf);
+    if (child_stack)
+        tf_set_sp(&child->tf, child_stack);
+    child->tls = parent->tls;
+
+    int tid = task_spawn_proc("spawn", process_entry, child);
+    if (tid < 0) {
+        release_fds(csh);
+        kfree(child->kstack);
+        child->used = 0;
+        csh->used = 0;
+        return -LERR_NOMEM;
+    }
+    child->task_id = tid;
+    csh->main_task = tid;
+
+    /* vfork: block until the child execs (new address space) or exits. */
+    while (csh->vforking)
+        task_block();
+
+    return csh->pid;
+}
+
+/* clone3(&args, size): parse the clone_args and route like clone. The struct is
+ * a run of u64s; we read flags, the stack and its size, and tls. */
+static long
+do_clone3(uint64_t uargs, uint64_t size)
+{
+    if (size < 8 * 8)
+        return -LERR_INVAL;
+    const uint64_t *a = (const uint64_t *)(uintptr_t)uargs;
+    uint64_t flags = a[0];
+    uint64_t ctid  = a[2];              /* child_tid */
+    uint64_t ptid  = a[3];              /* parent_tid */
+    uint64_t stack = a[5];
+    uint64_t ssize = a[6];
+    uint64_t tls   = a[7];
+    uint64_t top = stack ? stack + ssize : 0;   /* clone3 gives base + size */
+
+    if ((flags & CLONE_VM) && (flags & CLONE_VFORK))
+        return do_spawn_vfork(flags, top);
+    if (flags & CLONE_VM)
+        return do_clone_thread(flags, top, ptid, ctid, tls);
+    return do_fork();
+}
+
 /* wait4: reap a child process. Returns its pid and writes an exit-encoded
  * status. Yields while children still run so they can finish. */
 static long
 do_wait4(long pid, int *status)
 {
     struct lshared *mysh = lproc_cur->sh;
+
+    /* pid is a pid_t (32-bit). A caller passing -1 (wait for any child) may set
+     * only the low 32 bits, so sign-extend before the > 0 and match tests. */
+    pid = (long)(int)pid;
 
     for (;;) {
         int haskid = 0;
@@ -1358,7 +1467,10 @@ do_wait4(long pid, int *status)
                 if (status)
                     *status = (int)((c->exit_status & 0xff) << 8);  /* WIFEXITED */
                 task_reap(c->main_task);
-                if (c->vmspace)         /* safe here: we run under our own CR3 */
+                /* Destroy the child's own space, never a borrowed one (a
+                 * posix_spawn child that died before exec still points at the
+                 * parent's space). */
+                if (c->vmspace && !c->vm_borrowed)
                     vmspace_destroy(c->vmspace);
                 c->used = 0;
                 return rpid;
@@ -1388,6 +1500,13 @@ do_exit(long code, int group)
     if (group) {
         sh->exited = 1;
         sh->exit_status = code;
+    }
+
+    /* A posix_spawn child that exits before exec (its exec failed) still has to
+     * release the parent blocked in vfork. */
+    if (sh->vforking) {
+        sh->vforking = 0;
+        task_wake(sh->vfork_waiter);
     }
 
     if (--sh->refs == 0) {
@@ -1564,6 +1683,20 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_getgid:
     case SYS_getegid:
         return 0;                       /* a single root-ish identity */
+    case SYS_setuid:
+    case SYS_setgid:
+    case SYS_setreuid:
+    case SYS_setregid:
+    case SYS_setresuid:
+    case SYS_setresgid:
+    case SYS_setgroups:
+    case SYS_setpgid:
+        /* One identity and one process group; a set to it succeeds, and there
+         * is nothing else to become. posix_spawn's child sets these before it
+         * execs the recipe shell. */
+        return 0;
+    case SYS_setsid:
+        return lproc_cur->sh->pid;      /* the new session id is our pid */
     case SYS_prctl:
         return 0;                       /* accept and ignore */
     case SYS_getcwd: {
@@ -1573,6 +1706,19 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         ubuf[0] = '/';
         ubuf[1] = 0;
         return 2;
+    }
+    case SYS_chdir: {
+        /* The cwd is always "/" (getcwd above), so this cannot really move; but
+         * accept a chdir to the root or to a directory that exists, so a tool
+         * restoring its cwd at exit (make does) succeeds quietly. */
+        const char *rel = bundle_path((const char *)a1);
+        if (rel[0] == '\0')
+            return 0;                   /* the root */
+        int isdir;
+        uint64_t size, ino;
+        if (meta_path((const char *)a1, &isdir, &size, &ino) < 0)
+            return -LERR_NOENT;
+        return isdir ? 0 : -LERR_NOTDIR;
     }
     case SYS_readlinkat:
         return -LERR_INVAL;             /* nothing in the bundle is a symlink */
@@ -1604,12 +1750,17 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_vfork:
         return do_fork();
     case SYS_clone:
-        /* A thread shares the address space (CLONE_VM); otherwise clone is the
-         * fork path (glibc/musl fork() is clone with SIGCHLD, no CLONE_VM). */
+        /* CLONE_VM|CLONE_VFORK is posix_spawn; CLONE_VM alone is a thread;
+         * otherwise clone is the fork path (fork() is clone with SIGCHLD and no
+         * CLONE_VM). */
+        if (((uint64_t)a1 & CLONE_VM) && ((uint64_t)a1 & CLONE_VFORK))
+            return do_spawn_vfork((uint64_t)a1, (uint64_t)a2);
         if ((uint64_t)a1 & CLONE_VM)
             return do_clone_thread((uint64_t)a1, (uint64_t)a2, (uint64_t)a3,
                                    (uint64_t)a4, (uint64_t)a5);
         return do_fork();
+    case SYS_clone3:
+        return do_clone3((uint64_t)a1, (uint64_t)a2);
     case SYS_wait4:
         return do_wait4(a1, (int *)a2);
     case SYS_futex:
@@ -1847,8 +1998,11 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
         argc = 1;
     }
 
-    /* A fresh address space for the new image, replacing the old one. */
+    /* A fresh address space for the new image, replacing the old one. A
+     * posix_spawn child runs in its parent's borrowed space, which execve must
+     * not destroy and which the parent reclaims itself. */
     vmspace_t old = lproc_cur->sh->vmspace;
+    int borrowed = lproc_cur->sh->vm_borrowed;
     vmspace_t as = linux_vmspace_setup();
     if (!as) {
         p9_clunk(LINUX_FID);
@@ -1869,11 +2023,19 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     }
 
     lproc_cur->sh->vmspace = as;        /* the resume hook now restores this one */
+    lproc_cur->sh->vm_borrowed = 0;
     brk_cur = LINUX_HEAP_BASE;          /* fresh heap for the new image */
     mmap_cur = mmap_top;
     uint64_t rsp = build_stack_vec(na, argc, ne, envc, &exe, &interp);
     kfree(sbuf);
-    vmspace_destroy(old);               /* release the replaced image's frames */
+
+    /* The child now has its own space, so the vfork parent can safely resume. */
+    if (lproc_cur->sh->vforking) {
+        lproc_cur->sh->vforking = 0;
+        task_wake(lproc_cur->sh->vfork_waiter);
+    }
+    if (!borrowed)
+        vmspace_destroy(old);           /* release the replaced image's frames */
 
     linux_jump(entry, rsp);             /* enter the new image; does not return */
 }

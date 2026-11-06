@@ -44,13 +44,23 @@
 #define SYS_uname           63
 #define SYS_fcntl           72
 #define SYS_getcwd          79
+#define SYS_chdir           80
 #define SYS_getuid          102
+#define SYS_setuid          105
+#define SYS_setgid          106
 #define SYS_getgid          104
 #define SYS_geteuid         107
 #define SYS_getegid         108
+#define SYS_setpgid         109
 #define SYS_getppid         110
 #define SYS_getpgrp         111
+#define SYS_setsid          112
+#define SYS_setreuid        113
+#define SYS_setregid        114
 #define SYS_getgroups       115
+#define SYS_setgroups       116
+#define SYS_setresuid       117
+#define SYS_setresgid       119
 #define SYS_sigaltstack     131
 #define SYS_statfs          137
 #define SYS_fstatfs         138
@@ -75,6 +85,7 @@
 #define SYS_getrandom       318
 #define SYS_statx           332
 #define SYS_rseq            334
+#define SYS_clone3          435
 #define SYS_faccessat2      439
 
 /* arch_prctl subfunction: set the FS base (TLS). */
