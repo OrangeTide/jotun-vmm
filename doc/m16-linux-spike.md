@@ -227,3 +227,73 @@ shared unchanged:
 Run it with `make linux-spike` on macos/arm64 (HVF). It needs a static musl
 AArch64 toolchain; the default is `aarch64-linux-musl-gcc`, overridable with
 `SPIKE_CC=`. `SPIKE_PROG` selects the program (default `linuxhello`).
+
+## Real tools: busybox sed/awk and GNU make
+
+The committed tests are small musl programs. To check the trap against real
+tools, three static non-PIE binaries were run by hand through the `bin` guest
+on x86-64. These are not committed targets, because they need host binaries or
+an external build, but they exercise the path well beyond the musl tests.
+
+- **busybox** (`/usr/bin/busybox`, Ubuntu's static glibc build) is `ET_EXEC`,
+  non-PIE, linked at `0x400000`, no interpreter. Its `sed` and `awk` applets
+  run clean:
+
+  ```
+  ./jotun libos.elf bin busybox sed 's/green/GREEN/; s/^/> /' input.txt
+  ./jotun libos.elf bin busybox awk '{ sum += $2 } END { print "total:", sum }' input.txt
+  ```
+
+- **GNU make 4.4.1** built static non-PIE against musl
+  (`CC=musl-gcc CFLAGS="-O2 -static -no-pie" LDFLAGS="-static -no-pie"`). It
+  parses a Makefile, builds the dependency graph, forks a shell per recipe, and
+  exits 0. The shell is busybox staged in the bundle under the name `sh`, with
+  `SHELL := /sh` in the Makefile. `execve` resolves a path straight against the
+  bundle with no `PATH` search, so the shell has to be reachable at the exact
+  path make hands it.
+
+Two gaps turned up and are worth recording.
+
+### faccessat / faccessat2
+
+make calls `faccessat2` (439), falling back to `faccessat` (269), to check its
+shell is executable before `execve`. Both returned `-ENOSYS`, so make reported
+`/sh: Function not implemented` and stopped with error 127. They are now
+serviced in `linux_sys_dispatch`: the bundle and ramfs carry no permission
+bits, so an existing path is accessible for any mode. The handler reuses the
+`meta_path` existence check and returns 0 if the path resolves, or `-ENOENT` if
+it does not. The `dirfd` argument is ignored, which matches the rest of the
+`*at` handlers (paths resolve against the bundle root; `dirfd` is `AT_FDCWD` in
+practice). `SYS_faccessat` and `SYS_faccessat2` were added to both
+`arch/x86_64_linuxabi.h` and `arch/arm64_linuxabi.h`. This is generic: any
+program that calls `access()` before running another benefits.
+
+### posix_spawn is a thread clone, not a child
+
+With `faccessat` in place, make forked a recipe shell and then its `wait`
+returned `ECHILD`, so it looped on "Waiting for unfinished jobs" forever. The
+cause is make's default job launcher. A musl-built make detects `posix_spawn`
+and uses it, and musl's `posix_spawn` is `clone(CLONE_VM | CLONE_VFORK)`. The
+dispatcher routes any `CLONE_VM` to the thread path (`do_clone_thread`), so the
+"child" became a thread with no parent-child link, and the parent's `wait4`
+found no children.
+
+The workaround used here is to build make with `posix_spawn` disabled
+(`ac_cv_func_posix_spawn=no ./configure ...`), which forces the plain
+`fork()` + `execve` path the spike already supports. This is a property of the
+binary, not a loader limitation. Supporting `posix_spawn` directly is future
+work: it means handling `clone(CLONE_VM | CLONE_VFORK)` where the child shares
+the address space briefly, then `execve` replaces its image, with the parent
+suspended until the child execs or exits.
+
+One harmless loose end remains: make issues `chdir` (80) at exit, which is
+unhandled and returns `-ENOSYS`. make ignores the result and still exits 0. The
+guest cwd is always `/`, so a faithful `chdir` would have little to do.
+
+## Next: dynamic binaries
+
+Static linking was the stepping stone that proved the ring-0 SYSCALL trap and
+the address-space model. The project's goal is to run unmodified native Linux
+binaries, which on a normal distribution means dynamically linked, PIE, glibc
+programs loaded through `ld-linux-x86-64.so.2`. The design for that step lives
+in `doc/m16-dynamic.md`.
