@@ -18,14 +18,17 @@ struct manifest_net {
     char proto[8];                      /* "tcp", "udp", or "" for any */
 };
 
-/* One "mount <name> <bundle> <ref> [subtree]" graft: a shared read-only tree
+/* One "mount <name> <source> <ref> [subtree]" graft: a shared read-only tree
  * that appears as the top-level directory `name` in the guest root. Several may
- * be declared; the host chains them, so each adds one top-level name. */
+ * be declared; the host chains them, so each adds one top-level name. The
+ * source is a bundle depot, or a live host directory when written "host:<path>"
+ * (then is_host is 1, bundle holds the path, and ref and subtree are unused). */
 struct manifest_mount {
     char name[64];                      /* top-level name in the guest root */
-    char bundle[256];                   /* depot path to serve */
+    char bundle[256];                   /* depot path, or host dir when is_host */
     char ref[64];                       /* ref name, default "root" */
     char subtree[256];                  /* subtree within that bundle, or "" */
+    int  is_host;                       /* source is a live host directory */
 };
 
 struct manifest {

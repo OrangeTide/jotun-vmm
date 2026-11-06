@@ -426,8 +426,44 @@ grafts), so any number of mounts coexist. `main.c` builds one wrapper and adds
 each mount to it.
 
 This is the design the project was aiming for: a guest picks up an installed or
-bundled runtime, or in time the host's own `/lib64` and `/lib/x86_64-linux-gnu`,
-through a read-only mount, with nothing baked into the app image.
+bundled runtime, or the host's own `/lib64` and `/lib/x86_64-linux-gnu`, through
+a read-only mount, with nothing baked into the app image.
+
+### Grafting a live host directory
+
+A mount source can now be a live host directory, not only a bundle. Written
+`host:<path>`, it grafts that directory through `p9hostdir`, a read-only 9P
+backend over the real filesystem (`host/p9hostdir.{c,h}`). So the host's own
+runtime grafts in with no packing step at all:
+
+```
+bundle app-depot
+ref root
+init bin sed s/red/GREEN/ in.txt
+mount lib64 host:/usr/lib/x86_64-linux-gnu
+mount lib   host:/usr/lib
+```
+
+```
+[9p] guest 0: grafted host:/usr/lib/x86_64-linux-gnu at /lib64
+[9p] guest 0: grafted host:/usr/lib at /lib
+...
+one GREEN fish
+```
+
+`p9hostdir` serves each node by the path relative to its root (kept in the node
+handle) and uses the host inode as the qid, so the dynamic linker's library
+dedup works. A one-entry fd cache turns a library's run of sequential reads into
+a single `open`. It is confined to the directory it is opened on: a walk accepts
+only a single path component, never `.` or `..`, and a path that resolves (via a
+symlink) outside the root is refused. A confinement test confirms an in-mount
+library opens while `/lib/../../../../etc/hostname` and a symlink-style escape
+are denied. The manifest, written by the operator, chooses which host directory
+is exposed; the guest only reads within it.
+
+This is the "system's native runtime" half of the goal: the two mount kinds,
+`host:<path>` and a bundle, let a guest run against the host's live libraries or
+against a packed, content-addressed runtime, whichever the operator mounts.
 
 ## The cut line
 

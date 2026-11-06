@@ -40,3 +40,11 @@ init rc
 # interpreter and shared libraries from the mount:
 # mount lib64 runtime-depot root lib64
 # mount lib   runtime-depot root lib
+#
+# A source written "host:<path>" grafts a live host directory instead of a
+# bundle (read-only, and confined to that directory: a walk takes single path
+# components, never "..", and a symlink that leaves the directory is refused).
+# The manifest, not the guest, chooses which host directory is exposed. This
+# grafts the host's own runtime so a glibc binary runs with no packing at all:
+# mount lib64 host:/usr/lib/x86_64-linux-gnu
+# mount lib   host:/usr/lib

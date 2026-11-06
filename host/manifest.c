@@ -99,10 +99,19 @@ manifest_load(const char *path, struct manifest *m)
             if (nt >= 2 && m->nmount < MANIFEST_MAXMOUNT) {
                 struct manifest_mount *mo = &m->mount[m->nmount++];
                 copy_field(mo->name, sizeof mo->name, tok[0]);
-                copy_field(mo->bundle, sizeof mo->bundle, tok[1]);
-                copy_field(mo->ref, sizeof mo->ref, nt >= 3 ? tok[2] : "root");
-                copy_field(mo->subtree, sizeof mo->subtree,
-                           nt >= 4 ? tok[3] : "");
+                /* "host:<path>" serves a live host directory; otherwise the
+                 * source is a bundle depot with a ref and optional subtree. */
+                if (strncmp(tok[1], "host:", 5) == 0) {
+                    mo->is_host = 1;
+                    copy_field(mo->bundle, sizeof mo->bundle, tok[1] + 5);
+                } else {
+                    mo->is_host = 0;
+                    copy_field(mo->bundle, sizeof mo->bundle, tok[1]);
+                    copy_field(mo->ref, sizeof mo->ref,
+                               nt >= 3 ? tok[2] : "root");
+                    copy_field(mo->subtree, sizeof mo->subtree,
+                               nt >= 4 ? tok[3] : "");
+                }
             }
         } else if (strcmp(key, "bundle") == 0) {
             copy_field(m->bundle, sizeof m->bundle, val);

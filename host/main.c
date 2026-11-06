@@ -21,6 +21,7 @@
 #include "p9smolvfs.h"
 #include "p9overlay.h"
 #include "p9graft.h"
+#include "p9hostdir.h"
 #include "manifest.h"
 #include "bundlepull.h"
 #include "net.h"
@@ -701,23 +702,31 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
             for (int mi = 0; mi < gp->manifest.nmount; mi++) {
                 struct manifest_mount *mo = &gp->manifest.mount[mi];
                 void *gctx = NULL;
-                const struct p9_backend *gbe =
-                    p9smolvfs_open(mo->bundle, mo->ref, mo->subtree, JOTUN_ARCH,
-                                   &gctx);
+                const struct p9_backend *gbe = mo->is_host
+                    ? p9hostdir_open(mo->bundle, &gctx)
+                    : p9smolvfs_open(mo->bundle, mo->ref, mo->subtree,
+                                     JOTUN_ARCH, &gctx);
                 if (!gbe) {
                     fprintf(stderr,
-                            "[9p] guest %d: could not open mount bundle %s\n",
-                            gid, mo->bundle);
+                            "[9p] guest %d: could not open mount %s%s\n",
+                            gid, mo->is_host ? "host:" : "", mo->bundle);
                     continue;
                 }
                 if (p9graft_add(g, gbe, gctx, mo->name) != 0) {
                     fprintf(stderr, "[9p] guest %d: too many mounts, dropped %s\n",
                             gid, mo->name);
-                    p9smolvfs_close(gctx);
+                    if (mo->is_host)
+                        p9hostdir_close(gctx);
+                    else
+                        p9smolvfs_close(gctx);
                     continue;
                 }
-                fprintf(stderr, "[9p] guest %d: grafted %s (ref %s) at /%s\n",
-                        gid, mo->bundle, mo->ref, mo->name);
+                if (mo->is_host)
+                    fprintf(stderr, "[9p] guest %d: grafted host:%s at /%s\n",
+                            gid, mo->bundle, mo->name);
+                else
+                    fprintf(stderr, "[9p] guest %d: grafted %s (ref %s) at /%s\n",
+                            gid, mo->bundle, mo->ref, mo->name);
             }
             be = p9graft_backend();
             p9ctx = g;
