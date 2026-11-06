@@ -96,12 +96,12 @@ manifest_load(const char *path, struct manifest *m)
                 if (*p)
                     *p++ = '\0';
             }
-            if (nt >= 2) {
-                copy_field(m->mount_name, sizeof m->mount_name, tok[0]);
-                copy_field(m->mount_bundle, sizeof m->mount_bundle, tok[1]);
-                copy_field(m->mount_ref, sizeof m->mount_ref,
-                           nt >= 3 ? tok[2] : "root");
-                copy_field(m->mount_subtree, sizeof m->mount_subtree,
+            if (nt >= 2 && m->nmount < MANIFEST_MAXMOUNT) {
+                struct manifest_mount *mo = &m->mount[m->nmount++];
+                copy_field(mo->name, sizeof mo->name, tok[0]);
+                copy_field(mo->bundle, sizeof mo->bundle, tok[1]);
+                copy_field(mo->ref, sizeof mo->ref, nt >= 3 ? tok[2] : "root");
+                copy_field(mo->subtree, sizeof mo->subtree,
                            nt >= 4 ? tok[3] : "");
             }
         } else if (strcmp(key, "bundle") == 0) {

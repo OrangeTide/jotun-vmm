@@ -30,5 +30,13 @@ init rc
 # Graft a shared read-only tree at a top-level name in the guest root, in
 # addition to the guest's own tree: "mount <name> <bundle> <ref> [subtree]".
 # The ref may be a ref name, a pinned root hash, or a jimage, like bundle/ref
-# above. The name must not already exist in the guest's own root.
+# above. The name must not already exist in the guest's own root. Several mount
+# lines are allowed, each adding one top-level name.
 # mount shared shared-depot root
+#
+# A runtime supplied read-only, so the libraries stay out of the app bundle.
+# Here a separate runtime depot holds lib64/ and lib/ subtrees, grafted at the
+# paths the dynamic linker expects, so an unmodified glibc binary resolves its
+# interpreter and shared libraries from the mount:
+# mount lib64 runtime-depot root lib64
+# mount lib   runtime-depot root lib

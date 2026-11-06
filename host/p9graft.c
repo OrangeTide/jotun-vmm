@@ -1,34 +1,49 @@
-/* p9graft.c : graft a second backend's tree at a name in a base backend. */
+/* p9graft.c : graft other backends' trees at names in a base backend. */
 
 #include "p9graft.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-/* The top bit of a qid path tags which tree a node belongs to: set for the
- * graft, clear for the base. The wrapper rewrites every node's qid path as it
- * passes, so routing is reliable (the top bit) and the two trees' qids are
- * disjoint for the client. The underlying backends key off the opaque handle,
- * not the qid path, so rewriting the qid does not disturb delegation. */
-#define GRAFT_BIT (1ull << 63)
+/* The high bits of a qid path carry a tree id: 0 for the base, 1..N for the
+ * grafts. The wrapper rewrites every node's qid as it passes, so routing reads
+ * the id back from the node, and the trees' qids stay disjoint for the client.
+ * The underlying backends key off the opaque handle, not the qid path, so
+ * rewriting the qid does not disturb delegation. Four bits allow 15 grafts. */
+#define GRAFT_SHIFT 60
+#define GRAFT_IDMASK 0xfull
+#define GRAFT_QMASK  ((1ull << GRAFT_SHIFT) - 1)
+
+#define GRAFT_MAX 15
+
+struct graft_entry {
+    const struct p9_backend *be;
+    void *ctx;
+    char name[256];
+    struct p9_node root;            /* cached graft root, qid tagged */
+    int root_ok;
+};
 
 struct p9graft {
     const struct p9_backend *base;
     void *base_ctx;
-    const struct p9_backend *graft;
-    void *graft_ctx;
-    char name[256];                 /* mount leaf name in the base root */
-
-    struct p9_node base_root;       /* cached base root, qid cleared */
+    struct p9_node base_root;       /* cached base root, qid tagged id 0 */
     int base_root_ok;
-    struct p9_node graft_root;      /* cached graft root, qid tagged */
-    int graft_root_ok;
+    struct graft_entry g[GRAFT_MAX];
+    int ng;
 };
 
-static int
-is_graft(const struct p9_node *n)
+static unsigned
+tree_id(const struct p9_node *n)
 {
-    return (n->qid_path & GRAFT_BIT) != 0;
+    return (unsigned)((n->qid_path >> GRAFT_SHIFT) & GRAFT_IDMASK);
+}
+
+/* Tag a node's qid with a tree id, replacing the high id bits. */
+static void
+set_tree_id(struct p9_node *n, unsigned id)
+{
+    n->qid_path = (n->qid_path & GRAFT_QMASK) | ((uint64_t)id << GRAFT_SHIFT);
 }
 
 static int
@@ -37,20 +52,21 @@ ensure_base_root(struct p9graft *g)
     if (!g->base_root_ok) {
         if (g->base->root(g->base_ctx, &g->base_root) != 0)
             return -1;
-        g->base_root.qid_path &= ~GRAFT_BIT;
+        set_tree_id(&g->base_root, 0);
         g->base_root_ok = 1;
     }
     return 0;
 }
 
 static int
-ensure_graft_root(struct p9graft *g)
+ensure_graft_root(struct p9graft *g, int i)
 {
-    if (!g->graft_root_ok) {
-        if (g->graft->root(g->graft_ctx, &g->graft_root) != 0)
+    struct graft_entry *e = &g->g[i];
+    if (!e->root_ok) {
+        if (e->be->root(e->ctx, &e->root) != 0)
             return -1;
-        g->graft_root.qid_path |= GRAFT_BIT;
-        g->graft_root_ok = 1;
+        set_tree_id(&e->root, (unsigned)(i + 1));
+        e->root_ok = 1;
     }
     return 0;
 }
@@ -70,31 +86,36 @@ gr_walk(void *ctx, const struct p9_node *dir, const char *name,
         struct p9_node *out)
 {
     struct p9graft *g = ctx;
+    unsigned id = tree_id(dir);
 
-    if (is_graft(dir)) {
-        if (g->graft->walk(g->graft_ctx, dir, name, out) != 0)
+    if (id != 0) {                  /* inside a graft: delegate to its backend */
+        struct graft_entry *e = &g->g[id - 1];
+        if (e->be->walk(e->ctx, dir, name, out) != 0)
             return -1;
-        out->qid_path |= GRAFT_BIT;
+        set_tree_id(out, id);
         return 0;
     }
 
     if (ensure_base_root(g) != 0)
         return -1;
 
-    /* The mount name, walked from the base root, enters the graft tree. */
-    if (strcmp(dir->handle, g->base_root.handle) == 0
-        && strcmp(name, g->name) == 0) {
-        if (ensure_graft_root(g) != 0)
-            return -1;
-        *out = g->graft_root;
-        strncpy(out->name, g->name, sizeof out->name - 1);
-        out->name[sizeof out->name - 1] = '\0';
-        return 0;
+    /* A graft name, walked from the base root, enters that graft's tree. */
+    if (strcmp(dir->handle, g->base_root.handle) == 0) {
+        for (int i = 0; i < g->ng; i++) {
+            if (strcmp(name, g->g[i].name) != 0)
+                continue;
+            if (ensure_graft_root(g, i) != 0)
+                return -1;
+            *out = g->g[i].root;
+            strncpy(out->name, g->g[i].name, sizeof out->name - 1);
+            out->name[sizeof out->name - 1] = '\0';
+            return 0;
+        }
     }
 
     if (g->base->walk(g->base_ctx, dir, name, out) != 0)
         return -1;
-    out->qid_path &= ~GRAFT_BIT;
+    set_tree_id(out, 0);
     return 0;
 }
 
@@ -102,11 +123,14 @@ static int
 gr_list(void *ctx, const struct p9_node *dir, struct p9_dirent *ents, int max)
 {
     struct p9graft *g = ctx;
+    unsigned id = tree_id(dir);
 
-    if (is_graft(dir)) {
-        int n = g->graft->list(g->graft_ctx, dir, ents, max);
+    if (id != 0) {
+        struct graft_entry *e = &g->g[id - 1];
+        int n = e->be->list(e->ctx, dir, ents, max);
         for (int i = 0; i < n; i++)
-            ents[i].qid_path |= GRAFT_BIT;
+            ents[i].qid_path = (ents[i].qid_path & GRAFT_QMASK)
+                             | ((uint64_t)id << GRAFT_SHIFT);
         return n;
     }
 
@@ -114,22 +138,25 @@ gr_list(void *ctx, const struct p9_node *dir, struct p9_dirent *ents, int max)
         return -1;
     int at_root = strcmp(dir->handle, g->base_root.handle) == 0;
 
-    /* Keep one slot for the injected mount entry when listing the base root. */
-    int n = g->base->list(g->base_ctx, dir, ents, at_root ? max - 1 : max);
+    /* Keep one slot per graft for the injected entries when listing the root. */
+    int reserve = at_root ? g->ng : 0;
+    int n = g->base->list(g->base_ctx, dir, ents, max - reserve);
     if (n < 0)
         n = 0;
     for (int i = 0; i < n; i++)
-        ents[i].qid_path &= ~GRAFT_BIT;
+        ents[i].qid_path &= GRAFT_QMASK;        /* tree id 0 */
 
-    if (at_root && n < max) {
-        if (ensure_graft_root(g) != 0)
-            return -1;
-        memset(&ents[n], 0, sizeof ents[n]);
-        strncpy(ents[n].name, g->name, sizeof ents[n].name - 1);
-        ents[n].is_dir = 1;
-        ents[n].mode = g->graft_root.mode ? g->graft_root.mode : 0555;
-        ents[n].qid_path = g->graft_root.qid_path;      /* already tagged */
-        n++;
+    if (at_root) {
+        for (int i = 0; i < g->ng && n < max; i++) {
+            if (ensure_graft_root(g, i) != 0)
+                return -1;
+            memset(&ents[n], 0, sizeof ents[n]);
+            strncpy(ents[n].name, g->g[i].name, sizeof ents[n].name - 1);
+            ents[n].is_dir = 1;
+            ents[n].mode = g->g[i].root.mode ? g->g[i].root.mode : 0555;
+            ents[n].qid_path = g->g[i].root.qid_path;   /* already tagged */
+            n++;
+        }
     }
     return n;
 }
@@ -139,9 +166,10 @@ gr_readf(void *ctx, const struct p9_node *file, uint64_t off, void *buf,
          uint32_t n)
 {
     struct p9graft *g = ctx;
+    unsigned id = tree_id(file);
 
-    if (is_graft(file))
-        return g->graft->readf(g->graft_ctx, file, off, buf, n);
+    if (id != 0)
+        return g->g[id - 1].be->readf(g->g[id - 1].ctx, file, off, buf, n);
     return g->base->readf(g->base_ctx, file, off, buf, n);
 }
 
@@ -153,18 +181,30 @@ static const struct p9_backend graft_backend = {
 };
 
 struct p9graft *
-p9graft_new(const struct p9_backend *base, void *base_ctx,
-            const struct p9_backend *graft, void *graft_ctx, const char *name)
+p9graft_new(const struct p9_backend *base, void *base_ctx)
 {
     struct p9graft *g = calloc(1, sizeof *g);
     if (!g)
         return NULL;
     g->base = base;
     g->base_ctx = base_ctx;
-    g->graft = graft;
-    g->graft_ctx = graft_ctx;
-    strncpy(g->name, name, sizeof g->name - 1);
     return g;
+}
+
+int
+p9graft_add(struct p9graft *g, const struct p9_backend *graft, void *graft_ctx,
+            const char *name)
+{
+    if (g->ng >= GRAFT_MAX)
+        return -1;
+    struct graft_entry *e = &g->g[g->ng];
+    e->be = graft;
+    e->ctx = graft_ctx;
+    strncpy(e->name, name, sizeof e->name - 1);
+    e->name[sizeof e->name - 1] = '\0';
+    e->root_ok = 0;
+    g->ng++;
+    return 0;
 }
 
 const struct p9_backend *

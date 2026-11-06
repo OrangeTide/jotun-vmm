@@ -8,6 +8,7 @@
 
 #define MANIFEST_MAXARG 16
 #define MANIFEST_MAXNET 16
+#define MANIFEST_MAXMOUNT 8
 
 /* One "net allow <cidr> <ports> [proto]" rule, kept as unparsed strings; the
  * host turns these into the numeric net policy. */
@@ -15,6 +16,16 @@ struct manifest_net {
     char cidr[64];                      /* "a.b.c.d" or "a.b.c.d/prefix" */
     char ports[32];                     /* "p", "lo-hi", or "*" */
     char proto[8];                      /* "tcp", "udp", or "" for any */
+};
+
+/* One "mount <name> <bundle> <ref> [subtree]" graft: a shared read-only tree
+ * that appears as the top-level directory `name` in the guest root. Several may
+ * be declared; the host chains them, so each adds one top-level name. */
+struct manifest_mount {
+    char name[64];                      /* top-level name in the guest root */
+    char bundle[256];                   /* depot path to serve */
+    char ref[64];                       /* ref name, default "root" */
+    char subtree[256];                  /* subtree within that bundle, or "" */
 };
 
 struct manifest {
@@ -30,13 +41,11 @@ struct manifest {
     int  nnet;
     struct manifest_net net[MANIFEST_MAXNET];   /* network-allow rules */
 
-    /* An optional read-only graft mount: a shared tree that appears as the
-     * top-level directory mount_name in the guest root. mount_name is "" when
-     * no mount is declared. */
-    char mount_name[64];
-    char mount_bundle[256];
-    char mount_ref[64];
-    char mount_subtree[256];
+    /* Read-only graft mounts: shared trees that appear as top-level directories
+     * in the guest root, chained so each adds one name. nmount is 0 when none
+     * are declared. */
+    int  nmount;
+    struct manifest_mount mount[MANIFEST_MAXMOUNT];
 };
 
 /* Parse the manifest file at path. Returns 0 on success, -1 on error. */

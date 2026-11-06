@@ -382,11 +382,52 @@ JOTUN_BUNDLE=bundle-depot JOTUN_REF=root ./jotun libos.elf bin sed 's/red/GREEN/
 ```
 
 Hand-copying five libraries is the bring-up shortcut. The production path is the
-`p9graft` read-only mount: graft the host's `/lib64` and `/lib/x86_64-linux-gnu`
-(or a bundled runtime) read-only, and sed resolves its libraries at their real
-paths with no copying. That is the next piece of work, and it needs no loader
-change, only a manifest `mount` entry. A dynamic glibc `hello` and all ten
-committed static tests still pass, each with zero unhandled syscalls.
+`p9graft` read-only mount: graft a runtime read-only so the libraries stay out
+of the app bundle, and sed resolves them at their real paths with no copying. A
+dynamic glibc `hello` and all ten committed static tests still pass, each with
+zero unhandled syscalls.
+
+## Runtime mount wired
+
+The read-only runtime mount now works, with no loader change. The libraries live
+in a separate runtime bundle, grafted into the app guest through the manifest.
+
+The app bundle holds only `sed` and `in.txt`, no libraries. A runtime bundle
+holds `lib64/ld-linux-x86-64.so.2` and `lib/x86_64-linux-gnu/*.so*`. The
+manifest grafts the runtime's two subtrees at the paths the dynamic linker
+expects:
+
+```
+bundle app-depot
+ref root
+init bin sed s/red/GREEN/ in.txt
+mount lib64 runtime-depot root lib64
+mount lib   runtime-depot root lib
+```
+
+```
+./jotun libos.elf -m sed.manifest
+[9p] guest 0: grafted runtime-depot (ref root) at /lib64
+[9p] guest 0: grafted runtime-depot (ref root) at /lib
+...
+one GREEN fish
+two blue fish
+three GREEN fish
+```
+
+Wiring this up needed two host changes. The manifest took a single `mount`; it
+now holds an array and the parser accepts several `mount` lines
+(`manifest.{c,h}`, `main.c`). And `p9graft` grafted one tree with a single
+reserved qid bit to route nodes, which does not compose: chaining two graft
+wrappers made the outer one clear the inner one's bit, so the inner graft's
+nodes misrouted. `p9graft` now holds several grafts in one wrapper and routes by
+a small tree id in the high bits of each qid (0 for the base, 1..N for the
+grafts), so any number of mounts coexist. `main.c` builds one wrapper and adds
+each mount to it.
+
+This is the design the project was aiming for: a guest picks up an installed or
+bundled runtime, or in time the host's own `/lib64` and `/lib/x86_64-linux-gnu`,
+through a read-only mount, with nothing baked into the app image.
 
 ## The cut line
 
