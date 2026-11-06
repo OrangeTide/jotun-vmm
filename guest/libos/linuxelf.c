@@ -192,6 +192,10 @@ struct lfd {
     uint32_t p9fid;             /* backing 9P fid, 0 for the console fds */
     uint64_t pos;               /* read cursor (file) or 9P dir offset */
     uint64_t size;
+    uint64_t ino;               /* stable identity (9P qid path): a fresh fd for
+                                 * the same file reports the same inode, which
+                                 * the dynamic linker relies on to dedup a
+                                 * library it has already mapped */
 };
 
 /* A writable in-memory file. The read-only 9P bundle cannot hold new files, so
@@ -371,12 +375,20 @@ do_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags,
         va = addr & ~(PAGE_SIZE - 1);
         if (va < VM_USER_LO || va + n > VM_USER_HI)
             return MMAP_FAILED;
-        /* An overlay inside an existing reservation: do not move mmap_cur. */
+        /* An overlay inside an existing reservation: do not move mmap_cur. The
+         * frames may already hold stale bytes (the dynamic linker first maps a
+         * library's whole span file-backed, then overlays each segment here),
+         * so clear the range. For a file mapping the file bytes are copied back
+         * over it next; for an anonymous one the zeroing is the whole point
+         * (this is how the .bss overlay must read). */
+        memset((void *)(uintptr_t)va, 0, n);
     } else {
         if (mmap_cur - n < brk_cur)
             return MMAP_FAILED;
         mmap_cur -= n;
         va = mmap_cur;
+        /* Fresh descending address: never mapped before, so an anonymous
+         * mapping already reads as zero on fault and needs no eager backing. */
     }
 
     if (!(flags & MAP_ANONYMOUS) && fd >= 0) {
@@ -694,9 +706,11 @@ do_open(const char *path, long flags)
     struct p9_stat st;
     int isdir = 0;
     uint64_t size = 0;
+    uint64_t ino = p9fid;               /* fallback if the stat fails */
     if (p9_stat(p9fid, &st) == 0) {
         isdir = (st.qid.type & P9_QTDIR) != 0;
         size = st.length;
+        ino = st.qid.path;              /* stable per-file identity */
     }
     if ((flags & O_DIRECTORY) && !isdir) {
         p9_clunk(p9fid);
@@ -713,6 +727,7 @@ do_open(const char *path, long flags)
     fds[fd].p9fid = p9fid;
     fds[fd].pos = 0;
     fds[fd].size = size;
+    fds[fd].ino = ino;
     gfidref[p9fid - LINUX_FID_BASE] = 1;
     return fd;
 }
@@ -981,7 +996,7 @@ do_fstat(long fd, struct linux_stat *out)
         fill_stat(out, 0, ramfs[f->ridx].len, (uint64_t)(0x10000 + f->ridx));
         return 0;
     }
-    fill_stat(out, f->isdir, f->size, f->p9fid);
+    fill_stat(out, f->isdir, f->size, f->ino);
     return 0;
 }
 
@@ -1506,6 +1521,12 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_pipe2((int *)a1);
     case SYS_pipe2:
         return do_pipe2((int *)a1);     /* flags (O_CLOEXEC/O_NONBLOCK) ignored */
+    case SYS_statfs:
+    case SYS_fstatfs:
+        /* No real filesystem to describe. Report ENOSYS quietly; callers such
+         * as libselinux probing for a filesystem type fall back cleanly, and a
+         * logged "unhandled" line here would pollute a tool's output stream. */
+        return -LERR_NOSYS;
     case SYS_dup: {
         struct lfd *f = fd_get(a1);
         if (!f || a1 < 3)
@@ -1547,6 +1568,14 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     }
     case SYS_readlinkat:
         return -LERR_INVAL;             /* nothing in the bundle is a symlink */
+    case SYS_access: {
+        /* access(path, mode): path is the first argument. The dynamic linker
+         * probes /etc/ld.so.cache and candidate library directories this way. */
+        int isdir;
+        uint64_t size, ino;
+        long r = meta_path((const char *)a1, &isdir, &size, &ino);
+        return r < 0 ? r : 0;
+    }
     case SYS_faccessat:
     case SYS_faccessat2: {
         /* faccessat(dirfd, path, mode, ...): the bundle and ramfs carry no

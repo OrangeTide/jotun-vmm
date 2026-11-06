@@ -27,6 +27,7 @@
 #define SYS_ioctl           16
 #define SYS_pread64         17
 #define SYS_writev          20
+#define SYS_access          21
 #define SYS_pipe            22
 #define SYS_sched_yield     24
 #define SYS_madvise         28
@@ -47,6 +48,8 @@
 #define SYS_geteuid         107
 #define SYS_getegid         108
 #define SYS_getppid         110
+#define SYS_statfs          137
+#define SYS_fstatfs         138
 #define SYS_prctl           157
 #define SYS_arch_prctl      158
 #define SYS_gettid          186

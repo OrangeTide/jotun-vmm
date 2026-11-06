@@ -16,6 +16,8 @@
 #define SYS_dup3            24
 #define SYS_fcntl           25
 #define SYS_ioctl           29
+#define SYS_statfs          43
+#define SYS_fstatfs         44
 #define SYS_faccessat       48
 #define SYS_openat          56
 #define SYS_close           57
@@ -73,6 +75,7 @@
 #define SYS_vfork      (-7)
 #define SYS_arch_prctl (-8)
 #define SYS_time       (-9)
+#define SYS_access     (-10)
 
 /* arch_prctl is x86-only; defined so the shared case body compiles. */
 #define ARCH_SET_FS 0x1002

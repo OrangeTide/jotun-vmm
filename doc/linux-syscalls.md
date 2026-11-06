@@ -26,7 +26,7 @@ Statuses used below:
 - **stub**: accepted and ignored (returns 0 or a fixed value) with no real
   effect; present so startup and common idioms do not fail.
 
-## Implemented (59 calls)
+## Implemented (62 calls)
 
 ### File and directory I/O
 
@@ -37,17 +37,20 @@ Statuses used below:
 | 2 | open | full | 9P bundle (RO) and ramfs overlay for writes/creates |
 | 3 | close | full | releases pipe and 9P references, refcounted |
 | 4 | stat | full | path via ramfs or 9P |
-| 5 | fstat | full | reports pipes as FIFO, console, ramfs, 9P |
+| 5 | fstat | full | pipes as FIFO, console, ramfs, 9P; stable per-file inode (9P qid) so the dynamic linker dedups libraries correctly |
 | 6 | lstat | full | same as stat (no symlinks in the bundle) |
 | 8 | lseek | full | file and ramfs cursors |
 | 16 | ioctl | stub | returns ENOTTY so libc falls back |
 | 17 | pread64 | full | read at an explicit offset, cursor unchanged; ramfs and 9P |
 | 20 | writev | full | loops over do_write |
+| 21 | access | full | existence check via meta_path; the dynamic linker probes ld.so.cache and library dirs this way |
 | 22 | pipe | full | in-memory byte ring |
 | 32 | dup | full | refcounted share of the backing object |
 | 33 | dup2 | full | targets 0/1/2 allowed (shell redirects) |
 | 72 | fcntl | partial | returns 0; does not honor F_DUPFD or report F_GETFL/F_GETFD |
 | 79 | getcwd | stub | always returns "/" |
+| 137 | statfs | stub | quiet ENOSYS; no real filesystem to describe (libselinux probes this) |
+| 138 | fstatfs | stub | quiet ENOSYS, as statfs |
 | 217 | getdents64 | full | packs 9P directory entries |
 | 257 | openat | partial | dirfd ignored; namespace is effectively rooted |
 | 262 | newfstatat | full | AT_EMPTY_PATH maps to fstat |
@@ -62,7 +65,7 @@ Statuses used below:
 
 | nr | name | status | notes |
 |----|------|--------|-------|
-| 9 | mmap | partial | anonymous (bump arena, down) and file-backed (eager copy from the fd); MAP_FIXED overlays an exact address; prot not enforced; no COW |
+| 9 | mmap | partial | anonymous (bump arena, down) and file-backed (eager copy from the fd); a MAP_FIXED overlay zeroes the range first (so a .bss overlay reads as zero), then copies any file bytes; prot not enforced; no COW |
 | 10 | mprotect | stub | flat RW map, nothing to enforce |
 | 11 | munmap | stub | returns 0; the bump arena does not reclaim |
 | 12 | brk | full | grows the heap within the arena |

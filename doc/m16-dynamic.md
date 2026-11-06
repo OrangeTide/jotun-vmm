@@ -271,7 +271,8 @@ New tag values: `AT_PHDR=3`, `AT_PHENT=4`, `AT_PHNUM=5`, `AT_BASE=7`,
    `libc.so`. **Done.** See "Step 2 result" below.
 3. glibc: stage the host `ld-linux-x86-64.so.2` and `libc.so.6`, run a dynamic
    glibc hello, then the host's real `/usr/bin/sed`. That last step is the
-   thesis, an unmodified host binary running under the trap.
+   thesis, an unmodified host binary running under the trap. **Done.** See
+   "Step 3 result" below.
 
 ## Step 2 result
 
@@ -319,6 +320,73 @@ that, so step 3 likely raises the heap base or places the interpreter higher.
 Zero unhandled syscalls, and all ten committed static tests still pass. The dynamic
 musl hello stays a documented manual probe, like the busybox and make runs,
 because it needs the host musl loader rather than a committed bundle file.
+
+## Step 3 result
+
+The thesis holds: the host's unmodified `/usr/bin/sed` runs under the trap.
+
+```
+JOTUN_BUNDLE=bundle-depot JOTUN_REF=root ./jotun libos.elf bin sed 's/red/GREEN/' in.txt
+one GREEN fish
+two blue fish
+three GREEN fish
+[bin] pid 1 exited, status=0
+```
+
+sed is a glibc PIE with four shared objects (`libc.so.6`, `libacl.so.1`,
+`libselinux.so.1`, and `libpcre2-8.so.0` pulled in by libselinux). A glibc
+`hello` was the first milestone, then sed. Getting there turned up two bugs that
+musl never exercised, because the musl loader is itself libc and opens no
+library.
+
+- **A MAP_FIXED overlay must zero its range.** The dynamic linker maps a
+  library's whole span file-backed, then overlays the `.bss` with an anonymous
+  `MAP_FIXED` mapping and expects zeros. Our anonymous path assumed pages fault
+  in zeroed, but these frames were already present (the file-backed reservation
+  had filled them), so `.bss` held stale file bytes. A glibc startup lock sat in
+  that `.bss`, read non-zero, and glibc blocked on a `futex` that never woke.
+  `do_mmap` now zeroes any `MAP_FIXED` range before copying file bytes over it.
+- **fstat must report a stable per-file inode.** The linker dedups libraries by
+  `(st_dev, st_ino)`. `do_fstat` reported `st_ino = p9fid`, the transient fid,
+  which is reused across open and close. So the second library opened reused the
+  first library's fid value, the linker concluded they were the same file, and
+  reused the wrong mapping, which made every symbol version vanish. The fd now
+  carries the 9P qid path captured at open, and `fstat` reports that.
+
+Two syscalls the glibc loader needs were added: `access` (21), which it uses to
+probe `/etc/ld.so.cache` and candidate library directories, and quiet
+`statfs`/`fstatfs` stubs returning `-ENOSYS` (libselinux probes the filesystem
+type; a logged "unhandled" line would otherwise pollute a tool's output).
+
+The loader found `libc.so.6` at `/lib/x86_64-linux-gnu/libc.so.6` with no
+`ld.so.cache`, no `RPATH`, and no `LD_LIBRARY_PATH`, because this host's glibc
+ld.so has the multiarch directory compiled into its default search path. The
+vDSO is absent, so glibc falls back to real syscalls for `clock_gettime` and
+the like.
+
+Staged by hand for the probe (the loader plus five libraries at their multiarch
+paths):
+
+```
+d=bundle-staging/x86_64
+mkdir -p $d/boot $d/lib64 $d/lib/x86_64-linux-gnu
+cp example/bundle/* $d/; cp libos.elf $d/boot/kernel; cp hello.elf $d/hello
+cp -L /usr/bin/sed $d/sed
+cp -L /lib64/ld-linux-x86-64.so.2 $d/lib64/ld-linux-x86-64.so.2
+for l in libc.so.6 libacl.so.1 libselinux.so.1 libpcre2-8.so.0; do \
+    cp -L /lib/x86_64-linux-gnu/$l $d/lib/x86_64-linux-gnu/$l; done
+printf 'one red fish\ntwo blue fish\nthree red fish\n' > $d/in.txt
+./jbundle -d bundle-depot --ref root --name jotun-demo --arch x86_64=$d
+./castool -d bundle-depot pack
+JOTUN_BUNDLE=bundle-depot JOTUN_REF=root ./jotun libos.elf bin sed 's/red/GREEN/' in.txt
+```
+
+Hand-copying five libraries is the bring-up shortcut. The production path is the
+`p9graft` read-only mount: graft the host's `/lib64` and `/lib/x86_64-linux-gnu`
+(or a bundled runtime) read-only, and sed resolves its libraries at their real
+paths with no copying. That is the next piece of work, and it needs no loader
+change, only a manifest `mount` entry. A dynamic glibc `hello` and all ten
+committed static tests still pass, each with zero unhandled syscalls.
 
 ## The cut line
 
