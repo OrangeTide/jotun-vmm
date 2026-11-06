@@ -26,7 +26,7 @@ Statuses used below:
 - **stub**: accepted and ignored (returns 0 or a fixed value) with no real
   effect; present so startup and common idioms do not fail.
 
-## Implemented (56 calls)
+## Implemented (59 calls)
 
 ### File and directory I/O
 
@@ -41,6 +41,7 @@ Statuses used below:
 | 6 | lstat | full | same as stat (no symlinks in the bundle) |
 | 8 | lseek | full | file and ramfs cursors |
 | 16 | ioctl | stub | returns ENOTTY so libc falls back |
+| 17 | pread64 | full | read at an explicit offset, cursor unchanged; ramfs and 9P |
 | 20 | writev | full | loops over do_write |
 | 22 | pipe | full | in-memory byte ring |
 | 32 | dup | full | refcounted share of the backing object |
@@ -51,15 +52,17 @@ Statuses used below:
 | 257 | openat | partial | dirfd ignored; namespace is effectively rooted |
 | 262 | newfstatat | full | AT_EMPTY_PATH maps to fstat |
 | 267 | readlinkat | stub | returns EINVAL (no symlinks) |
+| 269 | faccessat | full | existence check via meta_path; no permission bits, dirfd ignored |
 | 292 | dup3 | full | like dup2 |
 | 293 | pipe2 | full | flags (O_CLOEXEC, O_NONBLOCK) ignored |
 | 332 | statx | full | basic stats mask |
+| 439 | faccessat2 | full | same as faccessat (the flags variant) |
 
 ### Memory
 
 | nr | name | status | notes |
 |----|------|--------|-------|
-| 9 | mmap | partial | anonymous only, bump arena growing down; no file-backed, no MAP_FIXED |
+| 9 | mmap | partial | anonymous (bump arena, down) and file-backed (eager copy from the fd); MAP_FIXED overlays an exact address; prot not enforced; no COW |
 | 10 | mprotect | stub | flat RW map, nothing to enforce |
 | 11 | munmap | stub | returns 0; the bump arena does not reclaim |
 | 12 | brk | full | grows the heap within the arena |

@@ -228,11 +228,20 @@ New tag values: `AT_PHDR=3`, `AT_PHENT=4`, `AT_PHNUM=5`, `AT_BASE=7`,
 
 ## Supporting changes
 
-- Stage the libraries in the bundle at the paths `ld.so` searches:
-  `lib64/ld-linux-x86-64.so.2` and `lib64/libc.so.6`, copied from the host.
-  `execve` and `openat` strip the leading `/` through `bundle_path`, so
-  `/lib64/...` resolves. `ld.so` opening `/etc/ld.so.cache` and getting
-  `-ENOENT` is fine; it falls back to the default directories.
+- Stage the libraries where `ld.so` searches: `lib64/ld-linux-x86-64.so.2` and
+  `lib64/libc.so.6`. `execve` and `openat` strip the leading `/` through
+  `bundle_path`, so `/lib64/...` resolves. `ld.so` opening `/etc/ld.so.cache`
+  and getting `-ENOENT` is fine; it falls back to the default directories.
+  Two ways to supply them, from simplest to the intended design:
+  - Copy the host files into the bundle staging directory (the quick path, like
+    the `EXTRA_BUNDLE_FILES` hook used for the busybox and make probes).
+  - Graft a runtime as a read-only mount. The repo already has the mechanism:
+    the manifest `mount` entry served by the `p9graft` backend (M13) grafts a
+    shared read-only tree at a path. A bundled runtime, or the host's own
+    `/lib64` and `/usr/lib`, can be grafted in rather than copied file by file.
+    This is the design to aim for, since it lets the guest pick up either an
+    installed runtime or the system's native one without baking libraries into
+    each image.
 - RAM and window sizing. The user window is 24 MiB
   (`[0x400000, 0x1C00000)` in `arch/x86_64_vmspace.h`) and total guest RAM is
   32 MiB. Eager-filling `libc.so.6` into private frames, plus the executable,
@@ -250,6 +259,12 @@ New tag values: `AT_PHDR=3`, `AT_PHENT=4`, `AT_PHNUM=5`, `AT_BASE=7`,
 1. File-backed `mmap` and `pread64` first, proved in isolation with a static
    program that opens a bundle file, maps it `MAP_PRIVATE`, and reads the bytes
    back. No loader changes yet. This de-risks the core piece on its own.
+   **Done.** `example/linuxmmap.c` (run with `make linux-spike SPIKE_PROG=linuxmmap`)
+   checks a `MAP_PRIVATE` file mapping against a plain `read`, a `pread` at a
+   nonzero offset, and a `MAP_FIXED` overlay onto a prior anonymous reservation,
+   which is the exact move the dynamic linker makes. The committed musl tests
+   (including the `linuxmem` heap test that leans on anonymous `mmap`) still
+   pass. See the mmap and pread64 rows in `doc/linux-syscalls.md`.
 2. `elf_load_ex`, ET_DYN loading, and the fuller auxv, proved with a dynamic
    `hello` built against musl's `ld-musl-x86_64.so.1`. One small interpreter
    and one `DT_NEEDED`, simpler than glibc. Stage the musl loader and

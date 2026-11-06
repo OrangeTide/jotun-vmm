@@ -25,6 +25,7 @@
 #define SYS_rt_sigaction    13
 #define SYS_rt_sigprocmask  14
 #define SYS_ioctl           16
+#define SYS_pread64         17
 #define SYS_writev          20
 #define SYS_pipe            22
 #define SYS_sched_yield     24
@@ -116,6 +117,14 @@ tf_set_tls(struct trapframe *tf, uint64_t tls)
 {
     (void)tf;
     (void)tls;
+}
+
+/* The 6th syscall argument (mmap's offset), which the dispatcher's register
+ * set stops short of. On x86-64 syscall arg 6 is r9. */
+static inline uint64_t
+tf_arg6(struct trapframe *tf)
+{
+    return tf->r9;
 }
 
 /* x86-64 MSRs for the SYSCALL path. */

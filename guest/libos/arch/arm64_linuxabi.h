@@ -23,6 +23,7 @@
 #define SYS_getdents64      61
 #define SYS_lseek           62
 #define SYS_read            63
+#define SYS_pread64         67
 #define SYS_write           64
 #define SYS_writev          66
 #define SYS_readlinkat      78
@@ -109,6 +110,14 @@ static inline void
 tf_set_tls(struct trapframe *tf, uint64_t tls)
 {
     tf->tpidr = tls;
+}
+
+/* The 6th syscall argument (mmap's offset), which the dispatcher's register
+ * set stops short of. On AArch64 syscall arg 6 is x5. */
+static inline uint64_t
+tf_arg6(struct trapframe *tf)
+{
+    return tf->x[5];
 }
 
 /* Load the thread pointer into TPIDR_EL0. The SVC restore also sets it from the

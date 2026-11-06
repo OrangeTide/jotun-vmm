@@ -47,6 +47,8 @@
 #define PAGE_SIZE          0x1000ULL
 
 /* mmap flags and failure value. */
+#define MAP_PRIVATE   0x02
+#define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
 #define MMAP_FAILED   (-LERR_NOMEM)
 
@@ -276,6 +278,7 @@ struct lproc *lproc_cur;
 
 static long do_execve(const char *path, const char *const *argv,
                       const char *const *envp);
+static struct lfd *fd_get(long fd);
 static vmspace_t linux_vmspace_setup(void);
 /* linux_jump is declared by the arch backend (linux_arch.h); linux_resume takes
  * struct lproc, which is defined here, so it is declared here. */
@@ -303,19 +306,69 @@ do_brk(uint64_t want)
     return (long)brk_cur;
 }
 
+/* Copy [off, off+len) of the file open on fd into guest VAs [va, va+len). The
+ * writes fault each page in via pf_handle (a zeroed frame), so the tail of the
+ * last page past end-of-file is already zero: that is the implicit .bss fill a
+ * file mapping gets for the part of the final page beyond the file. There is no
+ * lazy file paging and no copy-on-write; the mapping is a private eager copy,
+ * which suits a run-once program and matches how elf_load_fid loads. */
 static long
-do_mmap(uint64_t addr, uint64_t len, uint64_t flags, long fd)
+mmap_fill(long fd, uint64_t va, uint64_t off, uint64_t len)
 {
-    (void)addr;
-    if (!(flags & MAP_ANONYMOUS) && fd >= 0)
-        return MMAP_FAILED;             /* file-backed mmap unsupported */
+    struct lfd *f = fd_get(fd);
+    if (!f || f->iscon || f->ispipe || f->isdir)
+        return -LERR_BADF;
+    uint8_t *dst = (uint8_t *)(uintptr_t)va;
+    if (f->isram) {                     /* ramfs file: copy from its buffer */
+        struct ramfile *rf = &ramfs[f->ridx];
+        for (uint64_t i = 0; i < len && off + i < rf->len; i++)
+            dst[i] = rf->data[off + i];
+        return 0;
+    }
+    uint64_t done = 0;                  /* 9P bundle file */
+    while (done < len) {
+        long n = p9_read(f->p9fid, off + done, dst + done, (uint32_t)(len - done));
+        if (n <= 0)
+            break;                      /* short read: the rest stays zero */
+        done += (uint64_t)n;
+    }
+    return 0;
+}
+
+/* mmap(addr, len, prot, flags, fd, off). prot is not enforced: pf_handle maps
+ * every user page writable, so this grants access, it does not restrict it.
+ * MAP_FIXED maps at the exact address (the dynamic linker overlays a file
+ * segment onto a span it first reserved); otherwise the mapping is bump
+ * allocated descending from the top of the arena. Anonymous pages need nothing,
+ * since pf_handle zeroes each frame on first touch. */
+static long
+do_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags,
+        long fd, uint64_t off)
+{
+    (void)prot;
     uint64_t n = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    if (n == 0 || mmap_cur - n < brk_cur)
+    if (n == 0)
         return MMAP_FAILED;
-    mmap_cur -= n;
-    /* The pages fault in zeroed on first touch (phys_alloc clears frames), so
-     * anonymous memory reads as zero without eager mapping. */
-    return (long)mmap_cur;
+
+    uint64_t va;
+    if (flags & MAP_FIXED) {
+        va = addr & ~(PAGE_SIZE - 1);
+        if (va < VM_USER_LO || va + n > VM_USER_HI)
+            return MMAP_FAILED;
+        /* An overlay inside an existing reservation: do not move mmap_cur. */
+    } else {
+        if (mmap_cur - n < brk_cur)
+            return MMAP_FAILED;
+        mmap_cur -= n;
+        va = mmap_cur;
+    }
+
+    if (!(flags & MAP_ANONYMOUS) && fd >= 0) {
+        long r = mmap_fill(fd, va, off, len);
+        if (r < 0)
+            return r;
+    }
+    return (long)va;
 }
 
 /* fds 0,1,2 are the console; higher fds are 9P-backed. */
@@ -683,6 +736,29 @@ do_read(long fd, void *buf, unsigned long count)
         return -LERR_INVAL;
     f->pos += (uint64_t)n;
     return n;
+}
+
+/* pread: read at an explicit offset without moving the fd cursor. The dynamic
+ * linker reads library program headers this way. Pipes and the console have no
+ * position, so they are rejected. */
+static long
+do_pread(long fd, void *buf, unsigned long count, uint64_t off)
+{
+    struct lfd *f = fd_get(fd);
+
+    if (!f || f->iscon || f->ispipe || f->isdir)
+        return -LERR_BADF;
+    if (f->isram) {
+        struct ramfile *rf = &ramfs[f->ridx];
+        if (off >= rf->len)
+            return 0;
+        uint32_t avail = rf->len - (uint32_t)off;
+        uint32_t n = count < avail ? (uint32_t)count : avail;
+        memcpy(buf, rf->data + off, n);
+        return n;
+    }
+    long n = p9_read(f->p9fid, off, buf, (uint32_t)count);
+    return n < 0 ? -LERR_INVAL : n;
 }
 
 static long
@@ -1334,7 +1410,10 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_brk:
         return do_brk((uint64_t)a1);
     case SYS_mmap:
-        return do_mmap((uint64_t)a1, (uint64_t)a2, (uint64_t)a4, a5);
+        /* The 6th argument (offset) is not in the dispatcher's register set;
+         * read it from the saved trapframe. */
+        return do_mmap((uint64_t)a1, (uint64_t)a2, (uint64_t)a3, (uint64_t)a4,
+                       a5, tf_arg6(&lproc_cur->tf));
     case SYS_munmap:
         return 0;                       /* bump arena: no reclaim */
     case SYS_time: {
@@ -1376,6 +1455,8 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return -LERR_NOTTY;             /* no tty: musl falls back */
     case SYS_read:
         return do_read(a1, (void *)a2, (unsigned long)a3);
+    case SYS_pread64:
+        return do_pread(a1, (void *)a2, (unsigned long)a3, (uint64_t)a4);
     case SYS_write:
         return do_write(a1, (const char *)a2, (unsigned long)a3);
     case SYS_writev:
