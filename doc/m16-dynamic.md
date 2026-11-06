@@ -268,10 +268,57 @@ New tag values: `AT_PHDR=3`, `AT_PHENT=4`, `AT_PHNUM=5`, `AT_BASE=7`,
 2. `elf_load_ex`, ET_DYN loading, and the fuller auxv, proved with a dynamic
    `hello` built against musl's `ld-musl-x86_64.so.1`. One small interpreter
    and one `DT_NEEDED`, simpler than glibc. Stage the musl loader and
-   `libc.so`.
+   `libc.so`. **Done.** See "Step 2 result" below.
 3. glibc: stage the host `ld-linux-x86-64.so.2` and `libc.so.6`, run a dynamic
    glibc hello, then the host's real `/usr/bin/sed`. That last step is the
    thesis, an unmodified host binary running under the trap.
+
+## Step 2 result
+
+The loader gained `elf_load_ex` (in `elfload.c`), which loads an ET_EXEC at its
+fixed vaddr or an ET_DYN at a caller-chosen bias, and reports the entry, bias,
+in-memory program-header address, and any `PT_INTERP` path. `elf_load_fid` is
+now a thin wrapper over it, so the native loader and the static non-PIE path are
+unchanged. In `linuxelf.c`, `load_program` loads the executable at
+`LINUX_PROG_BASE`, and when it has an interpreter, loads that just above the
+executable (2 MiB aligned) and returns the interpreter's entry. `build_stack_vec`
+now writes the full auxv the dynamic linker reads: `AT_PHDR`, `AT_PHENT`,
+`AT_PHNUM`, `AT_BASE`, `AT_ENTRY`, `AT_EXECFN`, `AT_PAGESZ`, `AT_RANDOM`,
+`AT_SECURE`, the uid/gid tags, and `AT_HWCAP`.
+
+Proved with a dynamic musl `hello` (`musl-gcc -O2`, an ET_DYN PIE whose
+interpreter is `/lib/ld-musl-x86_64.so.1`). The musl loader is itself `libc.so`,
+so the one `DT_NEEDED` on `libc.so` is self-satisfied and no library open is
+needed. Staged by hand, since it needs the host musl loader:
+
+```
+d=bundle-staging/x86_64
+mkdir -p $d/boot $d/lib
+cp example/bundle/* $d/; cp libos.elf $d/boot/kernel; cp hello.elf $d/hello
+musl-gcc -O2 -o $d/hellodyn example/linuxhello.c
+cp /usr/lib/x86_64-linux-musl/libc.so $d/lib/ld-musl-x86_64.so.1
+./jbundle -d bundle-depot --ref root --name jotun-demo --arch x86_64=$d
+./castool -d bundle-depot pack
+JOTUN_BUNDLE=bundle-depot JOTUN_REF=root ./jotun libos.elf bin hellodyn
+```
+
+```
+[bin] loaded, entry=0x000000000067bf0e interp=/lib/ld-musl-x86_64.so.1 base=0x0000000000600000
+...
+hello from musl
+[bin] pid 1 exited, status=0
+```
+
+The interpreter is staged at the nested bundle path `lib/ld-musl-x86_64.so.1`,
+which the loader resolves through `bundle_path` and `ns_walk`. This is the same
+path handling a read-only runtime mount will use, so real host paths like
+`/lib64/ld-linux-x86-64.so.2` need no loader change, only the file served there.
+The exe loads at `0x400000`, the interpreter at `0x600000`, both below the heap
+base at `0x800000`; glibc's larger `libc.so.6` may push the interpreter past
+that, so step 3 likely raises the heap base or places the interpreter higher.
+Zero unhandled syscalls, and all ten committed static tests still pass. The dynamic
+musl hello stays a documented manual probe, like the busybox and make runs,
+because it needs the host musl loader rather than a committed bundle file.
 
 ## The cut line
 

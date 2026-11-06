@@ -31,6 +31,7 @@
 /* The 9P fid used to load the program ELF, distinct from the native loader's
  * (prog.c uses 10), and the pool of fids backing open file descriptors. */
 #define LINUX_FID      12u
+#define LINUX_IFID     13u          /* loads the PT_INTERP dynamic linker */
 #define LINUX_FID_BASE 32u          /* open files use fids 32..32+LINUX_NFD */
 
 /* The Linux program's address space, independent of the native program window.
@@ -93,9 +94,24 @@
 #define LERR_AGAIN  11          /* EAGAIN */
 
 /* ELF auxv entry tags. */
-#define AT_NULL   0
-#define AT_PAGESZ 6
+#define AT_NULL    0
+#define AT_PHDR    3
+#define AT_PHENT   4
+#define AT_PHNUM   5
+#define AT_PAGESZ  6
+#define AT_BASE    7
+#define AT_ENTRY   9
+#define AT_UID    11
+#define AT_EUID   12
+#define AT_GID    13
+#define AT_EGID   14
+#define AT_HWCAP  16
+#define AT_SECURE 23
 #define AT_RANDOM 25
+#define AT_EXECFN 31
+
+/* How many auxv entries build_stack_vec writes, AT_NULL included. */
+#define LINUX_NAUXV 15
 
 /* The program stack lives at the top of the per-process user window, its pages
  * pre-mapped so growth never faults (which would fault on the stack itself). */
@@ -1611,14 +1627,17 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
 /* Build a System V initial stack at the top of the user window from explicit
  * argv and envp vectors (the stack pages must already be mapped and this
  * process's CR3 active) and return the rsp to enter with: argc, argv[], NULL,
- * envp[], NULL,
- * auxv (AT_PAGESZ, AT_RANDOM, AT_NULL), with the strings and 16 random bytes
- * placed above it. The argv/envp string pointers must stay valid during the
- * build (they come from boot data or an execve snapshot, never live user mem
- * that this overwrites). */
+ * envp[], NULL, auxv, with the strings and 16 random bytes placed above it. The
+ * auxv (AT_PHDR/PHENT/PHNUM/BASE/ENTRY and the identity and AT_RANDOM/EXECFN
+ * tags) is what a dynamic linker reads to find the program image it must
+ * relocate; exe describes the loaded executable and interp the loaded dynamic
+ * linker (AT_BASE), or has_interp is 0 for a static image. The argv/envp string
+ * pointers must stay valid during the build (they come from boot data or an
+ * execve snapshot, never live user memory that this overwrites). */
 static uint64_t
 build_stack_vec(const char *const *argv, int argc,
-                const char *const *envp, int envc)
+                const char *const *envp, int envc,
+                const struct elf_info *exe, const struct elf_info *interp)
 {
     uint8_t *sp = (uint8_t *)(uintptr_t)LINUX_USTACK_TOP;
     char *argp[LINUX_MAX_ARGS];
@@ -1648,8 +1667,8 @@ build_stack_vec(const char *const *argv, int argc,
 
     /* The control block below that, 16-byte aligned as the entry contract wants
      * rsp (pointing at argc) to be. Words: argc, argv[0..], NULL, envp[0..],
-     * NULL, three auxv pairs. */
-    int nwords = 1 + argc + 1 + envc + 1 + 6;
+     * NULL, LINUX_NAUXV auxv pairs. */
+    int nwords = 1 + argc + 1 + envc + 1 + 2 * LINUX_NAUXV;
     uint64_t *blk = (uint64_t *)((uintptr_t)sp - (uintptr_t)nwords * 8);
     blk = (uint64_t *)((uintptr_t)blk & ~(uintptr_t)0xF);
 
@@ -1661,8 +1680,20 @@ build_stack_vec(const char *const *argv, int argc,
     for (int i = 0; i < envc; i++)
         blk[w++] = (uintptr_t)envpp[i];
     blk[w++] = 0;                       /* envp terminator */
+    blk[w++] = AT_PHDR;   blk[w++] = exe->phdr;
+    blk[w++] = AT_PHENT;  blk[w++] = exe->phentsize;
+    blk[w++] = AT_PHNUM;  blk[w++] = exe->phnum;
+    blk[w++] = AT_BASE;   blk[w++] = exe->has_interp ? interp->bias : 0;
+    blk[w++] = AT_ENTRY;  blk[w++] = exe->entry;
+    blk[w++] = AT_EXECFN; blk[w++] = (uintptr_t)argp[0];
     blk[w++] = AT_PAGESZ; blk[w++] = 4096;
     blk[w++] = AT_RANDOM; blk[w++] = (uintptr_t)rnd;
+    blk[w++] = AT_SECURE; blk[w++] = 0;
+    blk[w++] = AT_UID;    blk[w++] = 0;
+    blk[w++] = AT_EUID;   blk[w++] = 0;
+    blk[w++] = AT_GID;    blk[w++] = 0;
+    blk[w++] = AT_EGID;   blk[w++] = 0;
+    blk[w++] = AT_HWCAP;  blk[w++] = 0;
     blk[w++] = AT_NULL;   blk[w++] = 0;
 
     return (uint64_t)(uintptr_t)blk;
@@ -1672,7 +1703,8 @@ build_stack_vec(const char *const *argv, int argc,
  * boot arguments after it, no environment. `./jotun libos.elf bin <file>
  * <args...>` thus reaches the program as <file> <args...>. */
 static uint64_t
-build_stack(const char *argv0)
+build_stack(const char *argv0, const struct elf_info *exe,
+            const struct elf_info *interp)
 {
     const char *args[LINUX_MAX_ARGS];
     int argc = 0;
@@ -1680,7 +1712,7 @@ build_stack(const char *argv0)
     args[argc++] = argv0;
     for (int i = 2; i < boot_argc() && argc < LINUX_MAX_ARGS; i++)
         args[argc++] = boot_argv(i);
-    return build_stack_vec(args, argc, NULL, 0);
+    return build_stack_vec(args, argc, NULL, 0, exe, interp);
 }
 
 /* Copy a NULL-terminated user vector of string pointers into out[] with the
@@ -1709,6 +1741,42 @@ copy_uvec(const char *const *uvec, const char **out, char *buf, size_t buflen)
 }
 
 #define EXEC_STR_MAX 8192
+
+/* Load a program already open on LINUX_FID into the active address space, and
+ * its PT_INTERP dynamic linker if it has one. The executable loads at
+ * LINUX_PROG_BASE (an ET_DYN PIE biased there, an ET_EXEC at its fixed vaddr);
+ * the interpreter loads just above it, 2 MiB aligned. On return *entry is where
+ * to begin: the interpreter's entry when present (it relocates, then jumps to
+ * the executable via AT_ENTRY), else the executable's own. Returns 0, or -1 on
+ * any load error. */
+static int
+load_program(struct elf_info *exe, struct elf_info *interp, uint64_t *entry)
+{
+    if (elf_load_ex(LINUX_FID, VM_USER_LO, VM_USER_HI, LINUX_PROG_BASE, exe) != 0)
+        return -1;
+
+    if (!exe->has_interp) {
+        interp->has_interp = 0;
+        *entry = exe->entry;
+        return 0;
+    }
+
+    const char *irel = bundle_path(exe->interp);
+    if (ns_walk(irel, LINUX_IFID) != 0)
+        return -1;
+    if (p9_open(LINUX_IFID) != 0) {
+        p9_clunk(LINUX_IFID);
+        return -1;
+    }
+    uint64_t ibase = (exe->load_end + 0x1FFFFF) & ~0x1FFFFFULL;  /* 2 MiB aligned */
+    int r = elf_load_ex(LINUX_IFID, VM_USER_LO, VM_USER_HI, ibase, interp);
+    p9_clunk(LINUX_IFID);
+    if (r != 0)
+        return -1;
+
+    *entry = interp->entry;
+    return 0;
+}
 
 /* execve: replace the running image with a bundle program. The new argv/envp
  * are snapshotted into kernel memory first (they may point into the image we
@@ -1752,9 +1820,11 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     }
     vmspace_switch(as);
 
-    uint64_t entry = elf_load_fid(LINUX_FID, LINUX_PROG_BASE, LINUX_PROG_LIMIT);
+    struct elf_info exe, interp;
+    uint64_t entry;
+    int lr = load_program(&exe, &interp, &entry);
     p9_clunk(LINUX_FID);
-    if (entry == 0) {
+    if (lr != 0) {
         vmspace_switch(old);            /* keep the old image on failure */
         vmspace_destroy(as);
         kfree(sbuf);
@@ -1764,7 +1834,7 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     lproc_cur->sh->vmspace = as;        /* the resume hook now restores this one */
     brk_cur = LINUX_HEAP_BASE;          /* fresh heap for the new image */
     mmap_cur = mmap_top;
-    uint64_t rsp = build_stack_vec(na, argc, ne, envc);
+    uint64_t rsp = build_stack_vec(na, argc, ne, envc, &exe, &interp);
     kfree(sbuf);
     vmspace_destroy(old);               /* release the replaced image's frames */
 
@@ -1840,21 +1910,29 @@ linux_elf_run(const char *file)
         con_puts("[bin] open failed\n");
         return;
     }
-    uint64_t entry = elf_load_fid(LINUX_FID, LINUX_PROG_BASE, LINUX_PROG_LIMIT);
+    struct elf_info exe, interp;
+    uint64_t entry;
+    int lr = load_program(&exe, &interp, &entry);
     p9_clunk(LINUX_FID);
-    if (entry == 0) {
-        con_puts("[bin] load failed (not ET_EXEC at 0x400000?)\n");
+    if (lr != 0) {
+        con_puts("[bin] load failed (bad ELF, or interpreter not in bundle?)\n");
         return;
     }
     con_puts("[bin] loaded, entry=");
     con_puthex(entry);
+    if (exe.has_interp) {
+        con_puts(" interp=");
+        con_puts(exe.interp);
+        con_puts(" base=");
+        con_puthex(interp.bias);
+    }
     con_putc('\n');
 
     fds_init();
     arena_init();
     linux_trap_init();
     con_puts("[bin] syscall armed\n");
-    uint64_t rsp = build_stack(file);
+    uint64_t rsp = build_stack(file, &exe, &interp);
     con_puts("[bin] stack built\n");
 
     con_puts("[bin] entering guest\n");
