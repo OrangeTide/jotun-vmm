@@ -1450,6 +1450,17 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     }
     case SYS_readlinkat:
         return -LERR_INVAL;             /* nothing in the bundle is a symlink */
+    case SYS_faccessat:
+    case SYS_faccessat2: {
+        /* faccessat(dirfd, path, mode, ...): the bundle and ramfs carry no
+         * permission bits, so an existing path is accessible for any mode.
+         * Paths are resolved against the bundle root; dirfd is AT_FDCWD in
+         * practice. make checks its shell this way before execve. */
+        int isdir;
+        uint64_t size, ino;
+        long r = meta_path((const char *)a2, &isdir, &size, &ino);
+        return r < 0 ? r : 0;
+    }
     case SYS_fcntl:
         return 0;                       /* minimal: accept F_SETFD/F_SETFL */
     case SYS_execve:

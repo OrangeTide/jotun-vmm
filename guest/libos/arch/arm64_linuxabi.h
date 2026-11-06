@@ -16,6 +16,7 @@
 #define SYS_dup3            24
 #define SYS_fcntl           25
 #define SYS_ioctl           29
+#define SYS_faccessat       48
 #define SYS_openat          56
 #define SYS_close           57
 #define SYS_pipe2           59
@@ -58,6 +59,7 @@
 #define SYS_getrandom       278
 #define SYS_statx           291
 #define SYS_rseq            293
+#define SYS_faccessat2      439
 
 /* Not present on AArch64: distinct sentinels so the shared cases never match a
  * real (non-negative) call number. */

@@ -59,6 +59,7 @@
 #define SYS_openat          257
 #define SYS_newfstatat      262
 #define SYS_readlinkat      267
+#define SYS_faccessat       269
 #define SYS_set_robust_list 273
 #define SYS_dup3            292
 #define SYS_pipe2           293
@@ -66,6 +67,7 @@
 #define SYS_getrandom       318
 #define SYS_statx           332
 #define SYS_rseq            334
+#define SYS_faccessat2      439
 
 /* arch_prctl subfunction: set the FS base (TLS). */
 #define ARCH_SET_FS 0x1002
