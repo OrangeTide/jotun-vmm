@@ -1523,10 +1523,18 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_pipe2((int *)a1);     /* flags (O_CLOEXEC/O_NONBLOCK) ignored */
     case SYS_statfs:
     case SYS_fstatfs:
-        /* No real filesystem to describe. Report ENOSYS quietly; callers such
-         * as libselinux probing for a filesystem type fall back cleanly, and a
-         * logged "unhandled" line here would pollute a tool's output stream. */
+    case SYS_mincore:
+        /* Nothing to describe (no real filesystem; no page residency to report).
+         * Report ENOSYS quietly: callers such as libselinux probing a filesystem
+         * type, or a residency hint, fall back cleanly, and a logged "unhandled"
+         * line here would pollute a tool's output stream. */
         return -LERR_NOSYS;
+    case SYS_getgroups:
+        return 0;                       /* no supplementary groups */
+    case SYS_getpgrp:
+        return 1;                       /* a single process group */
+    case SYS_sigaltstack:
+        return 0;                       /* no signal delivery: accept and ignore */
     case SYS_dup: {
         struct lfd *f = fd_get(a1);
         if (!f || a1 < 3)

@@ -30,6 +30,7 @@
 #define SYS_access          21
 #define SYS_pipe            22
 #define SYS_sched_yield     24
+#define SYS_mincore         27
 #define SYS_madvise         28
 #define SYS_dup             32
 #define SYS_dup2            33
@@ -48,6 +49,9 @@
 #define SYS_geteuid         107
 #define SYS_getegid         108
 #define SYS_getppid         110
+#define SYS_getpgrp         111
+#define SYS_getgroups       115
+#define SYS_sigaltstack     131
 #define SYS_statfs          137
 #define SYS_fstatfs         138
 #define SYS_prctl           157

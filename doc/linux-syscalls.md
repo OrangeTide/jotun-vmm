@@ -26,7 +26,7 @@ Statuses used below:
 - **stub**: accepted and ignored (returns 0 or a fixed value) with no real
   effect; present so startup and common idioms do not fail.
 
-## Implemented (62 calls)
+## Implemented (66 calls)
 
 ### File and directory I/O
 
@@ -69,6 +69,7 @@ Statuses used below:
 | 10 | mprotect | stub | flat RW map, nothing to enforce |
 | 11 | munmap | stub | returns 0; the bump arena does not reclaim |
 | 12 | brk | full | grows the heap within the arena |
+| 27 | mincore | stub | quiet ENOSYS; no page-residency to report |
 | 28 | madvise | stub | returns 0 |
 
 ### Process and thread lifecycle
@@ -84,6 +85,9 @@ Statuses used below:
 | 231 | exit_group | full | ends the process |
 | 39 | getpid | full | process pid |
 | 110 | getppid | full | parent pid |
+| 111 | getpgrp | stub | returns 1, a single process group |
+| 115 | getgroups | stub | returns 0, no supplementary groups |
+| 131 | sigaltstack | stub | returns 0; no signal delivery, so accepted and ignored |
 | 186 | gettid | full | thread id |
 | 218 | set_tid_address | full | records the clear-on-exit tid address |
 

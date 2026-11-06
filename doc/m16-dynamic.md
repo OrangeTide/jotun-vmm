@@ -465,6 +465,25 @@ This is the "system's native runtime" half of the goal: the two mount kinds,
 `host:<path>` and a bundle, let a guest run against the host's live libraries or
 against a packed, content-addressed runtime, whichever the operator mounts.
 
+The host's `gawk` runs the same way, from an app bundle holding only the binary,
+a program file, and its input, with its seven libraries
+(`libsigsegv`, `libreadline`, `libmpfr`, `libgmp`, `libm`, `libc`, `libtinfo`)
+served from the live `/usr/lib`:
+
+```
+init bin gawk -f prog.awk data.txt
+mount lib64 host:/usr/lib/x86_64-linux-gnu
+mount lib   host:/usr/lib
+```
+
+`gawk '{ s[$1] += $2 } END { for (k in s) print k, s[k] }'` sums its input
+correctly. Bringing it up added quiet stubs for the calls its startup makes that
+were not yet serviced: `mincore` (ENOSYS), `getpgrp`, `getgroups`, and
+`sigaltstack` (libsigsegv installs a SIGSEGV handler on an alternate stack;
+there is no signal delivery, so the call is accepted and ignored). With those,
+gawk runs with zero unhandled syscalls. The manifest tokenizes `init` on spaces,
+so a multi-word program goes in a file read with `gawk -f`, not inline.
+
 ## The cut line
 
 Held against scope creep, and all deferred to later hardening milestones:

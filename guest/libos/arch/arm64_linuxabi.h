@@ -18,6 +18,9 @@
 #define SYS_ioctl           29
 #define SYS_statfs          43
 #define SYS_fstatfs         44
+#define SYS_sigaltstack     132
+#define SYS_getgroups       158
+#define SYS_mincore         232
 #define SYS_faccessat       48
 #define SYS_openat          56
 #define SYS_close           57
@@ -76,6 +79,7 @@
 #define SYS_arch_prctl (-8)
 #define SYS_time       (-9)
 #define SYS_access     (-10)
+#define SYS_getpgrp    (-11)
 
 /* arch_prctl is x86-only; defined so the shared case body compiles. */
 #define ARCH_SET_FS 0x1002
