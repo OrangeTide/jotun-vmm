@@ -1557,6 +1557,8 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_mprotect:
     case SYS_madvise:
         return 0;                       /* flat RW map, nothing to enforce */
+    case SYS_fadvise64:
+        return 0;                       /* advisory only; accept and ignore */
     case SYS_brk:
         return do_brk((uint64_t)a1);
     case SYS_mmap:
@@ -1583,6 +1585,17 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         }
         return 0;
     }
+    case SYS_gettimeofday: {
+        uint64_t t = arch_cycles();
+        uint64_t *tv = (uint64_t *)a1;    /* struct timeval { sec; usec; } */
+        if (tv) {
+            tv[0] = t / 1000000000ULL;
+            tv[1] = (t / 1000ULL) % 1000000ULL;
+        }
+        return 0;
+    }
+    case SYS_socket:
+        return -LERR_NOSYS;             /* no sockets in this guest; quiet */
     case SYS_getrandom: {
         uint8_t *buf = (uint8_t *)a1;
         unsigned long len = (unsigned long)a2;

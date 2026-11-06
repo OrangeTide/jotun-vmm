@@ -26,7 +26,7 @@ Statuses used below:
 - **stub**: accepted and ignored (returns 0 or a fixed value) with no real
   effect; present so startup and common idioms do not fail.
 
-## Implemented (77 calls)
+## Implemented (80 calls)
 
 ### File and directory I/O
 
@@ -72,6 +72,7 @@ Statuses used below:
 | 12 | brk | full | grows the heap within the arena |
 | 27 | mincore | stub | quiet ENOSYS; no page-residency to report |
 | 28 | madvise | stub | returns 0 |
+| 221 | fadvise64 | stub | returns 0; advisory only (coreutils calls posix_fadvise on its input) |
 
 ### Process and thread lifecycle
 
@@ -117,6 +118,12 @@ Statuses used below:
 | 14 | rt_sigprocmask | stub | returns 0; no delivery |
 | 234 | tgkill | stub | returns 0; no delivery |
 
+### Sockets
+
+| nr | name | status | notes |
+|----|------|--------|-------|
+| 41 | socket | stub | quiet ENOSYS; no sockets in this guest (bash probes for one at startup) |
+
 ### Thread-local storage, identity, time, misc
 
 | nr | name | status | notes |
@@ -128,6 +135,7 @@ Statuses used below:
 | 108 | getegid | stub | returns 0 |
 | 157 | prctl | stub | returns 0 |
 | 201 | time | partial | derived from the cycle counter (approximate) |
+| 96 | gettimeofday | partial | cycle counter split into seconds and microseconds, as clock_gettime |
 | 228 | clock_gettime | partial | cycle counter at an assumed 1 GHz |
 | 63 | uname | full | fixed Linux/jotun/x86_64 fields |
 | 318 | getrandom | partial | cycle-counter PRNG, not cryptographic |
@@ -153,7 +161,6 @@ source.
 | 17 | pread64 | high | easy | positioned read over the existing fd read |
 | 18 | pwrite64 | med | easy | positioned write (ramfs) |
 | 40 | sendfile | high | easy | return ENOSYS cleanly, or a read/write loop; silences the cat/cp path |
-| 96 | gettimeofday | high | easy | reuse the clock_gettime source |
 | 35 | nanosleep | high | medium | cooperative: yield or a timed block; busybox sleep, retries |
 | 230 | clock_nanosleep | med | medium | same mechanism as nanosleep |
 | 21 | access | high | easy | stat-based existence/permission check |
@@ -216,7 +223,7 @@ target workload needs it.
 | 15 | rt_sigreturn | med | hard | pairs with real signal delivery |
 | 62 | kill | med | hard | inter-process signal delivery |
 | 131 | sigaltstack | low | medium | needed once signals deliver |
-| 41 | socket | med | hard | bridge to the guest net layer (net.c, dial strings) |
+| 41 | socket | med | hard | currently a quiet ENOSYS stub; real support bridges to the guest net layer (net.c, dial strings) |
 | 42 | connect | med | hard | net layer |
 | 43 | accept | med | hard | net layer |
 | 44-47 | sendto/recvfrom/sendmsg/recvmsg | med | hard | net layer datagram and stream I/O |

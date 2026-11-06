@@ -35,6 +35,7 @@
 #define SYS_dup             32
 #define SYS_dup2            33
 #define SYS_getpid          39
+#define SYS_socket          41
 #define SYS_clone           56
 #define SYS_fork            57
 #define SYS_vfork           58
@@ -45,6 +46,7 @@
 #define SYS_fcntl           72
 #define SYS_getcwd          79
 #define SYS_chdir           80
+#define SYS_gettimeofday    96
 #define SYS_getuid          102
 #define SYS_setuid          105
 #define SYS_setgid          106
@@ -71,6 +73,7 @@
 #define SYS_futex           202
 #define SYS_getdents64      217
 #define SYS_set_tid_address 218
+#define SYS_fadvise64       221
 #define SYS_clock_gettime   228
 #define SYS_exit_group      231
 #define SYS_tgkill          234

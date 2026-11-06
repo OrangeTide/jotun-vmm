@@ -529,6 +529,42 @@ The recipe shell is the host's `/bin/sh` (dash), grafted from the live `/bin`
 shell, and the shells' three child processes all run with zero unhandled
 syscalls.
 
+## bash: an interactive-class shell
+
+bash is the heaviest tool run so far. It is a PIE, so it loads at a bias the
+same way `ld.so` does, and it needs `libtinfo` alongside `libc`, both pulled
+from the host's live `/usr/lib`. A builtins-only script runs first (variables,
+`for`, arithmetic, a function), then a script that forks external commands
+through a pipe:
+
+```
+init bin bash bashtest.sh
+mount lib64   host:/usr/lib/x86_64-linux-gnu
+mount lib     host:/usr/lib
+mount hostbin host:/usr/bin
+```
+
+```
+export PATH=/hostbin
+echo one two three four | wc -w      ->  4
+echo hello | tr a-z A-Z              ->  HELLO
+```
+
+bash finds `wc` and `tr` on `PATH`, forks, wires the pipe with `pipe2` and
+`dup2`, and `execve`s each from the grafted `/usr/bin`. Those are unmodified
+host coreutils binaries, dynamic glibc PIEs, so each one is itself loaded
+through the ld.so path and runs its own libc from the same mount. The whole
+pipeline (bash plus four child processes) runs with zero unhandled syscalls.
+
+Three small calls surfaced and were added, all additive:
+
+- `gettimeofday` (96): bash reads the wall clock at startup. Split from the
+  cycle counter the same way as `clock_gettime`.
+- `socket` (41): bash probes for a socket during init. There are no sockets in
+  this guest, so it returns a quiet ENOSYS and bash falls back cleanly.
+- `fadvise64` (221): coreutils calls `posix_fadvise` on its input. It is
+  advisory, so the stub returns 0.
+
 ## The cut line
 
 Held against scope creep, and all deferred to later hardening milestones:

@@ -56,6 +56,7 @@
 #define SYS_rt_sigprocmask  135
 #define SYS_uname           160
 #define SYS_prctl           167
+#define SYS_gettimeofday    169
 #define SYS_getpid          172
 #define SYS_getppid         173
 #define SYS_getuid          174
@@ -63,9 +64,11 @@
 #define SYS_getgid          176
 #define SYS_getegid         177
 #define SYS_gettid          178
+#define SYS_socket          198
 #define SYS_brk             214
 #define SYS_munmap          215
 #define SYS_clone           220
+#define SYS_fadvise64       223
 #define SYS_execve          221
 #define SYS_mmap            222
 #define SYS_mprotect        226
