@@ -101,6 +101,7 @@
 #define LERR_XDEV   18          /* EXDEV: cross-device link/rename */
 #define LERR_ISDIR  21          /* EISDIR */
 #define LERR_NOTEMPTY 39        /* ENOTEMPTY */
+#define LERR_RANGE  34          /* ERANGE: getcwd buffer too small */
 
 /* ELF auxv entry tags. */
 #define AT_NULL    0
@@ -285,6 +286,11 @@ struct lshared {
      * loaded program image, which varies by binary); heap_mmap grows down from
      * heap_mmaptop. A bump allocator; munmap does not reclaim. */
     uint64_t heap_base, heap_brk, heap_mmap, heap_mmaptop;
+    /* The current working directory, as a normalized overlay key (bundle-relative,
+     * no leading slash; "" is the root). Relative paths resolve against it. It is
+     * per-process: shared by a process's threads, copied on fork and on the
+     * posix_spawn child, and preserved across execve. */
+    char     cwd[RAMFS_NAME];
 };
 
 /* A thread: one schedulable context. Its trapframe (the arch's user register
@@ -325,6 +331,7 @@ struct lproc *lproc_cur;
 #define brk_cur   (lproc_cur->sh->heap_brk)
 #define mmap_cur  (lproc_cur->sh->heap_mmap)
 #define mmap_top  (lproc_cur->sh->heap_mmaptop)
+#define cwd_key   (lproc_cur->sh->cwd)
 
 static long do_execve(const char *path, const char *const *argv,
                       const char *const *envp);
@@ -542,6 +549,31 @@ norm_key(const char *path, char *out, size_t n)
             out[w++] = s[i];
         out[w] = 0;
     }
+}
+
+/* Resolve a userspace path to a normalized overlay key, applying the current
+ * working directory to a relative path. An absolute path (leading slash), or any
+ * path when the cwd is the root, normalizes directly; otherwise the cwd is
+ * prepended before normalization so "." and ".." resolve against it. This is the
+ * path boundary for the syscall layer; internal helpers that already hold a key
+ * use norm_key, which is idempotent on a key. */
+static void
+resolve_path(const char *path, char *out, size_t n)
+{
+    if (path[0] == '/' || cwd_key[0] == 0) {
+        norm_key(path, out, n);
+        return;
+    }
+    char tmp[RAMFS_NAME * 2];
+    size_t w = 0;
+    for (const char *s = cwd_key; *s && w < sizeof tmp - 1; s++)
+        tmp[w++] = *s;
+    if (w < sizeof tmp - 1)
+        tmp[w++] = '/';
+    for (const char *s = path; *s && w < sizeof tmp - 1; s++)
+        tmp[w++] = *s;
+    tmp[w] = 0;
+    norm_key(tmp, out, n);
 }
 
 static int
@@ -844,7 +876,7 @@ static long
 do_open(const char *path, long flags)
 {
     char key[RAMFS_NAME];
-    norm_key(path, key, sizeof key);
+    resolve_path(path, key, sizeof key);
     int writing = (flags & (O_WRONLY | O_RDWR)) != 0;
 
     int ri = ramfs_find(key);               /* overlay entry (file or dir) */
@@ -1046,14 +1078,12 @@ fill_stat(struct linux_stat *s, int isdir, uint64_t size, uint64_t ino)
     s->st_ino = ino;
 }
 
-/* Resolve a path's metadata (a ramfs file shadows the bundle, else 9P). Returns
- * 0 and fills the out-params, or a negative errno. */
+/* Resolve a normalized key's metadata (a ramfs file shadows the bundle, else
+ * 9P). Returns 0 and fills the out-params, or a negative errno. Callers that
+ * hold a raw userspace path use meta_path, which applies the cwd first. */
 static long
-meta_path(const char *path, int *isdir, uint64_t *size, uint64_t *ino)
+meta_key(const char *key, int *isdir, uint64_t *size, uint64_t *ino)
 {
-    char key[RAMFS_NAME];
-    norm_key(path, key, sizeof key);
-
     int ri = ramfs_find(key);
     if (ri >= 0) {
         *isdir = ramfs[ri].is_dir;
@@ -1082,6 +1112,15 @@ meta_path(const char *path, int *isdir, uint64_t *size, uint64_t *ino)
     return ok ? 0 : -LERR_NOENT;
 }
 
+/* Metadata for a raw userspace path: resolve the cwd, then meta_key. */
+static long
+meta_path(const char *path, int *isdir, uint64_t *size, uint64_t *ino)
+{
+    char key[RAMFS_NAME];
+    resolve_path(path, key, sizeof key);
+    return meta_key(key, isdir, size, ino);
+}
+
 /* stat a path (stat/lstat/newfstatat with AT_FDCWD). */
 static long
 do_stat_path(const char *path, struct linux_stat *out)
@@ -1102,12 +1141,12 @@ static long
 do_mkdir(const char *path)
 {
     char key[RAMFS_NAME];
-    norm_key(path, key, sizeof key);
+    resolve_path(path, key, sizeof key);
     if (key[0] == 0)
         return -LERR_EXIST;             /* the root always exists */
     int isdir;
     uint64_t sz, ino;
-    if (meta_path(key, &isdir, &sz, &ino) == 0)
+    if (meta_key(key, &isdir, &sz, &ino) == 0)
         return -LERR_EXIST;
     if (ramfs_create(key, 1) < 0)
         return -LERR_NOMEM;
@@ -1120,7 +1159,7 @@ static long
 do_rmdir(const char *path)
 {
     char key[RAMFS_NAME];
-    norm_key(path, key, sizeof key);
+    resolve_path(path, key, sizeof key);
     if (key[0] == 0)
         return -LERR_ACCES;
     if (ramfs_has_desc(key))
@@ -1132,7 +1171,7 @@ do_rmdir(const char *path)
     }
     int isdir;
     uint64_t sz, ino;
-    if (meta_path(key, &isdir, &sz, &ino) != 0)
+    if (meta_key(key, &isdir, &sz, &ino) != 0)
         return -LERR_NOENT;
     return isdir ? -LERR_ROFS : -LERR_NOTDIR;
 }
@@ -1156,8 +1195,8 @@ static long
 do_rename(const char *oldp, const char *newp)
 {
     char ok[RAMFS_NAME], nk[RAMFS_NAME];
-    norm_key(oldp, ok, sizeof ok);
-    norm_key(newp, nk, sizeof nk);
+    resolve_path(oldp, ok, sizeof ok);
+    resolve_path(newp, nk, sizeof nk);
     if (ok[0] == 0 || nk[0] == 0)
         return -LERR_ACCES;
 
@@ -1165,7 +1204,7 @@ do_rename(const char *oldp, const char *newp)
     if (ri < 0) {
         int isdir;
         uint64_t sz, ino;
-        if (meta_path(ok, &isdir, &sz, &ino) == 0)
+        if (meta_key(ok, &isdir, &sz, &ino) == 0)
             return -LERR_XDEV;          /* read-only source: cannot rename */
         return -LERR_NOENT;
     }
@@ -1598,6 +1637,7 @@ do_fork(void)
     }
     csh->parent = parent->sh->pid;
     memcpy(csh->fdtab, parent->sh->fdtab, sizeof csh->fdtab);
+    memcpy(csh->cwd, parent->sh->cwd, sizeof csh->cwd);
     csh->heap_brk = parent->sh->heap_brk;
     csh->heap_mmap = parent->sh->heap_mmap;
     csh->heap_mmaptop = parent->sh->heap_mmaptop;
@@ -1716,6 +1756,7 @@ do_spawn_vfork(uint64_t flags, uint64_t child_stack)
     /* The child gets its own copy of the fd table (clone without CLONE_FILES),
      * so its file_actions dup2/close touch only its descriptors. */
     memcpy(csh->fdtab, parent->sh->fdtab, sizeof csh->fdtab);
+    memcpy(csh->cwd, parent->sh->cwd, sizeof csh->cwd);
     inherit_fds(csh);
     csh->heap_brk = parent->sh->heap_brk;
     csh->heap_mmap = parent->sh->heap_mmap;
@@ -2075,25 +2116,41 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_prctl:
         return 0;                       /* accept and ignore */
     case SYS_getcwd: {
+        /* Return the absolute cwd: a leading slash then the stored key. The
+         * syscall's return value is the length including the NUL terminator. */
         char *ubuf = (char *)a1;
-        if (a2 < 2)
-            return -LERR_INVAL;
+        size_t klen = strlen(cwd_key);
+        size_t need = 1 + klen + 1;         /* '/' + key + NUL */
+        if (a2 < need)
+            return -LERR_RANGE;
         ubuf[0] = '/';
-        ubuf[1] = 0;
-        return 2;
+        memcpy(ubuf + 1, cwd_key, klen);
+        ubuf[1 + klen] = 0;
+        return (long)need;
     }
     case SYS_chdir: {
-        /* The cwd is always "/" (getcwd above), so this cannot really move; but
-         * accept a chdir to the root or to a directory that exists, so a tool
-         * restoring its cwd at exit (make does) succeeds quietly. */
-        const char *rel = bundle_path((const char *)a1);
-        if (rel[0] == '\0')
-            return 0;                   /* the root */
+        /* Move the process's working directory. Resolve the target against the
+         * current cwd, require that it is a directory, and store its key. The
+         * root clears the key. */
+        char key[RAMFS_NAME];
+        resolve_path((const char *)a1, key, sizeof key);
+        if (key[0] == 0) {
+            cwd_key[0] = 0;             /* the root */
+            return 0;
+        }
         int isdir;
         uint64_t size, ino;
-        if (meta_path((const char *)a1, &isdir, &size, &ino) < 0)
+        if (meta_key(key, &isdir, &size, &ino) < 0)
             return -LERR_NOENT;
-        return isdir ? 0 : -LERR_NOTDIR;
+        if (!isdir)
+            return -LERR_NOTDIR;
+        size_t i = 0;
+        while (key[i] && i < sizeof cwd_key - 1) {
+            cwd_key[i] = key[i];
+            i++;
+        }
+        cwd_key[i] = 0;
+        return 0;
     }
     case SYS_readlink:
     case SYS_readlinkat:
@@ -2111,7 +2168,9 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
                                                : (const char *)a2;
         if (nr == SYS_unlinkat && (a3 & 0x200))
             return do_rmdir(upath);
-        if (ramfs_remove(bundle_path(upath)) == 0)
+        char ukey[RAMFS_NAME];
+        resolve_path(upath, ukey, sizeof ukey);
+        if (ramfs_remove(ukey) == 0)
             return 0;
         int isdir;
         uint64_t size, ino;
@@ -2406,7 +2465,9 @@ load_program(struct elf_info *exe, struct elf_info *interp, uint64_t *entry)
 static long
 do_execve(const char *path, const char *const *argv, const char *const *envp)
 {
-    const char *rel = bundle_path(path);
+    char relbuf[RAMFS_NAME];
+    resolve_path(path, relbuf, sizeof relbuf);
+    const char *rel = relbuf;
 
     if (ns_walk(rel, LINUX_FID) != 0)
         return -LERR_NOENT;
