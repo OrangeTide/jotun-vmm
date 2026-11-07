@@ -26,7 +26,7 @@ Statuses used below:
 - **stub**: accepted and ignored (returns 0 or a fixed value) with no real
   effect; present so startup and common idioms do not fail.
 
-## Implemented (104 calls)
+## Implemented (111 calls)
 
 ### File and directory I/O
 
@@ -47,9 +47,10 @@ Statuses used below:
 | 22 | pipe | full | in-memory byte ring |
 | 32 | dup | full | refcounted share of the backing object |
 | 33 | dup2 | full | any target; the old target (even a std fd holding a pipe) is closed before the rebind |
-| 72 | fcntl | partial | validates the fd first (a closed fd is EBADF, which a shell relies on to probe a redirect target); F_DUPFD/F_DUPFD_CLOEXEC duplicate to the lowest free fd; other commands return 0 |
+| 72 | fcntl | partial | validates the fd first (a closed fd is EBADF, which a shell relies on to probe a redirect target); F_DUPFD/F_DUPFD_CLOEXEC duplicate to the lowest free fd; F_GETFL reports the fd's access mode (glibc fdopen checks it); other commands return 0 |
 | 79 | getcwd | full | returns the process's current directory (a leading slash plus the stored key) |
 | 80 | chdir | full | sets a per-process working directory; resolves the target against the current cwd and requires it be a directory |
+| 81 | fchdir | full | sets the working directory from a directory fd (coreutils walk trees this way); the fd carries its normalized key |
 | 82 | rename | partial | within the writable overlay (a directory carries its subtree); a read-only source is EXDEV |
 | 83 | mkdir | full | creates a writable-overlay directory; EEXIST if anything already resolves there |
 | 84 | rmdir | partial | removes an empty overlay directory (ENOTEMPTY otherwise); a read-only bundle directory is EROFS |
@@ -158,6 +159,17 @@ preserved across execve.
 | 51 | getsockname | stub | quiet ENOSYS; no sockets in this guest |
 | 52 | getpeername | stub | quiet ENOSYS; gcc probes whether its output fd is a socket |
 
+### Extended attributes
+
+| nr | name | status | notes |
+|----|------|--------|-------|
+| 188 | setxattr | stub | quiet ENOTSUP; no extended attributes (cp and install then copy without them) |
+| 189 | lsetxattr | stub | quiet ENOTSUP |
+| 190 | fsetxattr | stub | quiet ENOTSUP |
+| 191 | getxattr | stub | quiet ENOTSUP |
+| 192 | lgetxattr | stub | quiet ENOTSUP |
+| 193 | fgetxattr | stub | quiet ENOTSUP |
+
 ### Thread-local storage, identity, time, misc
 
 | nr | name | status | notes |
@@ -200,7 +212,6 @@ source.
 | 35 | nanosleep | high | medium | cooperative: yield or a timed block; busybox sleep, retries |
 | 21 | access | high | easy | stat-based existence/permission check |
 | 269 | faccessat | high | easy | access with a dirfd (ignored like openat) |
-| 72 | fcntl (real) | high | medium | honor F_DUPFD, F_GETFL/F_SETFL, F_GETFD/F_SETFD |
 | 97 | getrlimit | med | easy | alias of the prlimit64 stub |
 | 160 | setrlimit | med | easy | accept and ignore |
 | 98 | getrusage | med | easy | zeroed struct |
@@ -227,7 +238,6 @@ poll-aware blocking) but stay within the cooperative model.
 | 23 | select | med | medium | poll expressed as fd sets |
 | 270 | pselect6 | med | medium | select with a mask |
 | 85 | creat | low | easy | open with O_CREAT, O_WRONLY, O_TRUNC |
-| 81 | fchdir | med | medium | cwd from a dir fd (chdir and a cwd now exist) |
 | 137 | statfs | low | medium | plausible filesystem stats (df) |
 | 138 | fstatfs | low | medium | fd form of statfs |
 | 247 | waitid | med | medium | wait4 variant some libcs prefer |
