@@ -565,14 +565,105 @@ Three small calls surfaced and were added, all additive:
 - `fadvise64` (221): coreutils calls `posix_fadvise` on its input. It is
   advisory, so the stub returns 0.
 
+## The C compiler, and the toolchain wall
+
+The next target was an autotools "hello world" (`./configure && make`), which
+needs a working C compiler. The host's gcc is a driver that execs the compiler
+proper `cc1`, the assembler `as`, and the linker `ld` (via `collect2`), each an
+unmodified dynamic binary from the live `/usr` mount.
+
+### What runs
+
+The driver and `cc1` are large: `cc1` alone is a 30 MiB image spanning about
+34 MiB of virtual address. The per-process user window was 24 MiB inside 32 MiB
+of RAM (both sized for the small demo guests), so `cc1` did not fit and the
+frame pool ran dry mid-load. Growing guest RAM to 128 MiB, with the window and
+the physmap derived from it (108 MiB window, RAM top less 16 MiB of vcpu
+stacks), gave it room. The device MMIO band at 0x0a000000 (160 MiB) is the
+ceiling: RAM must stay below it so a doorbell store still faults out to the
+host. See `host/main.c` and `arch/x86_64_vmspace.h`.
+
+With the window enlarged, an unmodified host gcc compiles a C file to an object
+file end to end:
+
+```
+init bin bash ccbuild.sh         # ccbuild.sh: PATH=/usr/bin; cc -c /hello.c -o /h.o
+mount lib64 host:/usr/lib/x86_64-linux-gnu
+mount lib   host:/usr/lib
+mount usr   host:/usr
+```
+
+The driver execs `cc1` (which preprocesses and compiles) piped to `as` (which
+assembles), producing a valid object in the ramfs overlay. `nm` on it reads
+`main`; `readelf` confirms a relocatable x86-64 object. The whole run takes
+about 1.4 seconds, pulling `cc1`, `as`, and their libraries on demand from the
+host mounts. So the compiler proper runs under the hypervisor.
+
+This needed three fixes besides the window:
+
+- `brk` started at a fixed 8 MiB, inside a large image. `arena_init` now places
+  the heap on the first page past the loaded program (interpreter end when
+  present), tracked per process so `brk` cannot retreat below it.
+- `do_mmap`'s bounds checks were not overflow-safe; a large mapping wrapped the
+  arena and returned a wild address the kernel faulted on. Rewritten as
+  `n > HI - va` and `n > mmap_cur - brk_cur`.
+- `split_path` now normalizes `.` and `..`. gcc's `is_directory()` stats a
+  candidate with `/.` appended; failing that, gcc judged every library
+  directory absent and passed `ld` no `-L` flags.
+
+Quiet stubs were added for the calls the toolchain makes: `sysinfo` (cc1 sizes
+its allocator), `getrusage`, `unlink`/`unlinkat` (remove overlay temporaries),
+`chmod`/`fchmod`/`fchmodat`, `umask`, and `readlink` (gcc probes
+`/proc/self/exe` and falls back to its default prefix).
+
+### Where it stops: the linker
+
+Linking does not complete. `ld` finds its inputs and libraries (the `-L` paths
+resolve after the `.`/`..` fix), but reports every cross-object symbol
+undefined, for example:
+
+```
+ld: Scrt1.o: in function `_start': undefined reference to `main'
+ld: undefined reference to `__libc_start_main'
+ld: crtbeginS.o: undefined reference to `__TMC_END__'
+ld: final link failed: bad value
+```
+
+The object that defines `main` is valid in isolation: `nm /h.o` prints
+`0000000000000000 T main`. But `ld`, reading the same object while linking,
+does not pick up its symbols, and the same happens for symbols in `libc.so` and
+in the crt objects. A trace shows `ld` reads object files with `read`/`pread`
+(only `ld.so`'s library mappings go through `mmap`), so this is inside `ld`'s
+own BFD-level object and symbol handling, not the file I/O path. It is not yet
+isolated. This is the current wall for the toolchain.
+
+### The gap to autotools
+
+Even with linking fixed, `./configure` needs more than a compiler:
+
+- A writable filesystem with directories. The overlay (ramfs) is flat, caps at
+  16 files of 1 MiB each, and has no `mkdir`. configure creates many files in
+  subdirectories (config.log, config.status, conftest.*, nested build dirs).
+- A real working directory. `chdir` is a no-op (cwd stays `/`), so configure's
+  relative-path and `cd` steps would not resolve.
+- Exec of freshly built binaries from the overlay. `do_execve` runs only bundle
+  and host-mount files, but configure compiles `conftest.c` and then runs
+  `./conftest` to check the compiler works.
+- More syscalls: `rename`, `mkdir`, `rmdir`, a real `getcwd`, `symlink`,
+  `link`, a real `dup`/`fcntl`, and `select`/`poll`.
+
+These are a milestone in their own right. The thesis target, running the
+unmodified compiler, is met; the autotools goal is deferred behind this list.
+
 ## The cut line
 
 Held against scope creep, and all deferred to later hardening milestones:
 
 - no `PROT_*` enforcement (no W^X, RELRO is advisory),
-- no copy-on-write and no lazy file paging (mappings are eager copies),
+- no copy-on-write and no lazy file paging (mappings are eager copies; a 30 MiB
+  `cc1` is copied in full on each exec, about 1.4 s per compile over 9P, which
+  a repeated-compile workload such as configure would feel),
 - `munmap` accepts but does not reclaim,
-- `posix_spawn` via `clone(CLONE_VM | CLONE_VFORK)` is not handled; see the
-  make notes in `doc/m16-linux-spike.md`.
+- linking (`ld`'s symbol resolution), and the autotools gaps above.
 
-None of these block `ld.so` or a first dynamic program.
+None of these block running the compiler to produce an object.

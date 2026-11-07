@@ -26,7 +26,7 @@ Statuses used below:
 - **stub**: accepted and ignored (returns 0 or a fixed value) with no real
   effect; present so startup and common idioms do not fail.
 
-## Implemented (80 calls)
+## Implemented (89 calls)
 
 ### File and directory I/O
 
@@ -50,17 +50,28 @@ Statuses used below:
 | 72 | fcntl | partial | returns 0; does not honor F_DUPFD or report F_GETFL/F_GETFD |
 | 79 | getcwd | stub | always returns "/" |
 | 80 | chdir | stub | cwd is fixed at "/"; accepts the root or an existing directory so a tool restoring its cwd at exit succeeds |
+| 87 | unlink | partial | removes a writable overlay file; a read-only bundle or host-mount path returns EROFS |
+| 89 | readlink | stub | returns EINVAL (no symlinks); gcc probes /proc/self/exe and falls back to its default prefix |
+| 90 | chmod | stub | no permission bits to enforce; returns 0 |
+| 91 | fchmod | stub | as chmod |
+| 95 | umask | stub | reports a conventional prior mask (022) |
 | 137 | statfs | stub | quiet ENOSYS; no real filesystem to describe (libselinux probes this) |
 | 138 | fstatfs | stub | quiet ENOSYS, as statfs |
 | 217 | getdents64 | full | packs 9P directory entries |
 | 257 | openat | partial | dirfd ignored; namespace is effectively rooted |
 | 262 | newfstatat | full | AT_EMPTY_PATH maps to fstat |
+| 263 | unlinkat | partial | as unlink; dirfd treated as AT_FDCWD |
 | 267 | readlinkat | stub | returns EINVAL (no symlinks) |
+| 268 | fchmodat | stub | as chmod |
 | 269 | faccessat | full | existence check via meta_path; no permission bits, dirfd ignored |
 | 292 | dup3 | full | like dup2 |
 | 293 | pipe2 | full | flags (O_CLOEXEC, O_NONBLOCK) ignored |
 | 332 | statx | full | basic stats mask |
 | 439 | faccessat2 | full | same as faccessat (the flags variant) |
+
+Path components `.` and `..` are normalized before a 9P walk (`split_path` in
+ns.c), so `.../13/.` and `a/b/../c` resolve. This is what lets gcc's
+`is_directory()` probe (which appends `/.`) recognize a library directory.
 
 ### Memory
 
@@ -136,6 +147,8 @@ Statuses used below:
 | 157 | prctl | stub | returns 0 |
 | 201 | time | partial | derived from the cycle counter (approximate) |
 | 96 | gettimeofday | partial | cycle counter split into seconds and microseconds, as clock_gettime |
+| 98 | getrusage | stub | zeroed counters; no CPU-time accounting (gcc, as query it) |
+| 99 | sysinfo | stub | reports total RAM and a plausible free fraction; cc1 sizes its allocator from this |
 | 228 | clock_gettime | partial | cycle counter at an assumed 1 GHz |
 | 63 | uname | full | fixed Linux/jotun/x86_64 fields |
 | 318 | getrandom | partial | cycle-counter PRNG, not cryptographic |
