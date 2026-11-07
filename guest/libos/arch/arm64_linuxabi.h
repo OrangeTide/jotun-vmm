@@ -13,6 +13,7 @@
 /* AArch64 (asm-generic) syscall numbers the dispatcher handles. */
 #define SYS_getcwd          17
 #define SYS_chdir           49
+#define SYS_fchdir          50
 #define SYS_dup             23
 #define SYS_dup3            24
 #define SYS_fcntl           25
@@ -81,6 +82,12 @@
 #define SYS_socket          198
 #define SYS_getsockname     204
 #define SYS_getpeername     205
+#define SYS_setxattr        5
+#define SYS_lsetxattr       6
+#define SYS_fsetxattr       7
+#define SYS_getxattr        8
+#define SYS_lgetxattr       9
+#define SYS_fgetxattr       10
 #define SYS_brk             214
 #define SYS_munmap          215
 #define SYS_clone           220

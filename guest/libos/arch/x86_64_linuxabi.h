@@ -38,6 +38,12 @@
 #define SYS_socket          41
 #define SYS_getsockname     51
 #define SYS_getpeername     52
+#define SYS_setxattr        188
+#define SYS_lsetxattr       189
+#define SYS_fsetxattr       190
+#define SYS_getxattr        191
+#define SYS_lgetxattr       192
+#define SYS_fgetxattr       193
 #define SYS_clone           56
 #define SYS_fork            57
 #define SYS_vfork           58
@@ -48,6 +54,7 @@
 #define SYS_fcntl           72
 #define SYS_getcwd          79
 #define SYS_chdir           80
+#define SYS_fchdir          81
 #define SYS_rename          82
 #define SYS_mkdir           83
 #define SYS_rmdir           84

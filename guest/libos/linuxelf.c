@@ -65,12 +65,15 @@
 
 /* open() flags we care about. The 9P bundle is read-only; writable files live
  * in the in-memory ramfs, reached by a write intent or O_CREAT. */
+#define O_RDONLY    0x0000
 #define O_WRONLY    0x0001
 #define O_RDWR      0x0002
+#define O_ACCMODE   0x0003
 #define O_CREAT     0x0040
 #define O_TRUNC     0x0200
 #define O_APPEND    0x0400
 #define O_DIRECTORY 0x10000
+#define O_LARGEFILE 0x8000      /* the kernel sets this on every 64-bit open */
 
 /* lseek whence. */
 #define SEEK_SET 0
@@ -104,6 +107,7 @@
 #define LERR_RANGE  34          /* ERANGE: getcwd buffer too small */
 #define LERR_PERM   1           /* EPERM: symlinks unsupported (triggers cp fallback) */
 #define LERR_SPIPE  29          /* ESPIPE: seek on a pipe or other non-seekable fd */
+#define LERR_NOTSUP 95          /* EOPNOTSUPP: the filesystem lacks this feature */
 
 /* ELF auxv entry tags. */
 #define AT_NULL    0
@@ -211,6 +215,9 @@ struct lfd {
     int      pidx;              /* pipe pool index when ispipe */
     int      ridx;              /* ramfs index when isram */
     int      wr;                /* pipe write end when set, else read end */
+    int      oflags;            /* open access mode (O_RDONLY/WRONLY/RDWR) plus
+                                 * O_APPEND, reported by fcntl(F_GETFL): glibc
+                                 * fdopen checks it to accept the stream mode */
     uint32_t p9fid;             /* backing 9P fid, 0 for the console fds */
     /* The seekable position lives in a shared open-file description, so a dup'd
      * or forked fd advances the same offset, as Unix requires: writes by any
@@ -359,6 +366,11 @@ struct lshared {
     int      main_task;         /* libOS task of the main thread, for wait4 reap */
     int      exited;            /* the process has terminated; status is set */
     long     exit_status;
+    int      exit_sig;          /* if nonzero, terminated by this signal (wait4
+                                 * reports WIFSIGNALED instead of WIFEXITED) */
+    int      sigpipe_ign;       /* SIGPIPE set to SIG_IGN or a handler: a write to
+                                 * a pipe with no readers returns EPIPE instead of
+                                 * terminating the process (the default action) */
     /* A posix_spawn child (clone with CLONE_VM|CLONE_VFORK) borrows its parent's
      * address space until it execs its own, so execve and wait4 must not destroy
      * it. While vforking, the parent is blocked on vfork_waiter and the child
@@ -421,6 +433,7 @@ struct lproc *lproc_cur;
 static long do_execve(const char *path, const char *const *argv,
                       const char *const *envp);
 static struct lfd *fd_get(long fd);
+static void __attribute__((noreturn)) do_exit(long code, int group);
 static vmspace_t linux_vmspace_setup(void);
 /* linux_jump is declared by the arch backend (linux_arch.h); linux_resume takes
  * struct lproc, which is defined here, so it is declared here. */
@@ -604,8 +617,10 @@ static void
 fds_init(void)
 {
     memset(fds, 0, sizeof(lproc_cur->sh->fdtab));
-    for (int i = 0; i < 3; i++)                     /* stdin/out/err: console */
+    for (int i = 0; i < 3; i++) {                   /* stdin/out/err: console */
         fds[i].used = fds[i].iscon = 1;
+        fds[i].oflags = O_RDWR;                     /* readable and writable */
+    }
 }
 
 /* Normalize a path to an overlay key: strip leading slashes, drop "."
@@ -865,6 +880,8 @@ do_pipe2(int *pfd)
     fds[rfd].pidx = fds[wfd].pidx = pidx;
     fds[rfd].wr = 0;
     fds[wfd].wr = 1;
+    fds[rfd].oflags = O_RDONLY;
+    fds[wfd].oflags = O_WRONLY;
 
     pfd[0] = rfd;
     pfd[1] = wfd;
@@ -925,10 +942,22 @@ do_write(long fd, const char *buf, unsigned long len)
         struct lpipe *p = &pipes[f->pidx];
         unsigned long done = 0;
         /* Write everything, yielding when the ring fills so a reader in another
-         * process can drain it. If every reader has closed, report EPIPE. */
+         * process can drain it. When every reader has closed, a write hits a
+         * broken pipe: deliver SIGPIPE's default action (terminate the process),
+         * which is what stops a producer looping forever once its consumer has
+         * quit. A process that ignores or handles SIGPIPE gets EPIPE instead. A
+         * partial write already done is reported; the SIGPIPE lands on the next
+         * write, as on Linux. */
         while (done < len) {
-            if (p->readers == 0)
-                return done ? (long)done : -LERR_PIPE;
+            if (p->readers == 0) {
+                if (done)
+                    return (long)done;
+                if (!lproc_cur->sh->sigpipe_ign) {
+                    lproc_cur->sh->exit_sig = 13;   /* SIGPIPE */
+                    do_exit(0, 1);                  /* does not return */
+                }
+                return -LERR_PIPE;
+            }
             long n = pipe_write(p, (const uint8_t *)buf + done, len - done);
             done += (unsigned long)n;
             if (done < len)
@@ -980,6 +1009,7 @@ open_ram(int ri, long flags)
     fds[fd].isram = 1;
     fds[fd].ridx = ri;
     fds[fd].of = of;
+    fds[fd].oflags = (int)(flags & (O_ACCMODE | O_APPEND));
     of->pos = (flags & O_APPEND) ? ramfs[ri].len : 0;
     ramfs[ri].nref++;
     return fd;
@@ -998,6 +1028,43 @@ fd_set_dir(struct lfd *f, const char *key)
     f->dpath[i] = 0;
     f->of->d9done = f->p9fid ? 0 : 1;
     f->of->dov = 0;
+}
+
+/* Rewrite a *at (dirfd, path) pair into a path the do_* helpers can resolve.
+ * An absolute path, or a relative one with dirfd AT_FDCWD, is returned
+ * unchanged (the do_* helpers resolve it against the cwd). Otherwise the path
+ * is taken relative to the directory already open on dirfd, built as an
+ * absolute "/<dir key>/<path>" in buf. coreutils removes a tree this way: it
+ * opens each directory and calls unlinkat(dirfd, "name"), never chdir. On a bad
+ * dirfd *err is set and NULL returned. */
+static const char *
+at_path(long dirfd, const char *path, char *buf, size_t n, long *err)
+{
+    /* dirfd is a 32-bit int; a caller passing AT_FDCWD (-100) may set only the
+     * low 32 bits, so sign-extend before comparing or looking it up. */
+    dirfd = (long)(int)dirfd;
+    *err = 0;
+    if (!path || path[0] == '/' || dirfd == AT_FDCWD)
+        return path;
+    struct lfd *f = fd_get(dirfd);
+    if (!f) {
+        *err = -LERR_BADF;
+        return NULL;
+    }
+    if (!f->isdir) {
+        *err = -LERR_NOTDIR;
+        return NULL;
+    }
+    size_t w = 0;
+    buf[w++] = '/';
+    for (const char *s = f->dpath; *s && w < n - 1; s++)
+        buf[w++] = *s;
+    if (w > 1 && w < n - 1)             /* a slash only when the key was nonempty */
+        buf[w++] = '/';
+    for (const char *s = path; *s && w < n - 1; s++)
+        buf[w++] = *s;
+    buf[w] = 0;
+    return buf;
 }
 
 static long
@@ -1071,6 +1138,7 @@ do_open(const char *path, long flags)
     fds[fd].size = size;
     fds[fd].ino = ino;
     fds[fd].of = of;
+    fds[fd].oflags = (int)(flags & (O_ACCMODE | O_APPEND));
     /* Keep a 9P fid open when there is a 9P file to read, or a 9P directory to
      * enumerate; an overlay-only directory needs none. */
     if (have9 && (!isdir || isdir9)) {
@@ -2006,7 +2074,9 @@ do_wait4(long pid, int *status)
             if (c->exited && c->refs == 0) {
                 int rpid = c->pid;
                 if (status)
-                    *status = (int)((c->exit_status & 0xff) << 8);  /* WIFEXITED */
+                    *status = c->exit_sig
+                        ? (c->exit_sig & 0x7f)                      /* WIFSIGNALED */
+                        : (int)((c->exit_status & 0xff) << 8);      /* WIFEXITED */
                 task_reap(c->main_task);
                 /* Destroy the child's own space, never a borrowed one (a
                  * posix_spawn child that died before exec still points at the
@@ -2174,10 +2244,16 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_writev(a1, (const struct iovec *)a2, a3);
     case SYS_open:
         return do_open((const char *)a1, a2);
-    case SYS_openat:
-        /* dirfd is ignored: the namespace is effectively rooted, so paths
-         * resolve from the 9P root (or absolute). Fine for the flat bundle. */
-        return do_open((const char *)a2, a3);
+    case SYS_openat: {
+        /* A relative path is taken against dirfd's directory (AT_FDCWD means the
+         * cwd); an absolute path ignores dirfd. */
+        char ab[RAMFS_NAME];
+        long e;
+        const char *p = at_path(a1, (const char *)a2, ab, sizeof ab, &e);
+        if (e)
+            return e;
+        return do_open(p, a3);
+    }
     case SYS_close:
         return do_close(a1);
     case SYS_lseek:
@@ -2185,12 +2261,18 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_stat:
     case SYS_lstat:
         return do_stat_path((const char *)a1, (struct linux_stat *)a2);
-    case SYS_newfstatat:
-        /* dirfd ignored (see openat). An empty path with AT_EMPTY_PATH means
-         * the dirfd itself, which maps to fstat. */
+    case SYS_newfstatat: {
+        /* An empty path with AT_EMPTY_PATH means the dirfd itself (fstat);
+         * otherwise resolve the path against dirfd. */
         if (((const char *)a2)[0] == 0 && (a4 & AT_EMPTY_PATH))
             return do_fstat(a1, (struct linux_stat *)a3);
-        return do_stat_path((const char *)a2, (struct linux_stat *)a3);
+        char ab[RAMFS_NAME];
+        long e;
+        const char *p = at_path(a1, (const char *)a2, ab, sizeof ab, &e);
+        if (e)
+            return e;
+        return do_stat_path(p, (struct linux_stat *)a3);
+    }
     case SYS_fstat:
         return do_fstat(a1, (struct linux_stat *)a2);
     case SYS_statx:
@@ -2201,6 +2283,17 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_pipe2((int *)a1);
     case SYS_pipe2:
         return do_pipe2((int *)a1);     /* flags (O_CLOEXEC/O_NONBLOCK) ignored */
+    case SYS_setxattr:
+    case SYS_lsetxattr:
+    case SYS_fsetxattr:
+    case SYS_getxattr:
+    case SYS_lgetxattr:
+    case SYS_fgetxattr:
+        /* No extended attributes. ENOTSUP is what a filesystem without xattr
+         * support returns, and it is what cp and install expect: they then copy
+         * the file without its attributes instead of failing. Quiet, like the
+         * other feature probes below. */
+        return -LERR_NOTSUP;
     case SYS_statfs:
     case SYS_fstatfs:
     case SYS_mincore:
@@ -2330,6 +2423,24 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         cwd_key[i] = 0;
         return 0;
     }
+    case SYS_fchdir: {
+        /* Move the working directory to a directory already open on a fd. Its
+         * normalized key is kept on the fd (dpath), so this just copies it in.
+         * coreutils walk trees this way (mkdir -p, rm -rf via fts), so without
+         * it rm -rf cannot descend to empty a directory and rmdir fails. */
+        struct lfd *f = fd_get(a1);
+        if (!f)
+            return -LERR_BADF;
+        if (!f->isdir)
+            return -LERR_NOTDIR;
+        size_t i = 0;
+        while (f->dpath[i] && i < sizeof cwd_key - 1) {
+            cwd_key[i] = f->dpath[i];
+            i++;
+        }
+        cwd_key[i] = 0;
+        return 0;
+    }
     case SYS_link:
     case SYS_linkat:
     case SYS_symlink:
@@ -2350,8 +2461,16 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
          * Only the writable overlay can be removed; the 9P bundle and host
          * mounts are read-only. ld, configure, and make all unlink temporaries,
          * which live in the overlay. */
-        const char *upath = (nr == SYS_unlink) ? (const char *)a1
-                                               : (const char *)a2;
+        char uab[RAMFS_NAME];
+        const char *upath;
+        if (nr == SYS_unlink)
+            upath = (const char *)a1;
+        else {
+            long e;
+            upath = at_path(a1, (const char *)a2, uab, sizeof uab, &e);
+            if (e)
+                return e;
+        }
         if (nr == SYS_unlinkat && (a3 & 0x200))
             return do_rmdir(upath);
         char ukey[RAMFS_NAME];
@@ -2366,16 +2485,30 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     }
     case SYS_mkdir:
         return do_mkdir((const char *)a1);
-    case SYS_mkdirat:
-        return do_mkdir((const char *)a2);      /* dirfd is AT_FDCWD */
+    case SYS_mkdirat: {
+        char ab[RAMFS_NAME];
+        long e;
+        const char *p = at_path(a1, (const char *)a2, ab, sizeof ab, &e);
+        if (e)
+            return e;
+        return do_mkdir(p);
+    }
     case SYS_rmdir:
         return do_rmdir((const char *)a1);
     case SYS_rename:
         return do_rename((const char *)a1, (const char *)a2);
     case SYS_renameat:
-        return do_rename((const char *)a2, (const char *)a4);   /* dirfds AT_FDCWD */
-    case SYS_renameat2:
-        return do_rename((const char *)a2, (const char *)a4);   /* flags ignored */
+    case SYS_renameat2: {       /* (olddirfd, old, newdirfd, new); flags ignored */
+        char oab[RAMFS_NAME], nab[RAMFS_NAME];
+        long eo, en;
+        const char *op = at_path(a1, (const char *)a2, oab, sizeof oab, &eo);
+        const char *np = at_path(a3, (const char *)a4, nab, sizeof nab, &en);
+        if (eo)
+            return eo;
+        if (en)
+            return en;
+        return do_rename(op, np);
+    }
     case SYS_access: {
         /* access(path, mode): path is the first argument. The dynamic linker
          * probes /etc/ld.so.cache and candidate library directories this way. */
@@ -2416,6 +2549,13 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
             }
             return -LERR_NOMEM;         /* EMFILE: no free descriptor */
         }
+        if (a2 == 3)                    /* F_GETFL: the access mode and flags.
+                                         * glibc fdopen reads this to check the
+                                         * fd allows the stream's mode; a bare 0
+                                         * (O_RDONLY) made fdopen(fd, "w") fail
+                                         * EINVAL, so a write temp file could not
+                                         * be opened (sort, among others). */
+            return src->oflags | O_LARGEFILE;
         return 0;
     }
     case SYS_execve:
@@ -2466,6 +2606,14 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_tgkill:
         return 0;                       /* no signal delivery: accept and ignore */
     case SYS_rt_sigaction:
+        /* No signal delivery, with one exception that matters for pipelines:
+         * track whether SIGPIPE is left at its default. sa_handler is the first
+         * field of struct sigaction; SIG_DFL is 0. If the program sets a handler
+         * or SIG_IGN, a broken-pipe write returns EPIPE rather than terminating
+         * (see do_write). */
+        if (a1 == 13 && a2)             /* SIGPIPE */
+            lproc_cur->sh->sigpipe_ign = (*(void **)a2 != 0);
+        return 0;
     case SYS_rt_sigprocmask:
         return 0;                       /* no signal delivery: accept and ignore */
     case SYS_uname: {
