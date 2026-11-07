@@ -862,12 +862,52 @@ objects (pipe, ramfile, 9P fid) were already refcounted this way.
 
 With those three fixes the automake "hello world" goes the whole way:
 `./configure` exits 0, `make` compiles `hello.c` to `hello.o` and links `hello`,
-and `./hello` prints its line. A few non-fatal messages remain and do not stop
-the build: `make` warns of clock skew because overlay timestamps come from a
-monotonic counter above the cycle-based wall clock; `gcc` makes a `getsockname`
-call that returns `ENOSYS`; and configure's cleanup prints a broken-pipe flood,
-a `sort` temp-file error, and a non-empty-directory `rm`. Those are the next
-small gaps, not blockers.
+and `./hello` prints its line.
+
+A handful of non-fatal messages were left over from that run and each turned out
+to be a small real gap. `make` warned of clock skew because overlay timestamps
+came from a monotonic counter running ahead of the cycle-based wall clock; the
+stamp now tracks the same clock the time syscalls report. `gcc` made a
+`getsockname`/`getpeername` call that fell through to "unhandled syscall"; both
+now return a quiet `ENOSYS`. A producer feeding a closed pipe printed an error
+per line because no `SIGPIPE` was ever delivered; a write to a pipe with no
+readers now raises the signal's default action. `sort` could not create a temp
+file because `fcntl(F_GETFL)` returned `O_RDONLY`, so glibc `fdopen(fd, "w")`
+refused it; descriptors now record their access mode. And `rm -r` left
+"Directory not empty" because coreutils removes a tree with
+`unlinkat(dirfd, "name")` against an open directory fd, which the overlay
+resolved against the wrong directory; an `at_path` helper now honors `dirfd`
+(sign-extending `AT_FDCWD`, the same 32-bit trap the `wait4` pid hit).
+
+### Sorting with a tiny buffer
+
+One deferred case remained: a `sort` forced to spill, `sort -S 1k` over several
+thousand lines, which builds hundreds of small sorted runs in `/tmp` and merges
+them. It failed three ways in succession, each a real bug the small synthetic
+case made visible where the real configure (which never spills) did not.
+
+First, `open` ignored `O_EXCL`. glibc `mkstemp` creates each temp with
+`O_CREAT | O_EXCL` and a random name; the guest `getrandom` is a weak seed, so
+two names eventually collided. A real kernel returns `EEXIST` and `mkstemp`
+retries, but the overlay silently reopened and truncated the existing entry.
+Two of `sort`'s temp nodes then aliased one overlay slot, and unlinking one
+deleted the file the other still needed. The reopen hit `ENOENT`, the temp file
+had vanished. Honoring `O_EXCL` (a create over an existing overlay name returns
+`EEXIST`) makes `mkstemp` draw a fresh name, whatever the quality of the seed.
+
+Second, the overlay leaked memory. `ramfs_remove` freed a slot but left its
+`kmalloc`'d data buffer attached, and `ramfs_create` cleared the pointer without
+freeing, so every recycled slot leaked its buffer until the kernel heap was
+exhausted and the next write or `fork` failed with `ENOMEM`. A single
+`ramfs_free_slot` now returns the buffer at every point a slot is destroyed:
+unlink, the deferred open-unlink close, `rmdir`, and a `rename` over an existing
+destination.
+
+Third, the overlay held only 256 entries, fewer than the runs `sort` keeps alive
+at once with a 1 KiB buffer. It now holds 1024.
+
+With those, `sort -S 1k` over 4000 lines sorts correctly, its output matches a
+reference sort, and `/tmp` drains back to empty.
 
 ## The cut line
 

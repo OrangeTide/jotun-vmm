@@ -34,7 +34,7 @@ Statuses used below:
 |----|------|--------|-------|
 | 0 | read | full | console EOF, pipe (blocking), ramfs, 9P |
 | 1 | write | full | console, pipe (blocking), ramfs; 9P bundle is read-only |
-| 2 | open | full | 9P bundle (RO) and ramfs overlay for writes/creates |
+| 2 | open | full | 9P bundle (RO) and ramfs overlay for writes/creates; O_CREAT/O_TRUNC/O_APPEND/O_EXCL honored (O_EXCL over an existing overlay name is EEXIST, so mkstemp retries) |
 | 3 | close | full | releases pipe and 9P references, refcounted |
 | 4 | stat | full | path via ramfs or 9P |
 | 5 | fstat | full | pipes as FIFO, console, ramfs, 9P; stable per-file inode (9P qid) so the dynamic linker dedups libraries correctly |
@@ -64,11 +64,11 @@ Statuses used below:
 | 137 | statfs | stub | quiet ENOSYS; no real filesystem to describe (libselinux probes this) |
 | 138 | fstatfs | stub | quiet ENOSYS, as statfs |
 | 217 | getdents64 | full | merges the 9P directory stream with the overlay's children |
-| 257 | openat | partial | dirfd ignored; namespace is effectively rooted |
-| 258 | mkdirat | full | as mkdir; dirfd treated as AT_FDCWD |
-| 262 | newfstatat | full | AT_EMPTY_PATH maps to fstat |
-| 263 | unlinkat | partial | as unlink; AT_REMOVEDIR routes to rmdir; dirfd AT_FDCWD |
-| 264 | renameat | partial | as rename; dirfds AT_FDCWD |
+| 257 | openat | full | as open; dirfd honored via at_path (a relative path resolves against the open directory fd), AT_FDCWD against the cwd |
+| 258 | mkdirat | full | as mkdir; dirfd honored via at_path |
+| 262 | newfstatat | full | AT_EMPTY_PATH maps to fstat; dirfd honored via at_path |
+| 263 | unlinkat | partial | as unlink; AT_REMOVEDIR routes to rmdir; dirfd honored via at_path |
+| 264 | renameat | partial | as rename; dirfds honored via at_path |
 | 265 | linkat | stub | as link (EPERM); dirfds AT_FDCWD |
 | 266 | symlinkat | stub | as symlink (EPERM) |
 | 267 | readlinkat | stub | returns EINVAL (no symlinks) |
@@ -76,7 +76,7 @@ Statuses used below:
 | 269 | faccessat | full | existence check via meta_path; no permission bits, dirfd ignored |
 | 292 | dup3 | full | like dup2 |
 | 293 | pipe2 | full | flags (O_CLOEXEC, O_NONBLOCK) ignored |
-| 316 | renameat2 | partial | as rename; flags ignored |
+| 316 | renameat2 | partial | as rename; dirfds honored via at_path; flags ignored |
 | 326 | copy_file_range | stub | quiet ENOSYS; cp and mv fall back to a read/write loop |
 | 332 | statx | full | basic stats mask |
 | 439 | faccessat2 | full | same as faccessat (the flags variant) |
