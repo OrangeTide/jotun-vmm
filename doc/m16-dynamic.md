@@ -829,6 +829,46 @@ One unrelated limit noted along the way: `copy_uvec` caps argv and envp at
 environment would reach the child truncated. It did not cause this crash, but it
 is worth raising when a workload needs it.
 
+### Two more fixes, then configure runs to the end
+
+With the heap fixed, `cc1` ran and `./configure` cleared every compiler check.
+Two further bugs stood between there and a finished build.
+
+The first was `lseek`. `do_lseek` rejected every descriptor below 3 as a bad
+file descriptor, on the assumption that 0, 1 and 2 are always the console. But a
+redirect moves a real file onto a standard descriptor, and `grep` does
+`lseek(0, 0, SEEK_CUR)` at startup, so it failed with "Bad file descriptor" on
+every input, pipe or file. The fix seeks a file-backed descriptor whatever its
+number and returns `ESPIPE` for a pipe or the console, which is what a caller
+expects of a non-seekable descriptor.
+
+The second was the file offset. Each descriptor carried its own read/write
+cursor inlined in its table entry, copied on dup and fork. On Unix those share
+one open-file description, so a write through any of them advances the single
+offset. Without that, a shell pointing several commands at one redirected file
+had them write at independent offsets and overwrite each other. config.status
+builds its substitution script exactly that way:
+
+```sh
+{ echo 'cat >subs.awk <<_ACEOF' && echo "$vars" | sed ... && echo _ACEOF; } >subs.sh
+```
+
+The three writers landed out of order and clobbered each other, so the here-doc
+header was lost and the shell ran the data lines as commands. The fix moves the
+cursor (and the getdents directory-enumeration cursor) into a shared, refcounted
+open-file description that descriptors point at; dup, fork and the vfork inherit
+path copy the pointer and take a reference, and close drops one. The backing
+objects (pipe, ramfile, 9P fid) were already refcounted this way.
+
+With those three fixes the automake "hello world" goes the whole way:
+`./configure` exits 0, `make` compiles `hello.c` to `hello.o` and links `hello`,
+and `./hello` prints its line. A few non-fatal messages remain and do not stop
+the build: `make` warns of clock skew because overlay timestamps come from a
+monotonic counter above the cycle-based wall clock; `gcc` makes a `getsockname`
+call that returns `ENOSYS`; and configure's cleanup prints a broken-pipe flood,
+a `sort` temp-file error, and a non-empty-directory `rm`. Those are the next
+small gaps, not blockers.
+
 ## The cut line
 
 Held against scope creep, and all deferred to later hardening milestones:
