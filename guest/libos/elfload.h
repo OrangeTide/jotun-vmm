@@ -25,6 +25,12 @@ struct elf_info {
 int elf_load_ex(uint32_t fid, uint64_t lo, uint64_t hi, uint64_t bias_hint,
                 struct elf_info *out);
 
+/* As elf_load_ex, but reading the ELF from an in-memory image of len bytes
+ * instead of a 9P fid. Used to exec a program built in the writable overlay,
+ * which has no backing 9P file. */
+int elf_load_mem(const void *data, uint64_t len, uint64_t lo, uint64_t hi,
+                 uint64_t bias_hint, struct elf_info *out);
+
 /* Load an ELF the old way: segments at their absolute p_vaddr within [lo, hi),
  * returning the entry address or 0 on error. A thin wrapper over elf_load_ex
  * for the native loader and the static non-PIE path. */

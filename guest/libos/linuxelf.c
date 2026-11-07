@@ -2428,9 +2428,16 @@ copy_uvec(const char *const *uvec, const char **out, char *buf, size_t buflen)
  * the executable via AT_ENTRY), else the executable's own. Returns 0, or -1 on
  * any load error. */
 static int
-load_program(struct elf_info *exe, struct elf_info *interp, uint64_t *entry)
+load_program(struct elf_info *exe, struct elf_info *interp, uint64_t *entry,
+             const unsigned char *exemem, uint64_t exelen)
 {
-    if (elf_load_ex(LINUX_FID, VM_USER_LO, VM_USER_HI, LINUX_PROG_BASE, exe) != 0)
+    /* The executable comes from the writable overlay (an in-memory image) when
+     * exemem is set, otherwise from the 9P fid already walked and opened. Its
+     * interpreter, if any, is always a 9P path (the host's ld-linux). */
+    int lr = exemem
+        ? elf_load_mem(exemem, exelen, VM_USER_LO, VM_USER_HI, LINUX_PROG_BASE, exe)
+        : elf_load_ex(LINUX_FID, VM_USER_LO, VM_USER_HI, LINUX_PROG_BASE, exe);
+    if (lr != 0)
         return -1;
 
     if (!exe->has_interp) {
@@ -2461,7 +2468,8 @@ load_program(struct elf_info *exe, struct elf_info *interp, uint64_t *entry)
  * are about to overwrite), then the ELF is loaded over the program window, the
  * heap reset, and a fresh stack built. Control returns to the linux_elf_run
  * loop via linux_exit, which re-enters the new entry. fds and the ramfs persist
- * across the exec, as on Linux. Only bundle files are exec'able for now. */
+ * across the exec, as on Linux. The program may come from a bundle or host
+ * mount (over 9P) or from the writable overlay (an in-memory image). */
 static long
 do_execve(const char *path, const char *const *argv, const char *const *envp)
 {
@@ -2469,18 +2477,31 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     resolve_path(path, relbuf, sizeof relbuf);
     const char *rel = relbuf;
 
-    if (ns_walk(rel, LINUX_FID) != 0)
-        return -LERR_NOENT;
-    if (p9_open(LINUX_FID) != 0) {
-        p9_clunk(LINUX_FID);
-        return -LERR_ACCES;
+    /* A program built in the writable overlay (configure's ./conftest, a linked
+     * a.out) execs from its in-memory image; a bundle or host-mount file execs
+     * over a 9P fid. Capture the overlay buffer here, before the vmspace switch,
+     * and open the 9P fid only in the bundle case. */
+    int ri = ramfs_find(rel);
+    const unsigned char *exemem = NULL;
+    uint64_t exelen = 0;
+    if (ri >= 0 && !ramfs[ri].is_dir) {
+        exemem = ramfs[ri].data;
+        exelen = ramfs[ri].len;
+    } else {
+        if (ns_walk(rel, LINUX_FID) != 0)
+            return -LERR_NOENT;
+        if (p9_open(LINUX_FID) != 0) {
+            p9_clunk(LINUX_FID);
+            return -LERR_ACCES;
+        }
     }
 
     static const char *na[LINUX_MAX_ARGS];
     static const char *ne[LINUX_MAX_ARGS];
     char *sbuf = kmalloc(EXEC_STR_MAX);
     if (!sbuf) {
-        p9_clunk(LINUX_FID);
+        if (!exemem)
+            p9_clunk(LINUX_FID);
         return -LERR_NOMEM;
     }
     int argc = copy_uvec(argv, na, sbuf, EXEC_STR_MAX / 2);
@@ -2497,7 +2518,8 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     int borrowed = lproc_cur->sh->vm_borrowed;
     vmspace_t as = linux_vmspace_setup();
     if (!as) {
-        p9_clunk(LINUX_FID);
+        if (!exemem)
+            p9_clunk(LINUX_FID);
         kfree(sbuf);
         return -LERR_NOMEM;
     }
@@ -2505,8 +2527,9 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
 
     struct elf_info exe, interp;
     uint64_t entry;
-    int lr = load_program(&exe, &interp, &entry);
-    p9_clunk(LINUX_FID);
+    int lr = load_program(&exe, &interp, &entry, exemem, exelen);
+    if (!exemem)
+        p9_clunk(LINUX_FID);
     if (lr != 0) {
         vmspace_switch(old);            /* keep the old image on failure */
         vmspace_destroy(as);
@@ -2602,7 +2625,7 @@ linux_elf_run(const char *file)
     }
     struct elf_info exe, interp;
     uint64_t entry;
-    int lr = load_program(&exe, &interp, &entry);
+    int lr = load_program(&exe, &interp, &entry, NULL, 0);
     p9_clunk(LINUX_FID);
     if (lr != 0) {
         con_puts("[bin] load failed (bad ELF, or interpreter not in bundle?)\n");
