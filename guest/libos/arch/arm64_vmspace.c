@@ -7,6 +7,8 @@
  * turns the MMU on (the guest boots with it off). */
 #include "arm64_vmspace.h"
 
+#include "arch.h"
+#include "mem.h"
 #include "string.h"
 
 /* ARMv8 descriptor bits (4 KiB granule). */
@@ -36,6 +38,16 @@ static int      physmap_on;                 /* phys_to_virt uses the physmap onc
 
 /* The address space the fault handler maps into (the running process). */
 vmspace_t cur_vmspace;
+
+/* The demand-grown kernel heap window (see the header). One shared L2 maps it
+ * in every address space; kheap_top is the next unmapped window VA. kheap_pd is
+ * 0 until kheap_init runs, which keeps vmspace_new and the grower inert on the
+ * native boot path that never sets the window up. */
+static uint64_t     kheap_pd;
+static uint64_t     kheap_top;
+static volatile int kheap_lock;
+
+#define KHEAP_CHUNK  0x200000ULL        /* map at least 2 MiB per growth */
 
 void *
 phys_to_virt(uint64_t p)
@@ -102,6 +114,8 @@ vmspace_new(void)
 
     tbl(l1)[0] = l2_low | D_TABLE;          /* [0, 1 GiB) */
     tbl(l1)[1] = l2_phys | D_TABLE;         /* [1 GiB, 2 GiB): physmap */
+    if (kheap_pd)
+        tbl(l1)[2] = kheap_pd | D_TABLE;    /* [2 GiB, 3 GiB): heap window */
 
     /* Low gigabyte: 2 MiB blocks everywhere outside the user window. RAM and the
      * low kernel are Normal; the device band (UART and doorbells at and above
@@ -199,6 +213,83 @@ vmspace_switch(vmspace_t as)
         __asm__ volatile ("dsb ish; tlbi vmalle1; dsb ish; isb");
     }
     cur_vmspace = as;
+}
+
+/* Map one zeroed pool frame at window VA va (4 KiB aligned, >= VM_KHEAP_VA),
+ * allocating the L3 table first if va opens a new 2 MiB span. Returns 0, or -1
+ * if the pool is empty. The caller holds kheap_lock. */
+static int
+kheap_map_page(uint64_t va)
+{
+    uint64_t *l2 = tbl(kheap_pd);
+    uint64_t l2i = (va >> 21) & 0x1FF;
+    uint64_t e = l2[l2i];
+
+    if (!(e & 1)) {
+        uint64_t l3 = phys_alloc();
+        if (!l3)
+            return -1;
+        l2[l2i] = l3 | D_TABLE;
+        e = l2[l2i];
+    }
+    uint64_t f = phys_alloc();
+    if (!f)
+        return -1;
+    uint64_t *l3 = tbl(pte_frame(e));
+    l3[(va >> 12) & 0x1FF] = (f & D_ADDR) | PAGE_NORMAL;
+    return 0;
+}
+
+/* The allocator's grower: map at least need bytes of fresh pool frames into the
+ * window, contiguous with what is already mapped, and hand the span to the
+ * allocator. Returns the bytes added, or 0 when it cannot satisfy need (the
+ * window is unreachable until the MMU is on, or the pool is empty). */
+static size_t
+kheap_grow(size_t need)
+{
+    if (!physmap_on)            /* the MMU (and so the window) is off before the first switch */
+        return 0;
+
+    size_t want = need < KHEAP_CHUNK ? KHEAP_CHUNK : need;
+    want = (want + VM_PAGE - 1) & ~(VM_PAGE - 1);
+
+    unsigned long irq = arch_irq_save();
+    while (__atomic_exchange_n(&kheap_lock, 1, __ATOMIC_ACQUIRE))
+        arch_cpu_relax();
+
+    uint64_t base = kheap_top;
+    size_t done = 0;
+    while (done < want) {
+        if (kheap_map_page(kheap_top) != 0)
+            break;
+        kheap_top += VM_PAGE;
+        done += VM_PAGE;
+    }
+    if (done)
+        __asm__ volatile ("dsb ish; isb");  /* publish the new entries to the table walker */
+
+    __atomic_store_n(&kheap_lock, 0, __ATOMIC_RELEASE);
+    arch_irq_restore(irq);
+
+    if (done == 0)
+        return 0;
+    memadd((void *)(uintptr_t)base, done);
+    return done < need ? 0 : done;      /* mapped, but short of the request */
+}
+
+void
+kheap_init(void)
+{
+    kheap_pd = phys_alloc();
+    if (!kheap_pd)
+        return;                 /* no window; the bootstrap band stands alone */
+    kheap_top = VM_KHEAP_VA;
+    mem_set_grower(kheap_grow);
+
+    /* The window's L2 is installed in every process by vmspace_new. The guest
+     * boots with the MMU off and no translation tables to patch, so nothing
+     * else is needed here; the window comes alive at the first switch, and the
+     * grower stays idle (physmap_on == 0) until then. */
 }
 
 int

@@ -27,10 +27,13 @@ backend supplies the machine-specific half:
 - `arch/arm64_linuxabi.h`: the asm-generic syscall numbers and the trapframe.
 
 The address space matches x86 after the kernel-heap work: 128 MiB RAM, a
-per-process user window at `[0x400000, 0x7000000)`, an 8 MiB kernel-heap band
-above it at `[0x7000000, 0x7800000)`, the vcpu stacks in the 8 MiB above that,
-and a physmap of all RAM at 1 GiB. The guest boots with the MMU off and turns it
-on at the first address-space switch.
+per-process user window at `[0x400000, 0x7000000)`, an 8 MiB kernel-heap
+bootstrap band above it at `[0x7000000, 0x7800000)`, the vcpu stacks in the 8
+MiB above that, and a physmap of all RAM at 1 GiB. Once the Linux-compat path is
+up, the heap also grows on demand into a window at 2 GiB, a shared page
+directory that `vmspace_new` installs in every process. The guest boots with the
+MMU off and turns it on at the first address-space switch; the growth window is
+reachable only after that switch, which is why the band carries the boot.
 
 ## Hosts and prerequisites
 
@@ -84,6 +87,13 @@ These confirm the 128 MiB layout this milestone introduced on arm64 (it was a
 3. **The heap band under load.** Any Phase C/D test that writes files into the
    overlay exercises the band as the real heap. Watch for an out-of-memory report
    from `linux_tables_init` or a fault in `[0x7000000, 0x7800000)`.
+4. **The growth window.** A test that writes more than the 8 MiB band into the
+   overlay (the x86 side uses a 36 MiB write/verify stress) forces the heap to
+   grow into the window at 2 GiB. On arm64 the window L2 is installed by
+   `vmspace_new` and the grower activates at the first switch, neither of which
+   has ever run; a fault whose `far` lands at or above `0x80000000` points here,
+   most likely a missing or wrong `L1[2]` install or a stale table walk needing
+   the `dsb ish; isb` the grower issues.
 
 ## Phase C: Linux-compat, single process
 

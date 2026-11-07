@@ -7,16 +7,21 @@
  *
  *   [0, 0x400000)            kernel image: identity, shared
  *   [0x400000, VM_USER_HI)   the user window: private 4 KiB pages per process
- *   [VM_KHEAP_LO, VM_KHEAP_HI)  the kernel heap: identity, shared
+ *   [VM_KHEAP_LO, VM_KHEAP_HI)  the kernel heap bootstrap band: identity, shared
  *   [VM_KHEAP_HI, RAM top)   vcpu stacks: identity, shared
  *   [RAM top, 0x40000000)    the device band (MMU as device): identity, shared
  *   [1 GiB, 1 GiB + RAM)     physmap: all RAM, reached by physical address
+ *   [VM_KHEAP_VA, ...)       the kernel heap growth window: shared, demand-grown
  *
  * 39-bit VA, 4 KiB granule: L1 (1 GiB/entry), L2 (2 MiB), L3 (4 KiB). The low
  * gigabyte is one L2 table of 2 MiB blocks with the user window punched out for
  * L3 page tables; the physmap is a second L2 of 2 MiB blocks. The kernel heap
- * sits above the user window (see x86_64_vmspace.h for why). AArch64 only; the
- * Linux-compat path needs the MMU. */
+ * starts in the bootstrap band above the user window (see x86_64_vmspace.h for
+ * why) and then grows on demand into the window at VM_KHEAP_VA, a third L1 entry
+ * mapping one shared L2 that vmspace_new installs in every process. Unlike x86,
+ * the guest boots with the MMU off, so there are no boot tables to install the
+ * window into: it becomes reachable at the first switch, and the grower stays
+ * idle until then. AArch64 only; the Linux-compat path needs the MMU. */
 #ifndef ARM64_VMSPACE_H
 #define ARM64_VMSPACE_H
 
@@ -32,6 +37,10 @@
 #define VM_KHEAP_HI  (VM_USER_HI + 0x800000ULL)
 #define VM_PHYSMAP   0x40000000ULL           /* 1 GiB */
 #define VM_PHYSMAP_PAGES (VM_RAM_SIZE / 0x200000ULL)  /* RAM in 2 MiB pages */
+/* The demand-grown kernel heap window: 2 GiB, a whole L1 entry (1 GiB of VA)
+ * above the physmap. Scattered pool frames are mapped contiguously here, so a
+ * single large allocation still gets contiguous VA. */
+#define VM_KHEAP_VA  0x80000000ULL
 
 /* The arch-neutral core passes these to vmspace_map; the AArch64 backend maps
  * every user page the same way (RW at EL1), so the flags carry no bits here. */
@@ -55,6 +64,10 @@ uint64_t vmspace_lookup(vmspace_t as, uint64_t vaddr);
 void vmspace_switch(vmspace_t as);
 void vmspace_destroy(vmspace_t as);
 vmspace_t vmspace_clone(vmspace_t src);
+
+/* Set up the demand-grown kernel heap window and register it as the allocator's
+ * grower. Call once, after phys_init, before the first vmspace_switch. */
+void kheap_init(void);
 
 /* The data/instruction-abort handler's C half (called from the arm64 exception
  * vector). Demand-maps a user-window page and returns 1, else returns 0. */
