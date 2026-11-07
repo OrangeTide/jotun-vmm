@@ -103,6 +103,7 @@
 #define LERR_NOTEMPTY 39        /* ENOTEMPTY */
 #define LERR_RANGE  34          /* ERANGE: getcwd buffer too small */
 #define LERR_PERM   1           /* EPERM: symlinks unsupported (triggers cp fallback) */
+#define LERR_SPIPE  29          /* ESPIPE: seek on a pipe or other non-seekable fd */
 
 /* ELF auxv entry tags. */
 #define AT_NULL    0
@@ -1128,8 +1129,13 @@ do_lseek(long fd, long off, long whence)
 {
     struct lfd *f = fd_get(fd);
 
-    if (!f || fd < 3)
+    if (!f)
         return -LERR_BADF;
+    /* A pipe or the console is not seekable, whatever fd number it sits on.
+     * A file-backed fd is seekable even when it has been moved onto 0, 1 or 2
+     * by a redirect, which is exactly what grep does: lseek(0, 0, SEEK_CUR). */
+    if (f->iscon || f->ispipe)
+        return -LERR_SPIPE;
     if (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END)
         return -LERR_INVAL;
     uint64_t end = f->isram ? ramfs[f->ridx].len : f->size;
