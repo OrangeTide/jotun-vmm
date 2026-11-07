@@ -200,6 +200,8 @@ struct linux_dirent64 {
 #define RAMFS_NAME    192
 #define RAMFS_FILE_MAX (4u * 1024u * 1024u)     /* per-file cap */
 
+struct ofile;                   /* shared open-file description, defined below */
+
 struct lfd {
     int      used;
     int      iscon;             /* this fd is the console (stdin/out/err) */
@@ -210,14 +212,16 @@ struct lfd {
     int      ridx;              /* ramfs index when isram */
     int      wr;                /* pipe write end when set, else read end */
     uint32_t p9fid;             /* backing 9P fid, 0 for the console fds */
-    uint64_t pos;               /* read cursor (file) or 9P dir offset */
-    /* Directory enumeration state (getdents): a directory may have both 9P and
-     * writable-overlay entries, so it is listed in two phases. dpath is the
-     * directory's normalized key; d9done marks the 9P phase finished; dov is the
-     * overlay scan cursor. */
+    /* The seekable position lives in a shared open-file description, so a dup'd
+     * or forked fd advances the same offset, as Unix requires: writes by any
+     * sharer move the one cursor, which is what lets a shell point several
+     * commands at one redirected file. NULL for a console or pipe fd, which
+     * have no position. */
+    struct ofile *of;
+    /* The directory's normalized key, for the overlay phase of getdents. It is
+     * fixed at open, so each fd keeps its own copy; the enumeration cursor that
+     * does advance lives in the shared open-file description. */
     char     dpath[RAMFS_NAME];
-    int      d9done;
-    uint32_t dov;
     uint64_t size;
     uint64_t ino;               /* stable identity (9P qid path): a fresh fd for
                                  * the same file reports the same inode, which
@@ -292,6 +296,43 @@ struct lpipe {
 #define LINUX_KSTACK (16u * 1024)       /* per-process syscall handler stack */
 #define CLONE_VM     0x00000100u        /* clone shares the address space (thread) */
 static struct lpipe pipes[LINUX_NPIPE];
+
+/* A shared open-file description: the offset state that several descriptors can
+ * share. One is made per open(); dup and fork copy the pointer, not the offset,
+ * and bump nref, so every sharer advances the same cursor. The pool is global
+ * (like pipes and the 9P fid pool) because a fork shares it across processes,
+ * while the fd tables are per process. Freed when the last fd closes (nref 0). */
+struct ofile {
+    int      nref;              /* fds across all processes pointing here */
+    uint64_t pos;               /* read/write cursor, or 9P dir offset (phase 1) */
+    int      d9done;            /* getdents: the 9P phase is finished */
+    uint32_t dov;               /* getdents: overlay scan cursor */
+};
+
+/* One per concurrently open file or directory; dups and forks share, so this
+ * need only cover distinct opens. Bounded above by the 9P fid pool plus the
+ * overlay, with headroom. */
+#define LINUX_NOFILE 256
+static struct ofile ofiles[LINUX_NOFILE];
+
+static struct ofile *
+ofile_alloc(void)
+{
+    for (int i = 0; i < LINUX_NOFILE; i++)
+        if (ofiles[i].nref == 0) {
+            memset(&ofiles[i], 0, sizeof ofiles[i]);
+            ofiles[i].nref = 1;
+            return &ofiles[i];
+        }
+    return NULL;
+}
+
+static void
+ofile_unref(struct ofile *of)
+{
+    if (of && of->nref > 0)
+        of->nref--;
+}
 
 /* Trapframe field offsets, mirrored in arch/x86_64_linuxsys.S as TF_*. The
  * SYSCALL assembly saves the user registers here on entry and restores them on
@@ -535,6 +576,8 @@ clone_fd(int dst, struct lfd *src)
 {
     fds[dst] = *src;
     fds[dst].used = 1;
+    if (src->of)
+        src->of->nref++;                /* share the offset with the new fd */
     if (src->ispipe) {
         struct lpipe *p = &pipes[src->pidx];
         if (src->wr)
@@ -887,13 +930,13 @@ do_write(long fd, const char *buf, unsigned long len)
     }
     if (f->isram) {
         struct ramfile *rf = &ramfs[f->ridx];
-        uint64_t end = f->pos + len;
+        uint64_t end = f->of->pos + len;
         if (end > RAMFS_FILE_MAX || ramfs_grow(rf, (uint32_t)end) < 0)
             return -LERR_NOMEM;
-        memcpy(rf->data + f->pos, buf, len);
-        f->pos += len;
-        if (f->pos > rf->len)
-            rf->len = (uint32_t)f->pos;
+        memcpy(rf->data + f->of->pos, buf, len);
+        f->of->pos += len;
+        if (f->of->pos > rf->len)
+            rf->len = (uint32_t)f->of->pos;
         rf->mtime = fs_stamp();
         return (long)len;
     }
@@ -921,11 +964,15 @@ open_ram(int ri, long flags)
     int fd = fd_alloc();
     if (fd < 0)
         return -LERR_NOMEM;
+    struct ofile *of = ofile_alloc();
+    if (!of)
+        return -LERR_NOMEM;
     memset(&fds[fd], 0, sizeof fds[fd]);
     fds[fd].used = 1;
     fds[fd].isram = 1;
     fds[fd].ridx = ri;
-    fds[fd].pos = (flags & O_APPEND) ? ramfs[ri].len : 0;
+    fds[fd].of = of;
+    of->pos = (flags & O_APPEND) ? ramfs[ri].len : 0;
     ramfs[ri].nref++;
     return fd;
 }
@@ -941,8 +988,8 @@ fd_set_dir(struct lfd *f, const char *key)
         i++;
     }
     f->dpath[i] = 0;
-    f->d9done = f->p9fid ? 0 : 1;
-    f->dov = 0;
+    f->of->d9done = f->p9fid ? 0 : 1;
+    f->of->dov = 0;
 }
 
 static long
@@ -1005,17 +1052,24 @@ do_open(const char *path, long flags)
         return -LERR_NOTDIR;
     }
 
+    struct ofile *of = ofile_alloc();
+    if (!of) {
+        p9_clunk(p9fid);
+        return -LERR_NOMEM;
+    }
     memset(&fds[fd], 0, sizeof fds[fd]);
     fds[fd].used = 1;
     fds[fd].isdir = isdir;
     fds[fd].size = size;
     fds[fd].ino = ino;
+    fds[fd].of = of;
     /* Keep a 9P fid open when there is a 9P file to read, or a 9P directory to
      * enumerate; an overlay-only directory needs none. */
     if (have9 && (!isdir || isdir9)) {
         if (p9_open(p9fid) != 0) {
             p9_clunk(p9fid);
             fds[fd].used = 0;
+            ofile_unref(of);
             return -LERR_ACCES;
         }
         fds[fd].p9fid = p9fid;
@@ -1048,20 +1102,20 @@ do_read(long fd, void *buf, unsigned long count)
     }
     if (f->isram) {
         struct ramfile *rf = &ramfs[f->ridx];
-        if (f->pos >= rf->len)
+        if (f->of->pos >= rf->len)
             return 0;
-        uint32_t avail = rf->len - (uint32_t)f->pos;
+        uint32_t avail = rf->len - (uint32_t)f->of->pos;
         uint32_t n = count < avail ? (uint32_t)count : avail;
-        memcpy(buf, rf->data + f->pos, n);
-        f->pos += n;
+        memcpy(buf, rf->data + f->of->pos, n);
+        f->of->pos += n;
         return n;
     }
     if (f->isdir)
         return -LERR_INVAL;
-    long n = p9_read(f->p9fid, f->pos, buf, (uint32_t)count);
+    long n = p9_read(f->p9fid, f->of->pos, buf, (uint32_t)count);
     if (n < 0)
         return -LERR_INVAL;
-    f->pos += (uint64_t)n;
+    f->of->pos += (uint64_t)n;
     return n;
 }
 
@@ -1101,10 +1155,11 @@ do_close(long fd)
     }
     if (f->isram) {
         ramfs_unref(f->ridx);           /* frees the slot if unlinked and last */
+        ofile_unref(f->of);
         f->used = 0;
         return 0;
     }
-    if (f->ispipe) {
+    if (f->ispipe) {                    /* a pipe fd has no offset (of is NULL) */
         struct lpipe *p = &pipes[f->pidx];
         if (f->wr && p->writers > 0)
             p->writers--;
@@ -1120,6 +1175,7 @@ do_close(long fd)
         if (gfidref[slot] && --gfidref[slot] == 0)
             p9_clunk(f->p9fid);         /* last reference: release the fid */
     }
+    ofile_unref(f->of);                 /* 9P file/dir, or an overlay-only dir */
     f->used = 0;
     return 0;
 }
@@ -1139,10 +1195,10 @@ do_lseek(long fd, long off, long whence)
     if (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END)
         return -LERR_INVAL;
     uint64_t end = f->isram ? ramfs[f->ridx].len : f->size;
-    uint64_t base = (whence == SEEK_CUR) ? f->pos :
+    uint64_t base = (whence == SEEK_CUR) ? f->of->pos :
                     (whence == SEEK_END) ? end : 0;
-    f->pos = base + (uint64_t)off;
-    return (long)f->pos;
+    f->of->pos = base + (uint64_t)off;
+    return (long)f->of->pos;
 }
 
 /* An overlay inode is 0x10000+ri, so recover a created file's own mtime from it;
@@ -1455,8 +1511,8 @@ dirent_emit(uint8_t *out, unsigned long used, unsigned long count,
 }
 
 /* getdents64 over a directory that may have both a read-only 9P side and a
- * writable overlay side. The 9P entries come first (phase 1, cursor in f->pos),
- * then the overlay's direct children (phase 2, cursor in f->dov). Each call
+ * writable overlay side. The 9P entries come first (phase 1, cursor in of->pos),
+ * then the overlay's direct children (phase 2, cursor in of->dov). Each call
  * emits as many whole records as fit and resumes where it left off; a return of
  * 0 means the directory is exhausted. Overlay and 9P are not deduplicated, so a
  * created file that shadows a bundle file of the same name lists twice. */
@@ -1474,15 +1530,15 @@ do_getdents64(long fd, void *buf, unsigned long count)
     unsigned long used = 0;
 
     /* Phase 1: the 9P directory stream. */
-    if (f->p9fid && !f->d9done) {
+    if (f->p9fid && !f->of->d9done) {
         uint8_t kbuf[4096];
-        long got = p9_read(f->p9fid, f->pos, kbuf, sizeof kbuf);
+        long got = p9_read(f->p9fid, f->of->pos, kbuf, sizeof kbuf);
         if (got > 0) {
             uint32_t off = 0, consumed = 0;
             struct p9_stat e;
             while (p9_dir_next(kbuf, (uint32_t)got, &off, &e)) {
                 unsigned long u = dirent_emit(out, used, count,
-                                              e.qid.path, (int64_t)(f->pos + off),
+                                              e.qid.path, (int64_t)(f->of->pos + off),
                                               (e.qid.type & P9_QTDIR) != 0, e.name);
                 if (u == 0)
                     break;              /* no room: leave for the next call */
@@ -1491,16 +1547,16 @@ do_getdents64(long fd, void *buf, unsigned long count)
             }
             if (used == 0 && off > 0)
                 return -LERR_INVAL;     /* a single entry too big for the buffer */
-            f->pos += consumed;
+            f->of->pos += consumed;
             if (used > 0)
                 return (long)used;      /* more 9P may remain; caller re-enters */
         }
-        f->d9done = 1;                  /* 9P stream exhausted */
+        f->of->d9done = 1;              /* 9P stream exhausted */
     }
 
     /* Phase 2: the writable overlay's direct children of this directory. */
-    for (int i = (int)f->dov; i < RAMFS_MAX; i++) {
-        f->dov = (uint32_t)i;
+    for (int i = (int)f->of->dov; i < RAMFS_MAX; i++) {
+        f->of->dov = (uint32_t)i;
         if (!ramfs[i].used || ramfs[i].unlinked)
             continue;
         const char *leaf = ramfs_child_leaf(ramfs[i].name, f->dpath);
@@ -1512,7 +1568,7 @@ do_getdents64(long fd, void *buf, unsigned long count)
             return used ? (long)used : -LERR_INVAL;     /* resume at i next call */
         used = u;
     }
-    f->dov = RAMFS_MAX;                  /* overlay exhausted */
+    f->of->dov = RAMFS_MAX;             /* overlay exhausted */
     return (long)used;
 }
 
@@ -1635,6 +1691,7 @@ release_fds(struct lshared *sh)
         struct lfd *f = &sh->fdtab[i];
         if (!f->used || f->iscon)
             continue;
+        ofile_unref(f->of);             /* drop this fd's share of the offset */
         if (f->ispipe) {
             struct lpipe *pp = &pipes[f->pidx];
             if (f->wr && pp->writers > 0)
@@ -1743,6 +1800,8 @@ do_fork(void)
         struct lfd *f = &csh->fdtab[i];
         if (!f->used || f->iscon)
             continue;
+        if (f->of)
+            f->of->nref++;              /* child shares the offset */
         if (f->ispipe) {
             if (f->wr)
                 pipes[f->pidx].writers++;
@@ -1821,6 +1880,8 @@ inherit_fds(struct lshared *csh)
         struct lfd *f = &csh->fdtab[i];
         if (!f->used || f->iscon)
             continue;
+        if (f->of)
+            f->of->nref++;              /* child shares the offset */
         if (f->ispipe) {
             if (f->wr)
                 pipes[f->pidx].writers++;
