@@ -909,6 +909,26 @@ at once with a 1 KiB buffer. It now holds 1024.
 With those, `sort -S 1k` over 4000 lines sorts correctly, its output matches a
 reference sort, and `/tmp` drains back to empty.
 
+### The descriptor cap
+
+The per-process descriptor table held 32 entries, so a process had 29 usable
+descriptors (0, 1 and 2 are the console). That is few: a program that keeps many
+files open at once runs out, and `bash`, which relocates its script descriptor
+to a high number, had to scan downward from a guessed high value because the
+guest reported `RLIMIT_NOFILE` as `RLIM_INFINITY` rather than the real limit.
+
+The table could not simply grow, because it is embedded in each process and each
+entry carried a 192-byte directory key, so a larger table would push the kernel
+image into the program's address space at 4 MiB. That key is only used by
+directory descriptors, and every directory descriptor already owns a shared
+open-file description, so the key moved there. Each table entry then dropped to
+about a quarter of its size, and the table grew to 128 entries at no extra cost
+to the kernel image. The 9P descriptor pool on both sides grew to match, so a
+process can hold that many host files open at once, not just that many numbers.
+And `prlimit64` now reports `RLIMIT_NOFILE` as the real cap, so a program sizes
+its descriptor arrays correctly and bash lands its script descriptor directly.
+A test held 87 host files open at once, where the old pool capped near 63.
+
 ## The cut line
 
 Held against scope creep, and all deferred to later hardening milestones:
@@ -918,6 +938,10 @@ Held against scope creep, and all deferred to later hardening milestones:
   `cc1` is copied in full on each exec, about 1.4 s per compile over 9P, which
   a repeated-compile workload such as configure would feel),
 - `munmap` accepts but does not reclaim,
+- a directory listing is capped: the 9P server serializes a directory into one
+  fixed buffer and returns at most 64 entries, so `ls` of a large host directory
+  (`/usr/bin` has thousands) is silently truncated. The autotools build never
+  reads such a directory, but a tool that scans one would see a short list,
 - the autotools gaps above (a writable directory tree, a real working
   directory, and exec of freshly built binaries from the overlay).
 

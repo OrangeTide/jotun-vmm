@@ -187,7 +187,7 @@ preserved across execve.
 | 228 | clock_gettime | partial | a fixed epoch plus the cycle counter at an assumed 1 GHz; shares the epoch with file timestamps so a freshly built file is not in the future |
 | 63 | uname | full | fixed Linux/jotun/x86_64 fields |
 | 318 | getrandom | partial | cycle-counter PRNG, not cryptographic |
-| 302 | prlimit64 | stub | reports RLIM_INFINITY |
+| 302 | prlimit64 | partial | reports RLIMIT_NOFILE as the real fd cap (LINUX_NFD), RLIM_INFINITY for other resources; a new limit is ignored |
 | 273 | set_robust_list | stub | returns 0 |
 | 334 | rseq | stub | returns 0 |
 
