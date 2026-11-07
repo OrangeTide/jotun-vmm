@@ -785,45 +785,49 @@ configure drove a long way and surfaced several real bugs, each fixed:
 With these, configure gets through install detection, the clock sanity check,
 `mkdir -p`, `gawk`, the `make` probes, finds gcc, and **passes the "C compiler
 works" check**, compiling and linking an overlay `conftest.c` into a running
-executable. It then stops at the next compile with a crash in `cc1`.
+executable. It then stopped at the next compile with a crash in `cc1`, which
+turned out to be a real heap-placement bug, now fixed.
 
-### The cc1 crash, isolated
+### The cc1 crash: the heap grew through ld.so
 
-`cc1` jumps through a corrupted pointer into its own `.data` and takes a #UD.
-What the isolation established:
+`cc1` took a #UD partway into a compile, in `ld.so` code that had run fine
+moments before. The cause was the program break being placed in the wrong spot.
 
-- It is **cc1-specific**. Every other glibc binary here runs: bash, sed, gawk,
-  make, the coreutils, the gcc driver, the assembler, and the linker. Only
-  `cc1`, the 30 MiB C++ program, crashes. `cc1` itself preprocesses (`-E`) and
-  emits assembly (`-S`) fine; the fault is in a full run.
-- It is **early**, in `cc1` startup (glibc and C++ constructors), before real
-  compilation: the stack pointer is only a few hundred bytes below the top and
-  cc1 has barely run. By the #UD cc1 has already been executing through its own
-  data for a few instructions, so the first corruption is upstream of where it
-  faults.
-- It is **layout-sensitive, not random**. With a fixed `AT_RANDOM` the crash is
-  bit-for-bit deterministic (same rip, same registers). It is not `AT_RANDOM`,
-  the stack canary, or the pointer guard. But it flips with anything that moves
-  memory around: the size of the environment, `EXEC_STR_MAX`, and
-  `LINUX_USTACK_SIZE` each turn it on or off. A small change elsewhere can hide
-  or expose it.
-- It is **not** several things ruled out: not frame-pool exhaustion or a frame
-  leak (the free count stays healthy and recovers), not argv/envp truncation
-  (raising the caps does not fix it, and it fires well under them), not an
-  unhandled syscall (none precedes it), and not the generic exec/stack handoff
-  (coreutils start fine with the same large environments).
+When a dynamic program loads, the executable goes at its own address and the
+interpreter (`ld.so`) loads 2 MiB-aligned just above it. The heap must start
+above both. `image_top()` chose where, and it tested the wrong flag: the
+interpreter's `has_interp` instead of the executable's. The interpreter has no
+`PT_INTERP` of its own, so that flag is always zero, and `image_top()` always
+returned the executable's end, ignoring the interpreter sitting above it.
 
-So it is a layout-dependent memory corruption confined to `cc1` startup that
-this environment triggers, with the originating write still unidentified.
-Pinning it down needs guest-side debugging of `cc1` (a gdb stub, or comparing
-its early memory and relocations against a native run), which is left for a
-later pass. The autotools goal is walked back here, one compile short of
-finishing configure, with the path and this characterization documented.
+For the small PIE tools this never bit, because the executable's end falls below
+the heap floor (`LINUX_HEAP_BASE`), which lands the heap above their `ld.so`
+anyway. `cc1` is different: a 30 MiB non-PIE `ET_EXEC` whose `_end` is at
+`0x22c7228`, with `ld.so` placed at `0x2400000` and ending near `0x243a000`. The
+heap was set to `0x22c8000`, **below** `ld.so`. glibc's `brk` heap then grew
+upward, crossed `0x2400000`, and `malloc` began writing chunk-size headers over
+`ld.so`'s `.text`. `ld.so` kept running until it reached one of the overwritten
+instructions and took the #UD. `cc1 -E` and `-S` escaped it only because they
+allocate little and finish before the heap climbs that far.
 
-One related limit noted along the way: `copy_uvec` caps argv and envp at
+The fix is one line of intent in `image_top()`: take the executable's end, and
+when the executable has an interpreter, the interpreter's end if it is higher.
+
+How it was found, after several wrong guesses (it is not `AT_RANDOM`, AVX, a
+frame leak, or argv truncation): a byte dump at the faulting rip showed it was
+`ld.so` `.text` holding garbage; a re-read of `ld.so` straight after loading
+proved it had loaded clean, so something corrupted it at run time. Watches in
+`phys_alloc` and `vmspace_map` stayed silent, ruling out a re-handed frame or a
+remap. Since the guest runs in ring 0, `CR0.WP` was clear and ring-0 stores
+ignored a read-only PTE, so marking `ld.so` `.text` read-only caught nothing
+until `WP` was set too. With both in place the write faulted, and the culprit
+was glibc `malloc`. A `brk` trace then showed the heap starting at `0x22c8000`
+and marching straight through `0x2400000`.
+
+One unrelated limit noted along the way: `copy_uvec` caps argv and envp at
 `EXEC_STR_MAX`/2 (16 KiB each) and silently drops the overflow, so a very large
-environment would reach the child truncated. It is not the cc1 crash (that
-fires far below the cap), but it is worth raising when a workload needs it.
+environment would reach the child truncated. It did not cause this crash, but it
+is worth raising when a workload needs it.
 
 ## The cut line
 
