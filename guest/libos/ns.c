@@ -119,6 +119,16 @@ split_path(const char *path, char comps[][NS_NAMELEN], int maxc)
             p++;
         }
         comps[n][i] = '\0';
+        /* Normalize "." (current dir: drop) and ".." (parent: pop one), so a
+         * path such as .../13/. or a/b/../c walks correctly. A ".." at the root
+         * is clamped. gcc's is_directory() stats "<dir>/." this way. */
+        if (comps[n][0] == '.' && comps[n][1] == '\0')
+            continue;
+        if (comps[n][0] == '.' && comps[n][1] == '.' && comps[n][2] == '\0') {
+            if (n > 0)
+                n--;
+            continue;
+        }
         n++;
     }
     return n;

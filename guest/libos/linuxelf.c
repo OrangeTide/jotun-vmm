@@ -395,7 +395,7 @@ do_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags,
     uint64_t va;
     if (flags & MAP_FIXED) {
         va = addr & ~(PAGE_SIZE - 1);
-        if (va < VM_USER_LO || va + n > VM_USER_HI)
+        if (va < VM_USER_LO || n > VM_USER_HI - va)   /* overflow-safe bound */
             return MMAP_FAILED;
         /* An overlay inside an existing reservation: do not move mmap_cur. The
          * frames may already hold stale bytes (the dynamic linker first maps a
@@ -405,7 +405,7 @@ do_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags,
          * (this is how the .bss overlay must read). */
         memset((void *)(uintptr_t)va, 0, n);
     } else {
-        if (mmap_cur - n < brk_cur)
+        if (n > mmap_cur - brk_cur)     /* overflow-safe: mmap_cur > brk_cur */
             return MMAP_FAILED;
         mmap_cur -= n;
         va = mmap_cur;
@@ -513,6 +513,19 @@ ramfs_create(const char *name)
         }
     }
     return -1;
+}
+
+/* Remove a ramfs file by name. Returns 0 if one was removed, -1 if absent.
+ * The buffer is kept (freed lazily on reuse) so a stale pointer is never left. */
+static int
+ramfs_remove(const char *name)
+{
+    int i = ramfs_find(name);
+    if (i < 0)
+        return -1;
+    ramfs[i].used = 0;
+    ramfs[i].len = 0;
+    return 0;
 }
 
 /* Ensure a ramfile's buffer holds at least `need` bytes, doubling as needed. */
@@ -1705,6 +1718,12 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     }
     case SYS_sigaltstack:
         return 0;                       /* no signal delivery: accept and ignore */
+    case SYS_umask:
+        return 022;                     /* report a conventional prior mask */
+    case SYS_chmod:
+    case SYS_fchmod:
+    case SYS_fchmodat:
+        return 0;                       /* no permission bits to enforce */
     case SYS_dup: {
         struct lfd *f = fd_get(a1);
         if (!f || a1 < 3)
@@ -1776,6 +1795,22 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return -LERR_INVAL;             /* nothing in the bundle is a symlink;
                                          * gcc probes /proc/self/exe and falls
                                          * back to its default prefix */
+    case SYS_unlink:
+    case SYS_unlinkat: {
+        /* unlink(path): path is a1. unlinkat(dirfd, path, flags): path is a2,
+         * dirfd is treated as AT_FDCWD. Only the writable ramfs overlay can be
+         * removed; the 9P bundle and host mounts are read-only. ld, configure,
+         * and make all unlink their temporaries, which live in the overlay. */
+        const char *upath = (nr == SYS_unlink) ? (const char *)a1
+                                               : (const char *)a2;
+        if (ramfs_remove(bundle_path(upath)) == 0)
+            return 0;
+        int isdir;
+        uint64_t size, ino;
+        if (meta_path(upath, &isdir, &size, &ino) == 0)
+            return -LERR_ROFS;          /* exists, but read-only */
+        return -LERR_NOENT;
+    }
     case SYS_access: {
         /* access(path, mode): path is the first argument. The dynamic linker
          * probes /etc/ld.so.cache and candidate library directories this way. */

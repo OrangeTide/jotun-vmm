@@ -16,6 +16,9 @@
 #define SYS_dup             23
 #define SYS_dup3            24
 #define SYS_fcntl           25
+#define SYS_unlinkat        35
+#define SYS_fchmod          52
+#define SYS_fchmodat        53
 #define SYS_ioctl           29
 #define SYS_statfs          43
 #define SYS_fstatfs         44
@@ -56,6 +59,7 @@
 #define SYS_rt_sigprocmask  135
 #define SYS_uname           160
 #define SYS_getrusage       165
+#define SYS_umask           166
 #define SYS_prctl           167
 #define SYS_gettimeofday    169
 #define SYS_getpid          172
@@ -97,6 +101,8 @@
 #define SYS_access     (-10)
 #define SYS_getpgrp    (-11)
 #define SYS_readlink   (-12)
+#define SYS_unlink     (-13)
+#define SYS_chmod      (-14)
 
 /* arch_prctl is x86-only; defined so the shared case body compiles. */
 #define ARCH_SET_FS 0x1002
