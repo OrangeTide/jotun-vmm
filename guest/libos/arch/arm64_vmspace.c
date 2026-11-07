@@ -116,9 +116,10 @@ vmspace_new(void)
         l2[i] = base | attr;
     }
 
-    /* physmap: the first 32 MiB of RAM as sixteen 2 MiB blocks at VM_PHYSMAP. */
+    /* physmap: all of RAM as 2 MiB blocks at VM_PHYSMAP, so the kernel reaches
+     * any frame by physical address regardless of the active TTBR0. */
     uint64_t *lp = tbl(l2_phys);
-    for (uint64_t i = 0; i < 16; i++)
+    for (uint64_t i = 0; i < VM_PHYSMAP_PAGES; i++)
         lp[i] = (i << 21) | BLOCK_NORMAL;
 
     return l1;

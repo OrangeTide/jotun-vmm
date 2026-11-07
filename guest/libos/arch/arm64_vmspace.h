@@ -5,14 +5,17 @@
  * turns the MMU on with that process's tables in TTBR0_EL1, and later switches
  * just reload TTBR0 and flush. The layout matches the x86 backend:
  *
- *   [0, 0x400000)            kernel, page tables, MMIO: identity, shared
- *   [0x400000, 0x1C00000)    the user window: private 4 KiB pages per process
- *   [0x1C00000, 0x40000000)  rest of the low 1 GiB: identity, shared
- *   [1 GiB, 1 GiB + 32 MiB)  physmap: all RAM, reached by physical address
+ *   [0, 0x400000)            kernel image: identity, shared
+ *   [0x400000, VM_USER_HI)   the user window: private 4 KiB pages per process
+ *   [VM_KHEAP_LO, VM_KHEAP_HI)  the kernel heap: identity, shared
+ *   [VM_KHEAP_HI, RAM top)   vcpu stacks: identity, shared
+ *   [RAM top, 0x40000000)    the device band (MMU as device): identity, shared
+ *   [1 GiB, 1 GiB + RAM)     physmap: all RAM, reached by physical address
  *
  * 39-bit VA, 4 KiB granule: L1 (1 GiB/entry), L2 (2 MiB), L3 (4 KiB). The low
  * gigabyte is one L2 table of 2 MiB blocks with the user window punched out for
- * L3 page tables; the physmap is a second L2 of 2 MiB blocks. AArch64 only; the
+ * L3 page tables; the physmap is a second L2 of 2 MiB blocks. The kernel heap
+ * sits above the user window (see x86_64_vmspace.h for why). AArch64 only; the
  * Linux-compat path needs the MMU. */
 #ifndef ARM64_VMSPACE_H
 #define ARM64_VMSPACE_H
@@ -20,9 +23,15 @@
 #include <stdint.h>
 
 #define VM_PAGE      0x1000ULL
+#define VM_RAM_SIZE  0x08000000ULL           /* 128 MiB; must match the host */
 #define VM_USER_LO   0x400000ULL
-#define VM_USER_HI   0x1C00000ULL
-#define VM_PHYSMAP   0x40000000ULL          /* 1 GiB */
+#define VM_USER_HI   (VM_RAM_SIZE - 0x1000000ULL)  /* RAM top less 16 MiB */
+/* The kernel heap: 8 MiB above the user window, with the vcpu stacks taking
+ * what remains up to RAM top. Both 2 MiB aligned. See x86_64_vmspace.h. */
+#define VM_KHEAP_LO  VM_USER_HI
+#define VM_KHEAP_HI  (VM_USER_HI + 0x800000ULL)
+#define VM_PHYSMAP   0x40000000ULL           /* 1 GiB */
+#define VM_PHYSMAP_PAGES (VM_RAM_SIZE / 0x200000ULL)  /* RAM in 2 MiB pages */
 
 /* The arch-neutral core passes these to vmspace_map; the AArch64 backend maps
  * every user page the same way (RW at EL1), so the flags carry no bits here. */
