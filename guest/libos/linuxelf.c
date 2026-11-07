@@ -392,12 +392,20 @@ arena_init(uint64_t image_top)
     mmap_cur = mmap_top;
 }
 
-/* The highest address occupied by the loaded image: the interpreter's end when
- * present (it loads above the executable), otherwise the executable's. */
+/* The highest address occupied by the loaded image: the executable's end, or
+ * the interpreter's when the executable has one (the interpreter loads above
+ * the executable). The test is the executable's has_interp, not the
+ * interpreter's: the interpreter itself has no PT_INTERP, so its has_interp is
+ * always zero. Getting this wrong placed the heap at the executable's end,
+ * below the interpreter, so a large executable's heap grew up through the
+ * interpreter's code. */
 static uint64_t
 image_top(const struct elf_info *exe, const struct elf_info *interp)
 {
-    return interp->has_interp ? interp->load_end : exe->load_end;
+    uint64_t top = exe->load_end;
+    if (exe->has_interp && interp->load_end > top)
+        top = interp->load_end;
+    return top;
 }
 
 static long
