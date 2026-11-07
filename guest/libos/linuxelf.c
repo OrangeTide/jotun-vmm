@@ -258,18 +258,26 @@ guest_now_sec(void)
     return GUEST_EPOCH + arch_cycles() / 1000000000ULL;
 }
 
-/* Overlay files are timestamped from a monotonic counter above the epoch, not
- * the wall clock: it is strictly increasing (so a later write is newer, which
- * make relies on) and bounded just above the bundle files' epoch (so a freshly
- * built file passes autotools' "not older than the sources" sanity check). A
- * wall-clock value here, which can be large and jump between reads, confused
- * the toolchain's timestamp logic. */
-static uint64_t fs_mtick;
+/* Overlay files are timestamped from the same wall clock the time syscalls
+ * report (GUEST_EPOCH + elapsed), so a freshly built file is never in the
+ * future relative to the clock make reads, which otherwise warns of clock skew.
+ * The stamp is held strictly above the epoch, so a generated file still beats
+ * the read-only bundle files (reported at the epoch) and passes autotools'
+ * "not older than the sources" sanity check, and never steps backwards, so a
+ * later write is never older than an earlier one. Within one clock second
+ * several files share a stamp, as on a real second-granularity filesystem. */
+static uint64_t fs_last_stamp;
 
 static uint64_t
 fs_stamp(void)
 {
-    return GUEST_EPOCH + ++fs_mtick;
+    uint64_t t = guest_now_sec();
+    if (t <= GUEST_EPOCH)
+        t = GUEST_EPOCH + 1;
+    if (t < fs_last_stamp)
+        t = fs_last_stamp;
+    fs_last_stamp = t;
+    return t;
 }
 
 static struct ramfile ramfs[RAMFS_MAX];
@@ -2131,7 +2139,11 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return 0;
     }
     case SYS_socket:
-        return -LERR_NOSYS;             /* no sockets in this guest; quiet */
+    case SYS_getsockname:
+    case SYS_getpeername:
+        /* No sockets in this guest. gcc calls getpeername on its output to see
+         * whether it is a socket; a quiet ENOSYS is the "no" it expects. */
+        return -LERR_NOSYS;
     case SYS_getrandom: {
         uint8_t *buf = (uint8_t *)a1;
         unsigned long len = (unsigned long)a2;

@@ -36,6 +36,8 @@
 #define SYS_dup2            33
 #define SYS_getpid          39
 #define SYS_socket          41
+#define SYS_getsockname     51
+#define SYS_getpeername     52
 #define SYS_clone           56
 #define SYS_fork            57
 #define SYS_vfork           58

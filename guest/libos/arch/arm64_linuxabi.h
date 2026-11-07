@@ -79,6 +79,8 @@
 #define SYS_gettid          178
 #define SYS_sysinfo         179
 #define SYS_socket          198
+#define SYS_getsockname     204
+#define SYS_getpeername     205
 #define SYS_brk             214
 #define SYS_munmap          215
 #define SYS_clone           220
