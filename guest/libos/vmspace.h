@@ -13,6 +13,7 @@
  *   frames     phys_init, phys_alloc, phys_free, phys_to_virt
  *   spaces     vmspace_new, vmspace_map, vmspace_lookup, vmspace_switch,
  *              vmspace_destroy, vmspace_clone
+ *   heap       kheap_init (set up the demand-grown kernel heap window)
  *   faults     pf_handle (called from the arch fault vector)
  */
 #ifndef LIBOS_VMSPACE_H

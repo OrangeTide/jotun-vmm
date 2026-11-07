@@ -10,6 +10,17 @@
 /* Hand the allocator a contiguous region to manage. Call once at boot. */
 void meminit(void *base, size_t size);
 
+/* Add another contiguous region to the free pool. Like meminit, but augments
+ * the pool rather than replacing it, so the heap can grow after boot. The
+ * region is inserted in address order and coalesces with an adjacent block. */
+void memadd(void *base, size_t size);
+
+/* Register a callback kmalloc invokes when the current free pool cannot
+ * satisfy a request. It should map and add at least `need` bytes as one
+ * contiguous region (via memadd) and return the bytes added, or 0 if it cannot
+ * grow. kmalloc retries the request after a successful growth. */
+void mem_set_grower(size_t (*grow)(size_t need));
+
 /* Allocate at least size bytes, or NULL if the region cannot satisfy it. */
 void *kmalloc(size_t size);
 

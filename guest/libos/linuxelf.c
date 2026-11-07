@@ -2978,6 +2978,7 @@ linux_phys_init(void)
     if (!phys_ready) {
         phys_init(LINUX_PROG_BASE, VM_USER_HI);
         linux_tables_init();
+        kheap_init();           /* heap now grows past the bootstrap band */
         phys_ready = 1;
     }
 }

@@ -998,9 +998,37 @@ and `RAMFS_MAX`, `LINUX_NFD`, `LINUX_NOFILE` and the process count no longer
 trade against it: raising `RAMFS_MAX` four-fold and the descriptor cap to 256
 leaves `_end` byte for byte unchanged.
 
-What is still finite is the band itself: 8 MiB of kernel memory shared by the
-tables, the overlay's file data, and the kstacks. A build that wrote tens of
-MiB of files into the overlay would exhaust it. The next step, if a workload
-ever needs it, is a kernel heap that grows on demand from the same frame pool
-the user pages come from, rather than a fixed band. It is not needed to clear
-the wall this milestone was about.
+### The heap grows past the band
+
+The band alone is still 8 MiB, shared by the tables, the overlay's file data,
+and the kstacks. A build that writes tens of MiB of files into the overlay would
+exhaust it. So the band is now only the bootstrap: once the Linux-compat path
+comes up, the heap also grows on demand from the same frame pool the user pages
+come from.
+
+The growth goes into a window at `VM_KHEAP_VA` (2 GiB), a whole unused PDPT
+entry above the physmap. The window is mapped by one shared page directory, not
+a per-process one: `kheap_init` installs it in the boot tables and `vmspace_new`
+installs the same directory in every process, so a frame mapped into the window
+once is reachable under every CR3. When `kmalloc` cannot satisfy a request from
+the current free pool, it calls a grower (registered by `kheap_init`) that maps
+fresh pool frames into the window, contiguous with what is already there, and
+hands the span to the allocator. Because the frames are mapped contiguously in
+the window even though they are scattered in physical memory, a single large
+allocation, such as a 4 MiB overlay file buffer, still gets one contiguous
+virtual range.
+
+The band carries the boot and the process-table setup, which happen before the
+first address-space switch while the window is not yet reachable (on arm64 the
+MMU is still off; on both arches the grower stays idle until the switch). After
+that, overlay writes grow the heap into the window as needed. The pool is now
+shared between user pages and kernel heap, which is the point: a run can spend
+the 108 MiB pool on whichever it needs, instead of being capped at an 8 MiB band
+for the kernel. Writing and verifying 36 MiB of overlay files, four and a half
+times the band, then freeing and rewriting half of it, runs clean.
+
+The window never shrinks and its pages, once mapped, are never unmapped, so
+growth needs no cross-cpu TLB shootdown: the entries it writes were not present
+before, so no stale translation can be cached for them. x86 is exercised by the
+full spike set plus the 36 MiB overlay stress; the arm64 side is the usual
+compile-only parity, pending a runtime host.

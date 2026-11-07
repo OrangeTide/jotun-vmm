@@ -10,16 +10,24 @@
  * Layout in every process address space (RAM is VM_RAM_SIZE, mapped at 0):
  *   [0, 0x400000)            kernel image: identity, shared
  *   [0x400000, VM_USER_HI)   the user window: private 4 KiB pages per process
- *   [VM_KHEAP_LO, VM_KHEAP_HI)  the kernel heap: identity, shared
+ *   [VM_KHEAP_LO, VM_KHEAP_HI)  the kernel heap bootstrap band: identity, shared
  *   [VM_KHEAP_HI, RAM top)   vcpu stacks: identity, shared
  *   [1 GiB, 1 GiB + RAM)     physmap: all RAM, so the kernel can reach any
  *                            frame by physical address regardless of CR3
+ *   [VM_KHEAP_VA, ...)       the kernel heap growth window: shared, demand-grown
  *
- * The kernel heap lives above the user window, not in the cramped identity
- * region below it, so kmalloc and the dynamically sized tables are not boxed
- * into the few MiB under the user's load address. It is identity-mapped like
- * the rest of [0, 1 GiB) outside the user window, so the one base pointer is
- * valid at boot and after every CR3 switch.
+ * The kernel heap starts in the bootstrap band above the user window, not in
+ * the cramped identity region below it, so kmalloc and the dynamically sized
+ * tables are not boxed into the few MiB under the user's load address. The band
+ * is identity-mapped like the rest of [0, 1 GiB) outside the user window, so the
+ * one base pointer is valid at boot and after every CR3 switch.
+ *
+ * The band is finite, so once the Linux-compat path is up the heap also grows
+ * on demand into the window at VM_KHEAP_VA, backed by frames drawn from the same
+ * pool the user pages come from. The window is a separate PDPT entry pointing at
+ * one shared page directory (kheap_init installs it in the boot tables and
+ * vmspace_new installs it in every process), so a frame mapped into it once is
+ * reachable in every address space. See kheap_init in the C file.
  *
  * VM_RAM_SIZE must match GUEST_RAM_SIZE in the host (host/main.c); the window
  * and the physmap are derived from it here. x86-64 only; the Linux-compat path
@@ -40,6 +48,10 @@
 #define VM_KHEAP_HI  (VM_USER_HI + 0x800000ULL)
 #define VM_PHYSMAP   0x40000000ULL           /* 1 GiB */
 #define VM_PHYSMAP_PAGES (VM_RAM_SIZE / 0x200000ULL)  /* RAM in 2 MiB pages */
+/* The demand-grown kernel heap window: 2 GiB, a whole PDPT entry (1 GiB of VA,
+ * far more than RAM) above the physmap. Backed by scattered pool frames mapped
+ * contiguously here, so a single large allocation still gets contiguous VA. */
+#define VM_KHEAP_VA  0x80000000ULL
 
 /* Page-table entry flags. */
 #define VM_P   0x1ULL                       /* present */
@@ -79,6 +91,10 @@ uint64_t vmspace_lookup(vmspace_t as, uint64_t vaddr);
 
 /* Make as the active address space (load CR3) and enable the physmap. */
 void vmspace_switch(vmspace_t as);
+
+/* Set up the demand-grown kernel heap window and register it as the allocator's
+ * grower. Call once, after phys_init, before the first vmspace_switch. */
+void kheap_init(void);
 
 /* Free every user-window frame and page table of as (not the shared kernel
  * tables, which are shared by reference). */

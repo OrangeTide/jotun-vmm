@@ -1,6 +1,8 @@
 /* x86_64_vmspace.c : per-process address spaces. See x86_64_vmspace.h. */
 #include "x86_64_vmspace.h"
 
+#include "arch.h"
+#include "mem.h"
 #include "string.h"
 
 /* Physical frame allocator: a free list whose link lives in each free frame,
@@ -10,6 +12,16 @@ static int      physmap_on;             /* phys_to_virt uses the physmap once se
 
 /* The address space the page-fault handler maps into (the running process). */
 vmspace_t cur_vmspace;
+
+/* The demand-grown kernel heap window (see the header). One shared page
+ * directory maps it in every address space; kheap_top is the next unmapped
+ * window VA. kheap_pd is 0 until kheap_init runs, which keeps vmspace_new and
+ * the grower inert on the native boot path that never sets the window up. */
+static uint64_t     kheap_pd;
+static uint64_t     kheap_top;
+static volatile int kheap_lock;
+
+#define KHEAP_CHUNK  0x200000ULL        /* map at least 2 MiB per growth */
 
 void *
 phys_to_virt(uint64_t p)
@@ -81,6 +93,8 @@ vmspace_new(void)
     tbl(pml4)[0] = pdpt | VM_P | VM_W | VM_U;
     tbl(pdpt)[0] = pd_low | VM_P | VM_W | VM_U;     /* [0, 1 GiB) */
     tbl(pdpt)[1] = pd_phys | VM_P | VM_W;           /* [1 GiB, 2 GiB): physmap */
+    if (kheap_pd)
+        tbl(pdpt)[2] = kheap_pd | VM_P | VM_W;      /* [2 GiB, 3 GiB): heap window */
 
     /* Everything in [0, 1 GiB) outside the user window is shared identity as
      * 2 MiB pages: the kernel, page tables, vcpu stacks, and the device MMIO
@@ -156,6 +170,92 @@ vmspace_switch(vmspace_t as)
     __asm__ volatile ("mov %0, %%cr3" : : "r"(as) : "memory");
     physmap_on = 1;
     cur_vmspace = as;
+}
+
+static uint64_t
+read_cr3(void)
+{
+    uint64_t v;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(v));
+    return v;
+}
+
+/* Map one zeroed pool frame at window VA va (4 KiB aligned, >= VM_KHEAP_VA),
+ * allocating the page table first if va opens a new 2 MiB span. Returns 0, or
+ * -1 if the pool is empty. The caller holds kheap_lock. */
+static int
+kheap_map_page(uint64_t va)
+{
+    uint64_t *pd = tbl(kheap_pd);
+    uint64_t pdi = (va >> 21) & 0x1FF;
+    uint64_t e = pd[pdi];
+
+    if (!(e & VM_P)) {
+        uint64_t pt = phys_alloc();
+        if (!pt)
+            return -1;
+        pd[pdi] = pt | VM_P | VM_W;
+        e = pd[pdi];
+    }
+    uint64_t f = phys_alloc();
+    if (!f)
+        return -1;
+    uint64_t *pt = tbl(pte_frame(e));
+    pt[(va >> 12) & 0x1FF] = f | VM_P | VM_W;
+    return 0;
+}
+
+/* The allocator's grower: map at least need bytes of fresh pool frames into the
+ * window, contiguous with what is already mapped, and hand the span to the
+ * allocator. Returns the bytes added, or 0 when it cannot satisfy need (the
+ * window is unreachable before the first switch, or the pool is empty). The new
+ * pages were not-present, so no TLB flush is needed before they are touched. */
+static size_t
+kheap_grow(size_t need)
+{
+    if (!physmap_on)            /* the window is mapped only once a vmspace runs */
+        return 0;
+
+    size_t want = need < KHEAP_CHUNK ? KHEAP_CHUNK : need;
+    want = (want + VM_PAGE - 1) & ~(VM_PAGE - 1);
+
+    unsigned long irq = arch_irq_save();
+    while (__atomic_exchange_n(&kheap_lock, 1, __ATOMIC_ACQUIRE))
+        arch_cpu_relax();
+
+    uint64_t base = kheap_top;
+    size_t done = 0;
+    while (done < want) {
+        if (kheap_map_page(kheap_top) != 0)
+            break;
+        kheap_top += VM_PAGE;
+        done += VM_PAGE;
+    }
+
+    __atomic_store_n(&kheap_lock, 0, __ATOMIC_RELEASE);
+    arch_irq_restore(irq);
+
+    if (done == 0)
+        return 0;
+    memadd((void *)(uintptr_t)base, done);
+    return done < need ? 0 : done;      /* mapped, but short of the request */
+}
+
+void
+kheap_init(void)
+{
+    kheap_pd = phys_alloc();
+    if (!kheap_pd)
+        return;                 /* no window; the bootstrap band stands alone */
+
+    /* Install the window's page directory in the current (boot) tables, so it
+     * is reachable from any cpu still running on them; vmspace_new installs the
+     * same shared directory in every process. physmap_on is still 0 here, so
+     * phys_to_virt is the identity map and the walk reads the boot tables. */
+    uint64_t *pdpt = tbl(pte_frame(tbl(read_cr3())[0]));
+    pdpt[VM_KHEAP_VA >> 30] = kheap_pd | VM_P | VM_W;
+    kheap_top = VM_KHEAP_VA;
+    mem_set_grower(kheap_grow);
 }
 
 /* The page-fault handler's C half (called from pf_isr). A not-present fault in
