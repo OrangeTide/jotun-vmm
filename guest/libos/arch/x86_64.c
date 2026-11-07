@@ -166,14 +166,24 @@ static const char *const exc_names[32] = {
     "#HV hypervisor", "#VC vmm communication", "#SX security", "reserved",
 };
 
+static void
+put_byte(uint8_t b)
+{
+    static const char hx[] = "0123456789abcdef";
+    con_putc(hx[b >> 4]);
+    con_putc(hx[b & 0xf]);
+}
+
 /* Print the fault and halt. Entered only on a CPU exception, which a healthy
  * guest never takes; it exists so a foreign Linux binary that faults leaves a
  * readable trail instead of a silent triple fault. */
 void
 fault_report(struct faultframe *f)
 {
-    uint64_t cr2;
+    uint64_t cr0, cr4, cr2;
     __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
 
     con_puts("\n*** CPU exception ");
     con_putu(f->vec);
@@ -208,6 +218,39 @@ fault_report(struct faultframe *f)
     con_puthex(f->rsi);
     con_puts(" rdi=");
     con_puthex(f->rdi);
+
+    /* CPU feature state. If OSXSAVE is clear, xgetbv itself is #UD, so only read
+     * XCR0 when it is set. A VEX/EVEX opcode faulting with XCR0 missing its AVX
+     * bits is the classic "glibc IFUNC picked an instruction the guest never
+     * enabled" trap. */
+    con_puts("\n  cr0=");
+    con_puthex(cr0);
+    con_puts(" cr4=");
+    con_puthex(cr4);
+    con_puts(" xcr0=");
+    if (cr4 & (1ULL << 18)) {
+        uint32_t lo, hi;
+        __asm__ volatile ("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        con_puthex(((uint64_t)hi << 32) | lo);
+    } else {
+        con_puts("(osxsave off)");
+    }
+
+    /* The bytes at RIP. For #UD this classifies the fault at a glance: 0f 0b is
+     * a deliberate ud2 (abort/trap, the real cause is upstream), a c5/c4/62
+     * prefix is a VEX/EVEX (AVX) instruction, anything else is likely a wild
+     * jump. The CPU fetched the faulting instruction, so RIP is mapped; stop at
+     * the page boundary so the dump never touches a second, possibly unmapped
+     * page. */
+    if (f->vec == 6) {
+        const uint8_t *p = (const uint8_t *)(uintptr_t)f->rip;
+        uint64_t page_end = (f->rip | 0xFFFULL) + 1;
+        con_puts("\n  code=");
+        for (int i = 0; i < 16 && f->rip + (uint64_t)i < page_end; i++) {
+            put_byte(p[i]);
+            con_putc(' ');
+        }
+    }
     con_puts("\nhalted\n");
 
     for (;;)
