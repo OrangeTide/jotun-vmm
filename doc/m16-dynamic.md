@@ -741,6 +741,60 @@ loader pulls from the mount as before. So a dynamic PIE copied into the overlay
 runs with its interpreter loaded from 9P, which is exactly what a compiled
 `conftest` is.
 
+## The autotools attempt
+
+With compile, link, writable directories, a working directory, and exec from
+the overlay all in place, the next target was a full `./configure && make` of a
+minimal automake "hello world": a project whose `configure` script, `Makefile.in`,
+and `hello.c` sit in the read-only bundle, with the host toolchain and coreutils
+grafted from live `/usr` mounts, run under `bin bash`. The build directory is
+the overlay (configure writes `config.log`, `config.status`, `Makefile`,
+`conftest.*` there, shadowing the read-only sources).
+
+configure drove a long way and surfaced several real bugs, each fixed:
+
+- **Shell fd redirection.** configure opens its log on a high fd and juggles
+  descriptors (`exec 6>&1`). `fcntl` validated no descriptor, so a closed fd
+  reported success; a shell that probes a target with `F_GETFD` before
+  redirecting believed it open and then failed to save it. `fcntl` now returns
+  EBADF for a closed fd.
+- **Command-substitution pipe deadlock.** `` `cmd | sed 1q` `` hung forever.
+  `dup2` onto a std fd did not close the previous occupant, so when a pipeline
+  stage's stdout (a pipe) was replaced on fd 1 the pipe's writer reference
+  leaked and the reader never saw EOF. `dup2`/`dup3` now close the old target
+  whatever its number. This also closed the earlier "heavy pipe" bug.
+- **Open-unlink aliasing.** `cat confdefs.h - > conftest.c` reported "input file
+  is output file". bash writes the heredoc to an overlay temp, unlinks it while
+  the fd is open, then creates `conftest.c`, which reused the just-freed slot
+  and aliased the two inodes. The overlay now holds an unlinked entry until its
+  last fd closes.
+- **Timestamps.** Every file reported mtime 0, so automake's sanity check ("a
+  freshly created file must not be older than the sources") failed on the
+  tie-break. Overlay files now carry a monotonic stamp above a fixed epoch, and
+  the wall clock shares that epoch so the new file is newer than the bundle yet
+  not in the future.
+- **A missing `/tmp`, process headroom, and small stubs.** `sort` needs a
+  writable temp dir; configure nests subshells and pipelines and gcc fans out
+  to cc1/as/ld, which overran the 8-process table (raised to 48);
+  `sched_getaffinity`, `clock_nanosleep`, and `link`/`symlink` (EPERM, so the
+  `ln -s` probe falls back to copying) round it out.
+- **gcc's tool prefix.** gcc finds `cc1` relative to its own path, so it must be
+  invoked as `/usr/bin/gcc` (prefix `/usr/libexec/gcc/...`), not through a
+  differently named mount.
+
+With these, configure gets through install detection, the clock sanity check,
+`mkdir -p`, `gawk`, the `make` probes, finds gcc, and **passes the "C compiler
+works" check**, compiling and linking an overlay `conftest.c` into a running
+executable. It then stops at "checking whether we are cross compiling" with a
+reproducible crash: `cc1`, compiling a larger unit, jumps through a corrupted
+pointer into its own data and takes a #UD. It is deterministic per input and
+sits deep in `cc1`; the glibc tools (bash, sed, gawk, make, coreutils, and gcc
+on bundle sources) are unaffected, and `cc1` preprocesses (`-E`) and generates
+assembly (`-S`) from overlay sources without trouble, so it is specific to the
+heavier `-c`/run path. Root-causing it needs guest-side debugging of `cc1` and
+is left for a later pass. So the autotools goal is walked back here, one check
+short of finishing configure, with the path and the gaps documented.
+
 ## The cut line
 
 Held against scope creep, and all deferred to later hardening milestones:

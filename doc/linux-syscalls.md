@@ -26,7 +26,7 @@ Statuses used below:
 - **stub**: accepted and ignored (returns 0 or a fixed value) with no real
   effect; present so startup and common idioms do not fail.
 
-## Implemented (96 calls)
+## Implemented (102 calls)
 
 ### File and directory I/O
 
@@ -46,14 +46,16 @@ Statuses used below:
 | 21 | access | full | existence check via meta_path; the dynamic linker probes ld.so.cache and library dirs this way |
 | 22 | pipe | full | in-memory byte ring |
 | 32 | dup | full | refcounted share of the backing object |
-| 33 | dup2 | full | targets 0/1/2 allowed (shell redirects) |
-| 72 | fcntl | partial | F_DUPFD/F_DUPFD_CLOEXEC duplicate to the lowest free fd (bash redirect save/restore); other commands accepted, returning 0 |
+| 33 | dup2 | full | any target; the old target (even a std fd holding a pipe) is closed before the rebind |
+| 72 | fcntl | partial | validates the fd first (a closed fd is EBADF, which a shell relies on to probe a redirect target); F_DUPFD/F_DUPFD_CLOEXEC duplicate to the lowest free fd; other commands return 0 |
 | 79 | getcwd | full | returns the process's current directory (a leading slash plus the stored key) |
 | 80 | chdir | full | sets a per-process working directory; resolves the target against the current cwd and requires it be a directory |
 | 82 | rename | partial | within the writable overlay (a directory carries its subtree); a read-only source is EXDEV |
 | 83 | mkdir | full | creates a writable-overlay directory; EEXIST if anything already resolves there |
 | 84 | rmdir | partial | removes an empty overlay directory (ENOTEMPTY otherwise); a read-only bundle directory is EROFS |
-| 87 | unlink | partial | removes a writable overlay file; a read-only bundle or host-mount path returns EROFS |
+| 86 | link | stub | EPERM (no hard links); callers fall back to copying |
+| 87 | unlink | partial | removes a writable overlay file (open-unlink: the inode is held until the last fd closes); a read-only path returns EROFS |
+| 88 | symlink | stub | EPERM (no symlinks); configure's `ln -s` probe falls back to copying |
 | 89 | readlink | stub | returns EINVAL (no symlinks); gcc probes /proc/self/exe and falls back to its default prefix |
 | 90 | chmod | stub | no permission bits to enforce; returns 0 |
 | 91 | fchmod | stub | as chmod |
@@ -66,6 +68,8 @@ Statuses used below:
 | 262 | newfstatat | full | AT_EMPTY_PATH maps to fstat |
 | 263 | unlinkat | partial | as unlink; AT_REMOVEDIR routes to rmdir; dirfd AT_FDCWD |
 | 264 | renameat | partial | as rename; dirfds AT_FDCWD |
+| 265 | linkat | stub | as link (EPERM); dirfds AT_FDCWD |
+| 266 | symlinkat | stub | as symlink (EPERM) |
 | 267 | readlinkat | stub | returns EINVAL (no symlinks) |
 | 268 | fchmodat | stub | as chmod |
 | 269 | faccessat | full | existence check via meta_path; no permission bits, dirfd ignored |
@@ -135,6 +139,8 @@ preserved across execve.
 |----|------|--------|-------|
 | 202 | futex | partial | private FUTEX_WAIT and FUTEX_WAKE; no requeue, no timeout |
 | 24 | sched_yield | full | cooperative yield |
+| 204 | sched_getaffinity | stub | reports a single online cpu (cpu 0) so a tool sizes its pool to one |
+| 230 | clock_nanosleep | stub | returns 0 (no timers; a cooperative guest has nothing to sleep on) |
 
 ### Signals (minimal)
 
@@ -161,10 +167,10 @@ preserved across execve.
 | 108 | getegid | stub | returns 0 |
 | 157 | prctl | stub | returns 0 |
 | 201 | time | partial | derived from the cycle counter (approximate) |
-| 96 | gettimeofday | partial | cycle counter split into seconds and microseconds, as clock_gettime |
+| 96 | gettimeofday | partial | a fixed epoch plus the cycle counter, split into seconds and microseconds |
 | 98 | getrusage | stub | zeroed counters; no CPU-time accounting (gcc, as query it) |
 | 99 | sysinfo | stub | reports total RAM and a plausible free fraction; cc1 sizes its allocator from this |
-| 228 | clock_gettime | partial | cycle counter at an assumed 1 GHz |
+| 228 | clock_gettime | partial | a fixed epoch plus the cycle counter at an assumed 1 GHz; shares the epoch with file timestamps so a freshly built file is not in the future |
 | 63 | uname | full | fixed Linux/jotun/x86_64 fields |
 | 318 | getrandom | partial | cycle-counter PRNG, not cryptographic |
 | 302 | prlimit64 | stub | reports RLIM_INFINITY |
@@ -190,7 +196,6 @@ source.
 | 18 | pwrite64 | med | easy | positioned write (ramfs) |
 | 40 | sendfile | high | easy | return ENOSYS cleanly, or a read/write loop; silences the cat/cp path |
 | 35 | nanosleep | high | medium | cooperative: yield or a timed block; busybox sleep, retries |
-| 230 | clock_nanosleep | med | medium | same mechanism as nanosleep |
 | 21 | access | high | easy | stat-based existence/permission check |
 | 269 | faccessat | high | easy | access with a dirfd (ignored like openat) |
 | 72 | fcntl (real) | high | medium | honor F_DUPFD, F_GETFL/F_SETFL, F_GETFD/F_SETFD |
