@@ -659,16 +659,17 @@ With compile and link working, `./configure` still needs more:
   a relative path resolves against it before the overlay lookup or 9P walk, and
   it is inherited on fork and the posix_spawn child and kept across `execve`.
   See "The working directory" below.
-- Exec of freshly built binaries from the overlay. `do_execve` runs only bundle
-  and host-mount files, but configure compiles `conftest.c` and then runs
-  `./conftest` to check the compiler works.
+- Exec of freshly built binaries from the overlay. **Done.** `do_execve` runs a
+  program from the writable overlay (an in-memory image) as well as a bundle or
+  host-mount file, so configure's `./conftest` and a linked `a.out` run. See
+  "Exec from the overlay" below.
 - A few more syscalls as they surface (`symlink`, `link`, `select`/`poll`), and
   the residual pipe bug where a reader draining a large multi-process writer
   sees EBADF.
 
 The thesis target, running the unmodified toolchain to compile and link, is
-met. The last big autotools gap is exec of a freshly built binary from the
-overlay.
+met, and a program built in the overlay now runs. The open items are the
+remaining syscalls and the pipe bug.
 
 ## The writable overlay
 
@@ -716,6 +717,29 @@ per-process: a process's threads share it, `fork` and the posix_spawn child
 copy it, and `execve` preserves it, matching Linux. This is what lets a build
 step `cd` into a subdirectory and then open, compile, and exec by relative
 paths.
+
+## Exec from the overlay
+
+A build produces its output in the writable overlay: configure writes
+`conftest.c`, compiles it, and runs `./conftest`; a link writes `a.out`. These
+have no backing 9P file, so `execve` had to learn to load from an in-memory
+image.
+
+The ELF loader read only over 9P. Its byte source is now a small `elf_src`
+(either a 9P fid or an `(image, length)` pair), and the one `read_full` either
+loops over 9P reads or copies from the image. `elf_load_ex` keeps the 9P
+signature as a thin wrapper, and a new `elf_load_mem` takes the in-memory form;
+the segment placement, bss zeroing, and bounds checks are shared.
+
+`do_execve` resolves the path (against the cwd), and if it names an overlay
+file it hands that buffer to the loader instead of walking and opening a 9P
+fid. The buffer is captured before the address-space switch; it lives in kernel
+memory, not the user window, so loading the new image and freeing the old space
+leave it intact. An interpreter, when the executable has one, is still a 9P
+path: a program built here links against the host's `ld-linux`, which the
+loader pulls from the mount as before. So a dynamic PIE copied into the overlay
+runs with its interpreter loaded from 9P, which is exactly what a compiled
+`conftest` is.
 
 ## The cut line
 

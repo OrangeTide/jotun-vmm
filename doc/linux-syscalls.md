@@ -108,7 +108,7 @@ preserved across execve.
 | 435 | clone3 | full | parses clone_args and routes like clone (posix_spawn, thread, or fork) |
 | 57 | fork | full | eager address-space copy, shared fds |
 | 58 | vfork | full | treated as fork |
-| 59 | execve | full | replaces the image; releases a vfork parent and keeps a borrowed space |
+| 59 | execve | full | replaces the image from a bundle/host file (9P) or a writable-overlay file (in-memory); releases a vfork parent and keeps a borrowed space |
 | 60 | exit | full | ends the calling thread |
 | 61 | wait4 | partial | child processes only; pid treated as 32-bit (so -1 matches any); rusage ignored |
 | 231 | exit_group | full | ends the process |
