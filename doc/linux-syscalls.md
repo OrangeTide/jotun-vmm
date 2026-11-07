@@ -26,7 +26,7 @@ Statuses used below:
 - **stub**: accepted and ignored (returns 0 or a fixed value) with no real
   effect; present so startup and common idioms do not fail.
 
-## Implemented (111 calls)
+## Implemented (112 calls)
 
 ### File and directory I/O
 
@@ -102,6 +102,7 @@ preserved across execve.
 | 11 | munmap | stub | returns 0; the bump arena does not reclaim |
 | 12 | brk | full | grows the heap within the arena |
 | 27 | mincore | stub | quiet ENOSYS; no page-residency to report |
+| 25 | mremap | stub | quiet ENOSYS; glibc realloc then copies into a fresh mmap itself, which is all a real mremap could do against the non-reclaiming bump arena |
 | 28 | madvise | stub | returns 0 |
 | 221 | fadvise64 | stub | returns 0; advisory only (coreutils calls posix_fadvise on its input) |
 
@@ -247,7 +248,6 @@ poll-aware blocking) but stay within the cooperative model.
 | 112 | setsid | med | easy | stub |
 | 124 | getsid | low | easy | stub |
 | 280 | utimensat | low | medium | timestamps on ramfs files |
-| 25 | mremap | med | hard | glibc malloc uses it; hard against a bump arena |
 
 ### Phase 3: signals, sockets, and event descriptors
 

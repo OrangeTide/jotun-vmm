@@ -938,11 +938,30 @@ Held against scope creep, and all deferred to later hardening milestones:
   `cc1` is copied in full on each exec, about 1.4 s per compile over 9P, which
   a repeated-compile workload such as configure would feel),
 - `munmap` accepts but does not reclaim,
-- a directory listing is capped: the 9P server serializes a directory into one
-  fixed buffer and returns at most 64 entries, so `ls` of a large host directory
-  (`/usr/bin` has thousands) is silently truncated. The autotools build never
-  reads such a directory, but a tool that scans one would see a short list,
 - the autotools gaps above (a writable directory tree, a real working
   directory, and exec of freshly built binaries from the overlay).
 
 None of these block compiling and linking a C program.
+
+### Uncapping directory listings
+
+One limit found while raising the descriptor cap was on the other side, in the
+host 9P server: a directory read serialized the backend's listing into a single
+8 KiB buffer and took at most 64 entries from the backend. A large host
+directory was silently truncated, so `ls /usr/bin` (thousands of entries)
+returned 64, and a glob or a directory scan saw a short list.
+
+The fix makes the listing stream. The backend's list operation emits each entry
+to a callback instead of filling a fixed array, and the server appends the
+serialized entries to a per-connection buffer that grows as needed. The whole
+listing is built once, at the start of a read, and later reads serve byte
+slices of it, so a directory is bounded only by host memory. All five backends
+convert to the callback; the graft backend keeps its identity retagging and the
+overlay its synthetic entries by driving the same callback.
+
+The larger listings then exercised `mremap`, which glibc's `realloc` uses to
+grow a big block. Our `mmap` is a non-reclaiming bump allocator, so a real
+`mremap` would only copy into a fresh region exactly as glibc's own fallback
+does when the call returns `ENOSYS`. It returns `ENOSYS`, quietly, and glibc
+does the copy. With both, `ls` of `/usr/bin` and `/usr/lib/x86_64-linux-gnu`
+returns the exact host counts, and a glob matches the host.
