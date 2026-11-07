@@ -53,8 +53,13 @@
 #define MAP_ANONYMOUS 0x20
 #define MMAP_FAILED   (-LERR_NOMEM)
 
-/* The most argv entries delivered to a Linux program. */
-#define LINUX_MAX_ARGS 32
+/* The most argv (or envp) entries delivered to a Linux program. A compiler
+ * driver builds long linker command lines: gcc's collect2 invocation of ld
+ * passes the crt objects, every -L path, the input objects, the -l libraries,
+ * and the end crt objects, which runs well past a few dozen arguments. Too low
+ * a cap silently drops the trailing arguments (the end crt objects, or the
+ * input object itself), which a linker then reports as undefined symbols. */
+#define LINUX_MAX_ARGS 256
 
 #define AT_FDCWD (-100)
 
@@ -2017,7 +2022,10 @@ copy_uvec(const char *const *uvec, const char **out, char *buf, size_t buflen)
     return n;
 }
 
-#define EXEC_STR_MAX 8192
+/* Scratch for one execve's argv and envp strings, split half and half. A
+ * compiler's linker command line plus gcc's inherited COLLECT and COMPILER_PATH
+ * environment runs to several kilobytes, so this is sized well above that. */
+#define EXEC_STR_MAX 32768
 
 /* Load a program already open on LINUX_FID into the active address space, and
  * its PT_INTERP dynamic linker if it has one. The executable loads at
