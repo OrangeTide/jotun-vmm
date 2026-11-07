@@ -26,7 +26,7 @@ Statuses used below:
 - **stub**: accepted and ignored (returns 0 or a fixed value) with no real
   effect; present so startup and common idioms do not fail.
 
-## Implemented (102 calls)
+## Implemented (104 calls)
 
 ### File and directory I/O
 
@@ -155,6 +155,8 @@ preserved across execve.
 | nr | name | status | notes |
 |----|------|--------|-------|
 | 41 | socket | stub | quiet ENOSYS; no sockets in this guest (bash probes for one at startup) |
+| 51 | getsockname | stub | quiet ENOSYS; no sockets in this guest |
+| 52 | getpeername | stub | quiet ENOSYS; gcc probes whether its output fd is a socket |
 
 ### Thread-local storage, identity, time, misc
 
