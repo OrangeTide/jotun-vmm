@@ -651,20 +651,48 @@ three layers up (an "undefined symbol" from the linker), far from its cause.
 
 With compile and link working, `./configure` still needs more:
 
-- A writable filesystem with directories. The overlay (ramfs) is flat, caps at
-  16 files of 1 MiB each, and has no `mkdir`. configure creates many files in
-  subdirectories (config.log, config.status, conftest.*, nested build dirs).
-- A real working directory. `chdir` is a no-op (cwd stays `/`), so configure's
-  relative-path and `cd` steps would not resolve.
+- A writable filesystem with directories. **Done.** The overlay is now
+  directory-aware (`mkdir`/`rmdir`/`rename`, nested files, and a `getdents` that
+  merges the 9P and overlay sides); it holds 256 entries of up to 4 MiB. See
+  "The writable overlay" below.
+- A real working directory. `chdir` is still a no-op (cwd stays `/`), so
+  configure's relative-path and `cd` steps resolve against the root, not a
+  build subdirectory.
 - Exec of freshly built binaries from the overlay. `do_execve` runs only bundle
   and host-mount files, but configure compiles `conftest.c` and then runs
   `./conftest` to check the compiler works.
-- More syscalls: `rename`, `mkdir`, `rmdir`, a real `getcwd`, `symlink`,
-  `link`, a real `dup`/`fcntl`, and `select`/`poll`.
+- A few more syscalls as they surface (`symlink`, `link`, `select`/`poll`), and
+  the residual pipe bug where a reader draining a large multi-process writer
+  sees EBADF.
 
-These are a milestone in their own right. The thesis target, running the
-unmodified toolchain to compile and link, is met; the autotools goal is
-deferred behind this list.
+The thesis target, running the unmodified toolchain to compile and link, is
+met. The remaining autotools gaps are the working directory and exec from the
+overlay.
+
+## The writable overlay
+
+Anything the guest creates or writes lives in an in-memory overlay that shadows
+the read-only 9P bundle and host mounts. It began as a flat set of 16
+path-keyed files with no directory concept, which a compiler's temporaries
+outgrew and a configure run could not use at all. It is now directory-aware:
+
+- Each entry carries an `is_dir` flag and a normalized bundle-relative key
+  (`norm_key` collapses `.` and `..`, so `/tmp/./x` and `tmp/x` are one entry).
+  The table holds 256 entries, names up to 192 bytes, files up to 4 MiB.
+- `do_open` resolves a directory three ways: an explicit overlay directory
+  (`mkdir`), one implied by files created below it, or a 9P directory, and when
+  a path is both it opens a merged directory. A directory fd records its key.
+- `getdents` lists a directory in two phases, the 9P stream then the overlay's
+  direct children, so a directory holding both bundle and created files shows
+  all of them. There is no dedup: a created file that shadows a bundle name of
+  the same path lists twice.
+- `mkdir`, `rmdir` (and `unlinkat` with `AT_REMOVEDIR`), and `rename` (a
+  directory carries its subtree; a read-only source is `EXDEV`) operate on the
+  overlay; `stat` and `test -d` see overlay directories through `meta_path`.
+
+The overlay is shared across processes (it lives in kernel memory, not a
+per-process space), so a directory one process creates is visible to the
+others, which a shell pipeline and a build both rely on.
 
 ## The cut line
 

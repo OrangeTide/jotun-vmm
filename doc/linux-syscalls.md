@@ -26,7 +26,7 @@ Statuses used below:
 - **stub**: accepted and ignored (returns 0 or a fixed value) with no real
   effect; present so startup and common idioms do not fail.
 
-## Implemented (89 calls)
+## Implemented (96 calls)
 
 ### File and directory I/O
 
@@ -47,9 +47,12 @@ Statuses used below:
 | 22 | pipe | full | in-memory byte ring |
 | 32 | dup | full | refcounted share of the backing object |
 | 33 | dup2 | full | targets 0/1/2 allowed (shell redirects) |
-| 72 | fcntl | partial | returns 0; does not honor F_DUPFD or report F_GETFL/F_GETFD |
+| 72 | fcntl | partial | F_DUPFD/F_DUPFD_CLOEXEC duplicate to the lowest free fd (bash redirect save/restore); other commands accepted, returning 0 |
 | 79 | getcwd | stub | always returns "/" |
 | 80 | chdir | stub | cwd is fixed at "/"; accepts the root or an existing directory so a tool restoring its cwd at exit succeeds |
+| 82 | rename | partial | within the writable overlay (a directory carries its subtree); a read-only source is EXDEV |
+| 83 | mkdir | full | creates a writable-overlay directory; EEXIST if anything already resolves there |
+| 84 | rmdir | partial | removes an empty overlay directory (ENOTEMPTY otherwise); a read-only bundle directory is EROFS |
 | 87 | unlink | partial | removes a writable overlay file; a read-only bundle or host-mount path returns EROFS |
 | 89 | readlink | stub | returns EINVAL (no symlinks); gcc probes /proc/self/exe and falls back to its default prefix |
 | 90 | chmod | stub | no permission bits to enforce; returns 0 |
@@ -57,21 +60,30 @@ Statuses used below:
 | 95 | umask | stub | reports a conventional prior mask (022) |
 | 137 | statfs | stub | quiet ENOSYS; no real filesystem to describe (libselinux probes this) |
 | 138 | fstatfs | stub | quiet ENOSYS, as statfs |
-| 217 | getdents64 | full | packs 9P directory entries |
+| 217 | getdents64 | full | merges the 9P directory stream with the overlay's children |
 | 257 | openat | partial | dirfd ignored; namespace is effectively rooted |
+| 258 | mkdirat | full | as mkdir; dirfd treated as AT_FDCWD |
 | 262 | newfstatat | full | AT_EMPTY_PATH maps to fstat |
-| 263 | unlinkat | partial | as unlink; dirfd treated as AT_FDCWD |
+| 263 | unlinkat | partial | as unlink; AT_REMOVEDIR routes to rmdir; dirfd AT_FDCWD |
+| 264 | renameat | partial | as rename; dirfds AT_FDCWD |
 | 267 | readlinkat | stub | returns EINVAL (no symlinks) |
 | 268 | fchmodat | stub | as chmod |
 | 269 | faccessat | full | existence check via meta_path; no permission bits, dirfd ignored |
 | 292 | dup3 | full | like dup2 |
 | 293 | pipe2 | full | flags (O_CLOEXEC, O_NONBLOCK) ignored |
+| 316 | renameat2 | partial | as rename; flags ignored |
+| 326 | copy_file_range | stub | quiet ENOSYS; cp and mv fall back to a read/write loop |
 | 332 | statx | full | basic stats mask |
 | 439 | faccessat2 | full | same as faccessat (the flags variant) |
 
 Path components `.` and `..` are normalized before a 9P walk (`split_path` in
 ns.c), so `.../13/.` and `a/b/../c` resolve. This is what lets gcc's
 `is_directory()` probe (which appends `/.`) recognize a library directory.
+
+The writable overlay is directory-aware: entries carry an is_dir flag and a
+normalized key, do_open resolves overlay and 9P directories (and their merge),
+and getdents lists both sides. It still has no per-process working directory
+(chdir is a no-op), so relative paths resolve against the root.
 
 ### Memory
 
