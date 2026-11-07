@@ -41,7 +41,9 @@ struct p9_backend {
                   void *buf, uint32_t n);
 };
 
-#define P9_MAXFID 64
+/* Must cover the guest's 9P fid pool (GFID_MAX in guest/libos/linuxelf.c) plus
+ * its interp-loader fid and a scratch fid, with headroom. */
+#define P9_MAXFID 160
 
 struct p9srv {
     const struct p9_backend *be;

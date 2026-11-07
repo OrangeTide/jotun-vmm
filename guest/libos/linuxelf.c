@@ -32,7 +32,7 @@
  * (prog.c uses 10), and the pool of fids backing open file descriptors. */
 #define LINUX_FID      12u
 #define LINUX_IFID     13u          /* loads the PT_INTERP dynamic linker */
-#define LINUX_FID_BASE 32u          /* open files use fids 32..32+LINUX_NFD */
+#define LINUX_FID_BASE 32u          /* 9P-backed opens use fids 32..32+GFID_MAX */
 
 /* The Linux program's address space, independent of the native program window.
  * A static non-PIE binary is linked at 0x400000; the load window runs to 8 MiB,
@@ -193,7 +193,7 @@ struct linux_dirent64 {
     char     d_name[];
 };
 
-#define LINUX_NFD   32
+#define LINUX_NFD   128                 /* per-process descriptors (0..NFD-1) */
 #define LINUX_NPIPE 4
 #define PIPE_CAP    4096
 
@@ -226,10 +226,6 @@ struct lfd {
      * commands at one redirected file. NULL for a console or pipe fd, which
      * have no position. */
     struct ofile *of;
-    /* The directory's normalized key, for the overlay phase of getdents. It is
-     * fixed at open, so each fd keeps its own copy; the enumeration cursor that
-     * does advance lives in the shared open-file description. */
-    char     dpath[RAMFS_NAME];
     uint64_t size;
     uint64_t ino;               /* stable identity (9P qid path): a fresh fd for
                                  * the same file reports the same inode, which
@@ -323,12 +319,17 @@ struct ofile {
     uint64_t pos;               /* read/write cursor, or 9P dir offset (phase 1) */
     int      d9done;            /* getdents: the 9P phase is finished */
     uint32_t dov;               /* getdents: overlay scan cursor */
+    /* A directory's normalized key, for the overlay phase of getdents and for
+     * resolving *at paths and fchdir against an open directory fd. Fixed at
+     * open; lives here (not in struct lfd) so the per-process fd table stays
+     * small enough to grow the fd count without overrunning the kernel image. */
+    char     dpath[RAMFS_NAME];
 };
 
 /* One per concurrently open file or directory; dups and forks share, so this
- * need only cover distinct opens. Bounded above by the 9P fid pool plus the
- * overlay, with headroom. */
-#define LINUX_NOFILE 256
+ * need only cover distinct opens. Sized above the per-process fd cap times a
+ * few busy processes, since the pool is global while the fd tables are not. */
+#define LINUX_NOFILE 512
 static struct ofile ofiles[LINUX_NOFILE];
 
 static struct ofile *
@@ -578,7 +579,9 @@ fd_alloc(void)
  * gfidref so dup and fork can share one fid (one server-side file, hence one
  * shared read offset, as fork semantics want) and it is clunked only when the
  * last fd across all processes closes. Index into gfidref is (fid - FID_BASE). */
-#define GFID_MAX 64
+#define GFID_MAX 128                    /* concurrent 9P-backed opens; the host
+                                         * server (P9_MAXFID) must cover this
+                                         * plus the interp and scratch fids */
 static uint8_t gfidref[GFID_MAX];
 
 /* A free pool fid (count 0), or 0 if the pool is exhausted. */
@@ -1028,17 +1031,18 @@ open_ram(int ri, long flags)
     return fd;
 }
 
-/* Record a directory's normalized key on its fd, for the overlay phase of
- * getdents. d9done starts set when there is no 9P side to enumerate. */
+/* Record a directory's normalized key on its open-file description, for the
+ * overlay phase of getdents. d9done starts set when there is no 9P side to
+ * enumerate. */
 static void
 fd_set_dir(struct lfd *f, const char *key)
 {
     size_t i = 0;
     while (key[i] && i < RAMFS_NAME - 1) {
-        f->dpath[i] = key[i];
+        f->of->dpath[i] = key[i];
         i++;
     }
-    f->dpath[i] = 0;
+    f->of->dpath[i] = 0;
     f->of->d9done = f->p9fid ? 0 : 1;
     f->of->dov = 0;
 }
@@ -1064,13 +1068,13 @@ at_path(long dirfd, const char *path, char *buf, size_t n, long *err)
         *err = -LERR_BADF;
         return NULL;
     }
-    if (!f->isdir) {
+    if (!f->isdir || !f->of) {
         *err = -LERR_NOTDIR;
         return NULL;
     }
     size_t w = 0;
     buf[w++] = '/';
-    for (const char *s = f->dpath; *s && w < n - 1; s++)
+    for (const char *s = f->of->dpath; *s && w < n - 1; s++)
         buf[w++] = *s;
     if (w > 1 && w < n - 1)             /* a slash only when the key was nonempty */
         buf[w++] = '/';
@@ -1653,7 +1657,7 @@ do_getdents64(long fd, void *buf, unsigned long count)
         f->of->dov = (uint32_t)i;
         if (!ramfs[i].used || ramfs[i].unlinked)
             continue;
-        const char *leaf = ramfs_child_leaf(ramfs[i].name, f->dpath);
+        const char *leaf = ramfs_child_leaf(ramfs[i].name, f->of->dpath);
         if (!leaf)
             continue;
         unsigned long u = dirent_emit(out, used, count, (uint64_t)(0x10000 + i),
@@ -2243,10 +2247,19 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return (long)len;               /* not cryptographic; a startup seed */
     }
     case SYS_prlimit64: {
+        /* prlimit64(pid, resource, new, old): report the descriptor cap
+         * truthfully for RLIMIT_NOFILE(7) so a caller sizes fd arrays and
+         * targets a valid high fd (bash moves its script fd just below this
+         * limit); everything else is unbounded. The new limit is ignored. */
         uint64_t *old = (uint64_t *)a4;   /* old_limit: {rlim_cur, rlim_max} */
         if (old) {
-            old[0] = ~0ULL;               /* RLIM_INFINITY */
-            old[1] = ~0ULL;
+            if (a2 == 7) {                /* RLIMIT_NOFILE */
+                old[0] = LINUX_NFD;
+                old[1] = LINUX_NFD;
+            } else {
+                old[0] = ~0ULL;           /* RLIM_INFINITY */
+                old[1] = ~0ULL;
+            }
         }
         return 0;
     }
@@ -2443,17 +2456,18 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     }
     case SYS_fchdir: {
         /* Move the working directory to a directory already open on a fd. Its
-         * normalized key is kept on the fd (dpath), so this just copies it in.
-         * coreutils walk trees this way (mkdir -p, rm -rf via fts), so without
-         * it rm -rf cannot descend to empty a directory and rmdir fails. */
+         * normalized key is kept on the open-file description (dpath), so this
+         * just copies it in. coreutils walk trees this way (mkdir -p, rm -rf
+         * via fts), so without it rm -rf cannot descend to empty a directory
+         * and rmdir fails. */
         struct lfd *f = fd_get(a1);
         if (!f)
             return -LERR_BADF;
-        if (!f->isdir)
+        if (!f->isdir || !f->of)
             return -LERR_NOTDIR;
         size_t i = 0;
-        while (f->dpath[i] && i < sizeof cwd_key - 1) {
-            cwd_key[i] = f->dpath[i];
+        while (f->of->dpath[i] && i < sizeof cwd_key - 1) {
+            cwd_key[i] = f->of->dpath[i];
             i++;
         }
         cwd_key[i] = 0;
