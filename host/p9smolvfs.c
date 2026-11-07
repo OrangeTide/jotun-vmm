@@ -131,7 +131,7 @@ sv_walk(void *vctx, const struct p9_node *dir, const char *name,
 }
 
 static int
-sv_list(void *vctx, const struct p9_node *dir, struct p9_dirent *ents, int max)
+sv_list(void *vctx, const struct p9_node *dir, p9_emit_fn emit, void *ectx)
 {
     struct smolctx *c = vctx;
     struct cas_tree_dir d;
@@ -141,22 +141,23 @@ sv_list(void *vctx, const struct p9_node *dir, struct p9_dirent *ents, int max)
     if (cas_tree_load(c->ct, dir->handle, &d) != CAS_OK)
         return -1;
 
-    int n = 0;
-    for (int i = 0; i < d.count && n < max; i++) {
+    for (int i = 0; i < d.count; i++) {
         struct cas_tree_entry *e = &d.entries[i];
         int isdir = (e->mode & CAS_TREE_S_IFMT) == CAS_TREE_S_IFDIR;
+        struct p9_dirent ent;
 
-        memset(&ents[n], 0, sizeof ents[n]);
-        strncpy(ents[n].name, e->name, sizeof ents[n].name - 1);
-        ents[n].is_dir = isdir;
-        ents[n].mode = (uint32_t)(e->mode & 0777);
-        ents[n].qid_path = qid_of(e->hash);
+        memset(&ent, 0, sizeof ent);
+        strncpy(ent.name, e->name, sizeof ent.name - 1);
+        ent.is_dir = isdir;
+        ent.mode = (uint32_t)(e->mode & 0777);
+        ent.qid_path = qid_of(e->hash);
         if (!isdir)
-            blob_len(c, e->hash, &ents[n].length);
-        n++;
+            blob_len(c, e->hash, &ent.length);
+        if (emit(ectx, &ent) != 0)
+            break;
     }
     cas_tree_dir_free(&d);
-    return n;
+    return 0;
 }
 
 static long

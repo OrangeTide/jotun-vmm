@@ -101,7 +101,7 @@ hd_walk(void *vctx, const struct p9_node *dir, const char *name,
 }
 
 static int
-hd_list(void *vctx, const struct p9_node *dir, struct p9_dirent *ents, int max)
+hd_list(void *vctx, const struct p9_node *dir, p9_emit_fn emit, void *ectx)
 {
     struct p9hostdir *c = vctx;
     char full[PATH_MAX];
@@ -113,9 +113,8 @@ hd_list(void *vctx, const struct p9_node *dir, struct p9_dirent *ents, int max)
     if (!d)
         return -1;
 
-    int n = 0;
     struct dirent *de;
-    while (n < max && (de = readdir(d))) {
+    while ((de = readdir(d))) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
             continue;
         char ep[PATH_MAX];
@@ -125,16 +124,18 @@ hd_list(void *vctx, const struct p9_node *dir, struct p9_dirent *ents, int max)
         struct stat st;
         if (stat(ep, &st) != 0)
             continue;
-        memset(&ents[n], 0, sizeof ents[n]);
-        strncpy(ents[n].name, de->d_name, sizeof ents[n].name - 1);
-        ents[n].is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
-        ents[n].mode = st.st_mode & 0777;
-        ents[n].length = ents[n].is_dir ? 0 : (uint64_t)st.st_size;
-        ents[n].qid_path = (uint64_t)st.st_ino;
-        n++;
+        struct p9_dirent e;
+        memset(&e, 0, sizeof e);
+        strncpy(e.name, de->d_name, sizeof e.name - 1);
+        e.is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
+        e.mode = st.st_mode & 0777;
+        e.length = e.is_dir ? 0 : (uint64_t)st.st_size;
+        e.qid_path = (uint64_t)st.st_ino;
+        if (emit(ectx, &e) != 0)
+            break;
     }
     closedir(d);
-    return n;
+    return 0;
 }
 
 static long

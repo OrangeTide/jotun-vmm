@@ -119,46 +119,63 @@ gr_walk(void *ctx, const struct p9_node *dir, const char *name,
     return 0;
 }
 
+/* Retag each entry's qid with a tree id as it streams up to the real emit, so
+ * the composed namespace stays routable: id 0 (the base) keeps only the low
+ * bits, a graft id is stamped into the high bits. */
+struct gr_tagctx {
+    p9_emit_fn emit;
+    void      *ectx;
+    uint64_t   id;
+};
+
 static int
-gr_list(void *ctx, const struct p9_node *dir, struct p9_dirent *ents, int max)
+gr_tag_emit(void *vc, const struct p9_dirent *de)
+{
+    struct gr_tagctx *t = vc;
+    struct p9_dirent e = *de;
+
+    if (t->id)
+        e.qid_path = (e.qid_path & GRAFT_QMASK) | (t->id << GRAFT_SHIFT);
+    else
+        e.qid_path &= GRAFT_QMASK;
+    return t->emit(t->ectx, &e);
+}
+
+static int
+gr_list(void *ctx, const struct p9_node *dir, p9_emit_fn emit, void *ectx)
 {
     struct p9graft *g = ctx;
     unsigned id = tree_id(dir);
 
     if (id != 0) {
         struct graft_entry *e = &g->g[id - 1];
-        int n = e->be->list(e->ctx, dir, ents, max);
-        for (int i = 0; i < n; i++)
-            ents[i].qid_path = (ents[i].qid_path & GRAFT_QMASK)
-                             | ((uint64_t)id << GRAFT_SHIFT);
-        return n;
+        struct gr_tagctx t = { emit, ectx, id };
+        return e->be->list(e->ctx, dir, gr_tag_emit, &t);
     }
 
     if (ensure_base_root(g) != 0)
         return -1;
     int at_root = strcmp(dir->handle, g->base_root.handle) == 0;
 
-    /* Keep one slot per graft for the injected entries when listing the root. */
-    int reserve = at_root ? g->ng : 0;
-    int n = g->base->list(g->base_ctx, dir, ents, max - reserve);
-    if (n < 0)
-        n = 0;
-    for (int i = 0; i < n; i++)
-        ents[i].qid_path &= GRAFT_QMASK;        /* tree id 0 */
+    struct gr_tagctx t = { emit, ectx, 0 };     /* base entries: tree id 0 */
+    if (g->base->list(g->base_ctx, dir, gr_tag_emit, &t) != 0)
+        return -1;
 
     if (at_root) {
-        for (int i = 0; i < g->ng && n < max; i++) {
+        for (int i = 0; i < g->ng; i++) {
             if (ensure_graft_root(g, i) != 0)
                 return -1;
-            memset(&ents[n], 0, sizeof ents[n]);
-            strncpy(ents[n].name, g->g[i].name, sizeof ents[n].name - 1);
-            ents[n].is_dir = 1;
-            ents[n].mode = g->g[i].root.mode ? g->g[i].root.mode : 0555;
-            ents[n].qid_path = g->g[i].root.qid_path;   /* already tagged */
-            n++;
+            struct p9_dirent e;
+            memset(&e, 0, sizeof e);
+            strncpy(e.name, g->g[i].name, sizeof e.name - 1);
+            e.is_dir = 1;
+            e.mode = g->g[i].root.mode ? g->g[i].root.mode : 0555;
+            e.qid_path = g->g[i].root.qid_path;     /* already tagged */
+            if (emit(ectx, &e) != 0)
+                break;
         }
     }
-    return n;
+    return 0;
 }
 
 static long

@@ -160,57 +160,47 @@ ov_walk(void *ctx, const struct p9_node *dir, const char *name,
 }
 
 static int
-ov_list(void *ctx, const struct p9_node *dir, struct p9_dirent *ents, int max)
+ov_emit_one(p9_emit_fn emit, void *ectx, const char *name, int is_dir,
+            uint32_t mode, uint64_t qid_path)
+{
+    struct p9_dirent e;
+    memset(&e, 0, sizeof e);
+    strncpy(e.name, name, sizeof e.name - 1);
+    e.is_dir = is_dir;
+    e.mode = mode;
+    e.qid_path = qid_path;
+    return emit(ectx, &e);
+}
+
+static int
+ov_list(void *ctx, const struct p9_node *dir, p9_emit_fn emit, void *ectx)
 {
     struct p9overlay *ov = ctx;
 
     if (!is_synth(dir))
-        return ov->under->list(ov->under_ctx, dir, ents, max);
+        return ov->under->list(ov->under_ctx, dir, emit, ectx);
 
     switch ((unsigned char)dir->handle[0]) {
-    case OV_ROOT: {
+    case OV_ROOT:
         /* The bundle's root entries, plus a synthetic "net". */
-        int n = ov->under->list(ov->under_ctx, &ov->under_root, ents, max - 1);
-        if (n < 0)
-            n = 0;
-        memset(&ents[n], 0, sizeof ents[n]);
-        strncpy(ents[n].name, "net", sizeof ents[n].name - 1);
-        ents[n].is_dir = 1;
-        ents[n].mode = 0555;
-        ents[n].qid_path = OV_QID_BASE + 1;
-        return n + 1;
-    }
-    case OV_NET: {
-        int n = 0;
-        if (max > 0) {
-            memset(&ents[n], 0, sizeof ents[n]);
-            strncpy(ents[n].name, "policy", sizeof ents[n].name - 1);
-            ents[n].mode = 0444;
-            ents[n].qid_path = OV_QID_BASE + 2;
-            n++;
-        }
-        if (max > 1) {
-            memset(&ents[n], 0, sizeof ents[n]);
-            strncpy(ents[n].name, "conn", sizeof ents[n].name - 1);
-            ents[n].is_dir = 1;
-            ents[n].mode = 0555;
-            ents[n].qid_path = OV_QID_BASE + 3;
-            n++;
-        }
-        return n;
-    }
+        ov->under->list(ov->under_ctx, &ov->under_root, emit, ectx);
+        ov_emit_one(emit, ectx, "net", 1, 0555, OV_QID_BASE + 1);
+        return 0;
+    case OV_NET:
+        ov_emit_one(emit, ectx, "policy", 0, 0444, OV_QID_BASE + 2);
+        ov_emit_one(emit, ectx, "conn", 1, 0555, OV_QID_BASE + 3);
+        return 0;
     case OV_CONN: {
         struct net_conninfo conns[OV_MAXCONN];
         int cn = net_conn_snapshot(ov->net, conns, OV_MAXCONN);
-        int n = 0;
-        for (int i = 0; i < cn && n < max; i++) {
-            memset(&ents[n], 0, sizeof ents[n]);
-            snprintf(ents[n].name, sizeof ents[n].name, "%d", conns[i].handle);
-            ents[n].mode = 0444;
-            ents[n].qid_path = OV_QID_BASE + 0x100 + conns[i].handle;
-            n++;
+        for (int i = 0; i < cn; i++) {
+            char nm[32];
+            snprintf(nm, sizeof nm, "%d", conns[i].handle);
+            if (ov_emit_one(emit, ectx, nm, 0, 0444,
+                            OV_QID_BASE + 0x100 + conns[i].handle) != 0)
+                break;
         }
-        return n;
+        return 0;
     }
     default:
         return -1;

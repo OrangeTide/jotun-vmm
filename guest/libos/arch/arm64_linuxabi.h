@@ -90,6 +90,7 @@
 #define SYS_fgetxattr       10
 #define SYS_brk             214
 #define SYS_munmap          215
+#define SYS_mremap          216
 #define SYS_clone           220
 #define SYS_fadvise64       223
 #define SYS_execve          221

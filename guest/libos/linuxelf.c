@@ -2333,6 +2333,12 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
          * type, or a residency hint, fall back cleanly, and a logged "unhandled"
          * line here would pollute a tool's output stream. */
         return -LERR_NOSYS;
+    case SYS_mremap:
+        /* glibc realloc grows a large (mmap-backed) block with mremap. Our mmap
+         * is a non-reclaiming bump allocator, so a real mremap would just copy
+         * into a fresh region exactly as glibc's own fallback does on ENOSYS.
+         * Report ENOSYS quietly and let glibc do the copy. */
+        return -LERR_NOSYS;
     case SYS_getgroups:
         return 0;                       /* no supplementary groups */
     case SYS_getpgrp:

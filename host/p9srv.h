@@ -29,14 +29,19 @@ struct p9_dirent {
     uint64_t qid_path;
 };
 
-/* The backend interface. root and walk return 0 or -1; list returns an entry
- * count or -1; readf returns a byte count or -1. */
+/* A directory listing streams its entries to this callback, one at a time, so
+ * no fixed-size array bounds a listing. Returns 0 to continue, -1 to stop
+ * early. The pointed-to entry is valid only for the call. */
+typedef int (*p9_emit_fn)(void *emit_ctx, const struct p9_dirent *de);
+
+/* The backend interface. root and walk return 0 or -1; list emits each entry
+ * and returns 0 or -1; readf returns a byte count or -1. */
 struct p9_backend {
     int  (*root)(void *ctx, struct p9_node *out);
     int  (*walk)(void *ctx, const struct p9_node *dir, const char *name,
                  struct p9_node *out);
     int  (*list)(void *ctx, const struct p9_node *dir,
-                 struct p9_dirent *ents, int max);
+                 p9_emit_fn emit, void *emit_ctx);
     long (*readf)(void *ctx, const struct p9_node *file, uint64_t off,
                   void *buf, uint32_t n);
 };
@@ -54,6 +59,16 @@ struct p9srv {
         uint32_t       fid;
         struct p9_node node;
     } fids[P9_MAXFID];
+    /* A directory read serializes the whole listing once (at offset 0) into
+     * this growable buffer, then serves byte ranges of it across the reads
+     * that walk the directory. Keyed by the fid it was built for; a read at
+     * offset 0, or of a different fid, rebuilds it. So a listing is bounded
+     * only by host memory, not by a fixed entry count or message size. */
+    uint8_t  *dirbuf;
+    uint32_t  dirbuf_cap;
+    uint32_t  dirbuf_len;
+    uint32_t  dir_fid;
+    int       dir_valid;
 };
 
 void p9srv_init(struct p9srv *s, const struct p9_backend *be, void *ctx);

@@ -57,22 +57,23 @@ mem_walk(void *ctx, const struct p9_node *dir, const char *name,
 }
 
 static int
-mem_list(void *ctx, const struct p9_node *dir, struct p9_dirent *ents, int max)
+mem_list(void *ctx, const struct p9_node *dir, p9_emit_fn emit, void *ectx)
 {
     (void)ctx;
     if (!dir->is_dir)
         return -1;
-    int n = 0;
-    for (int i = 0; i < NFILES && n < max; i++) {
-        memset(&ents[n], 0, sizeof ents[n]);
-        strncpy(ents[n].name, files[i].name, sizeof ents[n].name - 1);
-        ents[n].is_dir = 0;
-        ents[n].mode = 0444;
-        ents[n].length = strlen(files[i].data);
-        ents[n].qid_path = (uint64_t)(i + 1);
-        n++;
+    for (int i = 0; i < NFILES; i++) {
+        struct p9_dirent e;
+        memset(&e, 0, sizeof e);
+        strncpy(e.name, files[i].name, sizeof e.name - 1);
+        e.is_dir = 0;
+        e.mode = 0444;
+        e.length = strlen(files[i].data);
+        e.qid_path = (uint64_t)(i + 1);
+        if (emit(ectx, &e) != 0)
+            break;
     }
-    return n;
+    return 0;
 }
 
 static long

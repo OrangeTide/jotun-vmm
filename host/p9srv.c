@@ -5,6 +5,7 @@
  * backend's listing into 9P stat structures and serve byte ranges of that. */
 #include "p9srv.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "jotun_9p.h"
@@ -79,6 +80,36 @@ put_stat(struct p9_out *o, const char *name, int is_dir, uint32_t mode,
     p9o_str(o, "");                 /* uid */
     p9o_str(o, "");                 /* gid */
     p9o_str(o, "");                 /* muid */
+}
+
+/* Append one serialized stat entry to the server's growable directory buffer.
+ * The emit_ctx is the p9srv. Grows the buffer as needed; -1 only if out of
+ * memory, so a listing is bounded by host memory, not a fixed count. */
+static int
+dir_ser_emit(void *vctx, const struct p9_dirent *de)
+{
+    struct p9srv *s = vctx;
+    uint8_t tmp[384];                   /* one stat: 2 + 47 + name(<=255) */
+    struct p9_out o;
+
+    p9o_init(&o, tmp, sizeof tmp);
+    put_stat(&o, de->name, de->is_dir, de->mode, de->length, de->qid_path);
+    if (!o.ok)
+        return 0;                       /* skip an entry that will not fit */
+
+    if (s->dirbuf_len + o.n > s->dirbuf_cap) {
+        uint32_t ncap = s->dirbuf_cap ? s->dirbuf_cap : 65536;
+        while (ncap < s->dirbuf_len + o.n)
+            ncap *= 2;
+        uint8_t *nb = realloc(s->dirbuf, ncap);
+        if (!nb)
+            return -1;
+        s->dirbuf = nb;
+        s->dirbuf_cap = ncap;
+    }
+    memcpy(s->dirbuf + s->dirbuf_len, tmp, o.n);
+    s->dirbuf_len += o.n;
+    return 0;
 }
 
 /* Build an R-message header into o. */
@@ -221,24 +252,25 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
         reply_hdr(&o, rsp, rspcap, P9_RREAD, tag);
 
         if (n->is_dir) {
-            /* Serialize the whole listing, then serve the requested slice. */
-            static uint8_t dirbuf[JOTUN_P9_MSIZE];
-            struct p9_out d;
-            struct p9_dirent ents[64];
-            int ne = s->be->list(s->ctx, n, ents, 64);
-            if (ne < 0)
-                return reply_error(rsp, rspcap, tag, "list failed");
-            p9o_init(&d, dirbuf, sizeof dirbuf);
-            for (int k = 0; k < ne; k++)
-                put_stat(&d, ents[k].name, ents[k].is_dir, ents[k].mode,
-                         ents[k].length, ents[k].qid_path);
-            uint32_t total = d.n;
+            /* Serialize the whole listing once, at the start of a read (offset
+             * 0) or when the cache holds a different fid, then serve the
+             * requested byte slice of it. A read that splits a stat entry at
+             * its end is fine: the client consumes only whole entries and
+             * re-reads from the next entry's offset. */
+            if (offset == 0 || !s->dir_valid || s->dir_fid != fid) {
+                s->dirbuf_len = 0;
+                if (s->be->list(s->ctx, n, dir_ser_emit, s) != 0)
+                    return reply_error(rsp, rspcap, tag, "list failed");
+                s->dir_fid = fid;
+                s->dir_valid = 1;
+            }
+            uint32_t total = s->dirbuf_len;
             uint32_t start = (offset < total) ? (uint32_t)offset : total;
             uint32_t avail = total - start;
             if (count > avail)
                 count = avail;
             p9o_u32(&o, count);
-            p9o_bytes(&o, dirbuf + start, count);
+            p9o_bytes(&o, s->dirbuf + start, count);
         } else {
             uint8_t tmp[JOTUN_P9_MSIZE];
             if (count > sizeof tmp)
@@ -256,6 +288,8 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
         int fi = find_fid(s, fid);
         if (fi >= 0)
             s->fids[fi].used = 0;
+        if (s->dir_valid && s->dir_fid == fid)
+            s->dir_valid = 0;           /* its cached listing is now stale */
         reply_hdr(&o, rsp, rspcap, P9_RCLUNK, tag);
         return p9o_finish(&o);
     }
