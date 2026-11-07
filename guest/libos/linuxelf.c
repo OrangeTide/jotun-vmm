@@ -102,6 +102,7 @@
 #define LERR_ISDIR  21          /* EISDIR */
 #define LERR_NOTEMPTY 39        /* ENOTEMPTY */
 #define LERR_RANGE  34          /* ERANGE: getcwd buffer too small */
+#define LERR_PERM   1           /* EPERM: symlinks unsupported (triggers cp fallback) */
 
 /* ELF auxv entry tags. */
 #define AT_NULL    0
@@ -230,11 +231,41 @@ struct lfd {
 struct ramfile {
     int      used;
     int      is_dir;
+    int      unlinked;          /* name removed; slot held until the last fd closes */
+    int      nref;              /* open fds referencing this entry */
     char     name[RAMFS_NAME];
     uint8_t *data;
     uint32_t len;
     uint32_t cap;
+    uint64_t mtime;             /* seconds; stamped on create and write */
 };
+
+/* The guest has no battery clock, so wall time is a fixed epoch plus the cycle
+ * counter (see clock_gettime). The epoch is a recent date so timestamps look
+ * plausible and, crucially, a file written during a run is newer than the
+ * read-only bundle files (reported at the epoch): autotools' sanity check
+ * rejects a build tree whose freshly created file is older than its sources. */
+#define GUEST_EPOCH 1735689600ULL       /* 2025-01-01 UTC, in seconds */
+
+static uint64_t
+guest_now_sec(void)
+{
+    return GUEST_EPOCH + arch_cycles() / 1000000000ULL;
+}
+
+/* Overlay files are timestamped from a monotonic counter above the epoch, not
+ * the wall clock: it is strictly increasing (so a later write is newer, which
+ * make relies on) and bounded just above the bundle files' epoch (so a freshly
+ * built file passes autotools' "not older than the sources" sanity check). A
+ * wall-clock value here, which can be large and jump between reads, confused
+ * the toolchain's timestamp logic. */
+static uint64_t fs_mtick;
+
+static uint64_t
+fs_stamp(void)
+{
+    return GUEST_EPOCH + ++fs_mtick;
+}
 
 static struct ramfile ramfs[RAMFS_MAX];
 
@@ -252,7 +283,11 @@ struct lpipe {
 
 /* The pipe pool is shared across processes: a pipe inherited across fork is the
  * same buffer in parent and child. File tables and heaps are per process. */
-#define LINUX_NPROC  8
+/* Enough live processes (and zombies awaiting reap) for a real build: configure
+ * nests subshells and pipelines, and gcc fans out to cc1/as/ld. Each slot costs
+ * one struct lshared (its fd table dominates), so this stays well under the
+ * kernel's bss budget below VM_USER_LO. */
+#define LINUX_NPROC  48
 #define LINUX_KSTACK (16u * 1024)       /* per-process syscall handler stack */
 #define CLONE_VM     0x00000100u        /* clone shares the address space (thread) */
 static struct lpipe pipes[LINUX_NPIPE];
@@ -498,7 +533,7 @@ clone_fd(int dst, struct lfd *src)
         else
             p->readers++;
     } else if (src->isram) {
-        /* the ramfile persists regardless of fd count: nothing to refcount */
+        ramfs[src->ridx].nref++;        /* another fd references the ramfile */
     } else if (src->p9fid) {
         gfidref[src->p9fid - LINUX_FID_BASE]++;
     }
@@ -582,9 +617,26 @@ ramfs_find(const char *name)
     char key[RAMFS_NAME];
     norm_key(name, key, sizeof key);
     for (int i = 0; i < RAMFS_MAX; i++)
-        if (ramfs[i].used && strcmp(ramfs[i].name, key) == 0)
+        if (ramfs[i].used && !ramfs[i].unlinked &&
+            strcmp(ramfs[i].name, key) == 0)
             return i;
     return -1;
+}
+
+/* Drop one open reference to overlay entry ri; free the slot once the last fd
+ * on an unlinked entry closes (open-unlink semantics: the inode outlives the
+ * name). */
+static void
+ramfs_unref(int ri)
+{
+    if (ri < 0 || !ramfs[ri].used)
+        return;
+    if (ramfs[ri].nref > 0)
+        ramfs[ri].nref--;
+    if (ramfs[ri].nref == 0 && ramfs[ri].unlinked) {
+        ramfs[ri].used = 0;
+        ramfs[ri].len = 0;
+    }
 }
 
 static int
@@ -602,9 +654,12 @@ ramfs_create(const char *name, int is_dir)
             ramfs[i].name[n] = 0;
             ramfs[i].used = 1;
             ramfs[i].is_dir = is_dir;
+            ramfs[i].unlinked = 0;
+            ramfs[i].nref = 0;
             ramfs[i].data = NULL;
             ramfs[i].len = 0;
             ramfs[i].cap = 0;
+            ramfs[i].mtime = fs_stamp();
             return i;
         }
     }
@@ -612,13 +667,19 @@ ramfs_create(const char *name, int is_dir)
 }
 
 /* Remove an overlay entry by name. Returns 0 if one was removed, -1 if absent.
- * The buffer is kept (freed lazily on reuse) so a stale pointer is never left. */
+ * An entry with open fds is kept (marked unlinked, its name no longer resolves)
+ * so the fds keep reading and the slot is not reused under them; the slot frees
+ * when the last fd closes. The buffer is kept (freed lazily on reuse). */
 static int
 ramfs_remove(const char *name)
 {
     int i = ramfs_find(name);
     if (i < 0)
         return -1;
+    if (ramfs[i].nref > 0) {
+        ramfs[i].unlinked = 1;          /* free deferred to the last close */
+        return 0;
+    }
     ramfs[i].used = 0;
     ramfs[i].len = 0;
     return 0;
@@ -657,7 +718,7 @@ ramfs_has_desc(const char *dk)
 {
     size_t dl = strlen(dk);
     for (int i = 0; i < RAMFS_MAX; i++) {
-        if (!ramfs[i].used)
+        if (!ramfs[i].used || ramfs[i].unlinked)
             continue;
         if (dl == 0) {
             if (ramfs[i].name[0])
@@ -678,7 +739,8 @@ ramfs_is_dir_key(const char *key)
     if (key[0] == 0)
         return 1;
     for (int i = 0; i < RAMFS_MAX; i++)
-        if (ramfs[i].used && strcmp(ramfs[i].name, key) == 0)
+        if (ramfs[i].used && !ramfs[i].unlinked &&
+            strcmp(ramfs[i].name, key) == 0)
             return ramfs[i].is_dir;
     return ramfs_has_desc(key);
 }
@@ -823,6 +885,7 @@ do_write(long fd, const char *buf, unsigned long len)
         f->pos += len;
         if (f->pos > rf->len)
             rf->len = (uint32_t)f->pos;
+        rf->mtime = fs_stamp();
         return (long)len;
     }
     return -LERR_BADF;                  /* the bundle is read-only */
@@ -854,6 +917,7 @@ open_ram(int ri, long flags)
     fds[fd].isram = 1;
     fds[fd].ridx = ri;
     fds[fd].pos = (flags & O_APPEND) ? ramfs[ri].len : 0;
+    ramfs[ri].nref++;
     return fd;
 }
 
@@ -1027,7 +1091,8 @@ do_close(long fd)
         return 0;
     }
     if (f->isram) {
-        f->used = 0;                    /* the ramfile persists for the run */
+        ramfs_unref(f->ridx);           /* frees the slot if unlinked and last */
+        f->used = 0;
         return 0;
     }
     if (f->ispipe) {
@@ -1066,9 +1131,20 @@ do_lseek(long fd, long off, long whence)
     return (long)f->pos;
 }
 
+/* An overlay inode is 0x10000+ri, so recover a created file's own mtime from it;
+ * bundle files and other objects report the epoch. */
+static uint64_t
+mtime_of_ino(uint64_t ino)
+{
+    if (ino >= 0x10000 && ino < 0x10000 + (uint64_t)RAMFS_MAX)
+        return ramfs[ino - 0x10000].mtime;
+    return GUEST_EPOCH;
+}
+
 static void
 fill_stat(struct linux_stat *s, int isdir, uint64_t size, uint64_t ino)
 {
+    uint64_t mt = mtime_of_ino(ino);
     memset(s, 0, sizeof *s);
     s->st_mode = isdir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
     s->st_nlink = 1;
@@ -1076,6 +1152,7 @@ fill_stat(struct linux_stat *s, int isdir, uint64_t size, uint64_t ino)
     s->st_blksize = 4096;
     s->st_blocks = (int64_t)((size + 511) / 512);
     s->st_ino = ino;
+    s->st_atime = s->st_mtime = s->st_ctime = mt;
 }
 
 /* Resolve a normalized key's metadata (a ramfs file shadows the bundle, else
@@ -1216,7 +1293,7 @@ do_rename(const char *oldp, const char *newp)
     if (ramfs[ri].is_dir) {             /* carry the subtree: rewrite prefixes */
         size_t ol = strlen(ok);
         for (int i = 0; i < RAMFS_MAX; i++) {
-            if (!ramfs[i].used || i == ri)
+            if (!ramfs[i].used || ramfs[i].unlinked || i == ri)
                 continue;
             if (strncmp(ramfs[i].name, ok, ol) != 0 || ramfs[i].name[ol] != '/')
                 continue;
@@ -1271,6 +1348,7 @@ struct linux_statx {
 static void
 fill_statx(struct linux_statx *s, int isdir, uint64_t size, uint64_t ino)
 {
+    uint64_t mt = mtime_of_ino(ino);
     memset(s, 0, sizeof *s);
     s->stx_mask = STATX_BASIC_STATS;
     s->stx_blksize = 4096;
@@ -1279,6 +1357,8 @@ fill_statx(struct linux_statx *s, int isdir, uint64_t size, uint64_t ino)
     s->stx_ino = ino;
     s->stx_size = size;
     s->stx_blocks = (size + 511) / 512;
+    s->stx_atime.tv_sec = s->stx_mtime.tv_sec = s->stx_ctime.tv_sec = (int64_t)mt;
+    s->stx_btime.tv_sec = (int64_t)mt;
 }
 
 /* statx(dirfd, path, flags, mask, buf). An empty path with AT_EMPTY_PATH stats
@@ -1407,7 +1487,7 @@ do_getdents64(long fd, void *buf, unsigned long count)
     /* Phase 2: the writable overlay's direct children of this directory. */
     for (int i = (int)f->dov; i < RAMFS_MAX; i++) {
         f->dov = (uint32_t)i;
-        if (!ramfs[i].used)
+        if (!ramfs[i].used || ramfs[i].unlinked)
             continue;
         const char *leaf = ramfs_child_leaf(ramfs[i].name, f->dpath);
         if (!leaf)
@@ -1549,7 +1629,9 @@ release_fds(struct lshared *sh)
                 pp->readers--;
             if (pp->readers == 0 && pp->writers == 0)
                 pp->used = 0;
-        } else if (!f->isram && f->p9fid) {
+        } else if (f->isram) {
+            ramfs_unref(f->ridx);       /* drop this process's ramfile reference */
+        } else if (f->p9fid) {
             uint32_t slot = f->p9fid - LINUX_FID_BASE;
             if (gfidref[slot] && --gfidref[slot] == 0)
                 p9_clunk(f->p9fid);
@@ -1652,7 +1734,9 @@ do_fork(void)
                 pipes[f->pidx].writers++;
             else
                 pipes[f->pidx].readers++;
-        } else if (!f->isram && f->p9fid)
+        } else if (f->isram)
+            ramfs[f->ridx].nref++;
+        else if (f->p9fid)
             gfidref[f->p9fid - LINUX_FID_BASE]++;
     }
 
@@ -1728,7 +1812,9 @@ inherit_fds(struct lshared *csh)
                 pipes[f->pidx].writers++;
             else
                 pipes[f->pidx].readers++;
-        } else if (!f->isram && f->p9fid)
+        } else if (f->isram)
+            ramfs[f->ridx].nref++;
+        else if (f->p9fid)
             gfidref[f->p9fid - LINUX_FID_BASE]++;
     }
 }
@@ -1943,18 +2029,19 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_munmap:
         return 0;                       /* bump arena: no reclaim */
     case SYS_time: {
-        int64_t t = (int64_t)(arch_cycles() / 1000000000ULL);
+        int64_t t = (int64_t)guest_now_sec();
         if (a1)
             *(int64_t *)a1 = t;
         return (long)t;
     }
     case SYS_clock_gettime: {
-        /* No real clock: synthesise a monotonic time from the cycle counter,
-         * assuming roughly 1 GHz. Good enough to keep libc startup happy. */
+        /* No real clock: synthesise a time from the cycle counter (roughly 1
+         * GHz) plus the guest epoch, so it agrees with file mtimes (both are
+         * GUEST_EPOCH + elapsed). A fresh build file is then not in the future. */
         uint64_t t = arch_cycles();
         uint64_t *ts = (uint64_t *)a2;    /* struct timespec { sec; nsec; } */
         if (ts) {
-            ts[0] = t / 1000000000ULL;
+            ts[0] = GUEST_EPOCH + t / 1000000000ULL;
             ts[1] = t % 1000000000ULL;
         }
         return 0;
@@ -1963,7 +2050,7 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         uint64_t t = arch_cycles();
         uint64_t *tv = (uint64_t *)a1;    /* struct timeval { sec; usec; } */
         if (tv) {
-            tv[0] = t / 1000000000ULL;
+            tv[0] = GUEST_EPOCH + t / 1000000000ULL;
             tv[1] = (t / 1000ULL) % 1000000ULL;
         }
         return 0;
@@ -2089,8 +2176,12 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
             return -LERR_BADF;          /* a2 may be 0/1/2: a shell redirect */
         if (a1 == a2)
             return (nr == SYS_dup3) ? -LERR_INVAL : a2;
-        if (a2 >= 3 && fds[a2].used)
-            do_close(a2);               /* release a real fd; std fds just rebind */
+        if (fds[a2].used)
+            do_close(a2);               /* release the old target, std fd or not:
+                                         * a std fd may hold a refcounted pipe (a
+                                         * pipeline stage's stdout), and dropping
+                                         * it without a close leaks that writer so
+                                         * the reader never sees EOF */
         clone_fd((int)a2, f);
         return a2;
     }
@@ -2152,6 +2243,14 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         cwd_key[i] = 0;
         return 0;
     }
+    case SYS_link:
+    case SYS_linkat:
+    case SYS_symlink:
+    case SYS_symlinkat:
+        /* The overlay has no links. Report EPERM ("the filesystem does not
+         * support this"), which is the case configure and install scripts test
+         * for: they fall back to copying. */
+        return -LERR_PERM;
     case SYS_readlink:
     case SYS_readlinkat:
         return -LERR_INVAL;             /* nothing in the bundle is a symlink;
@@ -2210,16 +2309,18 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return r < 0 ? r : 0;
     }
     case SYS_fcntl: {
-        /* F_DUPFD (0) and F_DUPFD_CLOEXEC (1030) duplicate a1 to the lowest
-         * free fd >= a3. bash uses this to save and restore a redirected fd
-         * (e.g. `echo > file` saves fd 1), so returning a real new fd matters;
-         * the old stub returned 0, which bash then treated as the saved fd.
-         * Other commands (F_GETFD/F_SETFD/F_GETFL/F_SETFL) are accepted. */
+        /* Every command first validates the fd: a closed fd is EBADF. This
+         * matters because a shell probes whether a descriptor is open with
+         * F_GETFD before redirecting onto it; a blanket success made bash think
+         * a closed fd (e.g. 6 in `exec 6>&1`) was open, then fail to save it.
+         * F_DUPFD (0) and F_DUPFD_CLOEXEC (1030) duplicate to the lowest free fd
+         * >= a3 (used to save and restore a redirected fd). Other commands
+         * (F_GETFD/F_SETFD/F_GETFL/F_SETFL) are accepted with a benign value. */
+        struct lfd *src = fd_get(a1);
+        if (!src)
+            return -LERR_BADF;
         if (a2 == 0 || a2 == 1030) {
-            struct lfd *src = fd_get(a1);
-            if (!src)
-                return -LERR_BADF;
-            int lo = a3 < 3 ? 3 : (int)a3;
+            int lo = a3 < 0 ? 0 : (int)a3;
             for (int i = lo; i < LINUX_NFD; i++) {
                 if (!fds[i].used) {
                     clone_fd(i, src);
@@ -2254,6 +2355,20 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_futex((uint64_t)a1, (int)a2, (int)a3);
     case SYS_sched_yield:
         task_yield();
+        return 0;
+    case SYS_sched_getaffinity: {
+        /* sched_getaffinity(pid, cpusetsize, mask): report one online CPU so a
+         * tool that sizes its thread pool from the mask sees a single processor.
+         * The return value is the number of bytes written. */
+        unsigned long *mask = (unsigned long *)a3;
+        if (a2 < sizeof *mask || !mask)
+            return -LERR_INVAL;
+        *mask = 1;                      /* cpu 0 only */
+        return (long)sizeof *mask;
+    }
+    case SYS_clock_nanosleep:
+        /* No timers and a cooperative scheduler: treat a sleep as elapsed. A
+         * TIMER_ABSTIME request is already in the past from our clock's view. */
         return 0;
     case SYS_getpid:
         return lproc_cur->sh->pid;

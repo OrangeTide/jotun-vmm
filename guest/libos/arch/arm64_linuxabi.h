@@ -18,6 +18,8 @@
 #define SYS_fcntl           25
 #define SYS_mkdirat         34
 #define SYS_unlinkat        35
+#define SYS_symlinkat       36
+#define SYS_linkat          37
 #define SYS_renameat        38
 #define SYS_renameat2       276
 #define SYS_copy_file_range 285
@@ -56,6 +58,8 @@
 #define SYS_set_tid_address 96
 #define SYS_futex           98
 #define SYS_set_robust_list 99
+#define SYS_clock_nanosleep 115
+#define SYS_sched_getaffinity 123
 #define SYS_clock_gettime   113
 #define SYS_sched_yield     124
 #define SYS_tgkill          131
@@ -110,6 +114,8 @@
 #define SYS_mkdir      (-15)
 #define SYS_rmdir      (-16)
 #define SYS_rename     (-17)
+#define SYS_link       (-18)
+#define SYS_symlink    (-19)
 
 /* arch_prctl is x86-only; defined so the shared case body compiles. */
 #define ARCH_SET_FS 0x1002
