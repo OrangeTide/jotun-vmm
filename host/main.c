@@ -57,6 +57,14 @@
 #define STACK_SLOT     (512u * 1024)
 #define MAX_VCPUS      8
 
+/* The guest places its kernel heap just below the top of RAM (VM_KHEAP_HI in
+ * the guest's arch/x86_64_vmspace.h is RAM top less 8 MiB). The vcpu stacks
+ * carve down from RAM top, so all of them together must fit in that top 8 MiB
+ * and never dip into the heap band. */
+#define GUEST_STACK_FLOOR (GUEST_RAM_SIZE - 8u * 1024 * 1024)
+_Static_assert(GUEST_RAM_SIZE - (uint64_t)MAX_VCPUS * STACK_SLOT >= GUEST_STACK_FLOOR,
+               "vcpu stacks would overlap the guest kernel heap band");
+
 /* The host runs up to this many guests in one process, each its own VM. */
 #define MAX_GUESTS     8
 

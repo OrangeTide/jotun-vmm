@@ -8,11 +8,18 @@
  * private user window, and CR3 switching.
  *
  * Layout in every process address space (RAM is VM_RAM_SIZE, mapped at 0):
- *   [0, 0x400000)            kernel, page tables, MMIO: identity, shared
+ *   [0, 0x400000)            kernel image: identity, shared
  *   [0x400000, VM_USER_HI)   the user window: private 4 KiB pages per process
- *   [VM_USER_HI, RAM top)    vcpu stacks (top 16 MiB): identity, shared
+ *   [VM_KHEAP_LO, VM_KHEAP_HI)  the kernel heap: identity, shared
+ *   [VM_KHEAP_HI, RAM top)   vcpu stacks: identity, shared
  *   [1 GiB, 1 GiB + RAM)     physmap: all RAM, so the kernel can reach any
  *                            frame by physical address regardless of CR3
+ *
+ * The kernel heap lives above the user window, not in the cramped identity
+ * region below it, so kmalloc and the dynamically sized tables are not boxed
+ * into the few MiB under the user's load address. It is identity-mapped like
+ * the rest of [0, 1 GiB) outside the user window, so the one base pointer is
+ * valid at boot and after every CR3 switch.
  *
  * VM_RAM_SIZE must match GUEST_RAM_SIZE in the host (host/main.c); the window
  * and the physmap are derived from it here. x86-64 only; the Linux-compat path
@@ -25,7 +32,12 @@
 #define VM_PAGE      0x1000ULL
 #define VM_RAM_SIZE  0x08000000ULL           /* 128 MiB; must match the host */
 #define VM_USER_LO   0x400000ULL
-#define VM_USER_HI   (VM_RAM_SIZE - 0x1000000ULL)  /* RAM top less 16 MiB of stacks */
+#define VM_USER_HI   (VM_RAM_SIZE - 0x1000000ULL)  /* RAM top less 16 MiB */
+/* The kernel heap: 8 MiB directly above the user window. The vcpu stacks take
+ * what remains up to RAM top (8 MiB, ample for 512 KiB x the cpus). Both are
+ * 2 MiB aligned so the identity map covers them with whole large pages. */
+#define VM_KHEAP_LO  VM_USER_HI
+#define VM_KHEAP_HI  (VM_USER_HI + 0x800000ULL)
 #define VM_PHYSMAP   0x40000000ULL           /* 1 GiB */
 #define VM_PHYSMAP_PAGES (VM_RAM_SIZE / 0x200000ULL)  /* RAM in 2 MiB pages */
 

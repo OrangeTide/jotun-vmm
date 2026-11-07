@@ -20,18 +20,25 @@
 #include "task.h"
 #include "threads.h"
 #include "triton.h"
+#include "vmspace.h"
 #include "webterm.h"
 
-/* The heap lives in .bss. Guest RAM is zero-filled by the host before entry,
- * so no explicit clearing is needed before meminit lays down the first block. */
-static unsigned char heap[1u * 1024 * 1024];
+/* The kernel heap sits in its own RAM band above the user window
+ * ([VM_KHEAP_LO, VM_KHEAP_HI), see vmspace.h), not in .bss below the user's
+ * load address, so kmalloc is not boxed into the few MiB under 0x400000. The
+ * band is identity-mapped, and the host zero-fills guest RAM before entry, so
+ * meminit can lay down the first block directly. */
+static void
+heap_init(void)
+{
+    meminit(phys_to_virt(VM_KHEAP_LO), (size_t)(VM_KHEAP_HI - VM_KHEAP_LO));
+}
 
 /* Allocate, free in a different order, and confirm the free total returns to
  * where it started. A leak or a coalescing bug shows up as a mismatch. */
 static void
 heap_selftest(void)
 {
-    meminit(heap, sizeof heap);
     size_t before = memfree();
 
     void *a = kmalloc(128);
@@ -906,6 +913,7 @@ kmain(unsigned long id)
 
     if (id == 0) {
         con_puts("libos up\n");
+        heap_init();
         heap_selftest();
         show_boot_params();
         svc_publish();
