@@ -46,7 +46,10 @@
 #define SYS_fcntl           72
 #define SYS_getcwd          79
 #define SYS_chdir           80
+#define SYS_readlink        89
 #define SYS_gettimeofday    96
+#define SYS_getrusage       98
+#define SYS_sysinfo         99
 #define SYS_getuid          102
 #define SYS_setuid          105
 #define SYS_setgid          106

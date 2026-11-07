@@ -55,6 +55,7 @@
 #define SYS_rt_sigaction    134
 #define SYS_rt_sigprocmask  135
 #define SYS_uname           160
+#define SYS_getrusage       165
 #define SYS_prctl           167
 #define SYS_gettimeofday    169
 #define SYS_getpid          172
@@ -64,6 +65,7 @@
 #define SYS_getgid          176
 #define SYS_getegid         177
 #define SYS_gettid          178
+#define SYS_sysinfo         179
 #define SYS_socket          198
 #define SYS_brk             214
 #define SYS_munmap          215
@@ -94,6 +96,7 @@
 #define SYS_time       (-9)
 #define SYS_access     (-10)
 #define SYS_getpgrp    (-11)
+#define SYS_readlink   (-12)
 
 /* arch_prctl is x86-only; defined so the shared case body compiles. */
 #define ARCH_SET_FS 0x1002

@@ -7,23 +7,27 @@
  * builder for a fresh address space that shares the kernel mappings but has a
  * private user window, and CR3 switching.
  *
- * Layout in every process address space:
+ * Layout in every process address space (RAM is VM_RAM_SIZE, mapped at 0):
  *   [0, 0x400000)            kernel, page tables, MMIO: identity, shared
- *   [0x400000, 0x1C00000)    the user window: private 4 KiB pages per process
- *   [0x1C00000, 0x2000000)   vcpu stacks: identity, shared
- *   [1 GiB, 1 GiB + 32 MiB)  physmap: all RAM, so the kernel can reach any
+ *   [0x400000, VM_USER_HI)   the user window: private 4 KiB pages per process
+ *   [VM_USER_HI, RAM top)    vcpu stacks (top 16 MiB): identity, shared
+ *   [1 GiB, 1 GiB + RAM)     physmap: all RAM, so the kernel can reach any
  *                            frame by physical address regardless of CR3
  *
- * x86-64 only; the Linux-compat path is x86-64 only. */
+ * VM_RAM_SIZE must match GUEST_RAM_SIZE in the host (host/main.c); the window
+ * and the physmap are derived from it here. x86-64 only; the Linux-compat path
+ * is x86-64 only. */
 #ifndef X86_64_VMSPACE_H
 #define X86_64_VMSPACE_H
 
 #include <stdint.h>
 
 #define VM_PAGE      0x1000ULL
+#define VM_RAM_SIZE  0x08000000ULL           /* 128 MiB; must match the host */
 #define VM_USER_LO   0x400000ULL
-#define VM_USER_HI   0x1C00000ULL
-#define VM_PHYSMAP   0x40000000ULL          /* 1 GiB */
+#define VM_USER_HI   (VM_RAM_SIZE - 0x1000000ULL)  /* RAM top less 16 MiB of stacks */
+#define VM_PHYSMAP   0x40000000ULL           /* 1 GiB */
+#define VM_PHYSMAP_PAGES (VM_RAM_SIZE / 0x200000ULL)  /* RAM in 2 MiB pages */
 
 /* Page-table entry flags. */
 #define VM_P   0x1ULL                       /* present */

@@ -43,9 +43,14 @@
 
 /* Guest physical RAM mapped at address 0. 8 MiB is ample for the native demo
  * guests, but a Linux binary-compat guest (M16) needs a real heap for the
- * foreign program's malloc arenas, so the floor is higher. 32 MiB leaves ~20
- * MiB of mmap/brk arena above the program window and below the vcpu stacks. */
-#define GUEST_RAM_SIZE (32u * 1024 * 1024)
+ * foreign program's malloc arenas, and real tools are large: the GNU C compiler
+ * proper (cc1) is a ~30 MiB image on its own. 128 MiB gives the per-process user
+ * window room for such a binary plus its libraries and heap, and leaves the top
+ * 16 MiB for the vcpu stacks. The ceiling is the device MMIO band at 0x0a000000
+ * (160 MiB): RAM must stay below it so a doorbell store still faults out to the
+ * host instead of landing in RAM. This must match VM_RAM_SIZE in the guest's
+ * arch/x86_64_vmspace.h, which derives the window and physmap from it. */
+#define GUEST_RAM_SIZE (128u * 1024 * 1024)
 
 /* Each vcpu gets its own 512 KiB stack, carved from the top of RAM downward, so
  * vcpus sharing one guest image do not clobber each other's stacks. */

@@ -260,9 +260,10 @@ struct lshared {
     int      vforking;
     int      vfork_waiter;      /* task id of the blocked parent */
     struct lfd fdtab[LINUX_NFD];
-    /* The heap arena. heap_brk grows up from LINUX_HEAP_BASE; heap_mmap grows
-     * down from heap_mmaptop. A bump allocator; munmap does not reclaim. */
-    uint64_t heap_brk, heap_mmap, heap_mmaptop;
+    /* The heap arena. heap_brk grows up from heap_base (set just above the
+     * loaded program image, which varies by binary); heap_mmap grows down from
+     * heap_mmaptop. A bump allocator; munmap does not reclaim. */
+    uint64_t heap_base, heap_brk, heap_mmap, heap_mmaptop;
 };
 
 /* A thread: one schedulable context. Its trapframe (the arch's user register
@@ -299,6 +300,7 @@ struct lproc *lproc_cur;
 
 /* Reach the running process's shared state by the bare names the helpers use. */
 #define fds       (lproc_cur->sh->fdtab)
+#define heap_base (lproc_cur->sh->heap_base)
 #define brk_cur   (lproc_cur->sh->heap_brk)
 #define mmap_cur  (lproc_cur->sh->heap_mmap)
 #define mmap_top  (lproc_cur->sh->heap_mmaptop)
@@ -311,15 +313,28 @@ static vmspace_t linux_vmspace_setup(void);
  * struct lproc, which is defined here, so it is declared here. */
 extern void linux_resume(struct lproc *p) __attribute__((noreturn));
 
+/* Set up the heap arena above the loaded program image. brk grows up from
+ * heap_base (the first page past the highest loaded segment, so it never
+ * overlaps the executable or its interpreter); anonymous mmap grows down from
+ * just below the user stack at the top of the window. Pages in between fault in
+ * on demand, so the arena is lazily backed. */
 static void
-arena_init(void)
+arena_init(uint64_t image_top)
 {
-    /* brk grows up from the heap base; anonymous mmap grows down from just below
-     * the user stack at the top of the window. Pages in between fault in on
-     * demand, so the arena is lazily backed. */
-    brk_cur = LINUX_HEAP_BASE;
+    heap_base = (image_top + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (heap_base < LINUX_HEAP_BASE)
+        heap_base = LINUX_HEAP_BASE;    /* a small image still gets a sane floor */
+    brk_cur = heap_base;
     mmap_top = (LINUX_USTACK_TOP - LINUX_USTACK_SIZE) & ~(PAGE_SIZE - 1);
     mmap_cur = mmap_top;
+}
+
+/* The highest address occupied by the loaded image: the interpreter's end when
+ * present (it loads above the executable), otherwise the executable's. */
+static uint64_t
+image_top(const struct elf_info *exe, const struct elf_info *interp)
+{
+    return interp->has_interp ? interp->load_end : exe->load_end;
 }
 
 static long
@@ -327,7 +342,7 @@ do_brk(uint64_t want)
 {
     if (want == 0)
         return (long)brk_cur;
-    if (want < LINUX_HEAP_BASE || want > mmap_cur)
+    if (want < heap_base || want > mmap_cur)
         return (long)brk_cur;           /* refuse; caller falls back to mmap */
     brk_cur = want;
     return (long)brk_cur;
@@ -1665,6 +1680,29 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return 0;                       /* no supplementary groups */
     case SYS_getpgrp:
         return 1;                       /* a single process group */
+    case SYS_getrusage: {
+        /* usage is the second argument; who (a1) is ignored. Zeroed counters:
+         * no CPU-time accounting, which gcc and as query but tolerate. */
+        uint64_t *ru = (uint64_t *)a2;
+        if (ru)
+            for (int i = 0; i < 18; i++)        /* struct rusage is 18 longs */
+                ru[i] = 0;
+        return 0;
+    }
+    case SYS_sysinfo: {
+        /* Report the configured RAM as total and a fixed free fraction, zero for
+         * everything else. cc1 reads this to size its garbage collector; the
+         * numbers need only be plausible. struct sysinfo layout: uptime, three
+         * load averages, totalram, freeram, then fields this leaves zero. */
+        uint64_t *si = (uint64_t *)a1;
+        if (si) {
+            for (int i = 0; i < 14; i++)
+                si[i] = 0;
+            si[4] = VM_RAM_SIZE;                /* totalram */
+            si[5] = VM_RAM_SIZE / 2;            /* freeram (a plausible fraction) */
+        }
+        return 0;
+    }
     case SYS_sigaltstack:
         return 0;                       /* no signal delivery: accept and ignore */
     case SYS_dup: {
@@ -1733,8 +1771,11 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
             return -LERR_NOENT;
         return isdir ? 0 : -LERR_NOTDIR;
     }
+    case SYS_readlink:
     case SYS_readlinkat:
-        return -LERR_INVAL;             /* nothing in the bundle is a symlink */
+        return -LERR_INVAL;             /* nothing in the bundle is a symlink;
+                                         * gcc probes /proc/self/exe and falls
+                                         * back to its default prefix */
     case SYS_access: {
         /* access(path, mode): path is the first argument. The dynamic linker
          * probes /etc/ld.so.cache and candidate library directories this way. */
@@ -2037,8 +2078,7 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
 
     lproc_cur->sh->vmspace = as;        /* the resume hook now restores this one */
     lproc_cur->sh->vm_borrowed = 0;
-    brk_cur = LINUX_HEAP_BASE;          /* fresh heap for the new image */
-    mmap_cur = mmap_top;
+    arena_init(image_top(&exe, &interp));   /* fresh heap above the new image */
     uint64_t rsp = build_stack_vec(na, argc, ne, envc, &exe, &interp);
     kfree(sbuf);
 
@@ -2141,7 +2181,7 @@ linux_elf_run(const char *file)
     con_putc('\n');
 
     fds_init();
-    arena_init();
+    arena_init(image_top(&exe, &interp));
     linux_trap_init();
     con_puts("[bin] syscall armed\n");
     uint64_t rsp = build_stack(file, &exe, &interp);

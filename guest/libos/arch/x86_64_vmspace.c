@@ -93,9 +93,10 @@ vmspace_new(void)
             pdl[i] = base | VM_P | VM_W | VM_PS;
     }
 
-    /* physmap: the first 32 MiB of RAM as sixteen 2 MiB pages at VM_PHYSMAP. */
+    /* physmap: all of RAM as 2 MiB pages at VM_PHYSMAP, so the kernel reaches
+     * any frame by physical address regardless of the active CR3. */
     uint64_t *pdp = tbl(pd_phys);
-    for (uint64_t i = 0; i < 16; i++)
+    for (uint64_t i = 0; i < VM_PHYSMAP_PAGES; i++)
         pdp[i] = (i << 21) | VM_P | VM_W | VM_PS;
 
     return pml4;
