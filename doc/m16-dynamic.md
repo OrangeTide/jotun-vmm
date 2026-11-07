@@ -965,3 +965,42 @@ grow a big block. Our `mmap` is a non-reclaiming bump allocator, so a real
 does when the call returns `ENOSYS`. It returns `ENOSYS`, quietly, and glibc
 does the copy. With both, `ls` of `/usr/bin` and `/usr/lib/x86_64-linux-gnu`
 returns the exact host counts, and a glob matches the host.
+
+### Giving the kernel room to grow
+
+Several of the limits above (the overlay slot count, the descriptor cap) were
+awkward to raise for the same underlying reason: the guest kernel is identity
+mapped and linked at 1 MiB, and the page tables leave `[0x400000, VM_USER_HI)`
+unmapped for each process's private user window, so the whole kernel image has
+to fit in the 3 MiB hole below the user's load address. Its `kmalloc` heap was
+a 1 MiB static array, and the bookkeeping tables were static arrays, all in
+that hole. Every raised limit grew the image toward the `0x400000` wall.
+
+The address-space model itself was never the problem. Each process already has
+private page tables and a demand-paged user window. What was cramped was the
+kernel's own memory. The fix keeps the kernel code where it is and moves its
+data out of the hole, in two steps.
+
+First, the heap. `vmspace_new` identity-maps all of `[0, 1 GiB)` in every
+process except the user window, so a region placed just above the window is
+mapped in every address space, before and after a CR3 switch, with no new
+machinery. The heap moved to an 8 MiB band there, `[VM_USER_HI, VM_USER_HI +
+8 MiB)`, with the vcpu stacks taking the 8 MiB above it. The user frame pool is
+untouched. That alone grows the heap eightfold, and it is the memory that was
+actually scarce: the overlay's file buffers and the thread stacks.
+
+Second, the tables. The overlay, the open-file descriptions, and the per
+process and per thread state are now allocated once from that heap instead of
+living in `.bss`. Raising their counts costs heap, not image space. Together
+the two steps drop `_end` from about 3.5 MiB to 1.9 MiB, so the kernel image
+has around 2 MiB of slack under the user window instead of a few hundred KB,
+and `RAMFS_MAX`, `LINUX_NFD`, `LINUX_NOFILE` and the process count no longer
+trade against it: raising `RAMFS_MAX` four-fold and the descriptor cap to 256
+leaves `_end` byte for byte unchanged.
+
+What is still finite is the band itself: 8 MiB of kernel memory shared by the
+tables, the overlay's file data, and the kstacks. A build that wrote tens of
+MiB of files into the overlay would exhaust it. The next step, if a workload
+ever needs it, is a kernel heap that grows on demand from the same frame pool
+the user pages come from, rather than a fixed band. It is not needed to clear
+the wall this milestone was about.
