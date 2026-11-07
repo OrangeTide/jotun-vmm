@@ -315,6 +315,21 @@ pf_handle(uint64_t far, uint64_t esr)
     return 1;
 }
 
+int
+vmspace_unmap(vmspace_t as, uint64_t vaddr)
+{
+    if (vaddr < VM_USER_LO || vaddr >= VM_USER_HI)
+        return 0;
+    uint64_t *e = walk_user(as, vaddr, 0);
+    if (!e || !(*e & 1))
+        return 0;
+    phys_free(pte_frame(*e));
+    *e = 0;
+    if (as == cur_vmspace)
+        __asm__ volatile ("dsb ishst; tlbi vmalle1; dsb ish; isb");
+    return 1;
+}
+
 /* Visit every present user-window L3 entry, calling fn(vaddr, entry-ptr, arg). */
 static void
 user_walk(vmspace_t as, void (*fn)(uint64_t, uint64_t *, void *), void *arg)

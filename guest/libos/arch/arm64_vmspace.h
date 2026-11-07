@@ -61,6 +61,7 @@ void *phys_to_virt(uint64_t p);
 vmspace_t vmspace_new(void);
 int vmspace_map(vmspace_t as, uint64_t vaddr, uint64_t frame, uint64_t flags);
 uint64_t vmspace_lookup(vmspace_t as, uint64_t vaddr);
+int vmspace_unmap(vmspace_t as, uint64_t vaddr);
 void vmspace_switch(vmspace_t as);
 void vmspace_destroy(vmspace_t as);
 vmspace_t vmspace_clone(vmspace_t src);

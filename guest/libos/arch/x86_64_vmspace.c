@@ -281,6 +281,21 @@ pf_handle(uint64_t cr2, uint64_t err)
     return 1;
 }
 
+int
+vmspace_unmap(vmspace_t as, uint64_t vaddr)
+{
+    if (vaddr < VM_USER_LO || vaddr >= VM_USER_HI)
+        return 0;
+    uint64_t *e = walk_user(as, vaddr, 0);
+    if (!e || !(*e & VM_P))
+        return 0;
+    phys_free(pte_frame(*e));
+    *e = 0;
+    if (as == cur_vmspace)
+        __asm__ volatile ("invlpg (%0)" : : "r"(vaddr) : "memory");
+    return 1;
+}
+
 /* Visit every present user-window PT entry, calling fn(vaddr, entry-ptr). */
 static void
 user_walk(vmspace_t as, void (*fn)(uint64_t, uint64_t *, void *), void *arg)

@@ -11,8 +11,8 @@
  *   constants  VM_PAGE, VM_USER_LO, VM_USER_HI, and the map flags VM_W, VM_U
  *   state      cur_vmspace (the running process's space)
  *   frames     phys_init, phys_alloc, phys_free, phys_to_virt
- *   spaces     vmspace_new, vmspace_map, vmspace_lookup, vmspace_switch,
- *              vmspace_destroy, vmspace_clone
+ *   spaces     vmspace_new, vmspace_map, vmspace_lookup, vmspace_unmap,
+ *              vmspace_switch, vmspace_destroy, vmspace_clone
  *   heap       kheap_init (set up the demand-grown kernel heap window)
  *   faults     pf_handle (called from the arch fault vector)
  */

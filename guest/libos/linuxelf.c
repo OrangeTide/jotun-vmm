@@ -310,6 +310,7 @@ struct lpipe {
  * one struct lshared (its fd table dominates), so this stays well under the
  * kernel's bss budget below VM_USER_LO. */
 #define LINUX_NPROC  48
+#define LINUX_MMAP_HOLES 256            /* freed mmap spans tracked per address space */
 #define LINUX_KSTACK (16u * 1024)       /* per-process syscall handler stack */
 #define CLONE_VM     0x00000100u        /* clone shares the address space (thread) */
 static struct lpipe pipes[LINUX_NPIPE];
@@ -388,8 +389,14 @@ struct lshared {
     struct lfd fdtab[LINUX_NFD];
     /* The heap arena. heap_brk grows up from heap_base (set just above the
      * loaded program image, which varies by binary); heap_mmap grows down from
-     * heap_mmaptop. A bump allocator; munmap does not reclaim. */
+     * heap_mmaptop. munmap reclaims: a freed span at the heap_mmap low-water is
+     * popped back into the bump region, and one in the middle becomes a hole in
+     * mmap_holes that a later mmap reuses first-fit. Without this a program that
+     * churns mmap/munmap (a compiler's gc) exhausts the descending arena though
+     * its live footprint is small. */
     uint64_t heap_base, heap_brk, heap_mmap, heap_mmaptop;
+    struct { uint64_t va, len; } mmap_holes[LINUX_MMAP_HOLES];
+    int      mmap_nhole;
     /* The current working directory, as a normalized overlay key (bundle-relative,
      * no leading slash; "" is the root). Relative paths resolve against it. It is
      * per-process: shared by a process's threads, copied on fork and on the
@@ -435,6 +442,8 @@ struct lproc *lproc_cur;
 #define brk_cur   (lproc_cur->sh->heap_brk)
 #define mmap_cur  (lproc_cur->sh->heap_mmap)
 #define mmap_top  (lproc_cur->sh->heap_mmaptop)
+#define mholes    (lproc_cur->sh->mmap_holes)
+#define nhole     (lproc_cur->sh->mmap_nhole)
 #define cwd_key   (lproc_cur->sh->cwd)
 
 static long do_execve(const char *path, const char *const *argv,
@@ -460,6 +469,7 @@ arena_init(uint64_t image_top)
     brk_cur = heap_base;
     mmap_top = (LINUX_USTACK_TOP - LINUX_USTACK_SIZE) & ~(PAGE_SIZE - 1);
     mmap_cur = mmap_top;
+    nhole = 0;
 }
 
 /* The highest address occupied by the loaded image: the executable's end, or
@@ -518,6 +528,102 @@ mmap_fill(long fd, uint64_t va, uint64_t off, uint64_t len)
     return 0;
 }
 
+/* Reserve n bytes (page-rounded) of mmap address space: reuse a freed hole
+ * first-fit, else bump the descending low-water down. Returns the base VA, or 0
+ * if no hole fits and the gap to brk is too small. Does not back the pages; they
+ * fault in lazily (a reused hole was fully unmapped by munmap, so it reads as
+ * zero, which anonymous mmap requires). */
+static uint64_t
+mmap_reserve(uint64_t n)
+{
+    for (int i = 0; i < nhole; i++) {
+        if (mholes[i].len < n)
+            continue;
+        uint64_t va = mholes[i].va;
+        mholes[i].va += n;
+        mholes[i].len -= n;
+        if (mholes[i].len == 0)
+            mholes[i] = mholes[--nhole];    /* drop the emptied slot */
+        return va;
+    }
+    if (n > mmap_cur - brk_cur)             /* overflow-safe: mmap_cur > brk_cur */
+        return 0;
+    mmap_cur -= n;
+    return mmap_cur;
+}
+
+/* Coalesce the hole list and pop any hole sitting at the low-water back into the
+ * bump region, repeating until stable. Keeps the list short (so it rarely
+ * overflows) and lets the descending arena recover as soon as its bottom frees. */
+static void
+mmap_coalesce(void)
+{
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int i = 0; i < nhole; i++) {
+            if (mholes[i].va == mmap_cur) {         /* bottom of the stack: pop it */
+                mmap_cur += mholes[i].len;
+                mholes[i] = mholes[--nhole];
+                changed = 1;
+                break;
+            }
+            for (int j = 0; j < nhole; j++) {       /* merge an adjacent pair */
+                if (i != j && mholes[i].va + mholes[i].len == mholes[j].va) {
+                    mholes[i].len += mholes[j].len;
+                    mholes[j] = mholes[--nhole];
+                    changed = 1;
+                    break;
+                }
+            }
+            if (changed)
+                break;
+        }
+    }
+}
+
+/* Return a freed mmap span [va, va+n) to the arena: record it as a hole (or, if
+ * the list is full, leak the address range; the frames were still freed), then
+ * coalesce. */
+static void
+mmap_release(uint64_t va, uint64_t n)
+{
+    /* Guard against a double free: if the span is already inside a hole, adding
+     * it again would let mmap_reserve hand the same address out twice. */
+    for (int i = 0; i < nhole; i++)
+        if (va >= mholes[i].va && va + n <= mholes[i].va + mholes[i].len)
+            return;
+    if (nhole < LINUX_MMAP_HOLES) {
+        mholes[nhole].va = va;
+        mholes[nhole].len = n;
+        nhole++;
+    }
+    mmap_coalesce();
+}
+
+/* munmap(addr, len): free the frames under the mmap arena part of the range and
+ * return that span to the arena for reuse. Addresses outside [mmap_cur,
+ * mmap_top) are not the mmap arena (the image, brk heap, or stack), so they are
+ * left untouched. */
+static long
+do_munmap(uint64_t addr, uint64_t len)
+{
+    uint64_t n = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint64_t va = addr & ~(PAGE_SIZE - 1);
+    if (n == 0)
+        return 0;
+
+    uint64_t lo = va < mmap_cur ? mmap_cur : va;
+    uint64_t hi = va + n > mmap_top ? mmap_top : va + n;
+    if (lo >= hi)
+        return 0;                           /* nothing of it is in the mmap arena */
+
+    for (uint64_t p = lo; p < hi; p += PAGE_SIZE)
+        vmspace_unmap(cur_vmspace, p);
+    mmap_release(lo, hi - lo);
+    return 0;
+}
+
 /* mmap(addr, len, prot, flags, fd, off). prot is not enforced: pf_handle maps
  * every user page writable, so this grants access, it does not restrict it.
  * MAP_FIXED maps at the exact address (the dynamic linker overlays a file
@@ -546,12 +652,12 @@ do_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags,
          * (this is how the .bss overlay must read). */
         memset((void *)(uintptr_t)va, 0, n);
     } else {
-        if (n > mmap_cur - brk_cur)     /* overflow-safe: mmap_cur > brk_cur */
+        va = mmap_reserve(n);
+        if (va == 0)
             return MMAP_FAILED;
-        mmap_cur -= n;
-        va = mmap_cur;
-        /* Fresh descending address: never mapped before, so an anonymous
-         * mapping already reads as zero on fault and needs no eager backing. */
+        /* A bumped address was never mapped and a reused hole was unmapped by
+         * munmap, so either way an anonymous mapping reads as zero on fault and
+         * needs no eager backing. */
     }
 
     if (!(flags & MAP_ANONYMOUS) && fd >= 0) {
@@ -1897,6 +2003,9 @@ do_fork(void)
     csh->heap_brk = parent->sh->heap_brk;
     csh->heap_mmap = parent->sh->heap_mmap;
     csh->heap_mmaptop = parent->sh->heap_mmaptop;
+    csh->mmap_nhole = parent->sh->mmap_nhole;
+    memcpy(csh->mmap_holes, parent->sh->mmap_holes,
+           (size_t)csh->mmap_nhole * sizeof csh->mmap_holes[0]);
 
     /* Account for the inherited descriptors (the child shares them). */
     for (int i = 0; i < LINUX_NFD; i++) {
@@ -2025,6 +2134,9 @@ do_spawn_vfork(uint64_t flags, uint64_t child_stack)
     csh->heap_brk = parent->sh->heap_brk;
     csh->heap_mmap = parent->sh->heap_mmap;
     csh->heap_mmaptop = parent->sh->heap_mmaptop;
+    csh->mmap_nhole = parent->sh->mmap_nhole;
+    memcpy(csh->mmap_holes, parent->sh->mmap_holes,
+           (size_t)csh->mmap_nhole * sizeof csh->mmap_holes[0]);
 
     csh->vforking = 1;
     csh->vfork_waiter = parent->task_id;
@@ -2207,7 +2319,7 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_mmap((uint64_t)a1, (uint64_t)a2, (uint64_t)a3, (uint64_t)a4,
                        a5, tf_arg6(&lproc_cur->tf));
     case SYS_munmap:
-        return 0;                       /* bump arena: no reclaim */
+        return do_munmap((uint64_t)a1, (uint64_t)a2);
     case SYS_time: {
         int64_t t = (int64_t)guest_now_sec();
         if (a1)

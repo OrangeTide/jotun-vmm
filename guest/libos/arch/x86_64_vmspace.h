@@ -89,6 +89,11 @@ int vmspace_map(vmspace_t as, uint64_t vaddr, uint64_t frame, uint64_t flags);
 /* The frame backing vaddr in as, or 0 if unmapped. */
 uint64_t vmspace_lookup(vmspace_t as, uint64_t vaddr);
 
+/* Unmap one user-window page, free its frame, and flush the TLB entry if as is
+ * the active space. Returns 1 if a mapping was present, 0 otherwise. Used by
+ * munmap to reclaim both the frame and (via the caller) the address range. */
+int vmspace_unmap(vmspace_t as, uint64_t vaddr);
+
 /* Make as the active address space (load CR3) and enable the physmap. */
 void vmspace_switch(vmspace_t as);
 
