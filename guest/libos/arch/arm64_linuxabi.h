@@ -16,7 +16,11 @@
 #define SYS_dup             23
 #define SYS_dup3            24
 #define SYS_fcntl           25
+#define SYS_mkdirat         34
 #define SYS_unlinkat        35
+#define SYS_renameat        38
+#define SYS_renameat2       276
+#define SYS_copy_file_range 285
 #define SYS_fchmod          52
 #define SYS_fchmodat        53
 #define SYS_ioctl           29
@@ -103,6 +107,9 @@
 #define SYS_readlink   (-12)
 #define SYS_unlink     (-13)
 #define SYS_chmod      (-14)
+#define SYS_mkdir      (-15)
+#define SYS_rmdir      (-16)
+#define SYS_rename     (-17)
 
 /* arch_prctl is x86-only; defined so the shared case body compiles. */
 #define ARCH_SET_FS 0x1002

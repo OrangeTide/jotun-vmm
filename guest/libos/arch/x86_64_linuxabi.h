@@ -46,6 +46,9 @@
 #define SYS_fcntl           72
 #define SYS_getcwd          79
 #define SYS_chdir           80
+#define SYS_rename          82
+#define SYS_mkdir           83
+#define SYS_rmdir           84
 #define SYS_unlink          87
 #define SYS_readlink        89
 #define SYS_chmod           90
@@ -85,8 +88,10 @@
 #define SYS_exit_group      231
 #define SYS_tgkill          234
 #define SYS_openat          257
+#define SYS_mkdirat         258
 #define SYS_newfstatat      262
 #define SYS_unlinkat        263
+#define SYS_renameat        264
 #define SYS_readlinkat      267
 #define SYS_fchmodat        268
 #define SYS_faccessat       269
@@ -94,7 +99,9 @@
 #define SYS_dup3            292
 #define SYS_pipe2           293
 #define SYS_prlimit64       302
+#define SYS_renameat2       316
 #define SYS_getrandom       318
+#define SYS_copy_file_range 326
 #define SYS_statx           332
 #define SYS_rseq            334
 #define SYS_clone3          435

@@ -97,6 +97,10 @@
 #define LERR_PIPE   32          /* EPIPE: write to a pipe with no readers */
 #define LERR_CHILD  10          /* ECHILD: wait with no children */
 #define LERR_AGAIN  11          /* EAGAIN */
+#define LERR_EXIST  17          /* EEXIST */
+#define LERR_XDEV   18          /* EXDEV: cross-device link/rename */
+#define LERR_ISDIR  21          /* EISDIR */
+#define LERR_NOTEMPTY 39        /* ENOTEMPTY */
 
 /* ELF auxv entry tags. */
 #define AT_NULL    0
@@ -185,6 +189,14 @@ struct linux_dirent64 {
 #define LINUX_NPIPE 4
 #define PIPE_CAP    4096
 
+/* The writable in-memory overlay: files and directories created or written by
+ * the guest, keyed by normalized bundle-relative path ("" is the root). A
+ * compiler toolchain and a configure run create many files across a few
+ * directories, so the table is generous and names hold a nested path. */
+#define RAMFS_MAX     256
+#define RAMFS_NAME    192
+#define RAMFS_FILE_MAX (4u * 1024u * 1024u)     /* per-file cap */
+
 struct lfd {
     int      used;
     int      iscon;             /* this fd is the console (stdin/out/err) */
@@ -196,6 +208,13 @@ struct lfd {
     int      wr;                /* pipe write end when set, else read end */
     uint32_t p9fid;             /* backing 9P fid, 0 for the console fds */
     uint64_t pos;               /* read cursor (file) or 9P dir offset */
+    /* Directory enumeration state (getdents): a directory may have both 9P and
+     * writable-overlay entries, so it is listed in two phases. dpath is the
+     * directory's normalized key; d9done marks the 9P phase finished; dov is the
+     * overlay scan cursor. */
+    char     dpath[RAMFS_NAME];
+    int      d9done;
+    uint32_t dov;
     uint64_t size;
     uint64_t ino;               /* stable identity (9P qid path): a fresh fd for
                                  * the same file reports the same inode, which
@@ -203,16 +222,13 @@ struct lfd {
                                  * library it has already mapped */
 };
 
-/* A writable in-memory file. The read-only 9P bundle cannot hold new files, so
- * anything created or written goes here, keyed by its bundle-relative path. The
- * buffer grows on write and lives for the program's run (close keeps it, so a
- * file written early can be reopened and read later). */
-#define RAMFS_MAX     16
-#define RAMFS_NAME    64
-#define RAMFS_FILE_MAX (1024u * 1024u)      /* per-file cap */
-
+/* A writable overlay entry: a file (buffer grows on write, persists across
+ * close for the run) or a directory. The read-only 9P bundle and host mounts
+ * cannot hold new files, so anything created or written goes here, shadowing a
+ * bundle path of the same name. See the RAMFS_* sizes above. */
 struct ramfile {
     int      used;
+    int      is_dir;
     char     name[RAMFS_NAME];
     uint8_t *data;
     uint32_t len;
@@ -490,27 +506,70 @@ fds_init(void)
         fds[i].used = fds[i].iscon = 1;
 }
 
+/* Normalize a path to an overlay key: strip leading slashes, drop "."
+ * components, resolve ".." by popping, and join with single slashes. The root
+ * is the empty string. Keeps keys canonical so create/find/stat/list all agree
+ * (e.g. "/tmp/./x" and "tmp/x" map to the same entry). */
+static void
+norm_key(const char *path, char *out, size_t n)
+{
+    const char *p = path;
+    size_t w = 0;
+
+    out[0] = 0;
+    while (*p == '/')
+        p++;
+    while (*p) {
+        const char *s = p;
+        while (*p && *p != '/')
+            p++;
+        size_t clen = (size_t)(p - s);
+        while (*p == '/')
+            p++;
+        if (clen == 1 && s[0] == '.')
+            continue;
+        if (clen == 2 && s[0] == '.' && s[1] == '.') {
+            while (w > 0 && out[w - 1] != '/')
+                w--;
+            if (w > 0)
+                w--;                    /* drop the trailing slash */
+            out[w] = 0;
+            continue;
+        }
+        if (w > 0 && w < n - 1)
+            out[w++] = '/';
+        for (size_t i = 0; i < clen && w < n - 1; i++)
+            out[w++] = s[i];
+        out[w] = 0;
+    }
+}
+
 static int
 ramfs_find(const char *name)
 {
+    char key[RAMFS_NAME];
+    norm_key(name, key, sizeof key);
     for (int i = 0; i < RAMFS_MAX; i++)
-        if (ramfs[i].used && strcmp(ramfs[i].name, name) == 0)
+        if (ramfs[i].used && strcmp(ramfs[i].name, key) == 0)
             return i;
     return -1;
 }
 
 static int
-ramfs_create(const char *name)
+ramfs_create(const char *name, int is_dir)
 {
+    char key[RAMFS_NAME];
+    norm_key(name, key, sizeof key);
     for (int i = 0; i < RAMFS_MAX; i++) {
         if (!ramfs[i].used) {
             size_t n = 0;
-            while (name[n] && n < RAMFS_NAME - 1) {
-                ramfs[i].name[n] = name[n];
+            while (key[n] && n < RAMFS_NAME - 1) {
+                ramfs[i].name[n] = key[n];
                 n++;
             }
             ramfs[i].name[n] = 0;
             ramfs[i].used = 1;
+            ramfs[i].is_dir = is_dir;
             ramfs[i].data = NULL;
             ramfs[i].len = 0;
             ramfs[i].cap = 0;
@@ -520,7 +579,7 @@ ramfs_create(const char *name)
     return -1;
 }
 
-/* Remove a ramfs file by name. Returns 0 if one was removed, -1 if absent.
+/* Remove an overlay entry by name. Returns 0 if one was removed, -1 if absent.
  * The buffer is kept (freed lazily on reuse) so a stale pointer is never left. */
 static int
 ramfs_remove(const char *name)
@@ -531,6 +590,65 @@ ramfs_remove(const char *name)
     ramfs[i].used = 0;
     ramfs[i].len = 0;
     return 0;
+}
+
+/* If entry name `nm` is a direct child of normalized directory key `dk`, return
+ * a pointer to its leaf name; otherwise NULL. The root (dk == "") parents every
+ * top-level name (one with no slash). */
+static const char *
+ramfs_child_leaf(const char *nm, const char *dk)
+{
+    size_t dl = strlen(dk);
+    const char *leaf;
+
+    if (dl == 0) {
+        if (nm[0] == 0)
+            return NULL;
+        leaf = nm;
+    } else {
+        if (strncmp(nm, dk, dl) != 0 || nm[dl] != '/')
+            return NULL;
+        leaf = nm + dl + 1;
+        if (*leaf == 0)
+            return NULL;
+    }
+    for (const char *q = leaf; *q; q++)
+        if (*q == '/')
+            return NULL;                /* deeper descendant, not a direct child */
+    return leaf;
+}
+
+/* Does any overlay entry live under directory key `dk` (at any depth)? Used to
+ * recognize an implicit directory and to refuse removing a non-empty one. */
+static int
+ramfs_has_desc(const char *dk)
+{
+    size_t dl = strlen(dk);
+    for (int i = 0; i < RAMFS_MAX; i++) {
+        if (!ramfs[i].used)
+            continue;
+        if (dl == 0) {
+            if (ramfs[i].name[0])
+                return 1;
+        } else if (strncmp(ramfs[i].name, dk, dl) == 0 && ramfs[i].name[dl] == '/') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Is normalized key `key` a directory in the overlay? The root always is; an
+ * explicit entry reports its kind; otherwise a key with descendants is an
+ * implicit directory (a file was created below it without an explicit mkdir). */
+static int
+ramfs_is_dir_key(const char *key)
+{
+    if (key[0] == 0)
+        return 1;
+    for (int i = 0; i < RAMFS_MAX; i++)
+        if (ramfs[i].used && strcmp(ramfs[i].name, key) == 0)
+            return ramfs[i].is_dir;
+    return ramfs_has_desc(key);
 }
 
 /* Ensure a ramfile's buffer holds at least `need` bytes, doubling as needed. */
@@ -707,19 +825,39 @@ open_ram(int ri, long flags)
     return fd;
 }
 
+/* Record a directory's normalized key on its fd, for the overlay phase of
+ * getdents. d9done starts set when there is no 9P side to enumerate. */
+static void
+fd_set_dir(struct lfd *f, const char *key)
+{
+    size_t i = 0;
+    while (key[i] && i < RAMFS_NAME - 1) {
+        f->dpath[i] = key[i];
+        i++;
+    }
+    f->dpath[i] = 0;
+    f->d9done = f->p9fid ? 0 : 1;
+    f->dov = 0;
+}
+
 static long
 do_open(const char *path, long flags)
 {
-    const char *rel = bundle_path(path);
+    char key[RAMFS_NAME];
+    norm_key(path, key, sizeof key);
     int writing = (flags & (O_WRONLY | O_RDWR)) != 0;
 
-    /* Writable or newly created paths live in the ramfs. */
+    int ri = ramfs_find(key);               /* overlay entry (file or dir) */
+    int is_ovl_dir = (ri >= 0 && ramfs[ri].is_dir);
+
+    /* Writing or creating a plain file lands in the writable overlay. */
     if (writing || (flags & O_CREAT)) {
-        int ri = ramfs_find(rel);
+        if (is_ovl_dir || (ri < 0 && ramfs_is_dir_key(key)))
+            return -LERR_ISDIR;
         if (ri < 0) {
             if (!(flags & O_CREAT))
-                return -LERR_ROFS;      /* writing an existing RO bundle file */
-            ri = ramfs_create(rel);
+                return -LERR_ROFS;          /* writing an existing RO bundle file */
+            ri = ramfs_create(key, 0);
             if (ri < 0)
                 return -LERR_NOMEM;
         }
@@ -728,11 +866,11 @@ do_open(const char *path, long flags)
         return open_ram(ri, flags);
     }
 
-    /* Read-only: a ramfs file shadows the bundle; else fall back to 9P. */
-    int ri = ramfs_find(rel);
-    if (ri >= 0)
+    /* Read-only: an overlay file shadows the bundle. */
+    if (ri >= 0 && !ramfs[ri].is_dir)
         return open_ram(ri, flags);
 
+    /* A directory, or a bundle/host file. Probe the 9P side. */
     int fd = fd_alloc();
     if (fd < 0)
         return -LERR_NOMEM;
@@ -740,35 +878,48 @@ do_open(const char *path, long flags)
     if (p9fid == 0)
         return -LERR_NOMEM;
 
-    if (ns_walk(rel, p9fid) != 0)
-        return -LERR_NOENT;
+    int have9 = 0, isdir9 = 0;
+    uint64_t size = 0, ino = p9fid;
+    if (ns_walk(key, p9fid) == 0) {
+        struct p9_stat st;
+        if (p9_stat(p9fid, &st) == 0) {
+            have9 = 1;
+            isdir9 = (st.qid.type & P9_QTDIR) != 0;
+            size = st.length;
+            ino = st.qid.path;
+        }
+    }
+    int isdir = is_ovl_dir || ramfs_is_dir_key(key) || (have9 && isdir9);
 
-    struct p9_stat st;
-    int isdir = 0;
-    uint64_t size = 0;
-    uint64_t ino = p9fid;               /* fallback if the stat fails */
-    if (p9_stat(p9fid, &st) == 0) {
-        isdir = (st.qid.type & P9_QTDIR) != 0;
-        size = st.length;
-        ino = st.qid.path;              /* stable per-file identity */
+    if (!isdir && !have9) {
+        p9_clunk(p9fid);
+        return -LERR_NOENT;
     }
     if ((flags & O_DIRECTORY) && !isdir) {
         p9_clunk(p9fid);
         return -LERR_NOTDIR;
     }
-    if (p9_open(p9fid) != 0) {
-        p9_clunk(p9fid);
-        return -LERR_ACCES;
-    }
 
     memset(&fds[fd], 0, sizeof fds[fd]);
     fds[fd].used = 1;
     fds[fd].isdir = isdir;
-    fds[fd].p9fid = p9fid;
-    fds[fd].pos = 0;
     fds[fd].size = size;
     fds[fd].ino = ino;
-    gfidref[p9fid - LINUX_FID_BASE] = 1;
+    /* Keep a 9P fid open when there is a 9P file to read, or a 9P directory to
+     * enumerate; an overlay-only directory needs none. */
+    if (have9 && (!isdir || isdir9)) {
+        if (p9_open(p9fid) != 0) {
+            p9_clunk(p9fid);
+            fds[fd].used = 0;
+            return -LERR_ACCES;
+        }
+        fds[fd].p9fid = p9fid;
+        gfidref[p9fid - LINUX_FID_BASE] = 1;
+    } else {
+        p9_clunk(p9fid);
+    }
+    if (isdir)
+        fd_set_dir(&fds[fd], key);
     return fd;
 }
 
@@ -858,9 +1009,11 @@ do_close(long fd)
         f->used = 0;
         return 0;
     }
-    uint32_t slot = f->p9fid - LINUX_FID_BASE;
-    if (gfidref[slot] && --gfidref[slot] == 0)
-        p9_clunk(f->p9fid);             /* last reference: release the fid */
+    if (f->p9fid) {                     /* an overlay-only directory has none */
+        uint32_t slot = f->p9fid - LINUX_FID_BASE;
+        if (gfidref[slot] && --gfidref[slot] == 0)
+            p9_clunk(f->p9fid);         /* last reference: release the fid */
+    }
     f->used = 0;
     return 0;
 }
@@ -898,17 +1051,25 @@ fill_stat(struct linux_stat *s, int isdir, uint64_t size, uint64_t ino)
 static long
 meta_path(const char *path, int *isdir, uint64_t *size, uint64_t *ino)
 {
-    const char *rel = bundle_path(path);
+    char key[RAMFS_NAME];
+    norm_key(path, key, sizeof key);
 
-    int ri = ramfs_find(rel);
+    int ri = ramfs_find(key);
     if (ri >= 0) {
-        *isdir = 0;
-        *size = ramfs[ri].len;
+        *isdir = ramfs[ri].is_dir;
+        *size = ramfs[ri].is_dir ? 0 : ramfs[ri].len;
         *ino = (uint64_t)(0x10000 + ri);
         return 0;
     }
+    /* The root, or a directory implied by overlay files created below it. */
+    if (key[0] == 0 || ramfs_has_desc(key)) {
+        *isdir = 1;
+        *size = 0;
+        *ino = 1;
+        return 0;
+    }
     uint32_t fid = LINUX_FID_BASE + GFID_MAX;       /* scratch, above the pool */
-    if (ns_walk(rel, fid) != 0)
+    if (ns_walk(key, fid) != 0)
         return -LERR_NOENT;
     struct p9_stat st;
     int ok = p9_stat(fid, &st) == 0;
@@ -932,6 +1093,106 @@ do_stat_path(const char *path, struct linux_stat *out)
     if (rc == 0)
         fill_stat(out, isdir, size, ino);
     return rc;
+}
+
+/* mkdir: create a writable-overlay directory. Fails if anything already
+ * resolves at the path (an overlay entry, a bundle path, or an implicit
+ * directory). mkdir -p ignores the resulting EEXIST. */
+static long
+do_mkdir(const char *path)
+{
+    char key[RAMFS_NAME];
+    norm_key(path, key, sizeof key);
+    if (key[0] == 0)
+        return -LERR_EXIST;             /* the root always exists */
+    int isdir;
+    uint64_t sz, ino;
+    if (meta_path(key, &isdir, &sz, &ino) == 0)
+        return -LERR_EXIST;
+    if (ramfs_create(key, 1) < 0)
+        return -LERR_NOMEM;
+    return 0;
+}
+
+/* rmdir: remove an empty writable-overlay directory. A non-empty one is
+ * ENOTEMPTY; a read-only bundle directory is EROFS. */
+static long
+do_rmdir(const char *path)
+{
+    char key[RAMFS_NAME];
+    norm_key(path, key, sizeof key);
+    if (key[0] == 0)
+        return -LERR_ACCES;
+    if (ramfs_has_desc(key))
+        return -LERR_NOTEMPTY;
+    int ri = ramfs_find(key);
+    if (ri >= 0 && ramfs[ri].is_dir) {
+        ramfs[ri].used = 0;
+        return 0;
+    }
+    int isdir;
+    uint64_t sz, ino;
+    if (meta_path(key, &isdir, &sz, &ino) != 0)
+        return -LERR_NOENT;
+    return isdir ? -LERR_ROFS : -LERR_NOTDIR;
+}
+
+/* Overwrite entry index i's stored name with `name` (assumed normalized). */
+static void
+ramfs_rename_entry(int i, const char *name)
+{
+    size_t k = 0;
+    while (name[k] && k < RAMFS_NAME - 1) {
+        ramfs[i].name[k] = name[k];
+        k++;
+    }
+    ramfs[i].name[k] = 0;
+}
+
+/* rename within the writable overlay. A directory carries its descendants
+ * (their key prefix is rewritten). A read-only source cannot be renamed
+ * (EXDEV), which leaves the caller to fall back to copy-and-delete. */
+static long
+do_rename(const char *oldp, const char *newp)
+{
+    char ok[RAMFS_NAME], nk[RAMFS_NAME];
+    norm_key(oldp, ok, sizeof ok);
+    norm_key(newp, nk, sizeof nk);
+    if (ok[0] == 0 || nk[0] == 0)
+        return -LERR_ACCES;
+
+    int ri = ramfs_find(ok);
+    if (ri < 0) {
+        int isdir;
+        uint64_t sz, ino;
+        if (meta_path(ok, &isdir, &sz, &ino) == 0)
+            return -LERR_XDEV;          /* read-only source: cannot rename */
+        return -LERR_NOENT;
+    }
+
+    int di = ramfs_find(nk);            /* overwrite an existing destination */
+    if (di >= 0 && di != ri)
+        ramfs[di].used = 0;
+
+    if (ramfs[ri].is_dir) {             /* carry the subtree: rewrite prefixes */
+        size_t ol = strlen(ok);
+        for (int i = 0; i < RAMFS_MAX; i++) {
+            if (!ramfs[i].used || i == ri)
+                continue;
+            if (strncmp(ramfs[i].name, ok, ol) != 0 || ramfs[i].name[ol] != '/')
+                continue;
+            char nn[RAMFS_NAME];
+            size_t w = 0;
+            for (size_t j = 0; nk[j] && w < RAMFS_NAME - 1; j++)
+                nn[w++] = nk[j];
+            for (const char *s = ramfs[i].name + ol; *s && w < RAMFS_NAME - 1; s++)
+                nn[w++] = *s;
+            nn[w] = 0;
+            ramfs_rename_entry(i, nn);
+        }
+    }
+    ramfs_rename_entry(ri, nk);
+    return 0;
 }
 
 /* The subset of struct statx the basic-stats mask needs, padded to the kernel's
@@ -1040,9 +1301,32 @@ do_fstat(long fd, struct linux_stat *out)
     return 0;
 }
 
-/* getdents64: read directory entries from the 9P stream at the fd's cursor and
- * pack them as linux_dirent64 records into the user buffer. Advances the cursor
- * only past the entries actually emitted, so the next call resumes correctly. */
+/* Pack one getdents64 record into buf at `used`. Returns the new `used`, or 0
+ * if it would overflow `count` (the record is left for the next call). */
+static unsigned long
+dirent_emit(uint8_t *out, unsigned long used, unsigned long count,
+            uint64_t ino, int64_t off, int is_dir, const char *name)
+{
+    unsigned long nlen = strlen(name);
+    unsigned long reclen = (19 + nlen + 1 + 7) & ~(unsigned long)7;
+    if (used + reclen > count)
+        return 0;
+    struct linux_dirent64 *d = (struct linux_dirent64 *)(out + used);
+    d->d_ino = ino ? ino : 1;
+    d->d_off = off;
+    d->d_reclen = (uint16_t)reclen;
+    d->d_type = is_dir ? DT_DIR : DT_REG;
+    memcpy(d->d_name, name, nlen);
+    d->d_name[nlen] = 0;
+    return used + reclen;
+}
+
+/* getdents64 over a directory that may have both a read-only 9P side and a
+ * writable overlay side. The 9P entries come first (phase 1, cursor in f->pos),
+ * then the overlay's direct children (phase 2, cursor in f->dov). Each call
+ * emits as many whole records as fit and resumes where it left off; a return of
+ * 0 means the directory is exhausted. Overlay and 9P are not deduplicated, so a
+ * created file that shadows a bundle file of the same name lists twice. */
 static long
 do_getdents64(long fd, void *buf, unsigned long count)
 {
@@ -1053,35 +1337,49 @@ do_getdents64(long fd, void *buf, unsigned long count)
     if (!f->isdir)
         return -LERR_NOTDIR;
 
-    uint8_t kbuf[4096];
-    uint32_t want = sizeof kbuf;
-    long got = p9_read(f->p9fid, f->pos, kbuf, want);
-    if (got <= 0)
-        return 0;                       /* end of directory */
-
     uint8_t *out = buf;
     unsigned long used = 0;
-    uint32_t off = 0, consumed = 0;
-    struct p9_stat e;
 
-    while (p9_dir_next(kbuf, (uint32_t)got, &off, &e)) {
-        unsigned long nlen = strlen(e.name);
-        unsigned long reclen = (19 + nlen + 1 + 7) & ~(unsigned long)7;
-        if (used + reclen > count)
-            break;                      /* no room: leave for the next call */
-        struct linux_dirent64 *d = (struct linux_dirent64 *)(out + used);
-        d->d_ino = e.qid.path ? e.qid.path : 1;
-        d->d_off = (int64_t)(f->pos + off);
-        d->d_reclen = (uint16_t)reclen;
-        d->d_type = (e.qid.type & P9_QTDIR) ? DT_DIR : DT_REG;
-        memcpy(d->d_name, e.name, nlen);
-        d->d_name[nlen] = 0;
-        used += reclen;
-        consumed = off;
+    /* Phase 1: the 9P directory stream. */
+    if (f->p9fid && !f->d9done) {
+        uint8_t kbuf[4096];
+        long got = p9_read(f->p9fid, f->pos, kbuf, sizeof kbuf);
+        if (got > 0) {
+            uint32_t off = 0, consumed = 0;
+            struct p9_stat e;
+            while (p9_dir_next(kbuf, (uint32_t)got, &off, &e)) {
+                unsigned long u = dirent_emit(out, used, count,
+                                              e.qid.path, (int64_t)(f->pos + off),
+                                              (e.qid.type & P9_QTDIR) != 0, e.name);
+                if (u == 0)
+                    break;              /* no room: leave for the next call */
+                used = u;
+                consumed = off;
+            }
+            if (used == 0 && off > 0)
+                return -LERR_INVAL;     /* a single entry too big for the buffer */
+            f->pos += consumed;
+            if (used > 0)
+                return (long)used;      /* more 9P may remain; caller re-enters */
+        }
+        f->d9done = 1;                  /* 9P stream exhausted */
     }
-    if (used == 0 && off > 0)
-        return -LERR_INVAL;             /* a single entry too big for the buffer */
-    f->pos += consumed;
+
+    /* Phase 2: the writable overlay's direct children of this directory. */
+    for (int i = (int)f->dov; i < RAMFS_MAX; i++) {
+        f->dov = (uint32_t)i;
+        if (!ramfs[i].used)
+            continue;
+        const char *leaf = ramfs_child_leaf(ramfs[i].name, f->dpath);
+        if (!leaf)
+            continue;
+        unsigned long u = dirent_emit(out, used, count, (uint64_t)(0x10000 + i),
+                                      (int64_t)(i + 1), ramfs[i].is_dir, leaf);
+        if (u == 0)
+            return used ? (long)used : -LERR_INVAL;     /* resume at i next call */
+        used = u;
+    }
+    f->dov = RAMFS_MAX;                  /* overlay exhausted */
     return (long)used;
 }
 
@@ -1592,6 +1890,8 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         return 0;                       /* flat RW map, nothing to enforce */
     case SYS_fadvise64:
         return 0;                       /* advisory only; accept and ignore */
+    case SYS_copy_file_range:
+        return -LERR_NOSYS;             /* cp/mv fall back to a read/write loop */
     case SYS_brk:
         return do_brk((uint64_t)a1);
     case SYS_mmap:
@@ -1803,19 +2103,34 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_unlink:
     case SYS_unlinkat: {
         /* unlink(path): path is a1. unlinkat(dirfd, path, flags): path is a2,
-         * dirfd is treated as AT_FDCWD. Only the writable ramfs overlay can be
-         * removed; the 9P bundle and host mounts are read-only. ld, configure,
-         * and make all unlink their temporaries, which live in the overlay. */
+         * dirfd is treated as AT_FDCWD. AT_REMOVEDIR (0x200) routes to rmdir.
+         * Only the writable overlay can be removed; the 9P bundle and host
+         * mounts are read-only. ld, configure, and make all unlink temporaries,
+         * which live in the overlay. */
         const char *upath = (nr == SYS_unlink) ? (const char *)a1
                                                : (const char *)a2;
+        if (nr == SYS_unlinkat && (a3 & 0x200))
+            return do_rmdir(upath);
         if (ramfs_remove(bundle_path(upath)) == 0)
             return 0;
         int isdir;
         uint64_t size, ino;
         if (meta_path(upath, &isdir, &size, &ino) == 0)
-            return -LERR_ROFS;          /* exists, but read-only */
+            return isdir ? -LERR_ISDIR : -LERR_ROFS;
         return -LERR_NOENT;
     }
+    case SYS_mkdir:
+        return do_mkdir((const char *)a1);
+    case SYS_mkdirat:
+        return do_mkdir((const char *)a2);      /* dirfd is AT_FDCWD */
+    case SYS_rmdir:
+        return do_rmdir((const char *)a1);
+    case SYS_rename:
+        return do_rename((const char *)a1, (const char *)a2);
+    case SYS_renameat:
+        return do_rename((const char *)a2, (const char *)a4);   /* dirfds AT_FDCWD */
+    case SYS_renameat2:
+        return do_rename((const char *)a2, (const char *)a4);   /* flags ignored */
     case SYS_access: {
         /* access(path, mode): path is the first argument. The dynamic linker
          * probes /etc/ld.so.cache and candidate library directories this way. */
@@ -1835,8 +2150,27 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         long r = meta_path((const char *)a2, &isdir, &size, &ino);
         return r < 0 ? r : 0;
     }
-    case SYS_fcntl:
-        return 0;                       /* minimal: accept F_SETFD/F_SETFL */
+    case SYS_fcntl: {
+        /* F_DUPFD (0) and F_DUPFD_CLOEXEC (1030) duplicate a1 to the lowest
+         * free fd >= a3. bash uses this to save and restore a redirected fd
+         * (e.g. `echo > file` saves fd 1), so returning a real new fd matters;
+         * the old stub returned 0, which bash then treated as the saved fd.
+         * Other commands (F_GETFD/F_SETFD/F_GETFL/F_SETFL) are accepted. */
+        if (a2 == 0 || a2 == 1030) {
+            struct lfd *src = fd_get(a1);
+            if (!src)
+                return -LERR_BADF;
+            int lo = a3 < 3 ? 3 : (int)a3;
+            for (int i = lo; i < LINUX_NFD; i++) {
+                if (!fds[i].used) {
+                    clone_fd(i, src);
+                    return i;
+                }
+            }
+            return -LERR_NOMEM;         /* EMFILE: no free descriptor */
+        }
+        return 0;
+    }
     case SYS_execve:
         return do_execve((const char *)a1, (const char *const *)a2,
                          (const char *const *)a3);
