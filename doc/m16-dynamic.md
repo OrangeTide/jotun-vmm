@@ -565,7 +565,7 @@ Three small calls surfaced and were added, all additive:
 - `fadvise64` (221): coreutils calls `posix_fadvise` on its input. It is
   advisory, so the stub returns 0.
 
-## The C compiler, and the toolchain wall
+## The C compiler and linker
 
 The next target was an autotools "hello world" (`./configure && make`), which
 needs a working C compiler. The host's gcc is a driver that execs the compiler
@@ -616,11 +616,14 @@ its allocator), `getrusage`, `unlink`/`unlinkat` (remove overlay temporaries),
 `chmod`/`fchmod`/`fchmodat`, `umask`, and `readlink` (gcc probes
 `/proc/self/exe` and falls back to its default prefix).
 
-### Where it stops: the linker
+### Linking
 
-Linking does not complete. `ld` finds its inputs and libraries (the `-L` paths
-resolve after the `.`/`..` fix), but reports every cross-object symbol
-undefined, for example:
+Linking completes: `cc /hello.c -o /hello` produces a correct dynamic PIE
+executable (the right interpreter, LOAD segments, and entry point), default
+flags and LTO plugin included.
+
+Getting there meant isolating a failure that first looked like a linker symbol
+bug. `ld` reported every cross-object symbol undefined:
 
 ```
 ld: Scrt1.o: in function `_start': undefined reference to `main'
@@ -629,17 +632,24 @@ ld: crtbeginS.o: undefined reference to `__TMC_END__'
 ld: final link failed: bad value
 ```
 
-The object that defines `main` is valid in isolation: `nm /h.o` prints
-`0000000000000000 T main`. But `ld`, reading the same object while linking,
-does not pick up its symbols, and the same happens for symbols in `libc.so` and
-in the crt objects. A trace shows `ld` reads object files with `read`/`pread`
-(only `ld.so`'s library mappings go through `mmap`), so this is inside `ld`'s
-own BFD-level object and symbol handling, not the file I/O path. It is not yet
-isolated. This is the current wall for the toolchain.
+The object defining `main` was valid in isolation (`nm` and `readelf` both read
+it), so the reads were not the problem. Tracing `ld`'s file opens showed it
+never opened the input object at all, nor the end crt objects. The cause was
+argument-list truncation: `LINUX_MAX_ARGS` was 32, and `copy_uvec` silently
+drops arguments past the cap. gcc's `collect2` builds an `ld` command line with
+the crt objects, every `-L` path, the input objects, the `-l` libraries, and
+the end crt objects, well over thirty arguments, so the trailing ones fell off.
+Which symbol went missing depended only on command-line length: the input
+object when the LTO plugin lengthened the line (`main`), the end crt objects
+otherwise (`__TMC_END__` from crtend.o). Raising `LINUX_MAX_ARGS` to 256 and
+`EXEC_STR_MAX` to 32 KiB fixed it.
+
+The lesson for later tools: a dropped argument reads back as a semantic error
+three layers up (an "undefined symbol" from the linker), far from its cause.
 
 ### The gap to autotools
 
-Even with linking fixed, `./configure` needs more than a compiler:
+With compile and link working, `./configure` still needs more:
 
 - A writable filesystem with directories. The overlay (ramfs) is flat, caps at
   16 files of 1 MiB each, and has no `mkdir`. configure creates many files in
@@ -653,7 +663,8 @@ Even with linking fixed, `./configure` needs more than a compiler:
   `link`, a real `dup`/`fcntl`, and `select`/`poll`.
 
 These are a milestone in their own right. The thesis target, running the
-unmodified compiler, is met; the autotools goal is deferred behind this list.
+unmodified toolchain to compile and link, is met; the autotools goal is
+deferred behind this list.
 
 ## The cut line
 
@@ -664,6 +675,7 @@ Held against scope creep, and all deferred to later hardening milestones:
   `cc1` is copied in full on each exec, about 1.4 s per compile over 9P, which
   a repeated-compile workload such as configure would feel),
 - `munmap` accepts but does not reclaim,
-- linking (`ld`'s symbol resolution), and the autotools gaps above.
+- the autotools gaps above (a writable directory tree, a real working
+  directory, and exec of freshly built binaries from the overlay).
 
-None of these block running the compiler to produce an object.
+None of these block compiling and linking a C program.
