@@ -655,9 +655,10 @@ With compile and link working, `./configure` still needs more:
   directory-aware (`mkdir`/`rmdir`/`rename`, nested files, and a `getdents` that
   merges the 9P and overlay sides); it holds 256 entries of up to 4 MiB. See
   "The writable overlay" below.
-- A real working directory. `chdir` is still a no-op (cwd stays `/`), so
-  configure's relative-path and `cd` steps resolve against the root, not a
-  build subdirectory.
+- A real working directory. **Done.** Each process has a cwd (`chdir`/`getcwd`);
+  a relative path resolves against it before the overlay lookup or 9P walk, and
+  it is inherited on fork and the posix_spawn child and kept across `execve`.
+  See "The working directory" below.
 - Exec of freshly built binaries from the overlay. `do_execve` runs only bundle
   and host-mount files, but configure compiles `conftest.c` and then runs
   `./conftest` to check the compiler works.
@@ -666,7 +667,7 @@ With compile and link working, `./configure` still needs more:
   sees EBADF.
 
 The thesis target, running the unmodified toolchain to compile and link, is
-met. The remaining autotools gaps are the working directory and exec from the
+met. The last big autotools gap is exec of a freshly built binary from the
 overlay.
 
 ## The writable overlay
@@ -693,6 +694,28 @@ outgrew and a configure run could not use at all. It is now directory-aware:
 The overlay is shared across processes (it lives in kernel memory, not a
 per-process space), so a directory one process creates is visible to the
 others, which a shell pipeline and a build both rely on.
+
+## The working directory
+
+Each process now has a current working directory. It is stored as a normalized
+overlay key on the shared process state (the empty string is the root), so it
+costs one small field and no path parsing until a relative path is used.
+
+`resolve_path` is the path boundary for the syscall layer. An absolute path, or
+any path while the cwd is the root, normalizes directly. A relative path with a
+non-root cwd is joined to the cwd first, then normalized, so `.` and `..`
+resolve against the current directory. Every path syscall routes through it:
+open, stat, access, exec, mkdir, rmdir, rename, and unlink. The internal
+helpers that already hold a normalized key (for example `meta_key`) keep using
+`norm_key`, which a key passes through unchanged, so a path is never resolved
+against the cwd twice.
+
+`chdir` resolves its target, requires that it is a directory, and stores the
+key; `getcwd` returns a leading slash followed by the key. The cwd is
+per-process: a process's threads share it, `fork` and the posix_spawn child
+copy it, and `execve` preserves it, matching Linux. This is what lets a build
+step `cd` into a subdirectory and then open, compile, and exec by relative
+paths.
 
 ## The cut line
 

@@ -48,8 +48,8 @@ Statuses used below:
 | 32 | dup | full | refcounted share of the backing object |
 | 33 | dup2 | full | targets 0/1/2 allowed (shell redirects) |
 | 72 | fcntl | partial | F_DUPFD/F_DUPFD_CLOEXEC duplicate to the lowest free fd (bash redirect save/restore); other commands accepted, returning 0 |
-| 79 | getcwd | stub | always returns "/" |
-| 80 | chdir | stub | cwd is fixed at "/"; accepts the root or an existing directory so a tool restoring its cwd at exit succeeds |
+| 79 | getcwd | full | returns the process's current directory (a leading slash plus the stored key) |
+| 80 | chdir | full | sets a per-process working directory; resolves the target against the current cwd and requires it be a directory |
 | 82 | rename | partial | within the writable overlay (a directory carries its subtree); a read-only source is EXDEV |
 | 83 | mkdir | full | creates a writable-overlay directory; EEXIST if anything already resolves there |
 | 84 | rmdir | partial | removes an empty overlay directory (ENOTEMPTY otherwise); a read-only bundle directory is EROFS |
@@ -82,8 +82,11 @@ ns.c), so `.../13/.` and `a/b/../c` resolve. This is what lets gcc's
 
 The writable overlay is directory-aware: entries carry an is_dir flag and a
 normalized key, do_open resolves overlay and 9P directories (and their merge),
-and getdents lists both sides. It still has no per-process working directory
-(chdir is a no-op), so relative paths resolve against the root.
+and getdents lists both sides. Each process has a working directory (a stored
+key, "" at the root); `resolve_path` applies it to a relative path before the
+overlay lookup or 9P walk, so a relative open, stat, exec, mkdir, or rename
+resolves against the cwd. It is copied on fork and the posix_spawn child and
+preserved across execve.
 
 ### Memory
 
@@ -216,16 +219,8 @@ poll-aware blocking) but stay within the cooperative model.
 | 271 | ppoll | high | medium | poll with a timeout mask |
 | 23 | select | med | medium | poll expressed as fd sets |
 | 270 | pselect6 | med | medium | select with a mask |
-| 87 | unlink | high | medium | remove a ramfs file |
-| 263 | unlinkat | high | medium | unlink with a dirfd |
-| 83 | mkdir | med | medium | ramfs directories (needs a ramfs dir model) |
-| 258 | mkdirat | med | medium | mkdir with a dirfd |
-| 84 | rmdir | med | medium | remove a ramfs directory |
-| 82 | rename | med | medium | rename within the ramfs |
-| 264 | renameat | med | medium | rename with dirfds |
 | 85 | creat | low | easy | open with O_CREAT, O_WRONLY, O_TRUNC |
-| 80 | chdir | high | medium | needs a per-process cwd, then getcwd and relative paths become real |
-| 81 | fchdir | med | medium | cwd from a dir fd |
+| 81 | fchdir | med | medium | cwd from a dir fd (chdir and a cwd now exist) |
 | 137 | statfs | low | medium | plausible filesystem stats (df) |
 | 138 | fstatfs | low | medium | fd form of statfs |
 | 247 | waitid | med | medium | wait4 variant some libcs prefer |
@@ -275,11 +270,9 @@ seccomp, kexec, perf_event_open, and the rest of the administrative tail.
 
 A few handled calls are stubs that a future phase should make real:
 
-- **fcntl** returns 0 unconditionally. F_DUPFD should allocate a new fd, and
-  F_GETFL/F_GETFD should report flags. Programs that check O_NONBLOCK may
-  misbehave today.
-- **getcwd** always returns "/". A real cwd (Phase 2, with chdir) makes this and
-  relative-path resolution correct.
+- **fcntl** implements F_DUPFD/F_DUPFD_CLOEXEC (a real new fd); other commands
+  return 0, so F_GETFL/F_GETFD do not report flags and a program that checks
+  O_NONBLOCK may misbehave.
 - **time, clock_gettime, getrandom** are derived from the cycle counter. Fine
   for startup and seeding, not for real timekeeping or cryptography.
 - **the uid/gid family** returns 0 (a single root-ish identity), which suits the
