@@ -785,15 +785,45 @@ configure drove a long way and surfaced several real bugs, each fixed:
 With these, configure gets through install detection, the clock sanity check,
 `mkdir -p`, `gawk`, the `make` probes, finds gcc, and **passes the "C compiler
 works" check**, compiling and linking an overlay `conftest.c` into a running
-executable. It then stops at "checking whether we are cross compiling" with a
-reproducible crash: `cc1`, compiling a larger unit, jumps through a corrupted
-pointer into its own data and takes a #UD. It is deterministic per input and
-sits deep in `cc1`; the glibc tools (bash, sed, gawk, make, coreutils, and gcc
-on bundle sources) are unaffected, and `cc1` preprocesses (`-E`) and generates
-assembly (`-S`) from overlay sources without trouble, so it is specific to the
-heavier `-c`/run path. Root-causing it needs guest-side debugging of `cc1` and
-is left for a later pass. So the autotools goal is walked back here, one check
-short of finishing configure, with the path and the gaps documented.
+executable. It then stops at the next compile with a crash in `cc1`.
+
+### The cc1 crash, isolated
+
+`cc1` jumps through a corrupted pointer into its own `.data` and takes a #UD.
+What the isolation established:
+
+- It is **cc1-specific**. Every other glibc binary here runs: bash, sed, gawk,
+  make, the coreutils, the gcc driver, the assembler, and the linker. Only
+  `cc1`, the 30 MiB C++ program, crashes. `cc1` itself preprocesses (`-E`) and
+  emits assembly (`-S`) fine; the fault is in a full run.
+- It is **early**, in `cc1` startup (glibc and C++ constructors), before real
+  compilation: the stack pointer is only a few hundred bytes below the top and
+  cc1 has barely run. By the #UD cc1 has already been executing through its own
+  data for a few instructions, so the first corruption is upstream of where it
+  faults.
+- It is **layout-sensitive, not random**. With a fixed `AT_RANDOM` the crash is
+  bit-for-bit deterministic (same rip, same registers). It is not `AT_RANDOM`,
+  the stack canary, or the pointer guard. But it flips with anything that moves
+  memory around: the size of the environment, `EXEC_STR_MAX`, and
+  `LINUX_USTACK_SIZE` each turn it on or off. A small change elsewhere can hide
+  or expose it.
+- It is **not** several things ruled out: not frame-pool exhaustion or a frame
+  leak (the free count stays healthy and recovers), not argv/envp truncation
+  (raising the caps does not fix it, and it fires well under them), not an
+  unhandled syscall (none precedes it), and not the generic exec/stack handoff
+  (coreutils start fine with the same large environments).
+
+So it is a layout-dependent memory corruption confined to `cc1` startup that
+this environment triggers, with the originating write still unidentified.
+Pinning it down needs guest-side debugging of `cc1` (a gdb stub, or comparing
+its early memory and relocations against a native run), which is left for a
+later pass. The autotools goal is walked back here, one compile short of
+finishing configure, with the path and this characterization documented.
+
+One related limit noted along the way: `copy_uvec` caps argv and envp at
+`EXEC_STR_MAX`/2 (16 KiB each) and silently drops the overflow, so a very large
+environment would reach the child truncated. It is not the cc1 crash (that
+fires far below the cap), but it is worth raising when a workload needs it.
 
 ## The cut line
 
