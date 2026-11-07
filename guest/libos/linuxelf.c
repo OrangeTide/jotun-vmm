@@ -15,6 +15,7 @@
 
 #if defined(__x86_64__) || defined(__aarch64__)
 
+#include "arch.h"
 #include "boot.h"
 #include "elfload.h"
 #include "mem.h"
@@ -284,7 +285,11 @@ fs_stamp(void)
     return t;
 }
 
-static struct ramfile ramfs[RAMFS_MAX];
+/* The big per-run tables (the overlay, the open-file descriptions, and the
+ * per-process state and thread records) are allocated once from the kernel heap
+ * at init, not kept in .bss, so their element counts are not bounded by the
+ * kernel image's room below the user window. See linux_tables_init. */
+static struct ramfile *ramfs;           /* [RAMFS_MAX] */
 
 /* A unidirectional in-memory pipe: a byte ring with a reader and writer end
  * count. Single-threaded and non-blocking, which is enough for a program that
@@ -330,7 +335,7 @@ struct ofile {
  * need only cover distinct opens. Sized above the per-process fd cap times a
  * few busy processes, since the pool is global while the fd tables are not. */
 #define LINUX_NOFILE 512
-static struct ofile ofiles[LINUX_NOFILE];
+static struct ofile *ofiles;            /* [LINUX_NOFILE] */
 
 static struct ofile *
 ofile_alloc(void)
@@ -416,8 +421,8 @@ _Static_assert(__builtin_offsetof(struct lproc, tf) == 0, "trapframe first");
 _Static_assert(__builtin_offsetof(struct lproc, kstack_top) == sizeof(struct trapframe),
                "kstack_top follows the trapframe (the assembly's TF_KSTACK)");
 
-static struct lshared shareds[LINUX_NPROC];
-static struct lproc procs[LINUX_NPROC];
+static struct lshared *shareds;         /* [LINUX_NPROC], heap, see linux_tables_init */
+static struct lproc *procs;             /* [LINUX_NPROC] */
 
 /* The running thread. Set by the resume hook before the scheduler runs a thread
  * task, and read by the assembly as lproc_cur. All the do_* syscall helpers
@@ -2946,11 +2951,33 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
  * stacks backs every process's private pages and page tables. */
 static int phys_ready;
 
+/* Allocate the big per-run tables from the kernel heap, once. They are pointers
+ * (not .bss arrays) so raising a count costs heap, not the kernel's room below
+ * the user window. kmalloc'd memory is not zeroed, and the code relies on a
+ * cleared table (used == 0, nref == 0), so each is memset. */
+static void
+linux_tables_init(void)
+{
+    ramfs   = kmalloc(sizeof *ramfs * RAMFS_MAX);
+    ofiles  = kmalloc(sizeof *ofiles * LINUX_NOFILE);
+    shareds = kmalloc(sizeof *shareds * LINUX_NPROC);
+    procs   = kmalloc(sizeof *procs * LINUX_NPROC);
+    if (!ramfs || !ofiles || !shareds || !procs) {
+        con_puts("[bin] kernel heap too small for the process tables\n");
+        arch_halt();
+    }
+    memset(ramfs, 0, sizeof *ramfs * RAMFS_MAX);
+    memset(ofiles, 0, sizeof *ofiles * LINUX_NOFILE);
+    memset(shareds, 0, sizeof *shareds * LINUX_NPROC);
+    memset(procs, 0, sizeof *procs * LINUX_NPROC);
+}
+
 static void
 linux_phys_init(void)
 {
     if (!phys_ready) {
         phys_init(LINUX_PROG_BASE, VM_USER_HI);
+        linux_tables_init();
         phys_ready = 1;
     }
 }
