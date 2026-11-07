@@ -70,6 +70,7 @@
 #define O_RDWR      0x0002
 #define O_ACCMODE   0x0003
 #define O_CREAT     0x0040
+#define O_EXCL      0x0080
 #define O_TRUNC     0x0200
 #define O_APPEND    0x0400
 #define O_DIRECTORY 0x10000
@@ -200,7 +201,7 @@ struct linux_dirent64 {
  * the guest, keyed by normalized bundle-relative path ("" is the root). A
  * compiler toolchain and a configure run create many files across a few
  * directories, so the table is generous and names hold a nested path. */
-#define RAMFS_MAX     256
+#define RAMFS_MAX     1024
 #define RAMFS_NAME    192
 #define RAMFS_FILE_MAX (4u * 1024u * 1024u)     /* per-file cap */
 
@@ -698,6 +699,21 @@ ramfs_find(const char *name)
     return -1;
 }
 
+/* Release a destroyed slot's backing buffer and mark it free. The buffer is
+ * kmalloc'd by ram_grow, so it must be returned here; leaving it attached to a
+ * freed slot leaks it, since ramfs_create clears data without freeing. */
+static void
+ramfs_free_slot(int i)
+{
+    if (ramfs[i].data)
+        kfree(ramfs[i].data);
+    ramfs[i].data = NULL;
+    ramfs[i].len = 0;
+    ramfs[i].cap = 0;
+    ramfs[i].unlinked = 0;
+    ramfs[i].used = 0;
+}
+
 /* Drop one open reference to overlay entry ri; free the slot once the last fd
  * on an unlinked entry closes (open-unlink semantics: the inode outlives the
  * name). */
@@ -708,10 +724,8 @@ ramfs_unref(int ri)
         return;
     if (ramfs[ri].nref > 0)
         ramfs[ri].nref--;
-    if (ramfs[ri].nref == 0 && ramfs[ri].unlinked) {
-        ramfs[ri].used = 0;
-        ramfs[ri].len = 0;
-    }
+    if (ramfs[ri].nref == 0 && ramfs[ri].unlinked)
+        ramfs_free_slot(ri);
 }
 
 static int
@@ -743,8 +757,8 @@ ramfs_create(const char *name, int is_dir)
 
 /* Remove an overlay entry by name. Returns 0 if one was removed, -1 if absent.
  * An entry with open fds is kept (marked unlinked, its name no longer resolves)
- * so the fds keep reading and the slot is not reused under them; the slot frees
- * when the last fd closes. The buffer is kept (freed lazily on reuse). */
+ * so the fds keep reading and the slot is not reused under them; the slot and
+ * its buffer free when the last fd closes. */
 static int
 ramfs_remove(const char *name)
 {
@@ -755,8 +769,7 @@ ramfs_remove(const char *name)
         ramfs[i].unlinked = 1;          /* free deferred to the last close */
         return 0;
     }
-    ramfs[i].used = 0;
-    ramfs[i].len = 0;
+    ramfs_free_slot(i);
     return 0;
 }
 
@@ -1081,6 +1094,11 @@ do_open(const char *path, long flags)
     if (writing || (flags & O_CREAT)) {
         if (is_ovl_dir || (ri < 0 && ramfs_is_dir_key(key)))
             return -LERR_ISDIR;
+        /* O_EXCL demands the create make a new file. When the name already
+         * exists in the overlay, fail with EEXIST so a caller like mkstemp
+         * retries with a fresh name instead of aliasing an existing entry. */
+        if (ri >= 0 && (flags & O_CREAT) && (flags & O_EXCL))
+            return -LERR_EXIST;
         if (ri < 0) {
             if (!(flags & O_CREAT))
                 return -LERR_ROFS;          /* writing an existing RO bundle file */
@@ -1389,7 +1407,7 @@ do_rmdir(const char *path)
         return -LERR_NOTEMPTY;
     int ri = ramfs_find(key);
     if (ri >= 0 && ramfs[ri].is_dir) {
-        ramfs[ri].used = 0;
+        ramfs_free_slot(ri);
         return 0;
     }
     int isdir;
@@ -1434,7 +1452,7 @@ do_rename(const char *oldp, const char *newp)
 
     int di = ramfs_find(nk);            /* overwrite an existing destination */
     if (di >= 0 && di != ri)
-        ramfs[di].used = 0;
+        ramfs_free_slot(di);
 
     if (ramfs[ri].is_dir) {             /* carry the subtree: rewrite prefixes */
         size_t ol = strlen(ok);
