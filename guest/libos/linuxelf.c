@@ -38,13 +38,17 @@
 /* The Linux program's address space, independent of the native program window.
  * A static non-PIE binary is linked at 0x400000; the load window runs to 8 MiB,
  * which holds a 2 MiB-ish glibc image. Above that is the heap: brk grows up from
- * LINUX_HEAP_BASE and anonymous mmap grows down from the top of RAM, less a
- * reservation that matches the host's per-vcpu stacks (MAX_VCPUS * STACK_SLOT =
- * 8 * 512 KiB in host/main.c). They meet in the middle and fail there. */
+ * LINUX_HEAP_BASE and anonymous mmap grows down from the top of RAM, less the
+ * stack reservation. They meet in the middle and fail there. The stack is the
+ * top LINUX_USTACK_SIZE of the window and is demand-paged, so the reservation
+ * only bounds how far it may grow, not how much it costs. It is sized to match
+ * a Linux main-thread stack (8 MiB): the optimizer recurses deeply on a large
+ * translation unit, and a smaller stack silently grew down into the mmap arena
+ * and corrupted it. */
 #define LINUX_PROG_BASE    0x400000ULL
 #define LINUX_PROG_LIMIT   0x800000ULL
 #define LINUX_HEAP_BASE    0x800000ULL
-#define LINUX_USTACK_SIZE  (256u * 1024)
+#define LINUX_USTACK_SIZE  (8u * 1024 * 1024)
 #define LINUX_USTACK_TOP   VM_USER_HI       /* top of the user window */
 #define PAGE_SIZE          0x1000ULL
 
