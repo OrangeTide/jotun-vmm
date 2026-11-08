@@ -67,24 +67,35 @@ stack_init(void *stack, size_t size, void (*entry)(void))
  * task.c; the Linux-compat path runs single-vcpu, so this is headroom. */
 #define ARCH_MAX_CPUS 8
 
-/* GDT: null, 64-bit code (0x08), data (0x10), then two slots per cpu for that
- * cpu's 64-bit TSS descriptor (filled at runtime). The vcpu already runs with
- * the code/data selectors cached from KVM; the table must exist in memory so an
- * interrupt or iret can reload the selectors without faulting, and the TSS
- * descriptors give each cpu an interrupt-stack table for faults. */
-static uint64_t gdt[3 + 2 * ARCH_MAX_CPUS] __attribute__((aligned(16))) = {
-    0x0000000000000000ull,          /* null */
-    0x00af9a000000ffffull,          /* code: present, DPL0, L=1 */
-    0x00cf92000000ffffull,          /* data: present, DPL0, DB=1 */
+/* GDT: null, the kernel code/data pair (0x08/0x10), the user code/data pair at
+ * DPL 3 (0x20/0x28) with a reserved slot (0x18) before them, then two slots per
+ * cpu for that cpu's 64-bit TSS descriptor (filled at runtime). The user pair
+ * lets a Linux process run in CPL 3: the return path builds an IRETQ frame with
+ * CS 0x2b and SS 0x23 (the user selectors with RPL 3). The slot order matches
+ * the SYSRET rule (SS at base+8, CS at base+16, base 0x18) so a later SYSRET
+ * fast path needs no reshuffle. The vcpu runs with the kernel selectors cached
+ * from KVM; the table must exist in memory so an interrupt or iret can reload a
+ * selector without faulting, and the TSS descriptors give each cpu an
+ * interrupt-stack table and a ring-0 stack for faults taken in CPL 3. */
+static uint64_t gdt[6 + 2 * ARCH_MAX_CPUS] __attribute__((aligned(16))) = {
+    0x0000000000000000ull,          /* 0x00 null */
+    0x00af9a000000ffffull,          /* 0x08 kernel code: present, DPL0, L=1 */
+    0x00cf92000000ffffull,          /* 0x10 kernel data: present, DPL0, DB=1 */
+    0x0000000000000000ull,          /* 0x18 reserved: the SYSRET selector base */
+    0x00cff2000000ffffull,          /* 0x20 user data: present, DPL3, DB=1 */
+    0x00affa000000ffffull,          /* 0x28 user code: present, DPL3, L=1 */
 };
 
 /* The GDT selector of cpu id's TSS descriptor. */
-#define TSS_SEL(id) ((uint16_t)((3 + 2 * (id)) * 8))
+#define TSS_SEL(id) ((uint16_t)((6 + 2 * (id)) * 8))
 
-/* The 64-bit task state segment. We never switch rings, so rsp0..2 are unused;
- * what matters is the IST array, which gives chosen exception vectors their own
- * stack so a fault taken while the current stack is unusable (a bad or unmapped
- * rsp) still lands on solid ground instead of escalating to a triple fault. */
+/* The 64-bit task state segment. rsp0 is the stack the CPU switches to when an
+ * interrupt or exception is taken from CPL 3 (a Linux process) and the vector
+ * carries no IST; without it a fault in user code would push its frame onto the
+ * user rsp or, if that is bad, triple fault. The IST array still gives chosen
+ * vectors their own stack: #PF so its handler can demand-map and return even
+ * when the faulting stack is the problem, and #DF as a last resort. rsp1/rsp2
+ * stay unused (no CPL 1 or 2). */
 struct tss {
     uint32_t reserved0;
     uint64_t rsp[3];
@@ -105,6 +116,7 @@ struct tss {
 static struct tss cpu_tss[ARCH_MAX_CPUS];
 static uint8_t ist_pf_stack[ARCH_MAX_CPUS][IST_STACK_SZ] __attribute__((aligned(16)));
 static uint8_t ist_df_stack[ARCH_MAX_CPUS][IST_STACK_SZ] __attribute__((aligned(16)));
+static uint8_t rsp0_stack[ARCH_MAX_CPUS][IST_STACK_SZ] __attribute__((aligned(16)));
 
 /* Write a 64-bit available-TSS descriptor (type 0x9, present, DPL0) into the
  * two GDT slots at index `slot`. */
@@ -292,19 +304,21 @@ arch_traps_init(unsigned long id)
     struct desc_ptr gp = { sizeof gdt - 1, (uint64_t)(uintptr_t)gdt };
     __asm__ volatile ("lgdt %0" : : "m"(gp));
 
-    /* This cpu's TSS: the IST slots point at its private fault stacks. rsp0..2
-     * stay zero (we never change rings). iomap_base past the limit means no I/O
-     * permission bitmap. */
+    /* This cpu's TSS: rsp0 is the ring-0 stack for a fault taken in CPL 3, the
+     * IST slots point at its private fault stacks, rsp1/rsp2 stay zero (no CPL
+     * 1 or 2). iomap_base past the limit means no I/O permission bitmap. */
     if (id < ARCH_MAX_CPUS) {
         struct tss *t = &cpu_tss[id];
         for (unsigned i = 0; i < sizeof *t; i++)
             ((uint8_t *)t)[i] = 0;
+        t->rsp[0] =
+            (uint64_t)(uintptr_t)(rsp0_stack[id] + IST_STACK_SZ);
         t->ist[IST_PF - 1] =
             (uint64_t)(uintptr_t)(ist_pf_stack[id] + IST_STACK_SZ);
         t->ist[IST_DF - 1] =
             (uint64_t)(uintptr_t)(ist_df_stack[id] + IST_STACK_SZ);
         t->iomap_base = (uint16_t)sizeof *t;
-        set_tss_desc(3 + 2 * (int)id, (uint64_t)(uintptr_t)t, sizeof *t - 1);
+        set_tss_desc(6 + 2 * (int)id, (uint64_t)(uintptr_t)t, sizeof *t - 1);
         __asm__ volatile ("ltr %0" : : "r"(TSS_SEL(id)));
     }
 

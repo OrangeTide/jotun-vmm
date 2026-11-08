@@ -1,15 +1,18 @@
 /* x86_64_linuxsys.S : the SYSCALL trap and user entry for the Linux guest.
  *
- * Each Linux process runs in the same ring as the libOS (no privilege
- * boundary), so a SYSCALL does not change ring and we must not return with
- * SYSRET. The CPU vectors SYSCALL to LSTAR with the caller's return address in
- * rcx and its RFLAGS in r11, masking the bits in SFMASK.
+ * A Linux process runs in CPL 3; the libOS kernel runs in CPL 0. SYSCALL
+ * crosses from user to kernel: the CPU loads the kernel code and stack
+ * selectors from STAR, leaves the user rsp live, and puts the caller's return
+ * address in rcx and its RFLAGS in r11 (masked by SFMASK). The return crosses
+ * back to CPL 3 with an IRETQ frame (user SS, rsp, rflags, CS, rip); SYSRET
+ * would also work, but IRETQ is used uniformly for the syscall return, a forked
+ * child, and a fresh image, and it sidesteps the SYSRET corner cases.
  *
  * Several processes run as libOS tasks that switch cooperatively, so the entry
  * saves the full user register set into the running process's trapframe (so a
  * blocking syscall can yield and later resume, and fork can copy the frame),
  * runs the C dispatcher on that process's private handler stack, and returns by
- * restoring the frame and jumping back (jmp *rcx), not SYSRET.
+ * restoring the frame and IRETQ-ing back down to CPL 3.
  *
  * The running process is lproc_cur (linuxelf.c), a struct whose first fields are
  * the trapframe at the TF_* offsets below, then kstack_top. Those offsets are
@@ -45,6 +48,11 @@
 #define TF_R15    112
 #define TF_RSP    120       /* user rsp */
 #define TF_KSTACK 128       /* top of the handler stack */
+
+/* User selectors: the DPL-3 GDT entries (0x20 data, 0x28 code) with RPL 3. The
+ * IRETQ frame returns to CPL 3 with these. See the GDT in x86_64.c. */
+#define USER_CS   0x2b
+#define USER_SS   0x23
 
     .text
 
@@ -95,9 +103,26 @@ linux_syscall_entry:
     movq %rax, TF_RAX(%r15)
     jmp restore_tf
 
-/* Restore the user register set from the trapframe at %r15 and resume at the
- * saved user rip. Shared by the syscall return and linux_resume. */
+/* Restore the user register set from the trapframe at %r15 and resume in CPL 3
+ * at the saved user rip. Shared by the syscall return and linux_resume.
+ *
+ * Build the CPU privilege-return frame (SS, user rsp, rflags, CS, rip) on the
+ * current kernel handler stack, then load the general registers by hand and
+ * IRETQ. IRETQ reloads rip, rflags, rsp, cs, and ss from that frame and drops
+ * to CPL 3; rax is the only scratch needed to lay the frame down, so it is
+ * restored from the trapframe afterward. The user's rflags has IF clear (user
+ * runs with interrupts off, cooperatively), and IRETQ to the outer ring would
+ * not raise IF anyway with IOPL 0. */
 restore_tf:
+    movq TF_RSP(%r15), %rax
+    pushq $USER_SS
+    pushq %rax                      /* user rsp */
+    movq TF_R11(%r15), %rax
+    pushq %rax                      /* user rflags */
+    pushq $USER_CS
+    movq TF_RCX(%r15), %rax
+    pushq %rax                      /* user rip */
+
     movq TF_RAX(%r15), %rax
     movq TF_RBX(%r15), %rbx
     movq TF_RDX(%r15), %rdx
@@ -109,32 +134,34 @@ restore_tf:
     movq TF_R12(%r15), %r12
     movq TF_R13(%r15), %r13
     movq TF_R14(%r15), %r14
-    movq TF_RCX(%r15), %rcx         /* user rip (jmp target) */
-    movq TF_R11(%r15), %r11         /* user rflags */
-    pushq %r11
-    popfq                           /* restore rflags; IF stays off for the user */
+    movq TF_RCX(%r15), %rcx         /* user rcx (SYSCALL clobbers it; forks keep it) */
+    movq TF_R11(%r15), %r11         /* user r11 */
     movq TF_RDI(%r15), %rdi
-    movq TF_RSP(%r15), %rsp         /* back to the user stack */
-    movq TF_R15(%r15), %r15         /* finally user r15 (drops the frame pointer) */
-    jmp *%rcx
+    movq TF_R15(%r15), %r15         /* last: drops the trapframe pointer */
+    iretq
 
 /****************************************************************
  * linux_jump / linux_resume: enter user code.
  ****************************************************************/
     .global linux_jump
 linux_jump:
-    /* rdi = entry, rsi = user rsp. The SysV entry contract: rsp points at argc,
-     * rdx (an atexit function to register) is 0, rbp is 0. Interrupts off so the
-     * cooperative scheduler never preempts user code. */
+    /* rdi = entry, rsi = user rsp. Enter the fresh image in CPL 3 through an
+     * IRETQ frame. The SysV entry contract: rsp points at argc, rdx (an atexit
+     * function to register) is 0, rbp is 0. rflags is 0x2 (reserved bit only,
+     * IF off) so the cooperative scheduler never preempts user code. */
     cli
-    movq %rsi, %rsp
     xorq %rdx, %rdx
     xorq %rbp, %rbp
-    jmp *%rdi
+    pushq $USER_SS
+    pushq %rsi                      /* user rsp */
+    pushq $0x2                      /* rflags: IF off */
+    pushq $USER_CS
+    pushq %rdi                      /* entry */
+    iretq
 
     .global linux_resume
 linux_resume:
-    /* rdi = struct lproc *. Resume from its trapframe. */
+    /* rdi = struct lproc *. Resume from its trapframe into CPL 3. */
     cli
     movq %rdi, %r15
     jmp restore_tf

@@ -227,12 +227,19 @@ extern void linux_syscall_entry(void);
 extern void linux_jump(uint64_t entry, uint64_t user_rsp) __attribute__((noreturn));
 
 /* Arm the SYSCALL trap on this cpu: enable EFER.SCE, point LSTAR at the handler,
- * set the kernel selector in STAR, and mask IF and DF on entry. */
+ * set the selectors in STAR, and mask IF and DF on entry.
+ *
+ * STAR[47:32] is the kernel code selector SYSCALL loads (0x08; SS becomes
+ * 0x10). STAR[63:48] is the SYSRET selector base: SYSRET would load SS from
+ * base+8 and CS from base+16, both forced to RPL 3, so base 0x18 selects the
+ * user data at 0x20 and the user code at 0x28 (see the GDT in x86_64.c). The
+ * return path uses IRETQ for now, which ignores STAR[63:48]; the base is set so
+ * a later SYSRET fast path is a drop-in. */
 static inline void
 linux_trap_init(void)
 {
     wrmsr(MSR_EFER, read_efer() | 1u);          /* EFER.SCE */
-    wrmsr(MSR_STAR, (uint64_t)0x08u << 32);
+    wrmsr(MSR_STAR, ((uint64_t)0x08u << 32) | ((uint64_t)0x18u << 48));
     wrmsr(MSR_LSTAR, (uint64_t)(uintptr_t)linux_syscall_entry);
     wrmsr(MSR_SFMASK, 0x600u);                  /* mask IF and DF on entry */
 }
