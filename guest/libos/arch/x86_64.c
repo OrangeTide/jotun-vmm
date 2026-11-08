@@ -218,6 +218,22 @@ fault_report(struct faultframe *f)
     con_puthex(f->rsi);
     con_puts(" rdi=");
     con_puthex(f->rdi);
+    con_puts("\n  r8 =");
+    con_puthex(f->r8);
+    con_puts(" r9 =");
+    con_puthex(f->r9);
+    con_puts(" r10=");
+    con_puthex(f->r10);
+    con_puts(" r11=");
+    con_puthex(f->r11);
+    con_puts("\n  r12=");
+    con_puthex(f->r12);
+    con_puts(" r13=");
+    con_puthex(f->r13);
+    con_puts(" r14=");
+    con_puthex(f->r14);
+    con_puts(" r15=");
+    con_puthex(f->r15);
 
     /* CPU feature state. If OSXSAVE is clear, xgetbv itself is #UD, so only read
      * XCR0 when it is set. A VEX/EVEX opcode faulting with XCR0 missing its AVX
@@ -242,7 +258,7 @@ fault_report(struct faultframe *f)
      * jump. The CPU fetched the faulting instruction, so RIP is mapped; stop at
      * the page boundary so the dump never touches a second, possibly unmapped
      * page. */
-    if (f->vec == 6) {
+    if (f->vec == 6 || f->vec == 14 || f->vec == 13) {
         const uint8_t *p = (const uint8_t *)(uintptr_t)f->rip;
         uint64_t page_end = (f->rip | 0xFFFULL) + 1;
         con_puts("\n  code=");
