@@ -136,6 +136,9 @@ p9_read(uint32_t fid, uint64_t offset, void *buf, uint32_t count)
     uint32_t n = p9i_u32(&in);
     if (!in.ok)
         return -1;
+    if (n > count)                      /* a correct server never over-returns;
+                                         * clamp so a buggy one cannot overrun buf */
+        n = count;
     for (uint32_t i = 0; i < n; i++) {
         uint8_t c = p9i_u8(&in);
         if (out)
