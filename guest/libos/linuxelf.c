@@ -121,6 +121,8 @@
 #define LERR_PERM   1           /* EPERM: symlinks unsupported (triggers cp fallback) */
 #define LERR_SPIPE  29          /* ESPIPE: seek on a pipe or other non-seekable fd */
 #define LERR_NOTSUP 95          /* EOPNOTSUPP: the filesystem lacks this feature */
+#define LERR_FAULT  14          /* EFAULT: a user pointer fell outside the user window */
+#define LERR_NAMETOOLONG 36     /* ENAMETOOLONG: a user path did not fit the bounce buffer */
 
 /* ELF auxv entry tags. */
 #define AT_NULL    0
@@ -515,6 +517,111 @@ lx_yield(void)
     giant_unlock();
     task_yield();
     giant_lock();
+}
+
+/* User-pointer access.
+ *
+ * A Linux process will run in CPL 3 once privilege separation lands, so a
+ * pointer it passes to a syscall is untrusted: it may point at kernel memory,
+ * the physmap, the page tables, or off the end of the address space. These
+ * helpers are the single gate the kernel uses to touch user memory. Each one
+ * range-checks the whole span against the user window [VM_USER_LO, VM_USER_HI)
+ * and refuses anything outside it with EFAULT, so a process can never steer a
+ * kernel read or write at a kernel address (the classic confused-deputy write,
+ * where a bad output-buffer pointer turns a syscall into an arbitrary poke).
+ *
+ * While the guest still shares ring 0 the window pages and the kernel share one
+ * page table, so the copy itself is a plain memcpy once the bound passes. When
+ * CPL 3 and SMAP arrive, only the copy bodies change (an access-fault fixup and
+ * stac/clac around the move); every caller already routes through here, so the
+ * bound is enforced from this commit on, before the ring flip. */
+
+/* True if [va, va+n) lies wholly inside the user window. Overflow-safe: the
+ * second test is written so va+n cannot wrap past the top. n == 0 is allowed
+ * and always passes (an empty access touches nothing). */
+static int
+user_ok(uint64_t va, uint64_t n)
+{
+    return va >= VM_USER_LO && va < VM_USER_HI && n <= VM_USER_HI - va;
+}
+
+/* Copy n bytes from a user buffer into the kernel. Returns 0, or -LERR_FAULT if
+ * the user range is out of bounds (and copies nothing in that case). */
+static long
+copy_from_user(void *dst, uint64_t usrc, uint64_t n)
+{
+    if (!user_ok(usrc, n))
+        return -LERR_FAULT;
+    memcpy(dst, (const void *)(uintptr_t)usrc, n);
+    return 0;
+}
+
+/* Copy n bytes from the kernel into a user buffer. Returns 0, or -LERR_FAULT. */
+static long
+copy_to_user(uint64_t udst, const void *src, uint64_t n)
+{
+    if (!user_ok(udst, n))
+        return -LERR_FAULT;
+    memcpy((void *)(uintptr_t)udst, src, n);
+    return 0;
+}
+
+/* Zero n bytes of a user buffer. Returns 0, or -LERR_FAULT. */
+static long
+clear_user(uint64_t udst, uint64_t n)
+{
+    if (!user_ok(udst, n))
+        return -LERR_FAULT;
+    memset((void *)(uintptr_t)udst, 0, n);
+    return 0;
+}
+
+/* Copy a NUL-terminated string from user space into dst, at most max bytes
+ * including the terminator. Returns the string length (not counting the NUL) on
+ * success, -LERR_FAULT if the pointer leaves the window before a NUL is found,
+ * or -LERR_NOMEM if the string does not fit in max. Checks each byte's address
+ * as it goes, since the length is not known up front. */
+static long
+strncpy_from_user(char *dst, uint64_t usrc, uint64_t max)
+{
+    if (max == 0)
+        return -LERR_NOMEM;
+    for (uint64_t i = 0; i < max; i++) {
+        uint64_t va = usrc + i;
+        if (!user_ok(va, 1))
+            return -LERR_FAULT;
+        char c = *(const char *)(uintptr_t)va;
+        dst[i] = c;
+        if (c == '\0')
+            return (long)i;
+    }
+    return -LERR_NOMEM;              /* no terminator within max bytes */
+}
+
+/* The longest user path the syscall layer accepts. Paths normalize to overlay
+ * keys of at most RAMFS_NAME, so a longer raw path could never resolve anyway;
+ * doubling that leaves room for a cwd-relative path before normalization. */
+#define UPATH_MAX (RAMFS_NAME * 2)
+
+/* Bounce a user path argument into a kernel buffer of UPATH_MAX bytes. Returns
+ * kbuf on success, or NULL with *err set (EFAULT for a bad pointer,
+ * ENAMETOOLONG for one that overruns the buffer). Every path-taking syscall
+ * copies through here at the dispatcher boundary, so the path readers below
+ * (resolve_path, at_path, norm_key) only ever walk kernel memory. This is also
+ * why those readers cannot do the check themselves: at_path hands an absolute
+ * path straight back to its caller, and do_open then resolves either that user
+ * string or an internal kernel buffer, so only the dispatcher knows which
+ * pointers came from user space. */
+static const char *
+user_path(uint64_t uptr, char *kbuf, long *err)
+{
+    long n = strncpy_from_user(kbuf, uptr, UPATH_MAX);
+    if (n < 0) {
+        *err = (n == -LERR_NOMEM) ? -LERR_NAMETOOLONG : n;
+        return NULL;
+    }
+    *err = 0;
+    return kbuf;
 }
 
 /* Set up the heap arena above the loaded program image. brk grows up from
@@ -1054,6 +1161,8 @@ ramfs_grow(struct ramfile *rf, uint32_t need)
 static long
 do_pipe2(int *pfd)
 {
+    if (!user_ok((uint64_t)(uintptr_t)pfd, 2 * sizeof *pfd))
+        return -LERR_FAULT;
     int pidx = -1;
     for (int i = 0; i < LINUX_NPIPE; i++)
         if (!pipes[i].used) {
@@ -1138,6 +1247,8 @@ do_write(long fd, const char *buf, unsigned long len)
 
     if (!f)
         return -LERR_BADF;
+    if (len && !user_ok((uint64_t)(uintptr_t)buf, len))
+        return -LERR_FAULT;
     if (f->iscon) {                     /* console stdout/stderr */
         for (unsigned long i = 0; i < len; i++)
             con_putc(buf[i]);
@@ -1190,6 +1301,10 @@ do_writev(long fd, const struct iovec *iov, long cnt)
 {
     long total = 0;
 
+    if (cnt < 0)
+        return -LERR_INVAL;
+    if (cnt && !user_ok((uint64_t)(uintptr_t)iov, (uint64_t)cnt * sizeof *iov))
+        return -LERR_FAULT;
     for (long i = 0; i < cnt; i++) {
         long n = do_write(fd, iov[i].base, iov[i].len);
         if (n < 0)
@@ -1376,6 +1491,8 @@ do_read(long fd, void *buf, unsigned long count)
 
     if (!f)
         return -LERR_BADF;
+    if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
+        return -LERR_FAULT;
     if (f->iscon)
         return 0;                       /* console stdin: EOF */
     if (f->ispipe) {
@@ -1416,6 +1533,8 @@ do_pread(long fd, void *buf, unsigned long count, uint64_t off)
 
     if (!f || f->iscon || f->ispipe || f->isdir)
         return -LERR_BADF;
+    if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
+        return -LERR_FAULT;
     if (f->isram) {
         struct ramfile *rf = &ramfs[f->ridx];
         if (off >= rf->len)
@@ -1559,6 +1678,8 @@ meta_path(const char *path, int *isdir, uint64_t *size, uint64_t *ino)
 static long
 do_stat_path(const char *path, struct linux_stat *out)
 {
+    if (!user_ok((uint64_t)(uintptr_t)out, sizeof *out))
+        return -LERR_FAULT;
     int isdir = 0;
     uint64_t size = 0, ino = 1;
     long rc = meta_path(path, &isdir, &size, &ino);
@@ -1726,6 +1847,8 @@ do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
     int isdir = 0;
     uint64_t size = 0, ino = 1;
 
+    if (!user_ok((uint64_t)(uintptr_t)out, sizeof *out))
+        return -LERR_FAULT;
     if (path && path[0]) {
         long rc = meta_path(path, &isdir, &size, &ino);
         if (rc != 0)
@@ -1756,6 +1879,8 @@ do_fstat(long fd, struct linux_stat *out)
 
     if (!f)
         return -LERR_BADF;
+    if (!user_ok((uint64_t)(uintptr_t)out, sizeof *out))
+        return -LERR_FAULT;
     if (f->ispipe) {
         /* Report a FIFO so a tool copies with a read/write loop, not mmap. */
         memset(out, 0, sizeof *out);
@@ -1812,6 +1937,8 @@ do_getdents64(long fd, void *buf, unsigned long count)
         return -LERR_BADF;
     if (!f->isdir)
         return -LERR_NOTDIR;
+    if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
+        return -LERR_FAULT;
 
     uint8_t *out = buf;
     unsigned long used = 0;
@@ -2032,6 +2159,8 @@ do_futex(uint64_t uaddr, int op, int val)
 {
     int cmd = op & 0x7f;                /* strip PRIVATE and CLOCK_REALTIME */
 
+    if (!user_ok(uaddr, sizeof(int)))
+        return -LERR_FAULT;
     if (cmd == FUTEX_WAIT) {
         /* The compare and the enlisting both run under the giant lock, and so
          * does futex_wake, so a concurrent wake cannot slip between them: either
@@ -2142,6 +2271,16 @@ do_clone_thread(uint64_t flags, uint64_t child_stack, uint64_t ptid,
 {
     struct lproc *parent = lproc_cur;
     struct lshared *sh = parent->sh;
+
+    /* Validate the tid write targets before allocating, so a bad pointer fails
+     * cleanly with EFAULT instead of leaking a half-built thread. */
+    if ((flags & CLONE_CHILD_SETTID) && !user_ok(ctid, sizeof(int)))
+        return -LERR_FAULT;
+    if ((flags & CLONE_PARENT_SETTID) && !user_ok(ptid, sizeof(int)))
+        return -LERR_FAULT;
+    if ((flags & CLONE_CHILD_CLEARTID) && !user_ok(ctid, sizeof(int)))
+        return -LERR_FAULT;
+
     struct lproc *t = thr_alloc();
 
     if (!t)
@@ -2265,7 +2404,9 @@ do_clone3(uint64_t uargs, uint64_t size)
 {
     if (size < 8 * 8)
         return -LERR_INVAL;
-    const uint64_t *a = (const uint64_t *)(uintptr_t)uargs;
+    uint64_t a[8];
+    if (copy_from_user(a, uargs, sizeof a) < 0)
+        return -LERR_FAULT;
     uint64_t flags = a[0];
     uint64_t ctid  = a[2];              /* child_tid */
     uint64_t ptid  = a[3];              /* parent_tid */
@@ -2287,6 +2428,9 @@ static long
 do_wait4(long pid, int *status)
 {
     struct lshared *mysh = lproc_cur->sh;
+
+    if (status && !user_ok((uint64_t)(uintptr_t)status, sizeof *status))
+        return -LERR_FAULT;
 
     /* pid is a pid_t (32-bit). A caller passing -1 (wait for any child) may set
      * only the low 32 bits, so sign-extend before the > 0 and match tests. */
@@ -2333,8 +2477,10 @@ do_exit(long code, int group)
     struct lproc *t = lproc_cur;
     struct lshared *sh = t->sh;
 
-    /* A joined thread clears its tid word and wakes whoever waits on it. */
-    if (t->clear_ctid) {
+    /* A joined thread clears its tid word and wakes whoever waits on it. The
+     * address was validated when clone/set_tid_address recorded it, but recheck
+     * here so a later address-space change cannot turn it into a kernel write. */
+    if (t->clear_ctid && user_ok(t->clear_ctid, sizeof(int))) {
         *(volatile int *)(uintptr_t)t->clear_ctid = 0;
         futex_wake(t->clear_ctid, 1);
     }
@@ -2416,8 +2562,11 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_munmap((uint64_t)a1, (uint64_t)a2);
     case SYS_time: {
         int64_t t = (int64_t)guest_now_sec();
-        if (a1)
-            *(int64_t *)a1 = t;
+        if (a1) {
+            long e = copy_to_user((uint64_t)a1, &t, sizeof t);
+            if (e < 0)
+                return e;
+        }
         return (long)t;
     }
     case SYS_clock_gettime: {
@@ -2425,19 +2574,25 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
          * GHz) plus the guest epoch, so it agrees with file mtimes (both are
          * GUEST_EPOCH + elapsed). A fresh build file is then not in the future. */
         uint64_t t = arch_cycles();
-        uint64_t *ts = (uint64_t *)a2;    /* struct timespec { sec; nsec; } */
-        if (ts) {
+        if (a2) {                         /* struct timespec { sec; nsec; } */
+            uint64_t ts[2];
             ts[0] = GUEST_EPOCH + t / 1000000000ULL;
             ts[1] = t % 1000000000ULL;
+            long e = copy_to_user((uint64_t)a2, ts, sizeof ts);
+            if (e < 0)
+                return e;
         }
         return 0;
     }
     case SYS_gettimeofday: {
         uint64_t t = arch_cycles();
-        uint64_t *tv = (uint64_t *)a1;    /* struct timeval { sec; usec; } */
-        if (tv) {
+        if (a1) {                         /* struct timeval { sec; usec; } */
+            uint64_t tv[2];
             tv[0] = GUEST_EPOCH + t / 1000000000ULL;
             tv[1] = (t / 1000ULL) % 1000000ULL;
+            long e = copy_to_user((uint64_t)a1, tv, sizeof tv);
+            if (e < 0)
+                return e;
         }
         return 0;
     }
@@ -2450,6 +2605,8 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_getrandom: {
         uint8_t *buf = (uint8_t *)a1;
         unsigned long len = (unsigned long)a2;
+        if (len && !user_ok((uint64_t)a1, len))
+            return -LERR_FAULT;
         uint64_t s = arch_cycles();
         for (unsigned long i = 0; i < len; i++) {
             buf[i] = (uint8_t)s;
@@ -2462,8 +2619,8 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
          * truthfully for RLIMIT_NOFILE(7) so a caller sizes fd arrays and
          * targets a valid high fd (bash moves its script fd just below this
          * limit); everything else is unbounded. The new limit is ignored. */
-        uint64_t *old = (uint64_t *)a4;   /* old_limit: {rlim_cur, rlim_max} */
-        if (old) {
+        if (a4) {                         /* old_limit: {rlim_cur, rlim_max} */
+            uint64_t old[2];
             if (a2 == 7) {                /* RLIMIT_NOFILE */
                 old[0] = LINUX_NFD;
                 old[1] = LINUX_NFD;
@@ -2471,6 +2628,9 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
                 old[0] = ~0ULL;           /* RLIM_INFINITY */
                 old[1] = ~0ULL;
             }
+            long e = copy_to_user((uint64_t)a4, old, sizeof old);
+            if (e < 0)
+                return e;
         }
         return 0;
     }
@@ -2484,14 +2644,23 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_write(a1, (const char *)a2, (unsigned long)a3);
     case SYS_writev:
         return do_writev(a1, (const struct iovec *)a2, a3);
-    case SYS_open:
-        return do_open((const char *)a1, a2);
+    case SYS_open: {
+        char pb[UPATH_MAX];
+        long e;
+        const char *up = user_path((uint64_t)a1, pb, &e);
+        if (!up)
+            return e;
+        return do_open(up, a2);
+    }
     case SYS_openat: {
         /* A relative path is taken against dirfd's directory (AT_FDCWD means the
          * cwd); an absolute path ignores dirfd. */
-        char ab[RAMFS_NAME];
+        char pb[UPATH_MAX], ab[RAMFS_NAME];
         long e;
-        const char *p = at_path(a1, (const char *)a2, ab, sizeof ab, &e);
+        const char *up = user_path((uint64_t)a2, pb, &e);
+        if (!up)
+            return e;
+        const char *p = at_path(a1, up, ab, sizeof ab, &e);
         if (e)
             return e;
         return do_open(p, a3);
@@ -2501,24 +2670,39 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_lseek:
         return do_lseek(a1, a2, a3);
     case SYS_stat:
-    case SYS_lstat:
-        return do_stat_path((const char *)a1, (struct linux_stat *)a2);
+    case SYS_lstat: {
+        char pb[UPATH_MAX];
+        long e;
+        const char *up = user_path((uint64_t)a1, pb, &e);
+        if (!up)
+            return e;
+        return do_stat_path(up, (struct linux_stat *)a2);
+    }
     case SYS_newfstatat: {
         /* An empty path with AT_EMPTY_PATH means the dirfd itself (fstat);
          * otherwise resolve the path against dirfd. */
-        if (((const char *)a2)[0] == 0 && (a4 & AT_EMPTY_PATH))
-            return do_fstat(a1, (struct linux_stat *)a3);
-        char ab[RAMFS_NAME];
+        char pb[UPATH_MAX], ab[RAMFS_NAME];
         long e;
-        const char *p = at_path(a1, (const char *)a2, ab, sizeof ab, &e);
+        const char *up = user_path((uint64_t)a2, pb, &e);
+        if (!up)
+            return e;
+        if (up[0] == 0 && (a4 & AT_EMPTY_PATH))
+            return do_fstat(a1, (struct linux_stat *)a3);
+        const char *p = at_path(a1, up, ab, sizeof ab, &e);
         if (e)
             return e;
         return do_stat_path(p, (struct linux_stat *)a3);
     }
     case SYS_fstat:
         return do_fstat(a1, (struct linux_stat *)a2);
-    case SYS_statx:
-        return do_statx(a1, (const char *)a2, a3, (struct linux_statx *)a5);
+    case SYS_statx: {
+        char pb[UPATH_MAX];
+        long e;
+        const char *up = user_path((uint64_t)a2, pb, &e);
+        if (!up)
+            return e;
+        return do_statx(a1, up, a3, (struct linux_statx *)a5);
+    }
     case SYS_getdents64:
         return do_getdents64(a1, (void *)a2, (unsigned long)a3);
     case SYS_pipe:
@@ -2557,10 +2741,11 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_getrusage: {
         /* usage is the second argument; who (a1) is ignored. Zeroed counters:
          * no CPU-time accounting, which gcc and as query but tolerate. */
-        uint64_t *ru = (uint64_t *)a2;
-        if (ru)
-            for (int i = 0; i < 18; i++)        /* struct rusage is 18 longs */
-                ru[i] = 0;
+        if (a2) {                               /* struct rusage is 18 longs */
+            long e = clear_user((uint64_t)a2, 18 * sizeof(uint64_t));
+            if (e < 0)
+                return e;
+        }
         return 0;
     }
     case SYS_sysinfo: {
@@ -2568,12 +2753,15 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
          * everything else. cc1 reads this to size its garbage collector; the
          * numbers need only be plausible. struct sysinfo layout: uptime, three
          * load averages, totalram, freeram, then fields this leaves zero. */
-        uint64_t *si = (uint64_t *)a1;
-        if (si) {
+        if (a1) {
+            uint64_t si[14];
             for (int i = 0; i < 14; i++)
                 si[i] = 0;
             si[4] = VM_RAM_SIZE;                /* totalram */
             si[5] = VM_RAM_SIZE / 2;            /* freeram (a plausible fraction) */
+            long e = copy_to_user((uint64_t)a1, si, sizeof si);
+            if (e < 0)
+                return e;
         }
         return 0;
     }
@@ -2637,22 +2825,30 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_getcwd: {
         /* Return the absolute cwd: a leading slash then the stored key. The
          * syscall's return value is the length including the NUL terminator. */
-        char *ubuf = (char *)a1;
         size_t klen = strlen(cwd_key);
         size_t need = 1 + klen + 1;         /* '/' + key + NUL */
         if (a2 < need)
             return -LERR_RANGE;
-        ubuf[0] = '/';
-        memcpy(ubuf + 1, cwd_key, klen);
-        ubuf[1 + klen] = 0;
+        char kbuf[1 + RAMFS_NAME + 1];
+        kbuf[0] = '/';
+        memcpy(kbuf + 1, cwd_key, klen);
+        kbuf[1 + klen] = 0;
+        long e = copy_to_user((uint64_t)a1, kbuf, need);
+        if (e < 0)
+            return e;
         return (long)need;
     }
     case SYS_chdir: {
         /* Move the process's working directory. Resolve the target against the
          * current cwd, require that it is a directory, and store its key. The
          * root clears the key. */
+        char pb[UPATH_MAX];
+        long e;
+        const char *up = user_path((uint64_t)a1, pb, &e);
+        if (!up)
+            return e;
         char key[RAMFS_NAME];
-        resolve_path((const char *)a1, key, sizeof key);
+        resolve_path(up, key, sizeof key);
         if (key[0] == 0) {
             cwd_key[0] = 0;             /* the root */
             return 0;
@@ -2710,13 +2906,17 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
          * Only the writable overlay can be removed; the 9P bundle and host
          * mounts are read-only. ld, configure, and make all unlink temporaries,
          * which live in the overlay. */
-        char uab[RAMFS_NAME];
+        char pb[UPATH_MAX], uab[RAMFS_NAME];
+        long e;
+        const char *up = user_path(nr == SYS_unlink ? (uint64_t)a1 : (uint64_t)a2,
+                                   pb, &e);
+        if (!up)
+            return e;
         const char *upath;
         if (nr == SYS_unlink)
-            upath = (const char *)a1;
+            upath = up;
         else {
-            long e;
-            upath = at_path(a1, (const char *)a2, uab, sizeof uab, &e);
+            upath = at_path(a1, up, uab, sizeof uab, &e);
             if (e)
                 return e;
         }
@@ -2732,26 +2932,56 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
             return isdir ? -LERR_ISDIR : -LERR_ROFS;
         return -LERR_NOENT;
     }
-    case SYS_mkdir:
-        return do_mkdir((const char *)a1);
-    case SYS_mkdirat: {
-        char ab[RAMFS_NAME];
+    case SYS_mkdir: {
+        char pb[UPATH_MAX];
         long e;
-        const char *p = at_path(a1, (const char *)a2, ab, sizeof ab, &e);
+        const char *up = user_path((uint64_t)a1, pb, &e);
+        if (!up)
+            return e;
+        return do_mkdir(up);
+    }
+    case SYS_mkdirat: {
+        char pb[UPATH_MAX], ab[RAMFS_NAME];
+        long e;
+        const char *up = user_path((uint64_t)a2, pb, &e);
+        if (!up)
+            return e;
+        const char *p = at_path(a1, up, ab, sizeof ab, &e);
         if (e)
             return e;
         return do_mkdir(p);
     }
-    case SYS_rmdir:
-        return do_rmdir((const char *)a1);
-    case SYS_rename:
-        return do_rename((const char *)a1, (const char *)a2);
+    case SYS_rmdir: {
+        char pb[UPATH_MAX];
+        long e;
+        const char *up = user_path((uint64_t)a1, pb, &e);
+        if (!up)
+            return e;
+        return do_rmdir(up);
+    }
+    case SYS_rename: {
+        char ob[UPATH_MAX], nb[UPATH_MAX];
+        long eo, en;
+        const char *op = user_path((uint64_t)a1, ob, &eo);
+        if (!op)
+            return eo;
+        const char *np = user_path((uint64_t)a2, nb, &en);
+        if (!np)
+            return en;
+        return do_rename(op, np);
+    }
     case SYS_renameat:
     case SYS_renameat2: {       /* (olddirfd, old, newdirfd, new); flags ignored */
-        char oab[RAMFS_NAME], nab[RAMFS_NAME];
+        char ob[UPATH_MAX], nb[UPATH_MAX], oab[RAMFS_NAME], nab[RAMFS_NAME];
         long eo, en;
-        const char *op = at_path(a1, (const char *)a2, oab, sizeof oab, &eo);
-        const char *np = at_path(a3, (const char *)a4, nab, sizeof nab, &en);
+        const char *ou = user_path((uint64_t)a2, ob, &eo);
+        if (!ou)
+            return eo;
+        const char *nu = user_path((uint64_t)a4, nb, &en);
+        if (!nu)
+            return en;
+        const char *op = at_path(a1, ou, oab, sizeof oab, &eo);
+        const char *np = at_path(a3, nu, nab, sizeof nab, &en);
         if (eo)
             return eo;
         if (en)
@@ -2761,9 +2991,14 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_access: {
         /* access(path, mode): path is the first argument. The dynamic linker
          * probes /etc/ld.so.cache and candidate library directories this way. */
+        char pb[UPATH_MAX];
+        long e;
+        const char *up = user_path((uint64_t)a1, pb, &e);
+        if (!up)
+            return e;
         int isdir;
         uint64_t size, ino;
-        long r = meta_path((const char *)a1, &isdir, &size, &ino);
+        long r = meta_path(up, &isdir, &size, &ino);
         return r < 0 ? r : 0;
     }
     case SYS_faccessat:
@@ -2772,9 +3007,14 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
          * permission bits, so an existing path is accessible for any mode.
          * Paths are resolved against the bundle root; dirfd is AT_FDCWD in
          * practice. make checks its shell this way before execve. */
+        char pb[UPATH_MAX];
+        long e;
+        const char *up = user_path((uint64_t)a2, pb, &e);
+        if (!up)
+            return e;
         int isdir;
         uint64_t size, ino;
-        long r = meta_path((const char *)a2, &isdir, &size, &ino);
+        long r = meta_path(up, &isdir, &size, &ino);
         return r < 0 ? r : 0;
     }
     case SYS_fcntl: {
@@ -2807,9 +3047,15 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
             return src->oflags | O_LARGEFILE;
         return 0;
     }
-    case SYS_execve:
-        return do_execve((const char *)a1, (const char *const *)a2,
+    case SYS_execve: {
+        char pb[UPATH_MAX];
+        long e;
+        const char *up = user_path((uint64_t)a1, pb, &e);
+        if (!up)
+            return e;
+        return do_execve(up, (const char *const *)a2,
                          (const char *const *)a3);
+    }
     case SYS_fork:
     case SYS_vfork:
         return do_fork();
@@ -2836,11 +3082,13 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         /* sched_getaffinity(pid, cpusetsize, mask): report one online CPU so a
          * tool that sizes its thread pool from the mask sees a single processor.
          * The return value is the number of bytes written. */
-        unsigned long *mask = (unsigned long *)a3;
-        if (a2 < sizeof *mask || !mask)
+        unsigned long mask = 1;         /* cpu 0 only */
+        if (a2 < sizeof mask || !a3)
             return -LERR_INVAL;
-        *mask = 1;                      /* cpu 0 only */
-        return (long)sizeof *mask;
+        long e = copy_to_user((uint64_t)a3, &mask, sizeof mask);
+        if (e < 0)
+            return e;
+        return (long)sizeof mask;
     }
     case SYS_clock_nanosleep:
         /* No timers and a cooperative scheduler: treat a sleep as elapsed. A
@@ -2860,19 +3108,25 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
          * field of struct sigaction; SIG_DFL is 0. If the program sets a handler
          * or SIG_IGN, a broken-pipe write returns EPIPE rather than terminating
          * (see do_write). */
-        if (a1 == 13 && a2)             /* SIGPIPE */
-            lproc_cur->sh->sigpipe_ign = (*(void **)a2 != 0);
+        if (a1 == 13 && a2) {           /* SIGPIPE */
+            void *handler;
+            long e = copy_from_user(&handler, (uint64_t)a2, sizeof handler);
+            if (e < 0)
+                return e;
+            lproc_cur->sh->sigpipe_ign = (handler != 0);
+        }
         return 0;
     case SYS_rt_sigprocmask:
         return 0;                       /* no signal delivery: accept and ignore */
     case SYS_uname: {
         /* struct utsname: six NUL-terminated 65-byte fields. */
-        char *u = (char *)a1;
-        if (!u)
+        if (!a1)
             return -LERR_INVAL;
         static const char *const f[6] = {
             "Linux", "jotun", "6.0.0-jotun", "#1 jotun", "x86_64", "(none)",
         };
+        char u[6 * 65];
+        memset(u, 0, sizeof u);
         for (int i = 0; i < 6; i++) {
             char *d = u + i * 65;
             const char *s = f[i];
@@ -2880,6 +3134,9 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
             while (s[j] && j < 64) { d[j] = s[j]; j++; }
             d[j] = 0;
         }
+        long e = copy_to_user((uint64_t)a1, u, sizeof u);
+        if (e < 0)
+            return e;
         return 0;
     }
     case SYS_exit:
@@ -3013,14 +3270,21 @@ copy_uvec(const char *const *uvec, const char **out, char *buf, size_t buflen)
 
     if (!uvec)
         return 0;
-    while (uvec[n] && n < LINUX_MAX_ARGS - 1) {
-        const char *s = uvec[n];
-        size_t len = strlen(s) + 1;
-        if (off + len > buflen)
+    while (n < LINUX_MAX_ARGS - 1) {
+        /* The pointer slot and the string it names both live in user memory;
+         * validate the slot, then bounce the string. A fault or a full buffer
+         * ends the vector here, as a too-long argv would on Linux. */
+        if (!user_ok((uint64_t)(uintptr_t)&uvec[n], sizeof uvec[n]))
             break;
-        memcpy(buf + off, s, len);
+        const char *s = uvec[n];
+        if (!s)
+            break;
+        long len = strncpy_from_user(buf + off, (uint64_t)(uintptr_t)s,
+                                     buflen - off);
+        if (len < 0)
+            break;
         out[n] = buf + off;
-        off += len;
+        off += (size_t)len + 1;
         n++;
     }
     return n;
