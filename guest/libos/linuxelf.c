@@ -3514,23 +3514,20 @@ linux_phys_init(void)
     }
 }
 
-/* Build a fresh address space with the user stack pre-mapped (so stack growth
- * never faults on the stack page itself). Returns the vmspace, or 0. */
+/* Build a fresh address space. The user stack is demand-paged like the rest of
+ * the window: pf_handle backs each stack page on first touch (a user access, or
+ * a kernel copy_*_user into an initial-stack page build_stack has not reached
+ * yet), and the guard band below it still faults because pf_handle refuses that
+ * range. Pre-mapping the whole 8 MiB reservation here was the scaling ceiling: a
+ * process cost 2048 frames before it ran, and fork copied every one of them, so
+ * a handful of live processes exhausted the frame pool. Demand paging makes a
+ * fresh process and a fork cost only the pages actually touched (tens of KiB),
+ * which is what lets a real build hold many processes live at once. Returns the
+ * vmspace, or 0. */
 static vmspace_t
 linux_vmspace_setup(void)
 {
-    vmspace_t as = vmspace_new();
-    if (!as)
-        return 0;
-    for (uint64_t v = LINUX_USTACK_TOP - LINUX_USTACK_SIZE;
-         v < LINUX_USTACK_TOP; v += VM_PAGE) {
-        uint64_t f = phys_alloc();
-        if (!f || vmspace_map(as, v, f, VM_W | VM_U) != 0) {
-            vmspace_destroy(as);
-            return 0;
-        }
-    }
-    return as;
+    return vmspace_new();
 }
 
 void
