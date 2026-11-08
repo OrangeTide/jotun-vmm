@@ -1072,17 +1072,19 @@ print:
 ```
 d=0   sp=0x0effde70
 d=768 sp=0x0e9e8e70
-*** CPU exception 14 (#PF page fault) ***
-  err=0x02  rip=0x401188  cr2=0x0e7ff4a0  rsp=0x0e7ff4a0
-  halted
+[bin] pid 1 killed by signal 11
 ```
 
-The fault address `0x0e7ff4a0` sits in the guard band just under the 8 MiB
-floor (`stack_bottom` is `0x0e800000` at 256 MiB of RAM), the error code is a
-not-present write, and `rsp` equals `cr2`: the stack pointer had just crossed
-into the guard and the prologue's stack probe took the fault. Because the test
-halts the guest by design, it is run on its own with `SPIKE_PROG=linuxstackov`,
-not as part of the green spike set, which stays at 13 passing programs.
+The overflow store lands in the guard band just under the 8 MiB floor
+(`stack_bottom` is `0x0e800000` at 256 MiB of RAM) and takes a not-present
+write fault. Once the process runs in CPL 3 and the fault split is in place (see
+the privilege-separation section above), that fault is a user-mode fault the
+kernel cannot demand-page, so it terminates the process with SIGSEGV rather than
+dumping a fatal CPU exception and halting. The program being the only process,
+the guest then halts for want of anything to run, so it is kept out of the green
+set and launched on its own with `SPIKE_PROG=linuxstackov`. `linuxsegv` is the
+positive companion: a child faults the same way while the parent survives and
+its `wait4` reports the signal, which is the containment the split buys.
 
 ## Planned work: real privilege separation
 
@@ -1098,6 +1100,13 @@ the guest from the host, but there is no inner boundary between a process and
 its kernel. This section records the plan to add one: run each process in
 CPL 3, keep the kernel in CPL 0, and make the kernel stop trusting user
 pointers.
+
+Status: Phase A has landed. The kernel range-checks every user pointer through
+the copy helpers, each process runs in CPL 3 (a user read of a kernel address
+faults with `cs=0x2b`), and a fault taken in user mode terminates just that
+process with a signal instead of halting the guest. `linuxsegv` exercises the
+containment, `linuxkmem` the boundary. Phases B and C below are still ahead. The
+rest of this section is written as the original plan.
 
 ### What already holds
 
