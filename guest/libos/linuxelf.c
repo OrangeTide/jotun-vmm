@@ -468,6 +468,12 @@ static vmspace_t linux_vmspace_setup(void);
  * struct lproc, which is defined here, so it is declared here. */
 extern void linux_resume(struct lproc *p) __attribute__((noreturn));
 
+/* Called from the CPU fault path (x86_64_fault.S) when a process faults in
+ * CPL 3: terminate just that process with the signal the trap vector maps to,
+ * instead of halting the whole guest. Runs in ring 0 on the process's handler
+ * stack, which the fault path redirects an IRETQ into. */
+void linux_fault_kill(long vec) __attribute__((noreturn));
+
 /* The giant lock for the Linux syscall layer. The scheduler is preemptive and
  * SMP-capable, but the syscall handlers share mutable tables (the fd table, the
  * mmap arena, the writable overlay, the futex wait set) with no finer-grained
@@ -536,13 +542,27 @@ lx_yield(void)
  * stac/clac around the move); every caller already routes through here, so the
  * bound is enforced from this commit on, before the ring flip. */
 
-/* True if [va, va+n) lies wholly inside the user window. Overflow-safe: the
- * second test is written so va+n cannot wrap past the top. n == 0 is allowed
- * and always passes (an empty access touches nothing). */
+/* True if [va, va+n) lies wholly inside the user window and clear of the stack
+ * guard band. Overflow-safe: the span test is written so va+n cannot wrap past
+ * the top. n == 0 is allowed and always passes (an empty access touches
+ * nothing).
+ *
+ * The guard band is rejected so a process cannot hand the kernel a pointer into
+ * it: an in-window address there is the one spot pf_handle refuses to back, so
+ * a kernel copy that reached it would fault in ring 0 and halt the guest. Every
+ * other in-window page either is mapped or demand-pages on the kernel's touch,
+ * so once the guard is excluded a copy helper never faults (short of true OOM).
+ * The band straddles the span when it starts below the end and ends above the
+ * start. pf_guard_lo == pf_guard_hi (the default before arena_init) is empty
+ * and rejects nothing. */
 static int
 user_ok(uint64_t va, uint64_t n)
 {
-    return va >= VM_USER_LO && va < VM_USER_HI && n <= VM_USER_HI - va;
+    if (va < VM_USER_LO || va >= VM_USER_HI || n > VM_USER_HI - va)
+        return 0;
+    if (n && pf_guard_lo < pf_guard_hi && va < pf_guard_hi && va + n > pf_guard_lo)
+        return 0;                       /* the span touches the stack guard band */
+    return 1;
 }
 
 /* Copy n bytes from a user buffer into the kernel. Returns 0, or -LERR_FAULT if
@@ -2520,6 +2540,34 @@ do_exit(long code, int group)
         zombie_thr[n_zombie_thr++] = t;
     giant_unlock();                     /* task_exits never returns to the dispatcher */
     task_exits(NULL);
+}
+
+/* Terminate the running process after a CPU fault taken in CPL 3. The fault
+ * path (x86_64_fault.S) redirects its IRETQ to land here, in ring 0 on this
+ * process's handler stack, with the trap vector in the first argument. We were
+ * in user mode when the fault hit, so no syscall held the giant lock; take it,
+ * record the terminating signal (so the parent's wait4 reports WIFSIGNALED),
+ * and exit the process. do_exit releases the lock and switches away, so one
+ * process faulting no longer halts the guest. */
+void
+linux_fault_kill(long vec)
+{
+    int sig;
+    switch (vec) {
+    case 0:  sig = 8;  break;           /* #DE divide error  -> SIGFPE */
+    case 6:  sig = 4;  break;           /* #UD invalid opcode -> SIGILL */
+    case 13: sig = 11; break;           /* #GP               -> SIGSEGV */
+    case 14: sig = 11; break;           /* #PF page fault    -> SIGSEGV */
+    default: sig = 11; break;           /* anything else     -> SIGSEGV */
+    }
+    giant_lock();
+    con_puts("[bin] pid ");
+    put_dec(lproc_cur->sh->pid);
+    con_puts(" killed by signal ");
+    put_dec(sig);
+    con_putc('\n');
+    lproc_cur->sh->exit_sig = sig;
+    do_exit(0, 1);                      /* noreturn: releases the lock, tears down */
 }
 
 /* The body of the SYSCALL handler, run with the giant lock held (see

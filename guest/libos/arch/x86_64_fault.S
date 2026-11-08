@@ -14,6 +14,15 @@
  * can fault in ways the libOS never would, and a silent triple fault is the
  * alternative. */
 
+/* Offset of kstack_top (the handler stack) within struct lproc; mirrors
+ * TF_KSTACK in x86_64_linuxsys.S. A CPL-3 fault is redirected to run the kill
+ * trampoline on this stack. */
+#define TF_KSTACK 128
+
+/* Kernel and user segment selectors (see the GDT in x86_64.c). */
+#define KERN_CS   0x08
+#define KERN_SS   0x10
+
     .text
 
 /* A stub for a vector the CPU does not give an error code: push a zero in the
@@ -67,7 +76,9 @@ exc_stub_\vec:
 
 /* Common path: on entry the stack holds (low to high)
  *   vec, err, RIP, CS, RFLAGS, RSP, SS
- * Save the GP registers below that and hand their address to fault_report. */
+ * Save the GP registers below that. A fault taken in CPL 3 (a Linux process)
+ * terminates just that process; a fault in ring 0 (the kernel itself, or a
+ * double fault) is reported and halts. */
 exc_common:
     push %rax
     push %rbx
@@ -86,12 +97,52 @@ exc_common:
     push %r15
 
     cld
-    mov %rsp, %rdi             /* struct faultframe * */
+    cmpq $8, 120(%rsp)        /* #DF: the fault machinery is itself suspect */
+    je 1f
+    testb $3, 144(%rsp)       /* saved CS RPL: 3 means the fault was in CPL 3 */
+    jnz kill_user_fault
+1:  mov %rsp, %rdi            /* struct faultframe * */
     call fault_report
     /* fault_report halts and does not return, but guard anyway. */
-1:  cli
+2:  cli
     hlt
-    jmp 1b
+    jmp 2b
+
+/* Shared tail for a CPU fault taken in CPL 3: redirect the CPU's return frame
+ * so the IRETQ below re-enters the kernel at linux_fault_kill, running in ring 0
+ * on the faulting process's handler stack, which terminates the process. On
+ * entry the 15 saved GP registers sit at 0(%rsp) (r15) up to 112(%rsp) (rax),
+ * then the uniform trap frame: vec(120) err(128) rip(136) cs(144) rflags(152)
+ * rsp(160) ss(168). Reached from exc_common and pf_isr, which lay down the same
+ * frame. */
+kill_user_fault:
+    movq 120(%rsp), %rax      /* vec -> the argument for linux_fault_kill */
+    movq %rax, 72(%rsp)       /* overwrite saved rdi (first C argument) */
+    movq lproc_cur(%rip), %rax
+    movq TF_KSTACK(%rax), %rax
+    movq %rax, 160(%rsp)      /* return rsp = the process handler stack */
+    movq $KERN_SS, 168(%rsp)  /* return ss */
+    movq $KERN_CS, 144(%rsp)  /* return cs */
+    movq $0x2, 152(%rsp)      /* return rflags: reserved bit only, IF off */
+    leaq linux_fault_kill(%rip), %rax
+    movq %rax, 136(%rsp)      /* return rip */
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rbp
+    pop %rdi                  /* = vec */
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rbx
+    pop %rax
+    add $16, %rsp             /* discard vec and err */
+    iretq
 
 /* Page-fault handler (vector 14). Tries to demand-map the faulting page via
  * pf_handle; on success it retries the instruction, otherwise it falls through
@@ -122,7 +173,7 @@ pf_isr:
     mov 128(%rsp), %rsi        /* arg2: error code (15 regs + vec above it) */
     call pf_handle
     test %rax, %rax
-    jz 2f                      /* 0: not handled, report and halt */
+    jz 4f                      /* 0: not handled; kill the process or report */
 
     pop %r15
     pop %r14
@@ -142,7 +193,11 @@ pf_isr:
     add $16, %rsp              /* discard vec and the error code */
     iretq
 
-2:  mov %rsp, %rdi             /* struct faultframe * */
+    /* Not demand-paged: a fault in CPL 3 terminates the process, one in ring 0
+     * (a kernel bug, or OOM on a demand page) is reported and halts. */
+4:  testb $3, 144(%rsp)        /* saved CS RPL */
+    jnz kill_user_fault
+    mov %rsp, %rdi             /* struct faultframe * */
     call fault_report
 3:  cli
     hlt
