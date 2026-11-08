@@ -12,17 +12,19 @@
 
 /* Fixed guest-physical layout the two sides agree on. The ring sits low in
  * guest RAM, below the guest image. The doorbell is an unmapped MMIO address,
- * so a store to it faults out to the host as an MMIO exit. */
+ * so a store to it faults out to the host as an MMIO exit. The MMIO band sits
+ * well above guest RAM (which reaches GUEST_RAM_SIZE) and below the physmap at
+ * 1 GiB, so the addresses stay unbacked and keep faulting out. */
 #define JOTUN_RING_BASE     0x4000u
-#define JOTUN_DOORBELL      0x0a000000ull
+#define JOTUN_DOORBELL      0x3a000000ull
 
 /* SMP coordination doorbells (MMIO, so a store faults out to the host). A
  * store to IDLE blocks the calling vcpu in the host until another vcpu stores
  * to WAKE; a WAKE store carries the target vcpu id, or JOTUN_WAKE_ALL to wake
  * every vcpu. This is how an idle cpu halts and a cpu with new work rouses it,
  * without injecting an interrupt into a halted guest. */
-#define JOTUN_IDLE_DOORBELL 0x0a000010ull
-#define JOTUN_WAKE_DOORBELL 0x0a000018ull
+#define JOTUN_IDLE_DOORBELL 0x3a000010ull
+#define JOTUN_WAKE_DOORBELL 0x3a000018ull
 #define JOTUN_WAKE_ALL      0xffffffffu
 
 #define JOTUN_RING_SLOTS    8u

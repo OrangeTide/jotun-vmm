@@ -118,15 +118,16 @@ vmspace_new(void)
         tbl(l1)[2] = kheap_pd | D_TABLE;    /* [2 GiB, 3 GiB): heap window */
 
     /* Low gigabyte: 2 MiB blocks everywhere outside the user window. RAM and the
-     * low kernel are Normal; the device band (UART and doorbells at and above
-     * 0x08000000) is Device so stores still trap to the host. The user window
-     * is left invalid, to be filled with L3 pages on demand. */
+     * low kernel are Normal; everything at and above RAM top, including the
+     * device band (UART and doorbells near 0x39000000), is Device so stores
+     * still trap to the host. The user window is left invalid, to be filled with
+     * L3 pages on demand. */
     uint64_t *l2 = tbl(l2_low);
     for (uint64_t i = 0; i < 512; i++) {
         uint64_t base = i << 21;
         if (base >= VM_USER_LO && base < VM_USER_HI)
             continue;
-        uint64_t attr = (base >= 0x08000000ULL) ? BLOCK_DEVICE : BLOCK_NORMAL;
+        uint64_t attr = (base >= VM_RAM_SIZE) ? BLOCK_DEVICE : BLOCK_NORMAL;
         l2[i] = base | attr;
     }
 

@@ -23,7 +23,7 @@
  * below the guest image at 1 MiB. The doorbell follows the SMP doorbells
  * (jotun_abi.h). */
 #define JOTUN_NET_BASE      0x10000u
-#define JOTUN_NET_DOORBELL  0x0a000020ull
+#define JOTUN_NET_DOORBELL  0x3a000020ull
 #define JOTUN_NET_MSIZE     8192u
 #define JOTUN_NET_ADDRMAX   128u        /* a "host!port" address string */
 

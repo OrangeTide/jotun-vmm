@@ -8,11 +8,11 @@
 
 #include <stdint.h>
 
-#define UART_BASE   0x09000000ull
+#define UART_BASE   0x39000000ull
 #define UART_DR     (UART_BASE + 0x00)      /* data register */
 #define UART_FR     (UART_BASE + 0x18)      /* flag register */
 #define FR_TXFF     (1u << 5)               /* transmit FIFO full */
-#define POWEROFF    0x09010000ull
+#define POWEROFF    0x39010000ull
 
 void
 con_raw_putc(char c)

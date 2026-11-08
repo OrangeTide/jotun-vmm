@@ -38,7 +38,7 @@
 #include <stdint.h>
 
 #define VM_PAGE      0x1000ULL
-#define VM_RAM_SIZE  0x08000000ULL           /* 128 MiB; must match the host */
+#define VM_RAM_SIZE  0x10000000ULL           /* 256 MiB; must match the host */
 #define VM_USER_LO   0x400000ULL
 #define VM_USER_HI   (VM_RAM_SIZE - 0x1000000ULL)  /* RAM top less 16 MiB */
 /* The kernel heap: 8 MiB directly above the user window. The vcpu stacks take

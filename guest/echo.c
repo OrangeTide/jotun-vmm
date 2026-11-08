@@ -28,7 +28,7 @@ done(void)
 {
 #if defined(__aarch64__)
     /* MMIO poweroff, matching MMIO_POWEROFF in host/uart.h. */
-    *(volatile unsigned int *)(uintptr_t)0x09010000ull = 1;
+    *(volatile unsigned int *)(uintptr_t)0x39010000ull = 1;
 #else
     __asm__ volatile ("hlt");
 #endif

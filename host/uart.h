@@ -13,9 +13,9 @@
 /* MMIO console for arm64 guests, which have no port I/O. A small PL011 subset
  * sits at MMIO_UART_BASE; a store to MMIO_POWEROFF stops the VMM. Both regions
  * are left unmapped in the guest so accesses fault out as MMIO exits. */
-#define MMIO_UART_BASE 0x09000000ull
+#define MMIO_UART_BASE 0x39000000ull
 #define MMIO_UART_SIZE 0x1000
-#define MMIO_POWEROFF  0x09010000ull
+#define MMIO_POWEROFF  0x39010000ull
 
 /* Device state. Only the handful of latched registers a polling driver reads
  * back are kept; transmit goes straight to stdout and there is no receive

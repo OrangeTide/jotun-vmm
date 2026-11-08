@@ -98,7 +98,7 @@ vmspace_new(void)
 
     /* Everything in [0, 1 GiB) outside the user window is shared identity as
      * 2 MiB pages: the kernel, page tables, vcpu stacks, and the device MMIO
-     * band (the 9P and SMP doorbells near 0x0a000000). Only the user window
+     * band (the 9P and SMP doorbells near 0x3a000000). Only the user window
      * [0x400000, 0x1C00000) is left unmapped, to be demand-paged per process. */
     uint64_t *pdl = tbl(pd_low);
     for (uint64_t i = 0; i < 512; i++) {
