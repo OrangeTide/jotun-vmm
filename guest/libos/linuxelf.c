@@ -466,6 +466,57 @@ static vmspace_t linux_vmspace_setup(void);
  * struct lproc, which is defined here, so it is declared here. */
 extern void linux_resume(struct lproc *p) __attribute__((noreturn));
 
+/* The giant lock for the Linux syscall layer. The scheduler is preemptive and
+ * SMP-capable, but the syscall handlers share mutable tables (the fd table, the
+ * mmap arena, the writable overlay, the futex wait set) with no finer-grained
+ * locking. Without serialisation the timer can switch Linux tasks in the middle
+ * of a handler, so two threads of one process interleave on those tables, and
+ * the futex compare-and-park can lose a wakeup. One lock, held across each
+ * syscall dispatch, makes a handler body run to a well-defined point before any
+ * other Linux syscall starts.
+ *
+ * It is dropped around every voluntary sleep (lx_block / lx_yield) so a parked
+ * task never shuts the others out: a task that waits on a pipe, a child, or a
+ * futex must let the task it is waiting for take the lock and make progress.
+ * The acquire path yields on contention rather than spinning hard, so a holder
+ * that the timer preempted is rescheduled and finishes instead of deadlocking a
+ * single vcpu. (lproc_cur is still one global, so the Linux path remains single
+ * vcpu for now; this lock is what a move to several would also need.) */
+static volatile int giant_held;
+
+static void
+giant_lock(void)
+{
+    while (__atomic_exchange_n(&giant_held, 1, __ATOMIC_ACQUIRE))
+        task_yield();           /* contended: let the holder run, then retry */
+}
+
+static void
+giant_unlock(void)
+{
+    __atomic_store_n(&giant_held, 0, __ATOMIC_RELEASE);
+}
+
+/* Sleep from inside a syscall: drop the giant lock before parking so the task
+ * that will wake us (or that we are waiting on) can take it, then reacquire on
+ * the way out. A plain task_block/task_yield here would keep the lock held
+ * across the sleep and deadlock whoever has to run to wake us. */
+static void
+lx_block(void)
+{
+    giant_unlock();
+    task_block();
+    giant_lock();
+}
+
+static void
+lx_yield(void)
+{
+    giant_unlock();
+    task_yield();
+    giant_lock();
+}
+
 /* Set up the heap arena above the loaded program image. brk grows up from
  * heap_base (the first page past the highest loaded segment, so it never
  * overlaps the executable or its interpreter); anonymous mmap grows down from
@@ -1115,7 +1166,7 @@ do_write(long fd, const char *buf, unsigned long len)
             long n = pipe_write(p, (const uint8_t *)buf + done, len - done);
             done += (unsigned long)n;
             if (done < len)
-                task_yield();
+                lx_yield();          /* pipe full: let a reader drain it */
         }
         return (long)done;
     }
@@ -1333,7 +1384,7 @@ do_read(long fd, void *buf, unsigned long count)
         struct lpipe *p = &pipes[f->pidx];
         /* Block until data arrives or every writer has closed (then EOF = 0). */
         while (p->count == 0 && p->writers > 0)
-            task_yield();
+            lx_yield();          /* empty pipe: let a writer fill it */
         return pipe_read(p, buf, count);
     }
     if (f->isram) {
@@ -1982,6 +2033,13 @@ do_futex(uint64_t uaddr, int op, int val)
     int cmd = op & 0x7f;                /* strip PRIVATE and CLOCK_REALTIME */
 
     if (cmd == FUTEX_WAIT) {
+        /* The compare and the enlisting both run under the giant lock, and so
+         * does futex_wake, so a concurrent wake cannot slip between them: either
+         * the waker's value store lands first and the compare fails here (no
+         * block), or we are enlisted before the waker scans and it wakes us. The
+         * lock is only dropped inside lx_block, after we are in the wait set,
+         * and a wake in that final window is caught by task_block's wake_pending.
+         * That closes the lost-wakeup race a bare compare-then-block would have. */
         if (*(volatile int *)(uintptr_t)uaddr != val)
             return -LERR_AGAIN;         /* value changed: do not block */
         int slot = -1;
@@ -1992,12 +2050,17 @@ do_futex(uint64_t uaddr, int op, int val)
             }
         if (slot < 0)
             return -LERR_AGAIN;
+        int me = lproc_cur->task_id;
         fwaiters[slot].used = 1;
         fwaiters[slot].sh = lproc_cur->sh;
         fwaiters[slot].uaddr = uaddr;
-        fwaiters[slot].task_id = lproc_cur->task_id;
-        task_block();                   /* woken by futex_wake or thread exit */
-        fwaiters[slot].used = 0;
+        fwaiters[slot].task_id = me;
+        lx_block();                     /* drops the giant lock while parked */
+        /* Reclaim the slot, unless a wake already freed it and another waiter
+         * has since taken it (then used is set with a different task_id, and
+         * clearing it would strand that waiter). */
+        if (fwaiters[slot].used && fwaiters[slot].task_id == me)
+            fwaiters[slot].used = 0;
         return 0;
     }
     if (cmd == FUTEX_WAKE)
@@ -2186,9 +2249,11 @@ do_spawn_vfork(uint64_t flags, uint64_t child_stack)
     child->task_id = tid;
     csh->main_task = tid;
 
-    /* vfork: block until the child execs (new address space) or exits. */
+    /* vfork: block until the child execs (new address space) or exits. The
+     * giant lock is dropped while parked so the child can run its own syscalls
+     * (its execve is what clears vforking and wakes us). */
     while (csh->vforking)
-        task_block();
+        lx_block();
 
     return csh->pid;
 }
@@ -2255,7 +2320,7 @@ do_wait4(long pid, int *status)
         }
         if (!haskid)
             return -LERR_CHILD;
-        task_yield();                   /* a child is still running: let it run */
+        lx_yield();                     /* a child is still running: let it run */
     }
 }
 
@@ -2307,12 +2372,14 @@ do_exit(long code, int group)
      * zombie-thread drainer, which another thread reaps. */
     if (n_zombie_thr < LINUX_NPROC)
         zombie_thr[n_zombie_thr++] = t;
+    giant_unlock();                     /* task_exits never returns to the dispatcher */
     task_exits(NULL);
 }
 
-/* The C half of the SYSCALL handler. Return value goes back in rax. */
-long
-linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
+/* The body of the SYSCALL handler, run with the giant lock held (see
+ * linux_sys_dispatch). Return value goes back in rax. */
+static long
+linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
 {
     (void)a4;
     (void)a5;
@@ -2763,7 +2830,7 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_futex:
         return do_futex((uint64_t)a1, (int)a2, (int)a3);
     case SYS_sched_yield:
-        task_yield();
+        lx_yield();                     /* drop the giant lock so a peer can run */
         return 0;
     case SYS_sched_getaffinity: {
         /* sched_getaffinity(pid, cpusetsize, mask): report one online CPU so a
@@ -2825,6 +2892,18 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
         con_putc('\n');
         return -LERR_NOSYS;
     }
+}
+
+/* The C half of the SYSCALL handler. One Linux syscall runs at a time: take the
+ * giant lock, run the handler body, release it. Handlers that never return here
+ * (execve on success, exit) release the lock themselves before they leave. */
+long
+linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
+{
+    giant_lock();
+    long r = linux_sys_dispatch_inner(nr, a1, a2, a3, a4, a5);
+    giant_unlock();
+    return r;
 }
 
 /****************************************************************
@@ -3083,6 +3162,7 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     if (!borrowed)
         vmspace_destroy(old);           /* release the replaced image's frames */
 
+    giant_unlock();                     /* linux_jump never returns to the dispatcher */
     linux_jump(entry, rsp);             /* enter the new image; does not return */
 }
 
