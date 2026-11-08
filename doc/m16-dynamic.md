@@ -1032,3 +1032,54 @@ growth needs no cross-cpu TLB shootdown: the entries it writes were not present
 before, so no stale translation can be cached for them. x86 is exercised by the
 full spike set plus the 36 MiB overlay stress; the arm64 side is the usual
 compile-only parity, pending a runtime host.
+
+## A guard band below the user stack
+
+Large single translation units pushed two scale limits at once. The first was
+the heap, handled above. The second was the stack. The Linux process stack is
+the top of the user window, growing down, with the anonymous `mmap` arena
+growing down from just below it. The two were adjacent with nothing between
+them. The optimizer recurses deeply on a big function, and a stack that was
+originally 256 KiB overflowed its reservation, grew straight into the `mmap`
+arena, and a deep frame overwrote a GCC hash table. The crash surfaced far
+away, in unrelated code that later read the corrupted table, which made it slow
+to trace back to the stack.
+
+Raising the reservation to 8 MiB, the Linux main-thread default, fixed the
+immediate failure, but the arrangement was still unsound: the arena sat
+directly under the stack, so any future overflow would again corrupt live data
+silently instead of faulting. The fix is a guard band. `arena_init` lowers the
+arena ceiling by a fixed 1 MiB, leaving `[mmap_top, stack_bottom)` mapped by
+nothing, and publishes that range to the page-fault handler through two globals,
+`pf_guard_lo` and `pf_guard_hi` (declared in `vmspace.h`, defined in both the
+x86-64 and arm64 backends, zero and inert until the Linux loader sets them).
+`pf_handle` checks the range right after it confirms the fault is in the user
+window: an access in the guard returns failure instead of demand-paging a fresh
+frame, so the fault is reported fatal at the instruction that overflowed. The
+1 MiB width matches the Linux stack guard gap default. A single frame that steps
+more than that past the reservation in one store could still clear the band, the
+same limitation the real kernel has.
+
+The stack itself is pre-mapped whole at process setup, so ordinary growth never
+faults; only an overflow past the reservation reaches the unmapped guard. The
+band costs no frames, since it is never backed.
+
+`example/linuxstackov.c` is the negative test. It recurses with an 8 KiB touched
+frame so the stack marches down for real, not just in register moves, and it
+never returns. On a correct guest it dies in the guard before its `SURVIVED`
+print:
+
+```
+d=0   sp=0x0effde70
+d=768 sp=0x0e9e8e70
+*** CPU exception 14 (#PF page fault) ***
+  err=0x02  rip=0x401188  cr2=0x0e7ff4a0  rsp=0x0e7ff4a0
+  halted
+```
+
+The fault address `0x0e7ff4a0` sits in the guard band just under the 8 MiB
+floor (`stack_bottom` is `0x0e800000` at 256 MiB of RAM), the error code is a
+not-present write, and `rsp` equals `cr2`: the stack pointer had just crossed
+into the guard and the prologue's stack probe took the fault. Because the test
+halts the guest by design, it is run on its own with `SPIKE_PROG=linuxstackov`,
+not as part of the green spike set, which stays at 13 passing programs.
