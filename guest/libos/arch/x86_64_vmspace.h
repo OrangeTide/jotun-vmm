@@ -65,6 +65,14 @@ typedef uint64_t vmspace_t;                 /* physical address of the PML4 */
  * and consulted by the page-fault handler. */
 extern vmspace_t cur_vmspace;
 
+/* A guard band in the user window that pf_handle refuses to demand-page: a
+ * fault in [pf_guard_lo, pf_guard_hi) is reported fatal instead of being backed
+ * with a fresh frame. The Linux-compat loader sets it to the gap just below the
+ * user stack, so a stack overflow past the reservation faults cleanly rather
+ * than silently growing into the mmap arena. lo == hi (the default) disables it. */
+extern uint64_t pf_guard_lo;
+extern uint64_t pf_guard_hi;
+
 /* Thread the physical frames in [lo, hi) onto the free list. Called once. */
 void phys_init(uint64_t lo, uint64_t hi);
 

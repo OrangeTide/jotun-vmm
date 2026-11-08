@@ -40,16 +40,23 @@
  * which holds a 2 MiB-ish glibc image. Above that is the heap: brk grows up from
  * LINUX_HEAP_BASE and anonymous mmap grows down from the top of RAM, less the
  * stack reservation. They meet in the middle and fail there. The stack is the
- * top LINUX_USTACK_SIZE of the window and is demand-paged, so the reservation
- * only bounds how far it may grow, not how much it costs. It is sized to match
- * a Linux main-thread stack (8 MiB): the optimizer recurses deeply on a large
- * translation unit, and a smaller stack silently grew down into the mmap arena
- * and corrupted it. */
+ * top LINUX_USTACK_SIZE of the window. It is sized to match a Linux main-thread
+ * stack (8 MiB): the optimizer recurses deeply on a large translation unit, and
+ * a smaller stack silently grew down into the mmap arena and corrupted it.
+ *
+ * Below the stack reservation sits a LINUX_STACK_GUARD guard band: mmap never
+ * allocates into it, and pf_handle refuses to demand-page it (see pf_guard_lo in
+ * vmspace.h). A stack frame that overflows past the reservation faults there,
+ * which is a clean fatal fault, instead of silently writing into the mmap arena
+ * below. The 1 MiB width matches the Linux stack guard gap default; a frame that
+ * steps more than that past the reservation in one go could still skip it. */
 #define LINUX_PROG_BASE    0x400000ULL
 #define LINUX_PROG_LIMIT   0x800000ULL
 #define LINUX_HEAP_BASE    0x800000ULL
 #define LINUX_USTACK_SIZE  (8u * 1024 * 1024)
 #define LINUX_USTACK_TOP   VM_USER_HI       /* top of the user window */
+#define LINUX_STACK_GUARD  (1u * 1024 * 1024)   /* unmapped gap below the stack */
+#define LINUX_STACK_BOTTOM (LINUX_USTACK_TOP - LINUX_USTACK_SIZE)
 #define PAGE_SIZE          0x1000ULL
 
 /* mmap flags and failure value. */
@@ -471,9 +478,13 @@ arena_init(uint64_t image_top)
     if (heap_base < LINUX_HEAP_BASE)
         heap_base = LINUX_HEAP_BASE;    /* a small image still gets a sane floor */
     brk_cur = heap_base;
-    mmap_top = (LINUX_USTACK_TOP - LINUX_USTACK_SIZE) & ~(PAGE_SIZE - 1);
+    /* mmap grows down from just below the guard band, which is itself just below
+     * the stack reservation. The guard is left unmapped; pf_handle refuses it. */
+    mmap_top = (LINUX_STACK_BOTTOM - LINUX_STACK_GUARD) & ~(PAGE_SIZE - 1);
     mmap_cur = mmap_top;
     nhole = 0;
+    pf_guard_hi = LINUX_STACK_BOTTOM;
+    pf_guard_lo = mmap_top;
 }
 
 /* The highest address occupied by the loaded image: the executable's end, or

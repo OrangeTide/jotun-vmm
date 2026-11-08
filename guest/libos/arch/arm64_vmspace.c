@@ -39,6 +39,10 @@ static int      physmap_on;                 /* phys_to_virt uses the physmap onc
 /* The address space the fault handler maps into (the running process). */
 vmspace_t cur_vmspace;
 
+/* The stack guard band pf_handle refuses to back; see vmspace.h. Disabled until
+ * the Linux-compat loader sets it. */
+uint64_t pf_guard_lo, pf_guard_hi;
+
 /* The demand-grown kernel heap window (see the header). One shared L2 maps it
  * in every address space; kheap_top is the next unmapped window VA. kheap_pd is
  * 0 until kheap_init runs, which keeps vmspace_new and the grower inert on the
@@ -303,6 +307,8 @@ pf_handle(uint64_t far, uint64_t esr)
     if (!cur_vmspace || dfsc < 0x04 || dfsc > 0x07)
         return 0;
     if (far < VM_USER_LO || far >= VM_USER_HI)
+        return 0;
+    if (far >= pf_guard_lo && far < pf_guard_hi)  /* stack guard: a fault here is overflow */
         return 0;
 
     uint64_t f = phys_alloc();
