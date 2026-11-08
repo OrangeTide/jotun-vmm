@@ -495,6 +495,18 @@ do_brk(uint64_t want)
         return (long)brk_cur;
     if (want < heap_base || want > mmap_cur)
         return (long)brk_cur;           /* refuse; caller falls back to mmap */
+    /* Linux returns brk-extended memory zero-filled. When glibc trims the heap
+     * (brk shrinks) and later regrows it, the regrown pages must read as zero.
+     * Release the frames on a shrink so a later regrow faults in fresh zeroed
+     * pages through pf_handle, matching Linux. Without this the pages keep their
+     * pre-shrink content and glibc's allocator can build chunks on dirty memory
+     * and hand out allocations that overlap live ones. The range is page
+     * aligned up, so a partial final page below brk_cur keeps its data. */
+    if (want < brk_cur) {
+        uint64_t lo = (want + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        for (uint64_t p = lo; p < brk_cur; p += PAGE_SIZE)
+            vmspace_unmap(cur_vmspace, p);
+    }
     brk_cur = want;
     return (long)brk_cur;
 }
