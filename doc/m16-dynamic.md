@@ -1083,3 +1083,129 @@ not-present write, and `rsp` equals `cr2`: the stack pointer had just crossed
 into the guard and the prologue's stack probe took the fault. Because the test
 halts the guest by design, it is run on its own with `SPIKE_PROG=linuxstackov`,
 not as part of the green spike set, which stays at 13 passing programs.
+
+## Planned work: real privilege separation
+
+Today the guest kernel and the Linux process share ring 0. User code runs with
+the same privilege as the kernel: it can read and write kernel memory, the
+physmap, the page tables, and the device doorbells, and it can execute `cli` or
+`hlt`. This was a deliberate simplification to get the loader, the syscall
+layer, and demand paging working without also building a ring transition. It is
+temporary. A buggy or hostile process currently corrupts the whole guest
+instead of faulting in its own ring, and a single process segfault halts
+everything rather than being contained. The outer VM boundary still isolates
+the guest from the host, but there is no inner boundary between a process and
+its kernel. This section records the plan to add one: run each process in
+CPL 3, keep the kernel in CPL 0, and make the kernel stop trusting user
+pointers.
+
+### What already holds
+
+Most of the memory work is done. Kernel regions are already mapped
+supervisor-only: the identity map at `[0, 0x400000)` and `[VM_USER_HI, 1 GiB)`,
+the physmap, the kernel-heap window, and the bootstrap band all get leaf PTEs
+without the user bit (`x86_64_vmspace.c`). User-window pages carry `VM_U`,
+assigned by `pf_handle` and `vmspace_map`. The hardware enforces the split the
+moment user code drops to CPL 3, so no page-table reflagging is needed. The
+per-process page tables, the full trapframe saved on every syscall, and the
+fork path that copies that frame are already in place. The change is entirely
+guest-side. The host runs whatever privilege level the guest sets, so nothing
+under `host/` changes.
+
+One fact shapes the phasing. Syscalls already run with interrupts off, because
+`SFMASK` masks the interrupt flag on `SYSCALL` entry. The Linux path is
+therefore cooperative: a Linux task only switches at an explicit yield or block
+point, never by preemption. That lets privilege separation land first, without
+also building the interrupt-from-user path.
+
+### Phase A: the ring transition, still cooperative
+
+User code runs at CPL 3 with interrupts still off, so there is no preemption yet
+and no interrupt-from-user path to build. The pieces:
+
+- GDT reorder (`x86_64.c`). `SYSRET` forces the return selectors by a fixed
+  rule: `SS = STAR[63:48] + 8` and `CS = STAR[63:48] + 16`, both with RPL 3.
+  The TSS descriptors currently sit where the user segments must go, so the
+  layout becomes kernel code at `0x08`, kernel data at `0x10`, a reserved
+  `SYSRET` base at `0x18`, user data (DPL 3) at `0x20`, user code64 (DPL 3) at
+  `0x28`, and the per-cpu TSS descriptors from `0x30` up, with `TSS_SEL` moved
+  accordingly.
+- MSR arming (`x86_64_linuxabi.h`). Add the `SYSRET` half to `STAR` so the
+  user base is `0x18`. Keep `SFMASK` as it is.
+- Entry and exit (`x86_64_linuxsys.S`). Add `swapgs` on entry and before
+  return so the kernel reaches its per-cpu through GS even after a process sets
+  its own GS base through `arch_prctl`. Set the kernel GS base MSR at init. The
+  manual switch to `TF_KSTACK` stays, since `SYSCALL` does not switch the stack
+  pointer. Reload the user FS base, the process TLS, before returning. For the
+  return itself, the simplest correct first cut is a uniform `IRETQ`: build the
+  five-word frame in the syscall-return, resume, and fresh-exec paths alike,
+  then optimize the hot syscall-return path to `SYSRET` once it is proven.
+  `linux_jump` for a fresh exec must become an `IRETQ` to CPL 3, not a bare
+  jump.
+- `copy_to_user` and `copy_from_user` (`linuxelf.c`). This is the widest part.
+  Every handler that dereferences a user pointer, the dozens of sites that read
+  or write through `a1` to `a5`, routes through these helpers. Each helper
+  range-checks the whole span against `[VM_USER_LO, VM_USER_HI)` and returns
+  `-EFAULT` otherwise. That check is the security core: it stops a process
+  handing the kernel a kernel address as an output buffer. It is worth landing
+  as its own commit before the ring flip, so the pointer audit reviews
+  separately from the descriptor change.
+- Fault split (`pf_handle` and the exception path). A fault now carries a
+  privilege level. A user-mode fault in the window that is not present is
+  demand-paged as today. Anything else from user mode, the guard band, a kernel
+  address, a protection violation, kills that one process rather than halting
+  the guest, which is the containment win. A kernel-mode fault is legitimate
+  only at a copy site, where it jumps to a fixup returning `-EFAULT` through a
+  small exception table, and anywhere else it stays a fatal kernel bug. An
+  acceptable interim is to pre-validate each page by a table walk inside the
+  copy helpers and skip the exception table, slightly slower but simpler until
+  signals exist.
+
+At the end of Phase A processes are isolated, a crash is contained to one
+process, and syscalls stay cooperative. This is the security deliverable.
+
+### Phase B: preemptible user tasks
+
+Make a runaway user loop preemptible so one process cannot hold the vcpu.
+
+- Run user code with interrupts on, keep syscalls with interrupts off. The
+  giant lock already serializes the syscall layer, so interrupts fire only
+  during CPL 3 execution. That keeps the kernel non-reentrant.
+- An interrupt from CPL 3 switches to the stack named by `TSS.RSP0`, which the
+  scheduler sets to the current thread's kernel stack on each context switch.
+- The generic interrupt path (`x86_64_isr.S`) becomes privilege-aware:
+  `swapgs` when the saved selector has RPL 3, on entry and before the return.
+  From ring 0 it skips the swap and the stack switch, so the native kernel
+  tasks keep working.
+- Move `lproc_cur` from one global into the per-cpu structure, which unblocks
+  both preemption and, with the giant lock, multiple vcpus on the Linux path.
+
+### Phase C: hardening
+
+- Enable `CR4.SMEP` so the kernel can never execute a user page.
+- Enable `CR4.SMAP` and bracket the copy helpers with `stac` and `clac`, so an
+  accidental kernel dereference of a user address faults and every user access
+  is forced through the audited helpers. Do this only after the copy sweep is
+  complete, or it faults everywhere.
+
+### The arm64 side
+
+The arm64 Linux path is compile-only today, but the port is cleaner there.
+EL0 and EL1 are the native split, so running user code at EL0 needs no GDT or
+`SYSRET` arithmetic, only building the EL0 context and `eret`, with `TTBR0`
+already per-process. Land x86-64 fully, then mirror.
+
+### Order and risk
+
+The wide, mechanical copy-helper sweep and the fault split precede the ring
+flip. `SMAP` follows the whole sweep. Flipping that order leaves either a
+security gap or a storm of kernel faults. The honest hard part is the sweep
+itself: one missed user dereference is a silent hole, so it wants a mechanical
+audit as its own reviewed commit, not the ring mechanics, which are small and
+well understood. Because there is still no signal delivery, a fault kills the
+faulting process rather than delivering `SIGSEGV`. That is a strict improvement
+over halting the guest, and real signal delivery is a separate track. New
+negative tests mirror `linuxstackov`: a process that writes a kernel address
+expects to be killed with the guest surviving, a syscall handed a kernel
+pointer as an output buffer expects `-EFAULT`, and a wild user read expects a
+killed process rather than a guest panic.
