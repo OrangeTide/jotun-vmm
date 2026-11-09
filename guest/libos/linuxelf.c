@@ -87,6 +87,8 @@
 #define O_APPEND    0x0400
 #define O_DIRECTORY 0x10000
 #define O_LARGEFILE 0x8000      /* the kernel sets this on every 64-bit open */
+#define O_CLOEXEC   0x80000     /* close this fd on execve */
+#define FD_CLOEXEC  1           /* the fcntl F_GETFD/F_SETFD close-on-exec bit */
 
 /* lseek whence. */
 #define SEEK_SET 0
@@ -230,6 +232,9 @@ struct lfd {
     int      pidx;              /* pipe pool index when ispipe */
     int      ridx;              /* ramfs index when isram */
     int      wr;                /* pipe write end when set, else read end */
+    int      cloexec;           /* close this fd on execve (O_CLOEXEC/FD_CLOEXEC);
+                                 * subprocess marks its exec-error pipe this way
+                                 * and waits for it to close as the exec signal */
     int      oflags;            /* open access mode (O_RDONLY/WRONLY/RDWR) plus
                                  * O_APPEND, reported by fcntl(F_GETFL): glibc
                                  * fdopen checks it to accept the stream mode */
@@ -917,6 +922,8 @@ clone_fd(int dst, struct lfd *src)
 {
     fds[dst] = *src;
     fds[dst].used = 1;
+    fds[dst].cloexec = 0;               /* dup clears close-on-exec; the F_DUPFD_
+                                         * CLOEXEC and dup3 callers set it back */
     if (src->of)
         src->of->nref++;                /* share the offset with the new fd */
     if (src->ispipe) {
@@ -1179,7 +1186,7 @@ ramfs_grow(struct ramfile *rf, uint32_t need)
 
 /* Create a pipe: a reader fd in pfd[0] and a writer fd in pfd[1]. */
 static long
-do_pipe2(int *pfd)
+do_pipe2(int *pfd, int flags)
 {
     if (!user_ok((uint64_t)(uintptr_t)pfd, 2 * sizeof *pfd))
         return -LERR_FAULT;
@@ -1216,6 +1223,8 @@ do_pipe2(int *pfd)
     fds[wfd].wr = 1;
     fds[rfd].oflags = O_RDONLY;
     fds[wfd].oflags = O_WRONLY;
+
+    fds[rfd].cloexec = fds[wfd].cloexec = (flags & O_CLOEXEC) ? 1 : 0;
 
     pfd[0] = rfd;
     pfd[1] = wfd;
@@ -2805,7 +2814,10 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         const char *up = user_path((uint64_t)a1, pb, &e);
         if (!up)
             return e;
-        return do_open(up, a2);
+        long fd = do_open(up, a2);
+        if (fd >= 0 && (a2 & O_CLOEXEC))
+            fds[fd].cloexec = 1;
+        return fd;
     }
     case SYS_openat: {
         /* A relative path is taken against dirfd's directory (AT_FDCWD means the
@@ -2818,10 +2830,31 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         const char *p = at_path(a1, up, ab, sizeof ab, &e);
         if (e)
             return e;
-        return do_open(p, a3);
+        long fd = do_open(p, a3);
+        if (fd >= 0 && (a3 & O_CLOEXEC))
+            fds[fd].cloexec = 1;
+        return fd;
     }
     case SYS_close:
         return do_close(a1);
+    case SYS_close_range: {
+        /* close_range(first, last, flags): close every open descriptor in
+         * [first, last]. glibc's posix_spawn and CPython's subprocess use it in
+         * the child to drop inherited descriptors before exec; without it the
+         * child keeps a pipe's far end open, so the parent's close never yields
+         * EOF and a reader like "gcc -E -" blocks on stdin forever. CLOSE_RANGE_
+         * CLOEXEC (flags bit 0) would only mark them close-on-exec, but a plain
+         * close is correct here and the child execs immediately. */
+        uint64_t first = (uint64_t)a1, last = (uint64_t)a2;
+        if (first > last)
+            return -LERR_INVAL;
+        if (last >= LINUX_NFD)
+            last = LINUX_NFD - 1;
+        for (uint64_t fd = first; fd <= last; fd++)
+            if (fds[fd].used)
+                do_close((long)fd);
+        return 0;
+    }
     case SYS_lseek:
         return do_lseek(a1, a2, a3);
     case SYS_stat:
@@ -2861,9 +2894,9 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_getdents64:
         return do_getdents64(a1, (void *)a2, (unsigned long)a3);
     case SYS_pipe:
-        return do_pipe2((int *)a1);
+        return do_pipe2((int *)a1, 0);
     case SYS_pipe2:
-        return do_pipe2((int *)a1);     /* flags (O_CLOEXEC/O_NONBLOCK) ignored */
+        return do_pipe2((int *)a1, (int)a2);    /* O_CLOEXEC honored; O_NONBLOCK ignored */
     case SYS_setxattr:
     case SYS_lsetxattr:
     case SYS_fsetxattr:
@@ -2954,6 +2987,8 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
                                          * it without a close leaks that writer so
                                          * the reader never sees EOF */
         clone_fd((int)a2, f);
+        if (nr == SYS_dup3 && (a3 & O_CLOEXEC))
+            fds[a2].cloexec = 1;        /* dup3 can set close-on-exec; dup2 clears it */
         return a2;
     }
     case SYS_getuid:
@@ -3188,10 +3223,18 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
             for (int i = lo; i < LINUX_NFD; i++) {
                 if (!fds[i].used) {
                     clone_fd(i, src);
+                    if (a2 == 1030)     /* F_DUPFD_CLOEXEC sets close-on-exec */
+                        fds[i].cloexec = 1;
                     return i;
                 }
             }
             return -LERR_NOMEM;         /* EMFILE: no free descriptor */
+        }
+        if (a2 == 1)                    /* F_GETFD: the close-on-exec flag */
+            return src->cloexec ? FD_CLOEXEC : 0;
+        if (a2 == 2) {                  /* F_SETFD: set or clear close-on-exec */
+            src->cloexec = (a3 & FD_CLOEXEC) ? 1 : 0;
+            return 0;
         }
         if (a2 == 3)                    /* F_GETFL: the access mode and flags.
                                          * glibc fdopen reads this to check the
@@ -3569,6 +3612,15 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
 
     lproc_cur->sh->vmspace = as;        /* the resume hook now restores this one */
     lproc_cur->sh->vm_borrowed = 0;
+
+    /* The exec has committed, so now drop every close-on-exec descriptor. This
+     * is what delivers EOF on a subprocess exec-error pipe (the child marks it
+     * O_CLOEXEC and the parent waits for it to close as the signal that exec
+     * succeeded); without it the parent blocks forever and Popen hangs. */
+    for (int i = 0; i < LINUX_NFD; i++)
+        if (fds[i].used && fds[i].cloexec)
+            do_close(i);
+
     arena_init(image_top(&exe, &interp));   /* fresh heap above the new image */
     uint64_t rsp = build_stack_vec(na, argc, ne, envc, &exe, &interp);
     kfree(sbuf);

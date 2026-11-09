@@ -103,6 +103,7 @@
 #define SYS_statx           291
 #define SYS_rseq            293
 #define SYS_clone3          435
+#define SYS_close_range     436
 #define SYS_faccessat2      439
 
 /* Not present on AArch64: distinct sentinels so the shared cases never match a

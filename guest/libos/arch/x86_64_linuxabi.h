@@ -122,6 +122,7 @@
 #define SYS_statx           332
 #define SYS_rseq            334
 #define SYS_clone3          435
+#define SYS_close_range     436
 #define SYS_faccessat2      439
 
 /* arch_prctl subfunction: set the FS base (TLS). */
