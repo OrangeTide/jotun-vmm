@@ -440,6 +440,12 @@ run_vcpu(void *arg)
                    && e.mmio.write && e.mmio.address == JOTUN_DRAW_DOORBELL) {
             draw_service(gp);
             continue;
+        } else if (e.reason == VMM_EXIT_REASON_MMIO
+                   && e.mmio.write && e.mmio.address == JOTUN_EVENT_EOI) {
+            /* The arm64 guest acknowledges a preemption IRQ here so the backend
+             * lowers the line it holds asserted. */
+            vmm_vcpu_interrupt_clear(vcpu);
+            continue;
         } else if (e.reason == VMM_EXIT_REASON_MMIO) {
             int stop = 0;
             pthread_mutex_lock(&dev_lock);

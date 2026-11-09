@@ -51,7 +51,7 @@ arm64_vectors:
     .balign 0x80
     b   el1t_sync               /* 0x000 synchronous: SVC or fault */
     .balign 0x80
-    b   hang                    /* 0x080 IRQ (masked) */
+    b   el1t_irq                /* 0x080 IRQ: a preemption tick in user code */
     .balign 0x80
     b   hang                    /* 0x100 FIQ (masked) */
     .balign 0x80
@@ -190,6 +190,56 @@ restore_tf:
     ldr     x30,      [x19, #240]
     ldr     x19,      [x19, #152]   /* finally the user x19 */
     eret
+
+/****************************************************************
+ * App IRQ (vector 0x080, taken from EL1t): a preemption tick delivered while a
+ * Linux user thread runs. Save the full user register set into the running
+ * process's trapframe exactly as svc_entry does, run the C event handler on
+ * SP_EL1 (it acknowledges the host IRQ line and may reschedule to another task),
+ * then restore the frame and eret. Taking the IRQ masked DAIF, so the handler
+ * runs without nesting; the kernel itself always runs with IRQs masked, so this
+ * vector only ever fires from user mode.
+ ****************************************************************/
+el1t_irq:
+    stp     x0, x1, [sp, #-16]!
+    adrp    x0, lproc_cur
+    ldr     x0, [x0, #:lo12:lproc_cur]
+
+    stp     x2,  x3,  [x0, #16]
+    stp     x4,  x5,  [x0, #32]
+    stp     x6,  x7,  [x0, #48]
+    stp     x8,  x9,  [x0, #64]
+    stp     x10, x11, [x0, #80]
+    stp     x12, x13, [x0, #96]
+    stp     x14, x15, [x0, #112]
+    stp     x16, x17, [x0, #128]
+    stp     x18, x19, [x0, #144]
+    stp     x20, x21, [x0, #160]
+    stp     x22, x23, [x0, #176]
+    stp     x24, x25, [x0, #192]
+    stp     x26, x27, [x0, #208]
+    stp     x28, x29, [x0, #224]
+    str     x30,      [x0, #240]
+
+    ldp     x2, x3, [sp], #16       /* the parked x0, x1 */
+    stp     x2, x3, [x0, #0]
+
+    mrs     x2, sp_el0
+    str     x2, [x0, #TF_SP]
+    mrs     x2, elr_el1
+    str     x2, [x0, #TF_PC]
+    mrs     x2, spsr_el1
+    str     x2, [x0, #TF_PSTATE]
+    mrs     x2, tpidr_el0
+    str     x2, [x0, #TF_TPIDR]
+
+    bl      arm64_irq_entry         /* ack the host line; may switch tasks */
+
+    /* A reschedule may have run other tasks and returned here, so reload
+     * lproc_cur before restoring this process's frame. */
+    adrp    x19, lproc_cur
+    ldr     x19, [x19, #:lo12:lproc_cur]
+    b       restore_tf
 
 /****************************************************************
  * Abort: demand-map the faulting page, then retry. The faulting PC is left in
@@ -340,13 +390,15 @@ hang:
  ****************************************************************/
     .global linux_jump
 linux_jump:
-    /* x0 = entry, x1 = user sp. Enter EL1t (SPSel=0 -> SP_EL0) with all
-     * interrupts masked, so the cooperative scheduler never preempts the app.
-     * SP_EL1 is set to the handler stack for the first exception. */
+    /* x0 = entry, x1 = user sp. Enter EL1t (SPSel=0 -> SP_EL0) with IRQ
+     * unmasked so the preemption timer can interrupt a user compute loop; FIQ,
+     * SError and Debug stay masked. The kernel runs with all interrupts masked,
+     * so only user code is preemptible. SP_EL1 is the handler stack for the
+     * first exception. */
     msr     daifset, #0xf
     msr     sp_el0, x1
     msr     elr_el1, x0
-    mov     x2, #0x3c4              /* SPSR: EL1t (M=0b0100), DAIF masked */
+    mov     x2, #0x344             /* SPSR: EL1t (M=0b0100), DAIF=0b1011 (I clear) */
     msr     spsr_el1, x2
 
     adrp    x2, lproc_cur

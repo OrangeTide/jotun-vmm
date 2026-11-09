@@ -49,6 +49,14 @@
  * through the guest's exception vector instead. */
 #define JOTUN_EVENT_VECTOR  0x20u
 
+/* arm64 preemption acknowledge (MMIO, faults out to the host). An x86 guest
+ * acknowledges the event interrupt in its local APIC, but arm64 has no in-guest
+ * interrupt controller, so the host asserts the IRQ line directly and keeps it
+ * asserted until the guest's IRQ handler stores here. The store makes the host
+ * lower the line, so it is not re-taken the instant the guest returns to user
+ * with IRQs unmasked. Unused on x86. */
+#define JOTUN_EVENT_EOI     0x3a000030ull
+
 struct jotun_msg {
     uint16_t len;                   /* payload length, <= JOTUN_MSG_MAX */
     uint8_t  data[JOTUN_MSG_MAX];

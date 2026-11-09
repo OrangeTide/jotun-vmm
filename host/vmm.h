@@ -67,6 +67,11 @@ void vmm_vcpu_run(vmm_vcpu_t *vcpu, vmm_exit_info_t *exit_info);
  * can accept it. Pair with a signal to the vcpu thread to break a running
  * guest out of its run. */
 void vmm_vcpu_interrupt(vmm_vcpu_t *vcpu, uint8_t vector);
+/* Acknowledge the event interrupt so the backend lowers the IRQ line it holds
+ * asserted for the vcpu. Used by the arm64 guest, which has no in-guest
+ * interrupt controller to do its own end-of-interrupt; a no-op on backends
+ * (x86) whose guest acknowledges in its local APIC. */
+void vmm_vcpu_interrupt_clear(vmm_vcpu_t *vcpu);
 void vmm_vcpu_destroy(vmm_vcpu_t *vcpu);
 void vmm_vm_destroy(vmm_vm_t *vm);
 

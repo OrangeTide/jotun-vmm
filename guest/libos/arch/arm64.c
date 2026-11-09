@@ -5,6 +5,7 @@
  * sees as an MMIO exit that stops the run. */
 #include "arch.h"
 #include "print.h"
+#include "jotun_abi.h"
 
 #include <stdint.h>
 
@@ -106,8 +107,25 @@ arch_traps_init(unsigned long id)
     __asm__ volatile ("msr vbar_el1, %0; isb" : : "r"(arm64_vectors));
 }
 
-/* No asynchronous interrupt controller is wired up yet (see above), so these are
- * stubs that keep the arch interface uniform with x86. */
+/* The scheduler's event entry (task.c), reached from the IRQ vector. */
+extern void irq_event(unsigned cpl);
+
+/* IRQ handler body (called from el1t_irq in arm64_linuxsys.S). The host asserts
+ * the IRQ line and holds it until acknowledged, so first store to the event-EOI
+ * register to make the host lower it; otherwise the interrupt would be re-taken
+ * the instant we return to user with IRQs unmasked. The vector is only reached
+ * from EL1t, so the interrupted level is always user (cpl 3): run the device
+ * hooks and preempt the running thread. */
+void
+arm64_irq_entry(void)
+{
+    *(volatile uint32_t *)JOTUN_EVENT_EOI = 1;
+    irq_event(3);
+}
+
+/* arm64 has no in-guest interrupt controller: the host asserts the IRQ line
+ * directly (see host/vmm_hvf.c) rather than through an emulated APIC, so there
+ * is nothing to enable here. Kept to match the x86 arch interface. */
 void
 arch_apic_init(void)
 {

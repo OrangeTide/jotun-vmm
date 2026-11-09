@@ -116,14 +116,27 @@ vmm_vcpu_set_reg(vmm_vcpu_t *vcpu, vmm_reg_t reg, uint64_t value)
 
 /* Queue an asynchronous IRQ for the vcpu. On AArch64 there is no vector
  * number: the interrupt enters through the guest's exception vector (VBAR_EL1)
- * when IRQs are unmasked, so the vector argument is ignored. The flag is
- * applied before the next run. This path is implemented by analogy with the
- * KVM backend and is not yet validated on Apple Silicon. */
+ * when IRQs are unmasked, so the vector argument is ignored. The line is
+ * asserted on the next run and held until the guest acknowledges it (see
+ * vmm_vcpu_interrupt_clear). Force the vcpu out of any in-progress run so a
+ * running user compute loop is preempted at once; the kick is harmless if the
+ * vcpu is not currently in hv_vcpu_run. Safe to call from another thread. */
 void
 vmm_vcpu_interrupt(vmm_vcpu_t *vcpu, uint8_t vector)
 {
     (void)vector;
     __atomic_store_n(&vcpu->irq_pending, 1, __ATOMIC_SEQ_CST);
+    hv_vcpus_exit(&vcpu->vcpu, 1);
+}
+
+/* Lower the IRQ line the host holds asserted for this vcpu. The guest's IRQ
+ * handler triggers this through an MMIO store once it has taken the interrupt,
+ * so it is not re-taken the moment the guest returns to user with IRQs
+ * unmasked. */
+void
+vmm_vcpu_interrupt_clear(vmm_vcpu_t *vcpu)
+{
+    __atomic_store_n(&vcpu->irq_pending, 0, __ATOMIC_SEQ_CST);
 }
 
 /* Finish the MMIO access the previous run faulted on: deliver a load result
@@ -157,11 +170,12 @@ vmm_vcpu_run(vmm_vcpu_t *vcpu, vmm_exit_info_t *exit_info)
     if (vcpu->mmio_pending)
         complete_mmio(vcpu);
 
-    /* Assert or clear the IRQ line for this run (by analogy with KVM; not yet
-     * validated on hardware). Delivered when the guest unmasks IRQs. */
+    /* Assert the IRQ line for this run while one is pending. HVF samples it for
+     * the whole run, like a physical IRQ pin, so it is held asserted (not
+     * one-shot): the guest lowers it by acknowledging through vmm_vcpu_interrupt_clear.
+     * The guest takes it only when IRQs are unmasked, i.e. in user mode. */
     hv_vcpu_set_pending_interrupt(vcpu->vcpu, HV_INTERRUPT_TYPE_IRQ,
         __atomic_load_n(&vcpu->irq_pending, __ATOMIC_SEQ_CST) != 0);
-    __atomic_store_n(&vcpu->irq_pending, 0, __ATOMIC_SEQ_CST);
 
     if (hv_vcpu_run(vcpu->vcpu) != HV_SUCCESS) {
         exit_info->reason = VMM_EXIT_REASON_ERROR;
@@ -186,9 +200,16 @@ vmm_vcpu_run(vmm_vcpu_t *vcpu, vmm_exit_info_t *exit_info)
 
     /* ARM64 has no port I/O, so VMM_EXIT_REASON_IO never arises here. Guest
      * exits surface as exceptions; we decode the ones the abstraction models
-     * and report everything else as an error. */
+     * and report everything else as an error. A run cancelled by hv_vcpus_exit
+     * (used to inject a preemption IRQ) or woken by the virtual timer carries no
+     * exception to service, so report an interrupt and let the caller re-enter
+     * the run with the IRQ line applied. */
     if (vcpu->exit->reason != HV_EXIT_REASON_EXCEPTION) {
-        exit_info->reason = VMM_EXIT_REASON_ERROR;
+        if (vcpu->exit->reason == HV_EXIT_REASON_CANCELED ||
+            vcpu->exit->reason == HV_EXIT_REASON_VTIMER_ACTIVATED)
+            exit_info->reason = VMM_EXIT_REASON_INTR;
+        else
+            exit_info->reason = VMM_EXIT_REASON_ERROR;
         return;
     }
 

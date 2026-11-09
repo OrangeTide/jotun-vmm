@@ -314,6 +314,13 @@ void vmm_vcpu_interrupt(vmm_vcpu_t* vcpu, uint8_t vector) {
 #endif
 }
 
+/* The x86 guest acknowledges the event interrupt in its own local APIC, and the
+ * in-kernel irqchip handles end-of-interrupt, so the host holds no line to lower
+ * here. Present to satisfy the backend interface. */
+void vmm_vcpu_interrupt_clear(vmm_vcpu_t* vcpu) {
+    (void)vcpu;
+}
+
 void vmm_vcpu_run(vmm_vcpu_t* vcpu, vmm_exit_info_t* exit_info) {
     struct kvm_run *run = vcpu->run;
 
