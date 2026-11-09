@@ -295,3 +295,128 @@ A few handled calls are stubs that a future phase should make real:
   for startup and seeding, not for real timekeeping or cryptography.
 - **the uid/gid family** returns 0 (a single root-ish identity), which suits the
   single trust domain.
+
+## Fidelity gaps, by effort
+
+The phase tables above sort unimplemented calls by priority. This section is a
+different cut: an accounting of the Linux behaviors the guest currently fakes,
+ignores, or omits because no workload has forced the issue, sorted by the effort
+to make each faithful. It covers behavior glossed over inside calls we already
+handle, not just missing call numbers.
+
+Two notes on scope. A few of these (permission and ownership enforcement,
+multi-user access control) are arguably non-goals given the single trust domain:
+faithful reporting is cheap, faithful enforcement is high effort and may never be
+wanted. And the infrastructure-scaling items (guest RAM into the GiB range,
+overlay caps, `LINUX_NPROC`/`TASK_MAX`) are left out here. Those are tracked in
+TODO.md under "Scaling to a full build" and are about size, not Linux semantics.
+
+### Low effort
+
+A few lines each, over the VFS, arena, or time source already present. Mostly
+missing cheap calls or thin fakes.
+
+Missing calls that are near-trivial over existing machinery:
+
+- `readv` (19): a mirror of the existing `writev`.
+- `pwrite64` (18), `ftruncate` (77), `truncate` (76): positioned write and resize
+  over ramfs. `ftruncate` is wanted by anything that preallocates.
+- `fsync` (74), `fdatasync` (75), `sync` (162): no persistence, so a `return 0`
+  no-op is correct.
+- `creat` (85): just `open(O_CREAT|O_WRONLY|O_TRUNC)`.
+- `getdents` (78, legacy): a repack of `getdents64`.
+- `getrlimit` (97), `setrlimit` (160): alias the `prlimit64` stub.
+- `clock_getres` (229), `times` (100): fixed resolution, cycle-counter tick totals.
+- `sendfile` (40): a read/write loop, or a clean `ENOSYS` (the fallback works).
+
+Thin fakes worth making real:
+
+- **File mode bits.** `chmod`, `fchmod`, and `fchmodat` are no-ops; `umask`
+  reports a hardcoded `022` without storing it; overlay and ramfs files carry no
+  mode at all. We do not enforce permissions (single trust domain, so enforcement
+  is arguably a non-goal), but reporting a real mode and honoring `umask` on
+  create is cheap. Only the writable-mount create path honors the open mode today.
+- **uid/gid identity.** `getuid`, `geteuid`, and the rest return 0; `set*id`
+  return 0. Fine for one domain. Making it configurable is low value but low effort.
+- **`/dev` leftovers.** `/dev/fd/N`, the `std*` nodes as real-fd symlinks (they
+  route to the console, not to the process's actual fd 0, 1, or 2), and a real
+  `st_rdev`.
+- **`sysinfo` and `getrusage`** are zeroed or plausible; filling a few real-ish
+  fields is cheap.
+- **xattr family, `copy_file_range`, `splice`.** Return `ENOTSUP` or `ENOSYS`;
+  callers fall back. Leave as-is unless a workload appears.
+
+### Medium effort
+
+New state or a new mechanism, but inside the cooperative single-vcpu model.
+
+- **Real timekeeping and sleeping.** `time`, `clock_gettime`, and `gettimeofday`
+  are cycle-counter approximations at an assumed 1 GHz; `nanosleep` and
+  `clock_nanosleep` do not actually sleep (they return 0 immediately). A build
+  that times itself, or a `sleep` and retry-with-backoff, is wrong. Needs a
+  calibrated timebase and a timed-yield.
+- **`select`, `pselect6`, `ppoll`.** `poll` exists; these are the same readiness
+  model expressed as fd sets, or with a timeout mask.
+- **tty, termios, `ioctl`.** `ioctl` always returns `ENOTTY`, so `TIOCGWINSZ`
+  (window size), `tcgetattr` and `tcsetattr` (raw mode), and `isatty` all fail.
+  Interactive tools (readline, editors, anything checking a terminal) silently
+  drop to dumb or non-interactive mode. This is why Node's configure block-buffered
+  its output. Presenting the console as a minimal tty is medium.
+- **Advisory file locking.** `flock` and `fcntl(F_SETLK/F_GETLK)` are absent
+  entirely. A tool coordinating with lockfiles (sqlite, dpkg-style builds, some
+  `make` jobserver edges) gets no locking.
+- **`fcntl` flags.** Beyond `F_DUPFD` and cloexec, `F_GETFL`/`F_SETFL` do not
+  report or toggle `O_NONBLOCK` or `O_APPEND`; a program that flips nonblock on an
+  fd is ignored.
+- **`O_NONBLOCK` end to end.** Pipes and the console always block; honoring
+  nonblock (returning `EAGAIN`) is medium.
+- **`futex` completeness.** Only private `WAIT` and `WAKE`; no requeue
+  (`CMP_REQUEUE`, which some glibc condvars use), no timeout, no PI, no
+  cross-process (shared) futex.
+- **`munmap` and arena reclaim.** `munmap` is a no-op and the bump arena never
+  reclaims, so a long-lived process that maps and unmaps leaks address space.
+  `mremap` is a stub. (Enforcing `prot` is separate; that is high effort.)
+- **Hard links.** `link` and `linkat` return `EPERM`. Real overlay hardlinks (one
+  inode, several names, refcounted) would unblock builds that hardlink instead of
+  copy.
+- **`waitid` (247), `utimensat` (280), `statfs`/`fstatfs` real values,
+  `eventfd`/`eventfd2`.** `utimensat` would set a real mtime (today mtime is
+  seconds-only and atime and ctime just mirror it). `statfs` and `fstatfs` are
+  quiet `ENOSYS` now; `df` and some probes want them.
+- **9P fid aliasing across fork.** Cloning an open 9P fid across `fork` shares the
+  one server-side fid and its offset (pool `GFID_MAX` is 64). Two processes
+  reading the same inherited fd interfere. This is a real correctness gloss, not
+  just a missing feature.
+
+### High effort
+
+Whole subsystems. Each is a project; land only when a target workload needs it.
+
+- **Signals.** The big one. `rt_sigaction`, `rt_sigprocmask`, `sigaltstack`,
+  `kill`, and `tgkill` are all stubs with no delivery. Only `SIGPIPE` (terminate)
+  and the CPU-fault `SIGSEGV` are special-cased. No handlers are invoked, no
+  `sigreturn`, no masking, no `SIGCHLD`, no `SIGINT`/Ctrl-C, no
+  `SIGALRM`/`alarm`/`setitimer`. Anything with a signal handler or an interactive
+  interrupt is affected. Requires a delivery mechanism on the SYSCALL-return path.
+- **Sockets in the Linux ABI.** `socket`, `bind`, `listen`, `accept`, `connect`,
+  the `send*` and `recv*` family all stub `ENOSYS`. The guest has a net layer
+  (net.c, dial strings, vswitch); it is just not bridged to the Linux socket
+  calls. Bridging is the work.
+- **epoll** (`epoll_create1`, `epoll_ctl`, `epoll_wait`). Event loops and servers;
+  Node and the net poller want it. It could ride on the existing `poll` readiness
+  model, which lowers it toward medium, but it is still a real build-out. Today
+  `epoll_create1` is the last unhandled call Node's configure touches, and CPython
+  falls back to `poll`.
+- **Real page permissions.** The vmspace maps every user page RW and user: no
+  `mprotect` enforcement, no W^X or NX, no COW fork (fork is an eager copy).
+  Enforcing `prot` means real per-page permission changes and fault handling.
+- **Job control and sessions.** `setpgid`, `getpgid`, `setsid`, and `getsid` are
+  fixed-value stubs; no controlling terminal, no `tcsetpgrp`, no `SIGTTOU` or
+  `SIGTTIN`. A real interactive shell's job control is faked. This is coupled to
+  signals and the tty work above.
+- **Multi-vcpu / SMP guest.** `lproc_cur` is a single global, the SYSCALL MSRs are
+  armed on cpu0 only, and `sched_getaffinity` reports one cpu. True SMP is a
+  structural change.
+- **The administrative tail.** Namespaces and cgroups (`unshare`, `setns`,
+  `mount`, `pivot_root`), `seccomp`, `ptrace`, io_uring, inotify and fanotify,
+  userfaultfd, keyctl, bpf. Out of scope; `ENOSYS` until a concrete need appears.
