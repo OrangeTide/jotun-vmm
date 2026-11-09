@@ -38,7 +38,7 @@ Statuses used below:
 | 3 | close | full | releases pipe and 9P references, refcounted |
 | 4 | stat | full | path via ramfs or 9P |
 | 5 | fstat | full | pipes as FIFO, console, ramfs, 9P; stable per-file inode (9P qid) so the dynamic linker dedups libraries correctly |
-| 6 | lstat | full | same as stat (no symlinks in the bundle) |
+| 6 | lstat | full | like stat, but reports an overlay symlink as `S_IFLNK` instead of following it |
 | 8 | lseek | full | file and ramfs cursors |
 | 16 | ioctl | stub | returns ENOTTY so libc falls back |
 | 17 | pread64 | full | read at an explicit offset, cursor unchanged; ramfs and 9P |
@@ -56,8 +56,8 @@ Statuses used below:
 | 84 | rmdir | partial | removes an empty overlay directory (ENOTEMPTY otherwise); a read-only bundle directory is EROFS |
 | 86 | link | stub | EPERM (no hard links); callers fall back to copying |
 | 87 | unlink | partial | removes a writable overlay file (open-unlink: the inode is held until the last fd closes); a read-only path returns EROFS |
-| 88 | symlink | stub | EPERM (no symlinks); configure's `ln -s` probe falls back to copying |
-| 89 | readlink | stub | returns EINVAL (no symlinks); gcc probes /proc/self/exe and falls back to its default prefix |
+| 88 | symlink | partial | creates an overlay symlink (target stored verbatim); not yet followed when traversed on open/exec |
+| 89 | readlink | partial | returns an overlay symlink's stored target; EINVAL for a non-link, ENOENT if absent |
 | 90 | chmod | stub | no permission bits to enforce; returns 0 |
 | 91 | fchmod | stub | as chmod |
 | 95 | umask | stub | reports a conventional prior mask (022) |
@@ -70,8 +70,8 @@ Statuses used below:
 | 263 | unlinkat | partial | as unlink; AT_REMOVEDIR routes to rmdir; dirfd honored via at_path |
 | 264 | renameat | partial | as rename; dirfds honored via at_path |
 | 265 | linkat | stub | as link (EPERM); dirfds AT_FDCWD |
-| 266 | symlinkat | stub | as symlink (EPERM) |
-| 267 | readlinkat | stub | returns EINVAL (no symlinks) |
+| 266 | symlinkat | partial | as symlink (overlay link created; leaf not followed on traversal) |
+| 267 | readlinkat | partial | as readlink (returns an overlay symlink's stored target) |
 | 268 | fchmodat | stub | as chmod |
 | 269 | faccessat | full | existence check via meta_path; no permission bits, dirfd ignored |
 | 292 | dup3 | full | like dup2 |
@@ -268,6 +268,7 @@ target workload needs it.
 | 50 | listen | med | hard | net layer |
 | 288 | accept4 | low | hard | accept with flags |
 | 213 | epoll_create | low | hard | event loops; servers |
+| 291 | epoll_create1 | low | hard | the flags form; CPython's selector probes it, then falls back to poll on ENOSYS |
 | 232 | epoll_wait | low | hard | with epoll_ctl |
 | 233 | epoll_ctl | low | hard | |
 | 290 | eventfd2 | low | medium | cross-thread wakeups (284 eventfd is the older form) |

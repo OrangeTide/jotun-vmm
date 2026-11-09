@@ -128,6 +128,75 @@ clock may want a vDSO, though Go and musl both fall back to the syscall. The
 cheapest proof that the whole idea holds is M16.1 alone: a ring-0 `SYSCALL` trap,
 about a dozen startup syscalls, and a static musl hello world exiting cleanly.
 
+## Dynamic Linux + Node build: open gaps and bugs
+
+The milestone drifted well past the static-only scope above: the guest now runs
+unmodified dynamic glibc binaries, and the live goal (2026-11-08) is building a
+complex project, a NodeJS v26.13.0 checkout at `REF/node`. Staged A (run
+python3), B (run `./configure`), C (compile a target). Stage B is done:
+`./configure --with-intl=none --without-npm` runs end to end and generates
+`out/Makefile`. The items below are the gaps and bugs that surfaced getting
+there, plus what Stage C needs next.
+
+Fixed on the way to Stage B (for the record):
+
+- [x] Overlay symlinks. `symlink`/`symlinkat` create an overlay entry (a
+      ramfile flagged `is_link` whose data holds the target, stored verbatim),
+      `readlink`/`readlinkat` return it, `lstat` reports `S_IFLNK`. Hard links
+      stay `EPERM`. Unblocked Node's `make_bin_override` (`os.symlink`).
+      Commit b82c21c.
+- [x] `p9_node.handle` was 65 bytes, sized for the CAS backend's 64-hex hash,
+      but the host-dir backend stores a path relative to the mount root there,
+      so `hd_walk` refused any host-mount file whose relative path reached 64
+      bytes. Deep trees (Node reaches 175) returned `ENOENT` on `stat`/`open`
+      while `readdir` still listed them and sibling directories walked fine.
+      Raised to `P9_HANDLE_MAX` (1024) and widened the matching buffers.
+      Commit b618b91.
+
+Open gaps and bugs, Stage C and general correctness:
+
+- [ ] Leaf-symlink following on `open`/`execve`/`stat`. Creation and `readlink`
+      exist, but a symlink is never resolved when traversed, so `exec` of
+      `out/tools/bin/python` (the link the make phase shells out through) will
+      not reach the real interpreter. Follow the leaf target with a small loop
+      limit in `resolve_path`/`do_open`/`do_execve`/`meta_path`. Needed for the
+      Node make phase; the Stage B configure never execs the link (gyp runs
+      in-process via `gyp.main`), which is why it was deferred.
+- [ ] No `/dev`. The guest has no device files at all. `/dev/null`,
+      `/dev/zero`, `/dev/urandom` (back it with `getrandom`), `/dev/full`
+      (`ENOSPC` on write), and `/dev/tty` are the useful set. A shell redirect
+      `>/dev/null` today silently creates a regular file in the overlay named
+      `/dev/null`, which is wrong and surprising. Real build probes break on
+      this: `gcc -Wa,-v -c -o /dev/null -x assembler /dev/null` and similar
+      toolchain feature checks. Add a synthetic `/dev` the VFS serves specially
+      (read/write semantics per device), not as overlay regular files.
+- [ ] Overlay large-file cap. `RAMFS_FILE_MAX` is 4 MiB, so any generated file
+      bigger than that fails. It forced `--with-intl=none` (ICU's data file is
+      ~30 MiB) and will block real build outputs (object files, archives, the
+      linked binary). Raise the per-file cap and review the overall overlay
+      size budget; a build writes a lot.
+- [ ] `epoll_create1` (291) returns `ENOSYS`. Tolerated for now because
+      CPython falls back to a `PollSelector`, but it is the last unhandled
+      syscall Node's configure touches and is wanted for Stage C and for the
+      M16.6 network poller. Implement `epoll_create1`/`epoll_ctl`/`epoll_wait`
+      over the cooperative readiness model already used by `poll`.
+- [ ] `/usr/bin/which` fails in the guest with "cannot execute: required file
+      not found". Likely a `#!`-interpreter or missing-interp issue on that
+      specific file. Minor (nothing depends on it yet), but it points at an
+      `execve` or shebang-resolution corner worth pinning down.
+- [ ] Live-process / task ceiling under `make -j`. `LINUX_NPROC` is 48 and
+      `TASK_MAX` is 64; a parallel make can exceed them. Both are cheap
+      kmalloc'd tables (see the capacity work, commit cd04ef5); watch for
+      `fork: Cannot allocate memory` under Stage C and raise them together.
+- [ ] `mount bin host:/bin` is a manual run-config requirement: Node's gyp
+      shells out to `/bin/sh` (python `subprocess` with `shell=True`), and the
+      guest has no `/bin` unless the manifest mounts it. Decide whether to
+      provide a default `/bin` (or a `/bin/sh` the loader always resolves) so
+      every shell-using program does not need the operator to add the mount.
+- [ ] Full V8 build is almost certainly infeasible on a 256 MiB guest. Stage C
+      should target a single translation unit or a small subtarget, not the
+      whole binary, until the memory budget is understood.
+
 ## Investigations (unscheduled, feasibility unknown)
 
 Research items captured so they are not lost. Each needs a feasibility pass
