@@ -369,6 +369,22 @@ cpuid(uint32_t leaf, uint32_t subleaf,
  * paths, and tells the interrupt save path to use XSAVE so the wider vector
  * state survives a preemptive switch (the fallback is SSE-only FXSAVE). AVX-512
  * is intentionally left out of XCR0 to keep the save area small and bounded. */
+/* x86 long mode always runs with paging on (the host sets up the initial page
+ * tables), so the MMU needs no early bring-up here. */
+void
+arch_mmu_init(void)
+{
+}
+
+/* x86 instruction and data caches are coherent, so freshly written code needs no
+ * cache maintenance to become executable (see arch.h). */
+void
+arch_sync_icache(void *addr, size_t len)
+{
+    (void)addr;
+    (void)len;
+}
+
 void
 arch_fpu_init(void)
 {

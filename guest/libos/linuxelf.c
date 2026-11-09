@@ -58,7 +58,7 @@
 #define LINUX_USTACK_TOP   VM_USER_HI       /* top of the user window */
 #define LINUX_STACK_GUARD  (1u * 1024 * 1024)   /* unmapped gap below the stack */
 #define LINUX_STACK_BOTTOM (LINUX_USTACK_TOP - LINUX_USTACK_SIZE)
-#define PAGE_SIZE          0x1000ULL
+#define PAGE_SIZE          VM_PAGE      /* the arch translation granule (vmspace.h) */
 
 /* mmap flags and failure value. */
 #define MAP_PRIVATE   0x02
@@ -4556,7 +4556,7 @@ build_stack_vec(const char *const *argv, int argc,
     blk[w++] = AT_BASE;   blk[w++] = exe->has_interp ? interp->bias : 0;
     blk[w++] = AT_ENTRY;  blk[w++] = exe->entry;
     blk[w++] = AT_EXECFN; blk[w++] = (uintptr_t)argp[0];
-    blk[w++] = AT_PAGESZ; blk[w++] = 4096;
+    blk[w++] = AT_PAGESZ; blk[w++] = VM_PAGE;
     blk[w++] = AT_RANDOM; blk[w++] = (uintptr_t)rnd;
     blk[w++] = AT_SECURE; blk[w++] = 0;
     blk[w++] = AT_UID;    blk[w++] = 0;

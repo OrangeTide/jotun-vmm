@@ -6,28 +6,35 @@
  * just reload TTBR0 and flush. The layout matches the x86 backend:
  *
  *   [0, 0x400000)            kernel image: identity, shared
- *   [0x400000, VM_USER_HI)   the user window: private 4 KiB pages per process
+ *   [0x400000, VM_USER_HI)   the user window: private 16 KiB pages per process
  *   [VM_KHEAP_LO, VM_KHEAP_HI)  the kernel heap bootstrap band: identity, shared
  *   [VM_KHEAP_HI, RAM top)   vcpu stacks: identity, shared
  *   [RAM top, 0x40000000)    the device band (MMU as device): identity, shared
  *   [1 GiB, 1 GiB + RAM)     physmap: all RAM, reached by physical address
  *   [VM_KHEAP_VA, ...)       the kernel heap growth window: shared, demand-grown
  *
- * 39-bit VA, 4 KiB granule: L1 (1 GiB/entry), L2 (2 MiB), L3 (4 KiB). The low
- * gigabyte is one L2 table of 2 MiB blocks with the user window punched out for
- * L3 page tables; the physmap is a second L2 of 2 MiB blocks. The kernel heap
- * starts in the bootstrap band above the user window (see x86_64_vmspace.h for
- * why) and then grows on demand into the window at VM_KHEAP_VA, a third L1 entry
- * mapping one shared L2 that vmspace_new installs in every process. Unlike x86,
- * the guest boots with the MMU off, so there are no boot tables to install the
- * window into: it becomes reachable at the first switch, and the grower stays
- * idle until then. AArch64 only; the Linux-compat path needs the MMU. */
+ * 36-bit VA, 16 KiB granule (Apple Silicon's native page): the walk starts at
+ * level 2 (32 MiB/entry) and ends at level 3 (16 KiB pages). The 16 KiB granule
+ * is deliberate: on this host the page-table walker's coherency works in 16 KiB
+ * units, so a 4 KiB table (four to an Apple page) aliases its neighbours and the
+ * walker reads stale descriptors. A 16 KiB granule puts every table in its own
+ * Apple page and makes every user page a full Apple page, which the walker keeps
+ * coherent. The low RAM is mapped as 32 MiB level-2 blocks with the two blocks
+ * that straddle the user window (the first, holding the kernel image, and the
+ * last, holding the heap band and stacks) punched out into level-3 tables; the
+ * physmap is eight 32 MiB blocks sitting directly in the root table, with no
+ * second-level table to go stale. The kernel heap starts in the bootstrap band
+ * above the user window (see x86_64_vmspace.h) and grows on demand into the
+ * window at VM_KHEAP_VA, a run of shared level-3 tables vmspace_new installs in
+ * every process. The guest boots with the MMU off, so the window becomes
+ * reachable at the first switch and the grower stays idle until then. AArch64
+ * only; the Linux-compat path needs the MMU. */
 #ifndef ARM64_VMSPACE_H
 #define ARM64_VMSPACE_H
 
 #include <stdint.h>
 
-#define VM_PAGE      0x1000ULL
+#define VM_PAGE      0x4000ULL                /* 16 KiB: the translation granule */
 #define VM_RAM_SIZE  0x10000000ULL           /* 256 MiB; must match the host */
 #define VM_USER_LO   0x400000ULL
 #define VM_USER_HI   (VM_RAM_SIZE - 0x1000000ULL)  /* RAM top less 16 MiB */
@@ -36,7 +43,6 @@
 #define VM_KHEAP_LO  VM_USER_HI
 #define VM_KHEAP_HI  (VM_USER_HI + 0x800000ULL)
 #define VM_PHYSMAP   0x40000000ULL           /* 1 GiB */
-#define VM_PHYSMAP_PAGES (VM_RAM_SIZE / 0x200000ULL)  /* RAM in 2 MiB pages */
 /* The demand-grown kernel heap window: 2 GiB, a whole L1 entry (1 GiB of VA)
  * above the physmap. Scattered pool frames are mapped contiguously here, so a
  * single large allocation still gets contiguous VA. */

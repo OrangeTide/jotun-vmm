@@ -7,6 +7,7 @@
  * the relocation in userspace. */
 #include "elfload.h"
 
+#include "arch.h"
 #include "p9.h"
 #include "string.h"
 
@@ -142,6 +143,11 @@ elf_load_src(const struct elf_src *src, uint64_t lo, uint64_t hi,
             return -1;
         for (uint64_t b = ph.p_filesz; b < ph.p_memsz; b++)
             dst[b] = 0;
+        /* Make the just-written bytes executable where the caches are not
+         * coherent (arm64): the frames backing this segment may have held code in
+         * an earlier life, so stale instruction-cache lines must be dropped. A
+         * no-op on x86. */
+        arch_sync_icache(dst, ph.p_memsz);
 
         if (va + ph.p_memsz > out->load_end)
             out->load_end = va + ph.p_memsz;

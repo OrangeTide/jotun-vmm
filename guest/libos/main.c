@@ -908,6 +908,7 @@ static volatile int boot_ready;
 void
 kmain(unsigned long id)
 {
+    arch_mmu_init();            /* MMU on before the first lock (arm64 needs it) */
     cpu_init(id);
     arch_traps_init(id);        /* each cpu loads its own trap tables */
     arch_fpu_init();            /* enable FP/SIMD so the rasterizer can run */

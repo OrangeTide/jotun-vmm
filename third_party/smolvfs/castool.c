@@ -19,6 +19,13 @@
 #include <time.h>
 #include <unistd.h>
 
+/* macOS names the nanosecond mtime field st_mtimespec, not st_mtim. */
+#if defined(__APPLE__)
+#define CAS_ST_MTIM(st) ((st).st_mtimespec)
+#else
+#define CAS_ST_MTIM(st) ((st).st_mtim)
+#endif
+
 static const char *progname = "castool";
 
 /****************************************************************
@@ -534,8 +541,8 @@ cmd_import(struct cas_tree *ct, int argc, char **argv)
 			e.mode = CAS_TREE_S_IFREG | (st.st_mode & 0777);
 			e.uid = (int)st.st_uid;
 			e.gid = (int)st.st_gid;
-			e.mtime_s = (int64_t)st.st_mtim.tv_sec;
-			e.mtime_ns = (int32_t)st.st_mtim.tv_nsec;
+			e.mtime_s = (int64_t)CAS_ST_MTIM(st).tv_sec;
+			e.mtime_ns = (int32_t)CAS_ST_MTIM(st).tv_nsec;
 		}
 
 		memcpy(e.hash, bhash, CAS_HASH_HEX + 1);

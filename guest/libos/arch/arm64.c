@@ -77,12 +77,28 @@ arm64_fault_report(uint64_t far, uint64_t esr, uint64_t elr)
         ;
 }
 
-/* arm64 preemption is deferred: injecting IRQs without a vGIC (KVM) and the HVF
- * path both need hardware to validate, and the guest runs at EL1 with DAIF
- * masked. So the vectors handle only synchronous exceptions (SVC and faults);
- * IRQ/FIQ slots just hang. The mask helpers below still work, so the scheduler's
- * critical-region guards are correct, they simply never see an asynchronous
- * interrupt yet. */
+/* Make freshly written code executable (see arch.h). The instruction cache is
+ * not coherent with data stores on AArch64, so clean the stores to the point of
+ * unification, then invalidate the instruction cache over the range. A 64-byte
+ * step covers the smallest cache line this guest runs on; cleaning a larger line
+ * more than once is harmless. */
+void
+arch_sync_icache(void *addr, size_t len)
+{
+    uintptr_t base = (uintptr_t)addr & ~(uintptr_t)63;
+    uintptr_t end = (uintptr_t)addr + len;
+    for (uintptr_t p = base; p < end; p += 64)
+        __asm__ volatile ("dc cvau, %0" : : "r"(p) : "memory");
+    __asm__ volatile ("dsb ish" ::: "memory");
+    for (uintptr_t p = base; p < end; p += 64)
+        __asm__ volatile ("ic ivau, %0" : : "r"(p) : "memory");
+    __asm__ volatile ("dsb ish; isb" ::: "memory");
+}
+
+/* Install the exception vectors (VBAR_EL1). The app runs at EL1t with IRQ
+ * unmasked, so the preemption timer vectors through the 0x080 (current EL, SP_EL0)
+ * IRQ slot into el1t_irq; the kernel runs with IRQs masked, so it is never
+ * preempted. */
 void
 arch_traps_init(unsigned long id)
 {

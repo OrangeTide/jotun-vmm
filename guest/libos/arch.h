@@ -29,6 +29,22 @@ void *stack_init(void *stack, size_t size, void (*entry)(void));
  * per context, so a resumed context keeps its own masking. */
 void ctx_switch(void **oldsp, void *newsp);
 
+/* Bring up the MMU early, before the heap or any atomic runs. On AArch64 the
+ * guest boots with the MMU off, where all memory is Device and the exclusive
+ * instructions that back the atomics fault; this installs a boot-time identity
+ * map (the low RAM Normal, the device band Device) and enables translation, so
+ * the per-cpu heap locks work from the start. On x86 paging is already on and
+ * this is a no-op. Must run first on every cpu, before cpu_init touches a lock. */
+void arch_mmu_init(void);
+
+/* Make freshly written code at [addr, addr+len) executable: clean the data
+ * writes to the point of unification and invalidate the instruction cache over
+ * the range. Needed on arches whose instruction cache is not coherent with data
+ * stores (arm64), so a loaded or copied program is fetched correctly. The ELF
+ * loader calls this after writing each segment. On x86 the caches are coherent
+ * and this is a no-op. */
+void arch_sync_icache(void *addr, size_t len);
+
 /* Install the trap tables (GDT and IDT on x86) and the event interrupt gate.
  * Must run before any task starts, since a task runs with interrupts enabled
  * and a tick could arrive. id is the calling cpu, used to pick its own TSS and
