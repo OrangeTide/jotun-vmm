@@ -98,6 +98,7 @@
 /* Linux st_mode type bits and dirent types. */
 #define S_IFDIR  0040000
 #define S_IFREG  0100000
+#define S_IFLNK  0120000
 #define S_IFIFO  0010000
 #define DT_DIR  4
 #define DT_REG  8
@@ -120,7 +121,7 @@
 #define LERR_ISDIR  21          /* EISDIR */
 #define LERR_NOTEMPTY 39        /* ENOTEMPTY */
 #define LERR_RANGE  34          /* ERANGE: getcwd buffer too small */
-#define LERR_PERM   1           /* EPERM: symlinks unsupported (triggers cp fallback) */
+#define LERR_PERM   1           /* EPERM: an operation the overlay forbids */
 #define LERR_SPIPE  29          /* ESPIPE: seek on a pipe or other non-seekable fd */
 #define LERR_NOTSUP 95          /* EOPNOTSUPP: the filesystem lacks this feature */
 #define LERR_FAULT  14          /* EFAULT: a user pointer fell outside the user window */
@@ -259,6 +260,7 @@ struct lfd {
 struct ramfile {
     int      used;
     int      is_dir;
+    int      is_link;           /* symlink: data holds the target path string */
     int      unlinked;          /* name removed; slot held until the last fd closes */
     int      nref;              /* open fds referencing this entry */
     char     name[RAMFS_NAME];
@@ -1069,6 +1071,7 @@ ramfs_create(const char *name, int is_dir)
             ramfs[i].name[n] = 0;
             ramfs[i].used = 1;
             ramfs[i].is_dir = is_dir;
+            ramfs[i].is_link = 0;
             ramfs[i].unlinked = 0;
             ramfs[i].nref = 0;
             ramfs[i].data = NULL;
@@ -1818,9 +1821,67 @@ do_stat_path(const char *path, struct linux_stat *out)
     uint64_t size = 0, ino = 1;
     long rc = meta_path(path, &isdir, &size, &ino);
 
-    if (rc == 0)
+    if (rc == 0) {
         fill_stat(out, isdir, size, ino);
+        char key[RAMFS_NAME];
+        resolve_path(path, key, sizeof key);
+        int ri = ramfs_find(key);
+        if (ri >= 0 && ramfs[ri].is_link)
+            out->st_mode = S_IFLNK | 0777;  /* lstat sees the link, not its target */
+    }
     return rc;
+}
+
+/* Create an overlay symlink: a ramfile flagged is_link whose data holds the
+ * target path string. The target is stored verbatim and not resolved, so a
+ * dangling or absolute target is kept as given (readlink returns it as-is).
+ * Node's configure makes out/tools/bin/python point at the real interpreter. */
+static long
+do_symlink(const char *target, const char *linkpath)
+{
+    char key[RAMFS_NAME];
+    resolve_path(linkpath, key, sizeof key);
+    if (key[0] == 0)
+        return -LERR_EXIST;             /* the root always exists */
+    int isdir;
+    uint64_t sz, ino;
+    if (meta_key(key, &isdir, &sz, &ino) == 0)
+        return -LERR_EXIST;             /* overlay entry or bundle name taken */
+    int ri = ramfs_create(key, 0);
+    if (ri < 0)
+        return -LERR_NOMEM;             /* overlay table full */
+    size_t tl = strlen(target);
+    if (ramfs_grow(&ramfs[ri], (uint32_t)tl + 1) < 0) {
+        ramfs_free_slot(ri);
+        return -LERR_NOMEM;
+    }
+    memcpy(ramfs[ri].data, target, tl + 1);
+    ramfs[ri].len = (uint32_t)tl;
+    ramfs[ri].is_link = 1;
+    return 0;
+}
+
+/* readlink: copy an overlay symlink's stored target into the user buffer,
+ * truncated to bufsiz (no terminator, as Linux specifies). Returns the byte
+ * count, -LERR_INVAL for a non-symlink, or -LERR_NOENT if nothing resolves. */
+static long
+do_readlink(const char *path, char *ubuf, long bufsiz)
+{
+    if (bufsiz <= 0)
+        return -LERR_INVAL;
+    char key[RAMFS_NAME];
+    resolve_path(path, key, sizeof key);
+    int ri = ramfs_find(key);
+    if (ri < 0)
+        return -LERR_NOENT;             /* bundle entries are never symlinks */
+    if (!ramfs[ri].is_link)
+        return -LERR_INVAL;
+    uint32_t n = ramfs[ri].len;
+    if ((long)n > bufsiz)
+        n = (uint32_t)bufsiz;
+    if (copy_to_user((uint64_t)(uintptr_t)ubuf, ramfs[ri].data, n) != 0)
+        return -LERR_FAULT;
+    return (long)n;
 }
 
 /* mkdir: create a writable-overlay directory. Fails if anything already
@@ -3078,17 +3139,55 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     }
     case SYS_link:
     case SYS_linkat:
-    case SYS_symlink:
-    case SYS_symlinkat:
-        /* The overlay has no links. Report EPERM ("the filesystem does not
-         * support this"), which is the case configure and install scripts test
-         * for: they fall back to copying. */
+        /* Hard links are still unsupported. Report EPERM ("the filesystem does
+         * not support this"), which configure and install scripts test for:
+         * they fall back to copying. */
         return -LERR_PERM;
+    case SYS_symlink:
+    case SYS_symlinkat: {
+        /* symlink(target, linkpath): a1=target, a2=linkpath.
+         * symlinkat(target, newdirfd, linkpath): a1=target, a2=newdirfd,
+         * a3=linkpath. Only the writable overlay takes a new link. Node's
+         * configure points out/tools/bin/python at the real interpreter. */
+        char tb[UPATH_MAX], lb[UPATH_MAX], lab[RAMFS_NAME];
+        long et, el;
+        const char *target = user_path((uint64_t)a1, tb, &et);
+        if (!target)
+            return et;
+        const char *lp = user_path(nr == SYS_symlink ? (uint64_t)a2 : (uint64_t)a3,
+                                   lb, &el);
+        if (!lp)
+            return el;
+        const char *linkpath = lp;
+        if (nr == SYS_symlinkat) {
+            linkpath = at_path(a2, lp, lab, sizeof lab, &el);
+            if (el)
+                return el;
+        }
+        return do_symlink(target, linkpath);
+    }
     case SYS_readlink:
-    case SYS_readlinkat:
-        return -LERR_INVAL;             /* nothing in the bundle is a symlink;
-                                         * gcc probes /proc/self/exe and falls
-                                         * back to its default prefix */
+    case SYS_readlinkat: {
+        /* readlink(path, buf, bufsiz): a1,a2,a3.
+         * readlinkat(dirfd, path, buf, bufsiz): a1=dirfd, a2..a4. Only overlay
+         * symlinks resolve; bundle entries are never links, so gcc's probe of
+         * /proc/self/exe still falls back to its default prefix. */
+        char pb[UPATH_MAX], pab[RAMFS_NAME];
+        long e;
+        const char *up = user_path(nr == SYS_readlink ? (uint64_t)a1 : (uint64_t)a2,
+                                   pb, &e);
+        if (!up)
+            return e;
+        const char *path = up;
+        if (nr == SYS_readlinkat) {
+            path = at_path(a1, up, pab, sizeof pab, &e);
+            if (e)
+                return e;
+        }
+        if (nr == SYS_readlink)
+            return do_readlink(path, (char *)a2, a3);
+        return do_readlink(path, (char *)a3, a4);
+    }
     case SYS_unlink:
     case SYS_unlinkat: {
         /* unlink(path): path is a1. unlinkat(dirfd, path, flags): path is a2,
