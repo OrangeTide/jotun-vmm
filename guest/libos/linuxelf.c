@@ -297,17 +297,31 @@ struct ramfile {
     uint64_t mtime;             /* seconds; stamped on create and write */
 };
 
-/* The guest has no battery clock, so wall time is a fixed epoch plus the cycle
- * counter (see clock_gettime). The epoch is a recent date so timestamps look
+/* The guest has no battery clock. The epoch is a recent date so timestamps look
  * plausible and, crucially, a file written during a run is newer than the
  * read-only bundle files (reported at the epoch): autotools' sanity check
  * rejects a build tree whose freshly created file is older than its sources. */
 #define GUEST_EPOCH 1735689600ULL       /* 2025-01-01 UTC, in seconds */
 
+/* Nanoseconds since boot, monotonic. With the host preemption timer running,
+ * this comes from the tick counter the host advances in wall time (accurate and
+ * steady regardless of the guest's interrupt state). Without a timer there is no
+ * real clock, so it falls back to the cycle counter read as nanoseconds (the old
+ * behavior: it assumes roughly 1 GHz and only stands in for a real clock). */
+static uint64_t
+guest_mono_ns(void)
+{
+    uint32_t hz = boot_timer_hz();
+    if (hz == 0)
+        return arch_cycles();           /* no timer: cycles as ns, approximate */
+    uint64_t per_tick_ns = 1000000000ULL / hz;
+    return boot_timer_ticks() * per_tick_ns;
+}
+
 static uint64_t
 guest_now_sec(void)
 {
-    return GUEST_EPOCH + arch_cycles() / 1000000000ULL;
+    return GUEST_EPOCH + guest_mono_ns() / 1000000000ULL;
 }
 
 /* Overlay files are timestamped from the same wall clock the time syscalls
@@ -3497,14 +3511,18 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return (long)t;
     }
     case SYS_clock_gettime: {
-        /* No real clock: synthesise a time from the cycle counter (roughly 1
-         * GHz) plus the guest epoch, so it agrees with file mtimes (both are
-         * GUEST_EPOCH + elapsed). A fresh build file is then not in the future. */
-        uint64_t t = arch_cycles();
+        /* The host preemption timer drives a real wall clock; without it this is
+         * the cycle counter read as nanoseconds (approximate). It shares the
+         * epoch with file mtimes (both GUEST_EPOCH + elapsed), so a fresh build
+         * file is never in the future. A MONOTONIC request gets uptime from the
+         * same source without the epoch offset. */
+        uint64_t ns = guest_mono_ns();
+        int monotonic = (a1 == 1 || a1 == 4);   /* MONOTONIC, MONOTONIC_RAW */
+        uint64_t base = monotonic ? 0 : GUEST_EPOCH;
         if (a2) {                         /* struct timespec { sec; nsec; } */
             uint64_t ts[2];
-            ts[0] = GUEST_EPOCH + t / 1000000000ULL;
-            ts[1] = t % 1000000000ULL;
+            ts[0] = base + ns / 1000000000ULL;
+            ts[1] = ns % 1000000000ULL;
             long e = copy_to_user((uint64_t)a2, ts, sizeof ts);
             if (e < 0)
                 return e;
@@ -3512,11 +3530,11 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return 0;
     }
     case SYS_gettimeofday: {
-        uint64_t t = arch_cycles();
+        uint64_t ns = guest_mono_ns();
         if (a1) {                         /* struct timeval { sec; usec; } */
             uint64_t tv[2];
-            tv[0] = GUEST_EPOCH + t / 1000000000ULL;
-            tv[1] = (t / 1000ULL) % 1000000ULL;
+            tv[0] = GUEST_EPOCH + ns / 1000000000ULL;
+            tv[1] = (ns / 1000ULL) % 1000000ULL;
             long e = copy_to_user((uint64_t)a1, tv, sizeof tv);
             if (e < 0)
                 return e;

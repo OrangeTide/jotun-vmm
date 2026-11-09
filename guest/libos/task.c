@@ -455,7 +455,13 @@ void
 irq_event(void)
 {
     run_event_hooks();
-    if (this_cpu()->cur)
+    struct percpu *pc = this_cpu();
+    /* Preempt a plain kernel task on a timer tick. A task that carries a proc (a
+     * Linux process thread) is not yet preempted here: a safe reschedule of it
+     * from interrupt context needs the FPU and per-thread stack handling that
+     * preemption stage P4 adds. Until then the timer only advances its clock
+     * (host-maintained) and the Linux path stays cooperative. */
+    if (pc->cur && !pc->cur->proc)
         task_yield();
 }
 

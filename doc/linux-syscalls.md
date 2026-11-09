@@ -191,11 +191,11 @@ doc/m16-signals.md.
 | 107 | geteuid | stub | returns 0 |
 | 108 | getegid | stub | returns 0 |
 | 157 | prctl | stub | returns 0 |
-| 201 | time | partial | derived from the cycle counter (approximate) |
-| 96 | gettimeofday | partial | a fixed epoch plus the cycle counter, split into seconds and microseconds |
+| 201 | time | partial | the guest epoch plus host-timer monotonic time (JOTUN_HZ); falls back to the cycle counter when no timer runs |
+| 96 | gettimeofday | partial | the guest epoch plus host-timer time (JOTUN_HZ), split into seconds and microseconds; cycle-counter fallback without a timer |
 | 98 | getrusage | stub | zeroed counters; no CPU-time accounting (gcc, as query it) |
 | 99 | sysinfo | stub | reports total RAM and a plausible free fraction; cc1 sizes its allocator from this |
-| 228 | clock_gettime | partial | a fixed epoch plus the cycle counter at an assumed 1 GHz; shares the epoch with file timestamps so a freshly built file is not in the future |
+| 228 | clock_gettime | partial | realtime is the guest epoch plus host-timer monotonic time (JOTUN_HZ), monotonic is uptime from the same source; shares the epoch with file timestamps so a freshly built file is not in the future; cycle-counter fallback at an assumed 1 GHz when no timer runs. See doc/m16-preemption.md |
 | 63 | uname | full | fixed Linux/jotun/x86_64 fields |
 | 318 | getrandom | partial | cycle-counter PRNG, not cryptographic |
 | 302 | prlimit64 | partial | reports RLIMIT_NOFILE as the real fd cap (LINUX_NFD), RLIM_INFINITY for other resources; a new limit is ignored |

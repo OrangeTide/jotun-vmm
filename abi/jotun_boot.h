@@ -18,10 +18,10 @@
 /* Sentinel and version, so the guest can tell a block was placed and that the
  * two sides agree on the layout. */
 #define JOTUN_BOOT_MAGIC    0x4a4f5442u     /* a fixed sentinel, "JOTB" */
-#define JOTUN_BOOT_VERSION  2u
+#define JOTUN_BOOT_VERSION  3u
 
 /* Byte budget for the packed string blob. The whole block is one page. */
-#define JOTUN_BOOT_BLOB_MAX 3456u
+#define JOTUN_BOOT_BLOB_MAX 3440u
 
 /* Writable-mount guest prefixes. The host lists the guest-visible mountpoint of
  * each writable host mount here (for example "/out"); the guest routes a
@@ -42,6 +42,14 @@ struct jotun_bootinfo {
     uint32_t blob_len;              /* bytes used in blob */
     uint32_t nrwmount;              /* writable-mount prefixes in rwmount[] */
     char     rwmount[JOTUN_BOOT_RWMOUNT_MAX][JOTUN_BOOT_RWMOUNT_LEN];
+    /* Preemption-timer parameters. timer_hz is the tick rate the host drives
+     * (0 when no timer is running). timer_ticks is a monotonic counter the host
+     * increments once per tick, in wall time, independent of the guest's
+     * interrupt state; the guest reads it for a real clock. 8-byte aligned so a
+     * guest load and the host store are each atomic. */
+    uint32_t timer_hz;
+    uint32_t _pad_timer;
+    uint64_t timer_ticks;
     uint8_t  blob[JOTUN_BOOT_BLOB_MAX];
 };
 

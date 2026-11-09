@@ -78,3 +78,19 @@ boot_rwmount(int i)
         return NULL;
     return info->rwmount[i];
 }
+
+uint32_t
+boot_timer_hz(void)
+{
+    return info ? info->timer_hz : 0;
+}
+
+uint64_t
+boot_timer_ticks(void)
+{
+    if (!info)
+        return 0;
+    /* The host updates this field concurrently; read it volatile so the compiler
+     * does not hoist or cache a stale value. An aligned 8-byte load is atomic. */
+    return *(const volatile uint64_t *)&info->timer_ticks;
+}

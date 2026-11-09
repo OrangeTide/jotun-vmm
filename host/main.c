@@ -127,6 +127,10 @@ struct guest {
 };
 
 static struct guest guests[MAX_GUESTS];
+
+/* The preemption-timer rate (JOTUN_HZ), 0 when disabled. Set once before guest
+ * bring-up and read by setup_bootinfo, so the guest learns it at boot. */
+static unsigned g_timer_hz;
 static int nguests;
 
 static void
@@ -204,6 +208,7 @@ setup_bootinfo(struct guest *gp, int gargc, char **gargv)
     b->magic = JOTUN_BOOT_MAGIC;
     b->version = JOTUN_BOOT_VERSION;
     b->ram_size = gp->gm.size;
+    b->timer_hz = g_timer_hz;       /* 0 when no preemption timer is running */
 
     uint32_t off = 0;
     int n = 0;
@@ -488,6 +493,7 @@ struct timer_ctx {
     struct guest *guests;
     int nguests;
     unsigned hz;
+    int preempt;                /* also inject the event interrupt to reschedule */
     volatile int stop;
 };
 
@@ -504,6 +510,20 @@ run_timer(void *arg)
         nanosleep(&period, NULL);
         for (int gi = 0; gi < t->nguests; gi++) {
             struct guest *gp = &t->guests[gi];
+            /* Advance the guest's monotonic tick once per tick, in wall time,
+             * so its clock runs even while the vcpu is in an interrupts-off
+             * stretch and the event injection is deferred. */
+            struct jotun_bootinfo *b =
+                gpa_to_host(gp, JOTUN_BOOT_BASE, sizeof *b);
+            if (b)
+                __atomic_fetch_add(&b->timer_ticks, 1, __ATOMIC_RELAXED);
+            /* Injecting the event interrupt is what preempts a running vcpu. It
+             * is opt-in (JOTUN_PREEMPT): the clock needs only the tick above, and
+             * preempting a guest that is executing a Linux process is not yet
+             * safe (see doc/m16-preemption.md, stage P4). Without it the counter
+             * still advances, so the clock works. */
+            if (!t->preempt)
+                continue;
             for (int i = 0; i < gp->nvcpus; i++) {
                 if (!__atomic_load_n(&gp->ctx[i].live, __ATOMIC_SEQ_CST))
                     continue;
@@ -851,6 +871,7 @@ main(int argc, char **argv)
     const char *hz_env = getenv("JOTUN_HZ");
     if (hz_env)
         hz = (unsigned)strtoul(hz_env, NULL, 0);
+    g_timer_hz = hz;                /* so setup_bootinfo can tell the guest */
 
     uart_init(&uart);
 
@@ -889,7 +910,8 @@ main(int argc, char **argv)
     }
 
     pthread_t timer_thread = 0;
-    struct timer_ctx tctx = { guests, nguests, hz, 0 };
+    int preempt = getenv("JOTUN_PREEMPT") != NULL;
+    struct timer_ctx tctx = { guests, nguests, hz, preempt, 0 };
     if (hz > 0)
         pthread_create(&timer_thread, NULL, run_timer, &tctx);
 

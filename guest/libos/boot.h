@@ -29,4 +29,14 @@ int boot_nrwmount(void);
  * Points into the boot block, mapped for the life of the guest. */
 const char *boot_rwmount(int i);
 
+/* The preemption-timer rate in ticks per second, or 0 when no timer is running
+ * (then there is no host-driven clock and callers fall back to the cycle
+ * counter). Constant for the life of the guest. */
+uint32_t boot_timer_hz(void);
+
+/* The current monotonic tick count. The host advances it in wall time, so a
+ * fresh read reflects elapsed real time even across an interrupts-off stretch.
+ * Zero when no timer is running. */
+uint64_t boot_timer_ticks(void);
+
 #endif /* LIBOS_BOOT_H */
