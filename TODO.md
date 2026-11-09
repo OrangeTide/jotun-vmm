@@ -163,14 +163,16 @@ Open gaps and bugs, Stage C and general correctness:
       readlink/symlink/unlink stay nofollow. Verified: `out/tools/bin/python`
       (the link configure points at the interpreter) now execs through to
       `Python 3.12.3`. Commit 84929ee.
-- [ ] No `/dev`. The guest has no device files at all. `/dev/null`,
-      `/dev/zero`, `/dev/urandom` (back it with `getrandom`), `/dev/full`
-      (`ENOSPC` on write), and `/dev/tty` are the useful set. A shell redirect
-      `>/dev/null` today silently creates a regular file in the overlay named
-      `/dev/null`, which is wrong and surprising. Real build probes break on
-      this: `gcc -Wa,-v -c -o /dev/null -x assembler /dev/null` and similar
-      toolchain feature checks. Add a synthetic `/dev` the VFS serves specially
-      (read/write semantics per device), not as overlay regular files.
+- [x] Synthetic `/dev`. The guest now serves `/dev` entirely in-guest (no host
+      round trip, so it works on a non-Linux host): `null`, `zero`, `full`
+      (`ENOSPC` on write), `random`, `urandom`, `tty`, `console`, and
+      `stdin`/`stdout`/`stderr`. A device opens to a character-device fd with
+      read/write computed by kind, caught before the overlay so a redirect
+      `>/dev/null` reaches the device instead of creating an overlay file.
+      `stat` reports `S_IFCHR`; `/dev` lists its nodes and shows up in a root
+      listing. Proof: example/linuxdev.c. Still missing: `/dev/fd/N` and
+      `/dev/stdin`-as-symlink semantics (the std* nodes route to the console,
+      not to the process's actual fd 0/1/2), `ptmx`/`pts`, and a real `rdev`.
 - [ ] Overlay large-file cap. `RAMFS_FILE_MAX` is 4 MiB, so any generated file
       bigger than that fails. It forced `--with-intl=none` (ICU's data file is
       ~30 MiB) and will block real build outputs (object files, archives, the

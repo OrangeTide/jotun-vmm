@@ -102,8 +102,10 @@
 #define S_IFREG  0100000
 #define S_IFLNK  0120000
 #define S_IFIFO  0010000
+#define S_IFCHR  0020000
 #define DT_DIR  4
 #define DT_REG  8
+#define DT_CHR  2
 
 /* A few errnos, returned as negatives in rax the way the kernel does. */
 #define LERR_BADF   9
@@ -128,6 +130,7 @@
 #define LERR_NOTSUP 95          /* EOPNOTSUPP: the filesystem lacks this feature */
 #define LERR_FAULT  14          /* EFAULT: a user pointer fell outside the user window */
 #define LERR_NAMETOOLONG 36     /* ENAMETOOLONG: a user path did not fit the bounce buffer */
+#define LERR_NOSPC  28          /* ENOSPC: a write to /dev/full */
 
 /* ELF auxv entry tags. */
 #define AT_NULL    0
@@ -233,6 +236,8 @@ struct lfd {
     int      ispipe;            /* this fd is a pipe end */
     int      isram;             /* this fd is a ramfs file */
     int      is9w;              /* this fd is a writable 9P file (host rw mount) */
+    int      isdev;             /* this fd is a synthetic /dev character device */
+    int      devno;             /* which device (a DEV_* kind) when isdev */
     int      pidx;              /* pipe pool index when ispipe */
     int      ridx;              /* ramfs index when isram */
     int      wr;                /* pipe write end when set, else read end */
@@ -348,6 +353,8 @@ struct ofile {
     uint64_t pos;               /* read/write cursor, or 9P dir offset (phase 1) */
     int      d9done;            /* getdents: the 9P phase is finished */
     uint32_t dov;               /* getdents: overlay scan cursor */
+    int      dsynth;            /* getdents: synthetic-entry cursor (/dev nodes,
+                                 * and the "dev" entry listed in the root) */
     /* A directory's normalized key, for the overlay phase of getdents and for
      * resolving *at paths and fchdir against an open directory fd. Fixed at
      * open; lives here (not in struct lfd) so the per-process fd table stays
@@ -1018,6 +1025,118 @@ resolve_path(const char *path, char *out, size_t n)
     norm_key(tmp, out, n);
 }
 
+/****************************************************************
+ * A synthetic /dev. These character devices are emulated entirely inside the
+ * guest: no request reaches the host, so the sandbox presents the same /dev on
+ * any host OS. This is part of making the guest a self-contained Linux
+ * emulation rather than a pass-through to a Linux host.
+ ****************************************************************/
+
+enum {
+    DEV_NULL = 1, DEV_ZERO, DEV_FULL, DEV_RANDOM, DEV_URANDOM,
+    DEV_TTY, DEV_CONSOLE, DEV_STDIN, DEV_STDOUT, DEV_STDERR,
+};
+
+/* Synthetic inode numbers for /dev, in a range clear of the ramfs (0x10000),
+ * pipe (0x20000) ranges so identities never collide. */
+#define DEV_INO_BASE 0x30000ULL
+
+static const struct devnode {
+    const char *name;           /* leaf name under /dev */
+    int         kind;           /* a DEV_* value */
+} devtab[] = {
+    { "null",    DEV_NULL },    { "zero",    DEV_ZERO },
+    { "full",    DEV_FULL },    { "random",  DEV_RANDOM },
+    { "urandom", DEV_URANDOM }, { "tty",     DEV_TTY },
+    { "console", DEV_CONSOLE }, { "stdin",   DEV_STDIN },
+    { "stdout",  DEV_STDOUT },  { "stderr",  DEV_STDERR },
+};
+#define NDEV ((int)(sizeof devtab / sizeof devtab[0]))
+
+/* The device kind at a normalized key ("dev/null" -> DEV_NULL), or 0 when the
+ * key does not name a known /dev node. */
+static int
+dev_lookup(const char *key)
+{
+    if (key[0] != 'd' || key[1] != 'e' || key[2] != 'v' || key[3] != '/')
+        return 0;
+    const char *leaf = key + 4;
+    for (int i = 0; i < NDEV; i++)
+        if (strcmp(leaf, devtab[i].name) == 0)
+            return devtab[i].kind;
+    return 0;
+}
+
+/* True when the key names the synthetic /dev directory itself. */
+static int
+dev_is_dir(const char *key)
+{
+    return key[0] == 'd' && key[1] == 'e' && key[2] == 'v' && key[3] == 0;
+}
+
+/* Bind a fresh fd to a /dev character device. These carry no offset, no 9P fid,
+ * and no overlay entry: read and write are computed on the fly by kind. */
+static long
+open_dev(int kind, long flags)
+{
+    int fd = fd_alloc();
+    if (fd < 0)
+        return -LERR_NOMEM;
+    memset(&fds[fd], 0, sizeof fds[fd]);
+    fds[fd].used = 1;
+    fds[fd].isdev = 1;
+    fds[fd].devno = kind;
+    fds[fd].ino = DEV_INO_BASE + (uint64_t)kind;
+    fds[fd].oflags = (int)(flags & (O_ACCMODE | O_APPEND));
+    return fd;
+}
+
+/* read() from a /dev node. zero and full yield an endless run of zero bytes;
+ * random and urandom yield a (non-cryptographic) pseudo-random stream; the rest
+ * are at end of file. */
+static long
+dev_read(int kind, void *buf, unsigned long count)
+{
+    switch (kind) {
+    case DEV_ZERO:
+    case DEV_FULL:
+        memset(buf, 0, count);
+        return (long)count;
+    case DEV_RANDOM:
+    case DEV_URANDOM: {
+        uint8_t *b = buf;
+        uint64_t s = arch_cycles();
+        for (unsigned long i = 0; i < count; i++) {
+            b[i] = (uint8_t)(s >> 24);
+            s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        }
+        return (long)count;
+    }
+    default:                    /* null, tty, console, std*, and anything else */
+        return 0;               /* EOF */
+    }
+}
+
+/* write() to a /dev node. The console-like nodes echo to the UART; full reports
+ * a disk-full error; the rest silently swallow the bytes. */
+static long
+dev_write(int kind, const char *buf, unsigned long len)
+{
+    switch (kind) {
+    case DEV_FULL:
+        return -LERR_NOSPC;
+    case DEV_TTY:
+    case DEV_CONSOLE:
+    case DEV_STDOUT:
+    case DEV_STDERR:
+        for (unsigned long i = 0; i < len; i++)
+            con_putc(buf[i]);
+        return (long)len;
+    default:                    /* null, zero, random, urandom, stdin: discard */
+        return (long)len;
+    }
+}
+
 static int
 ramfs_find(const char *name)
 {
@@ -1367,6 +1486,8 @@ do_write(long fd, const char *buf, unsigned long len)
         return -LERR_BADF;
     if (len && !user_ok((uint64_t)(uintptr_t)buf, len))
         return -LERR_FAULT;
+    if (f->isdev)
+        return dev_write(f->devno, buf, len);
     if (f->iscon) {                     /* console stdout/stderr */
         for (unsigned long i = 0; i < len; i++)
             con_putc(buf[i]);
@@ -1651,6 +1772,13 @@ do_open(const char *path, long flags, long mode)
         follow_link_key(key, sizeof key);
     int writing = (flags & (O_WRONLY | O_RDWR)) != 0;
 
+    /* A /dev character device is served from the guest, never the overlay or a
+     * mount, so it must be caught before either path. */
+    int dk = dev_lookup(key);
+    if (dk)
+        return open_dev(dk, flags);
+    int isdevdir = dev_is_dir(key);
+
     /* A write or create under a writable host mount goes to the host over 9P,
      * not to the in-RAM overlay, so build output lands on the host filesystem. */
     if ((writing || (flags & O_CREAT)) && under_rw_mount(key))
@@ -1703,7 +1831,8 @@ do_open(const char *path, long flags, long mode)
             ino = st.qid.path;
         }
     }
-    int isdir = is_ovl_dir || ramfs_is_dir_key(key) || (have9 && isdir9);
+    int isdir = is_ovl_dir || ramfs_is_dir_key(key) || (have9 && isdir9)
+                || isdevdir;
 
     if (!isdir && !have9) {
         p9_clunk(p9fid);
@@ -1859,6 +1988,8 @@ do_read(long fd, void *buf, unsigned long count)
         return -LERR_BADF;
     if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
         return -LERR_FAULT;
+    if (f->isdev)
+        return dev_read(f->devno, buf, count);
     if (f->iscon)
         return 0;                       /* console stdin: EOF */
     if (f->ispipe) {
@@ -1901,6 +2032,8 @@ do_pread(long fd, void *buf, unsigned long count, uint64_t off)
         return -LERR_BADF;
     if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
         return -LERR_FAULT;
+    if (f->isdev)
+        return dev_read(f->devno, buf, count);  /* char device: offset ignored */
     if (f->isram) {
         struct ramfile *rf = &ramfs[f->ridx];
         if (off >= rf->len)
@@ -1921,8 +2054,8 @@ do_close(long fd)
 
     if (!f)
         return -LERR_BADF;
-    if (f->iscon) {
-        f->used = 0;                    /* just drop this fd; the console stays */
+    if (f->iscon || f->isdev) {
+        f->used = 0;                    /* drop the fd; the device is stateless */
         return 0;
     }
     if (f->isram) {
@@ -1959,6 +2092,10 @@ do_lseek(long fd, long off, long whence)
 
     if (!f)
         return -LERR_BADF;
+    /* A /dev character device has no meaningful position; a seek on it is a
+     * no-op that reports offset 0, as /dev/null and friends do on Linux. */
+    if (f->isdev)
+        return 0;
     /* A pipe or the console is not seekable, whatever fd number it sits on.
      * A file-backed fd is seekable even when it has been moved onto 0, 1 or 2
      * by a redirect, which is exactly what grep does: lseek(0, 0, SEEK_CUR). */
@@ -2003,6 +2140,19 @@ fill_stat(struct linux_stat *s, int isdir, uint64_t size, uint64_t ino)
 static long
 meta_key(const char *key, int *isdir, uint64_t *size, uint64_t *ino)
 {
+    int dk = dev_lookup(key);           /* a /dev node, or the /dev directory */
+    if (dk) {
+        *isdir = 0;
+        *size = 0;
+        *ino = DEV_INO_BASE + (uint64_t)dk;
+        return 0;
+    }
+    if (dev_is_dir(key)) {
+        *isdir = 1;
+        *size = 0;
+        *ino = DEV_INO_BASE;
+        return 0;
+    }
     int ri = ramfs_find(key);
     if (ri >= 0) {
         *isdir = ramfs[ri].is_dir;
@@ -2057,7 +2207,9 @@ do_stat_path(const char *path, struct linux_stat *out, int follow)
 
     if (rc == 0) {
         fill_stat(out, isdir, size, ino);
-        if (!follow) {
+        if (dev_lookup(key))
+            out->st_mode = S_IFCHR | 0666;      /* a /dev character device */
+        else if (!follow) {
             int ri = ramfs_find(key);
             if (ri >= 0 && ramfs[ri].is_link)
                 out->st_mode = S_IFLNK | 0777;  /* lstat sees the link, not its target */
@@ -2276,7 +2428,7 @@ fill_statx(struct linux_statx *s, int isdir, uint64_t size, uint64_t ino)
 static long
 do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
 {
-    int isdir = 0, islink = 0;
+    int isdir = 0, islink = 0, ischar = 0;
     uint64_t size = 0, ino = 1;
 
     if (!user_ok((uint64_t)(uintptr_t)out, sizeof *out))
@@ -2289,7 +2441,8 @@ do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
         long rc = meta_key(key, &isdir, &size, &ino);
         if (rc != 0)
             return rc;
-        if (flags & AT_SYMLINK_NOFOLLOW) {
+        ischar = dev_lookup(key) != 0;
+        if (!ischar && (flags & AT_SYMLINK_NOFOLLOW)) {
             int ri = ramfs_find(key);       /* lstat-style: see the link itself */
             islink = ri >= 0 && ramfs[ri].is_link;
         }
@@ -2297,7 +2450,10 @@ do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
         struct lfd *f = fd_get(dirfd);
         if (!f)
             return -LERR_BADF;
-        if (f->isram) {
+        if (f->isdev) {
+            ischar = 1;
+            ino = f->ino;
+        } else if (f->isram) {
             size = ramfs[f->ridx].len;
             ino = (uint64_t)(0x10000 + f->ridx);
         } else {
@@ -2309,7 +2465,9 @@ do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
         return -LERR_NOENT;
     }
     fill_statx(out, isdir, size, ino);
-    if (islink)
+    if (ischar)
+        out->stx_mode = S_IFCHR | 0666;
+    else if (islink)
         out->stx_mode = S_IFLNK | 0777;
     return 0;
 }
@@ -2332,6 +2490,11 @@ do_fstat(long fd, struct linux_stat *out)
         out->st_ino = (uint64_t)(0x20000 + f->pidx);
         return 0;
     }
+    if (f->isdev) {
+        fill_stat(out, 0, 0, f->ino);
+        out->st_mode = S_IFCHR | 0666;              /* a /dev character device */
+        return 0;
+    }
     if (f->iscon) {
         fill_stat(out, 0, 0, (uint64_t)fd);         /* console: a plain reg */
         return 0;
@@ -2348,7 +2511,7 @@ do_fstat(long fd, struct linux_stat *out)
  * if it would overflow `count` (the record is left for the next call). */
 static unsigned long
 dirent_emit(uint8_t *out, unsigned long used, unsigned long count,
-            uint64_t ino, int64_t off, int is_dir, const char *name)
+            uint64_t ino, int64_t off, int dtype, const char *name)
 {
     unsigned long nlen = strlen(name);
     unsigned long reclen = (19 + nlen + 1 + 7) & ~(unsigned long)7;
@@ -2358,7 +2521,7 @@ dirent_emit(uint8_t *out, unsigned long used, unsigned long count,
     d->d_ino = ino ? ino : 1;
     d->d_off = off;
     d->d_reclen = (uint16_t)reclen;
-    d->d_type = is_dir ? DT_DIR : DT_REG;
+    d->d_type = (uint8_t)dtype;
     memcpy(d->d_name, name, nlen);
     d->d_name[nlen] = 0;
     return used + reclen;
@@ -2395,7 +2558,8 @@ do_getdents64(long fd, void *buf, unsigned long count)
             while (p9_dir_next(kbuf, (uint32_t)got, &off, &e)) {
                 unsigned long u = dirent_emit(out, used, count,
                                               e.qid.path, (int64_t)(f->of->pos + off),
-                                              (e.qid.type & P9_QTDIR) != 0, e.name);
+                                              (e.qid.type & P9_QTDIR) ? DT_DIR : DT_REG,
+                                              e.name);
                 if (u == 0)
                     break;              /* no room: leave for the next call */
                 used = u;
@@ -2410,6 +2574,29 @@ do_getdents64(long fd, void *buf, unsigned long count)
         f->of->d9done = 1;              /* 9P stream exhausted */
     }
 
+    /* Phase 1.5: synthetic entries. A listing of /dev yields its character
+     * nodes; a listing of the root yields a "dev" directory, so both are
+     * visible without the host serving them. */
+    if (dev_is_dir(f->of->dpath)) {
+        for (int i = f->of->dsynth; i < NDEV; i++) {
+            f->of->dsynth = i;
+            unsigned long u = dirent_emit(out, used, count,
+                                          DEV_INO_BASE + (uint64_t)devtab[i].kind,
+                                          (int64_t)(i + 1), DT_CHR, devtab[i].name);
+            if (u == 0)
+                return used ? (long)used : -LERR_INVAL;
+            used = u;
+        }
+        f->of->dsynth = NDEV;
+    } else if (f->of->dpath[0] == 0 && f->of->dsynth == 0) {
+        unsigned long u = dirent_emit(out, used, count, DEV_INO_BASE,
+                                      1, DT_DIR, "dev");
+        if (u == 0)
+            return used ? (long)used : -LERR_INVAL;
+        used = u;
+        f->of->dsynth = 1;
+    }
+
     /* Phase 2: the writable overlay's direct children of this directory. */
     for (int i = (int)f->of->dov; i < RAMFS_MAX; i++) {
         f->of->dov = (uint32_t)i;
@@ -2419,7 +2606,8 @@ do_getdents64(long fd, void *buf, unsigned long count)
         if (!leaf)
             continue;
         unsigned long u = dirent_emit(out, used, count, (uint64_t)(0x10000 + i),
-                                      (int64_t)(i + 1), ramfs[i].is_dir, leaf);
+                                      (int64_t)(i + 1),
+                                      ramfs[i].is_dir ? DT_DIR : DT_REG, leaf);
         if (u == 0)
             return used ? (long)used : -LERR_INVAL;     /* resume at i next call */
         used = u;
