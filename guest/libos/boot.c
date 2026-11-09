@@ -61,3 +61,20 @@ boot_argv(int i)
         return NULL;
     return argv[i];
 }
+
+int
+boot_nrwmount(void)
+{
+    if (!info)
+        return 0;
+    uint32_t n = info->nrwmount;
+    return n > JOTUN_BOOT_RWMOUNT_MAX ? JOTUN_BOOT_RWMOUNT_MAX : (int)n;
+}
+
+const char *
+boot_rwmount(int i)
+{
+    if (!info || i < 0 || i >= boot_nrwmount())
+        return NULL;
+    return info->rwmount[i];
+}

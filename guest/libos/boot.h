@@ -22,4 +22,11 @@ int boot_argc(void);
  * block, which stays mapped for the life of the guest. */
 const char *boot_argv(int i);
 
+/* Number of writable-mount guest prefixes the host declared. */
+int boot_nrwmount(void);
+
+/* The i-th writable-mount prefix (for example "/out"), or NULL if out of range.
+ * Points into the boot block, mapped for the life of the guest. */
+const char *boot_rwmount(int i);
+
 #endif /* LIBOS_BOOT_H */

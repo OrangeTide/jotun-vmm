@@ -101,15 +101,37 @@ p9_walk(uint32_t fid, uint32_t newfid, int nwname, const char *const *names)
 }
 
 int
-p9_open(uint32_t fid)
+p9_open_mode(uint32_t fid, uint8_t mode)
 {
     struct p9_out o;
     struct p9_in in;
 
     begin(&o, P9_TOPEN);
     p9o_u32(&o, fid);
-    p9o_u8(&o, P9_OREAD);
+    p9o_u8(&o, mode);
     if (txn(&o, &in) != P9_ROPEN)
+        return -1;
+    return 0;
+}
+
+int
+p9_open(uint32_t fid)
+{
+    return p9_open_mode(fid, P9_OREAD);
+}
+
+int
+p9_create(uint32_t fid, const char *name, uint32_t perm)
+{
+    struct p9_out o;
+    struct p9_in in;
+
+    begin(&o, P9_TCREATE);
+    p9o_u32(&o, fid);
+    p9o_str(&o, name);
+    p9o_u32(&o, perm);
+    p9o_u8(&o, P9_ORDWR);               /* open the new file for writing */
+    if (txn(&o, &in) != P9_RCREATE)
         return -1;
     return 0;
 }
@@ -149,6 +171,35 @@ p9_read(uint32_t fid, uint64_t offset, void *buf, uint32_t count)
     return (long)n;
 }
 
+long
+p9_write(uint32_t fid, uint64_t offset, const void *buf, uint32_t count)
+{
+    struct p9_out o;
+    struct p9_in in;
+    const uint8_t *src = buf;
+
+    /* Bound the request to what one message can carry: header(7) + fid[4] +
+     * offset[8] + count[4] = 23 bytes of framing, leave margin. */
+    uint32_t room = JOTUN_P9_MSIZE - 32;
+    if (count > room)
+        count = room;
+
+    begin(&o, P9_TWRITE);
+    p9o_u32(&o, fid);
+    p9o_u64(&o, offset);
+    p9o_u32(&o, count);
+    p9o_bytes(&o, src, count);
+    if (txn(&o, &in) != P9_RWRITE)
+        return -1;
+
+    uint32_t n = p9i_u32(&in);
+    if (!in.ok)
+        return -1;
+    if (n > count)                      /* a correct server never over-accepts */
+        n = count;
+    return (long)n;
+}
+
 int
 p9_clunk(uint32_t fid)
 {
@@ -158,6 +209,19 @@ p9_clunk(uint32_t fid)
     begin(&o, P9_TCLUNK);
     p9o_u32(&o, fid);
     if (txn(&o, &in) != P9_RCLUNK)
+        return -1;
+    return 0;
+}
+
+int
+p9_remove(uint32_t fid)
+{
+    struct p9_out o;
+    struct p9_in in;
+
+    begin(&o, P9_TREMOVE);
+    p9o_u32(&o, fid);
+    if (txn(&o, &in) != P9_RREMOVE)
         return -1;
     return 0;
 }

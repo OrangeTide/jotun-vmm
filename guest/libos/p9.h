@@ -31,8 +31,25 @@ int p9_walk(uint32_t fid, uint32_t newfid, int nwname, const char *const *names)
 /* Open fid for reading. Returns 0 or -1. */
 int p9_open(uint32_t fid);
 
+/* Open fid with an explicit 9P mode (P9_OREAD/OWRITE/ORDWR, optionally
+ * |P9_OTRUNC). Returns 0 or -1. */
+int p9_open_mode(uint32_t fid, uint8_t mode);
+
+/* Create a file named `name` in the directory fid points at; fid then refers
+ * to the new file, open for writing. perm is the 9P permission word (its
+ * P9_DMDIR bit makes a directory). Returns 0 or -1. */
+int p9_create(uint32_t fid, const char *name, uint32_t perm);
+
 /* Read up to count bytes at offset into buf. Returns the byte count, or -1. */
 long p9_read(uint32_t fid, uint64_t offset, void *buf, uint32_t count);
+
+/* Write up to count bytes at offset from buf. Returns the byte count the server
+ * accepted (may be short), or -1. */
+long p9_write(uint32_t fid, uint64_t offset, const void *buf, uint32_t count);
+
+/* Remove the file fid names; the fid is clunked by the server regardless.
+ * Returns 0 or -1. */
+int p9_remove(uint32_t fid);
 
 /* Release a fid. Returns 0 or -1. */
 int p9_clunk(uint32_t fid);

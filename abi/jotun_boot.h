@@ -18,10 +18,17 @@
 /* Sentinel and version, so the guest can tell a block was placed and that the
  * two sides agree on the layout. */
 #define JOTUN_BOOT_MAGIC    0x4a4f5442u     /* a fixed sentinel, "JOTB" */
-#define JOTUN_BOOT_VERSION  1u
+#define JOTUN_BOOT_VERSION  2u
 
 /* Byte budget for the packed string blob. The whole block is one page. */
-#define JOTUN_BOOT_BLOB_MAX 4000u
+#define JOTUN_BOOT_BLOB_MAX 3456u
+
+/* Writable-mount guest prefixes. The host lists the guest-visible mountpoint of
+ * each writable host mount here (for example "/out"); the guest routes a
+ * create or write under one of these prefixes to the host over 9P instead of to
+ * its in-RAM overlay. A handful is plenty: a build usually has one output tree. */
+#define JOTUN_BOOT_RWMOUNT_MAX  8
+#define JOTUN_BOOT_RWMOUNT_LEN  64
 
 /* The parameter block. argc argument strings followed by envc environment
  * strings live in blob[], each NUL-terminated and concatenated in order;
@@ -33,7 +40,8 @@ struct jotun_bootinfo {
     uint32_t argc;                  /* argument strings in blob */
     uint32_t envc;                  /* environment strings after them */
     uint32_t blob_len;              /* bytes used in blob */
-    uint32_t _pad;                  /* keep blob 8-byte aligned */
+    uint32_t nrwmount;              /* writable-mount prefixes in rwmount[] */
+    char     rwmount[JOTUN_BOOT_RWMOUNT_MAX][JOTUN_BOOT_RWMOUNT_LEN];
     uint8_t  blob[JOTUN_BOOT_BLOB_MAX];
 };
 

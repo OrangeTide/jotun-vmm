@@ -23,6 +23,7 @@
 #include "p9.h"
 #include "string.h"
 #include "task.h"
+#include "jotun_boot.h"      /* JOTUN_BOOT_RWMOUNT_MAX */
 #include "jotun_svc.h"       /* JOTUN_PROG_BASE */
 #include "vmspace.h"
 #include "linux_arch.h"
@@ -231,6 +232,7 @@ struct lfd {
     int      isdir;
     int      ispipe;            /* this fd is a pipe end */
     int      isram;             /* this fd is a ramfs file */
+    int      is9w;              /* this fd is a writable 9P file (host rw mount) */
     int      pidx;              /* pipe pool index when ispipe */
     int      ridx;              /* ramfs index when isram */
     int      wr;                /* pipe write end when set, else read end */
@@ -1028,6 +1030,42 @@ ramfs_find(const char *name)
     return -1;
 }
 
+/* Writable host-mount prefixes (normalized keys, no leading slash), delivered
+ * by the host in the boot block. A create or write under one of these goes to
+ * the host over 9P instead of to the in-RAM overlay, so a build's output lands
+ * on the host filesystem. Everything else keeps the overlay as its writable
+ * layer. */
+#define RWMOUNT_MAX JOTUN_BOOT_RWMOUNT_MAX
+static char rwmounts[RWMOUNT_MAX][RAMFS_NAME];
+static int  nrwmounts;
+
+static void
+linux_rwmount_init(void)
+{
+    nrwmounts = 0;
+    int n = boot_nrwmount();
+    for (int i = 0; i < n && nrwmounts < RWMOUNT_MAX; i++) {
+        const char *p = boot_rwmount(i);
+        if (!p)
+            continue;
+        norm_key(p, rwmounts[nrwmounts], RAMFS_NAME);
+        if (rwmounts[nrwmounts][0])     /* ignore "/" (the whole root) */
+            nrwmounts++;
+    }
+}
+
+/* True when key equals a writable-mount prefix or is nested under one. */
+static int
+under_rw_mount(const char *key)
+{
+    for (int i = 0; i < nrwmounts; i++) {
+        size_t l = strlen(rwmounts[i]);
+        if (strncmp(key, rwmounts[i], l) == 0 && (key[l] == 0 || key[l] == '/'))
+            return 1;
+    }
+    return 0;
+}
+
 /* Follow an overlay symlink at the final path component. If key names an
  * overlay symlink, replace it in place with the link's target resolved to a
  * key, repeating for a chain of links up to a small limit. An absolute target
@@ -1373,6 +1411,20 @@ do_write(long fd, const char *buf, unsigned long len)
         rf->mtime = fs_stamp();
         return (long)len;
     }
+    if (f->is9w) {                      /* writable 9P file on a host rw mount */
+        unsigned long done = 0;
+        while (done < len) {
+            long n = p9_write(f->p9fid, f->of->pos + done,
+                              buf + done, (uint32_t)(len - done));
+            if (n <= 0)
+                break;
+            done += (unsigned long)n;
+        }
+        if (done == 0 && len > 0)
+            return -LERR_ROFS;          /* the host refused the write */
+        f->of->pos += done;
+        return (long)done;
+    }
     return -LERR_BADF;                  /* the bundle is read-only */
 }
 
@@ -1468,14 +1520,141 @@ at_path(long dirfd, const char *path, char *buf, size_t n, long *err)
     return buf;
 }
 
+/* Open a file on a writable host mount over 9P: Topen an existing file (with
+ * OTRUNC when asked), or Tcreate a new one in its parent directory. The fd is
+ * is9w, so do_read/do_write go to the host, not the overlay. Returns the fd or
+ * a negative errno. */
 static long
-do_open(const char *path, long flags)
+open_9p_write(const char *key, long flags, long mode)
+{
+    /* Split key into its parent directory and leaf name. */
+    char parent[RAMFS_NAME];
+    size_t kl = strlen(key), cut = kl;
+    while (cut > 0 && key[cut - 1] != '/')
+        cut--;
+    const char *leaf = key + cut;
+    size_t plen = cut > 0 ? cut - 1 : 0;        /* drop the slash */
+    memcpy(parent, key, plen);
+    parent[plen] = '\0';
+    if (leaf[0] == '\0')
+        return -LERR_ISDIR;                     /* a trailing slash is not a file */
+
+    int fd = fd_alloc();
+    if (fd < 0)
+        return -LERR_NOMEM;
+    uint32_t p9fid = fid_alloc();
+    if (p9fid == 0)
+        return -LERR_NOMEM;
+
+    uint64_t size = 0, ino = p9fid;
+    int exists = 0, isdir9 = 0;
+    if (ns_walk(key, p9fid) == 0) {
+        struct p9_stat st;
+        if (p9_stat(p9fid, &st) == 0) {
+            exists = 1;
+            isdir9 = (st.qid.type & P9_QTDIR) != 0;
+            size = st.length;
+            ino = st.qid.path;
+        }
+    }
+
+    if (exists && isdir9) {
+        p9_clunk(p9fid);
+        return -LERR_ISDIR;
+    }
+    if (exists) {
+        if (flags & O_EXCL) {
+            p9_clunk(p9fid);
+            return -LERR_EXIST;
+        }
+        uint8_t mode = (uint8_t)(P9_ORDWR | ((flags & O_TRUNC) ? P9_OTRUNC : 0));
+        if (p9_open_mode(p9fid, mode) != 0) {
+            p9_clunk(p9fid);
+            return -LERR_ACCES;
+        }
+        if (flags & O_TRUNC)
+            size = 0;
+    } else {
+        if (!(flags & O_CREAT))
+            return -LERR_NOENT;
+        /* The failed walk left p9fid unallocated server-side, so reuse it to
+         * walk the parent directory, then create the leaf (Tcreate leaves the
+         * fid on the new file, open for writing). */
+        if (ns_walk(parent, p9fid) != 0)
+            return -LERR_NOENT;
+        /* Honor the caller's mode (masked to permission bits) so an executable
+         * created here, which the linker opens 0777, keeps its execute bits on
+         * the host. Fall back to 0644 when the caller passed no mode. */
+        uint32_t perm = (uint32_t)(mode & 0777);
+        if (perm == 0)
+            perm = 0644;
+        if (p9_create(p9fid, leaf, perm) != 0) {
+            p9_clunk(p9fid);
+            return -LERR_ACCES;
+        }
+        size = 0;
+    }
+
+    struct ofile *of = ofile_alloc();
+    if (!of) {
+        p9_clunk(p9fid);
+        return -LERR_NOMEM;
+    }
+    memset(&fds[fd], 0, sizeof fds[fd]);
+    fds[fd].used = 1;
+    fds[fd].is9w = 1;
+    fds[fd].p9fid = p9fid;
+    fds[fd].of = of;
+    fds[fd].size = size;
+    fds[fd].ino = ino;
+    fds[fd].oflags = (int)(flags & (O_ACCMODE | O_APPEND));
+    of->pos = (flags & O_APPEND) ? size : 0;
+    gfidref[p9fid - LINUX_FID_BASE] = 1;
+    return fd;
+}
+
+/* Create a directory on a writable host mount over 9P: walk its parent and
+ * Tcreate the leaf with the directory bit. Returns 0 or a negative errno. */
+static long
+create_9p_dir(const char *key)
+{
+    char parent[RAMFS_NAME];
+    size_t kl = strlen(key), cut = kl;
+    while (cut > 0 && key[cut - 1] != '/')
+        cut--;
+    const char *leaf = key + cut;
+    size_t plen = cut > 0 ? cut - 1 : 0;
+    memcpy(parent, key, plen);
+    parent[plen] = '\0';
+    if (leaf[0] == '\0')
+        return -LERR_EXIST;
+
+    uint32_t fid = fid_alloc();
+    if (fid == 0)
+        return -LERR_NOMEM;
+    if (ns_walk(parent, fid) != 0)
+        return -LERR_NOENT;
+    if (p9_create(fid, leaf, P9_DMDIR | 0755) != 0) {
+        p9_clunk(fid);
+        return -LERR_ACCES;
+    }
+    p9_clunk(fid);
+    return 0;
+}
+
+static long
+do_open(const char *path, long flags, long mode)
 {
     char key[RAMFS_NAME];
     resolve_path(path, key, sizeof key);
     if (!(flags & O_NOFOLLOW))
         follow_link_key(key, sizeof key);
     int writing = (flags & (O_WRONLY | O_RDWR)) != 0;
+
+    /* A write or create under a writable host mount goes to the host over 9P,
+     * not to the in-RAM overlay, so build output lands on the host filesystem. */
+    if ((writing || (flags & O_CREAT)) && under_rw_mount(key))
+        return open_9p_write(key, flags, mode);
 
     int ri = ramfs_find(key);               /* overlay entry (file or dir) */
     int is_ovl_dir = (ri >= 0 && ramfs[ri].is_dir);
@@ -1953,6 +2132,8 @@ do_mkdir(const char *path)
     uint64_t sz, ino;
     if (meta_key(key, &isdir, &sz, &ino) == 0)
         return -LERR_EXIST;
+    if (under_rw_mount(key))            /* land the directory on the host */
+        return create_9p_dir(key);
     if (ramfs_create(key, 1) < 0)
         return -LERR_NOMEM;
     return 0;
@@ -2941,7 +3122,7 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         const char *up = user_path((uint64_t)a1, pb, &e);
         if (!up)
             return e;
-        long fd = do_open(up, a2);
+        long fd = do_open(up, a2, a3);
         if (fd >= 0 && (a2 & O_CLOEXEC))
             fds[fd].cloexec = 1;
         return fd;
@@ -2957,7 +3138,7 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         const char *p = at_path(a1, up, ab, sizeof ab, &e);
         if (e)
             return e;
-        long fd = do_open(p, a3);
+        long fd = do_open(p, a3, a4);
         if (fd >= 0 && (a3 & O_CLOEXEC))
             fds[fd].cloexec = 1;
         return fd;
@@ -3827,6 +4008,7 @@ linux_tables_init(void)
     memset(ofiles, 0, sizeof *ofiles * LINUX_NOFILE);
     memset(shareds, 0, sizeof *shareds * LINUX_NPROC);
     memset(procs, 0, sizeof *procs * LINUX_NPROC);
+    linux_rwmount_init();
 }
 
 static void
