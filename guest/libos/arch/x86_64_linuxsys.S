@@ -110,9 +110,9 @@ linux_syscall_entry:
  * current kernel handler stack, then load the general registers by hand and
  * IRETQ. IRETQ reloads rip, rflags, rsp, cs, and ss from that frame and drops
  * to CPL 3; rax is the only scratch needed to lay the frame down, so it is
- * restored from the trapframe afterward. The user's rflags has IF clear (user
- * runs with interrupts off, cooperatively), and IRETQ to the outer ring would
- * not raise IF anyway with IOPL 0. */
+ * restored from the trapframe afterward. The user's saved rflags carries IF set
+ * (user runs preemptibly, from linux_jump's 0x202, preserved through each
+ * syscall in r11), so IRETQ resumes user code with interrupts enabled. */
 restore_tf:
     movq TF_RSP(%r15), %rax
     pushq $USER_SS
@@ -147,14 +147,15 @@ restore_tf:
 linux_jump:
     /* rdi = entry, rsi = user rsp. Enter the fresh image in CPL 3 through an
      * IRETQ frame. The SysV entry contract: rsp points at argc, rdx (an atexit
-     * function to register) is 0, rbp is 0. rflags is 0x2 (reserved bit only,
-     * IF off) so the cooperative scheduler never preempts user code. */
+     * function to register) is 0, rbp is 0. rflags is 0x202 (reserved bit plus
+     * IF) so the preemption timer can interrupt a user compute loop; the kernel
+     * stays non-preemptible because SYSCALL masks IF via SFMASK. */
     cli
     xorq %rdx, %rdx
     xorq %rbp, %rbp
     pushq $USER_SS
     pushq %rsi                      /* user rsp */
-    pushq $0x2                      /* rflags: IF off */
+    pushq $0x202                    /* rflags: IF on */
     pushq $USER_CS
     pushq %rdi                      /* entry */
     iretq

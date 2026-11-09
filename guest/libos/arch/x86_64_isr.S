@@ -50,6 +50,8 @@ isr_event:
 1:  fxsave (%r12)
 2:
     cld
+    movq 128(%rbp), %rdi       /* saved CS (15 GP regs then rip sit above rbp) */
+    andl $3, %edi              /* arg: the interrupted privilege level */
     call irq_event
 
     cmpb $0, fpu_use_xsave(%rip)
@@ -62,6 +64,17 @@ isr_event:
 4:
     mov %rbp, %rsp             /* drop the save area back to the GP frame */
 
+    /* Signal end-of-interrupt to the local APIC (x2APIC EOI MSR) so it will
+     * deliver the next one. Done before the GP registers are popped, since this
+     * clobbers rax/rcx/rdx, which the pops then restore to the interrupted
+     * values. Skipped when no APIC was enabled (then nothing uses this vector). */
+    cmpb $0, apic_enabled(%rip)
+    je 5f
+    xor %eax, %eax
+    xor %edx, %edx
+    mov $0x80b, %ecx
+    wrmsr
+5:
     pop %r15
     pop %r14
     pop %r13

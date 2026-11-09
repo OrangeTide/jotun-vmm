@@ -36,45 +36,53 @@ the syscall path running with interrupts masked. The design keeps that intact.
 
 ## Core design: preempt ring 3 only, keep the kernel cooperative
 
-- Linux user code runs with interrupts enabled (the initial `rflags` becomes
-  0x202 in `linux_jump` and in the fork and thread initial frames).
-- Everything in ring 0 stays non-preemptible. The syscall path keeps interrupts
-  masked (SFMASK already does this), so the timer never fires mid-syscall and the
-  giant lock is never interrupted. The libOS kernel tasks already run with
-  interrupts enabled, but the ISR declines to reschedule when it interrupts ring
-  0 (it checks the saved CS privilege level, as the fault stub does): there it
-  only does timekeeping and sends EOI.
+- Linux user code runs with interrupts enabled (`linux_jump` builds the entry
+  frame with `rflags` 0x202; forks and threads inherit it through the trapframe).
+- The whole libOS kernel runs with interrupts masked. The initial `rflags` for a
+  libOS task is 0x2 (IF clear, `stack_init`), and nothing in the kernel ever runs
+  `sti`, so the scheduler, every context switch, demand paging, and the syscall
+  handlers are all non-preemptible. The event vector is therefore delivered only
+  while a Linux process is in user mode (IF set); it never fires in ring 0.
 
-The timer therefore preempts a Linux user loop, while the kernel, the syscall
-handlers, demand paging, and the cooperative libOS tasks are untouched. No new
-locking is needed, because on a single vcpu the interrupts-masked kernel is
-already a critical section.
+The timer preempts a Linux user loop and nothing else. Because the kernel is
+always interrupts-masked on a single vcpu, it is one big critical section and
+needs no new locking. The ISR still checks the saved CS and reschedules only for
+a ring-3 interrupt; a stray ring-0 delivery would merely run the device hooks and
+return. This replaced an earlier attempt to run kernel tasks preemptibly: a tick
+landing in a ring-0 kernel compute loop corrupted the guest and raced the
+scheduler's own non-locked windows, so the kernel is kept strictly cooperative.
 
-## The mechanism
+## The mechanism (as built)
 
-1. Timer source. Map the local APIC page (0xFEE00000, unmapped today) into the
-   kernel's device region and run the APIC timer in periodic mode at about 100 to
-   1000 Hz. The PIT and 8259 by port I/O are the fallback if the APIC is awkward
-   under this KVM configuration. Set the spurious-interrupt vector (software
-   enable) and the timer vector (0x20), and mask the legacy PIC.
-2. Per-thread `rsp0`. A ring 3 to ring 0 interrupt lands on `TSS.rsp0`. For the
-   ISR to reschedule safely it must run on the preempted thread's own kernel
-   stack, not the shared `rsp0_stack`. So `linux_on_resume` also sets
-   `cpu_tss[cpu].rsp0 = lproc_cur->kstack_top`. This is safe because that stack is
-   idle while the thread runs in user mode (a syscall, which also uses it, runs
-   with interrupts masked and cannot be preempted).
-3. The ISR, a new assembly stub parallel to `linux_syscall_entry`. If the
-   interrupt came from ring 3, save the user registers into `lproc_cur->tf` (the
-   user rip, rsp, and rflags come from the CPU's interrupt frame), send EOI, call
-   `preempt_tick()`, then jump to `restore_tf` (reuse the existing syscall-return
-   path, which returns to user with interrupts enabled). If it came from ring 0,
-   send EOI, advance the tick, and return.
-4. `preempt_tick()` advances the monotonic tick, runs any due timers (a later
-   stage), and if the quantum has expired marks the current task ready and
-   `ctx_switch`es to the scheduler, exactly as `task_yield` does. The thread parks
-   inside the ISR; when it is rescheduled it returns up through the ISR and
-   returns to its later user rip. A thread parked in a syscall, in a cooperative
-   yield, or in this ISR all resume uniformly.
+1. In-kernel APIC. The host gives the VM an in-kernel irqchip
+   (`KVM_CREATE_IRQCHIP`, preceded by `KVM_SET_TSS_ADDR`), so KVM owns a per-vcpu
+   local APIC and delivers interrupts to a running vcpu itself. The preemption
+   tick and the device-event rouse both go out as a message-signalled interrupt
+   (`KVM_SIGNAL_MSI`, address `0xFEE00000 | apic_id<<12`, data = vector 0x20);
+   KVM routes it to the vcpu's APIC and kicks it out of guest mode to take it. No
+   userspace injection, no signal, so nothing races `KVM_RUN`. The host timer
+   thread still keeps the wall-clock tick counter in the boot block (P1/P2); with
+   `JOTUN_PREEMPT` it also sends the MSI each tick.
+2. Guest APIC in x2APIC mode. `arch_apic_init` enables the local APIC through the
+   `IA32_APIC_BASE` MSR and the spurious-vector register, all by `wrmsr`, so a
+   freestanding guest needs no APIC MMIO mapping. The ISR ends with an x2APIC EOI
+   (`wrmsr 0x80B`) so the APIC will deliver the next tick.
+3. Per-thread `rsp0`. A ring 3 to ring 0 interrupt lands on `TSS.rsp0`.
+   `linux_on_resume` (and the main thread's first entry) set it to the running
+   thread's `kstack_top`, so the preemption frame lands on that thread's own
+   kernel stack, which makes the reschedule reentrant across threads. The stack is
+   idle while the thread is in user mode (the syscall path, which also uses it,
+   runs with interrupts masked and cannot be preempted).
+4. The ISR (`isr_event`) is shared with device events. It saves the full register
+   and FPU state, passes the interrupted CS's privilege level to `irq_event`,
+   sends EOI, and returns. `irq_event` always runs the device hooks; for a ring-3
+   interrupt it then `task_yield`s, parking the thread inside the ISR on its own
+   kernel stack. When the scheduler resumes it, it returns up through the ISR and
+   `iretq`s back to the user rip. A ring-0 interrupt returns without rescheduling.
+
+Shutdown note: with the in-kernel APIC, KVM services `HLT` itself and never exits
+to the host, so the guest signals a clean stop with a store to `JOTUN_POWEROFF`
+rather than halting.
 
 ## The one large hidden cost: FPU and vector state
 
@@ -162,17 +170,20 @@ separated the clock from preemption:
 Proof: example/linuxtime.c, run as `JOTUN_HZ=1000 make linux-spike
 SPIKE_PROG=linuxtime`. All 16 spikes stay green, arm64 cross-compiles clean.
 
-## What P4 debugging already surfaced
+## What P4 debugging surfaced (resolved)
 
-Injecting the event vector into a guest that is executing a Linux process
-crashes or hangs it today (a page fault to a garbage rip with a trashed stack
-during Linux loading, and a livelock at high rates during the 9P-backed load).
-So preempting the Linux path is not a flip of the user interrupt flag; it needs
-the interrupt-context work this document describes (per-thread `rsp0`, the FPU
-save that `isr_event` already has, and a reschedule that is safe under the
-per-process CR3). As an interim guard, `irq_event` already declines to
-reschedule a task that carries a proc (a Linux thread), so kernel-task
-preemption is unaffected. This is the crux of P4.
+The old injection crash (a page fault to a garbage rip with a trashed stack, and
+a livelock at high rates) turned out to be host-side, not a guest interrupt-frame
+problem. The host preempted a running vcpu by sending SIGUSR1 to break `KVM_RUN`
+(EINTR) and then injecting the vector with `KVM_INTERRUPT` (no in-kernel APIC).
+That signal-then-inject sequence intermittently corrupted the guest: even a
+no-op `iretq`-only ISR crashed the same way, and disabling the SIGUSR1 kick made
+it run cleanly. `KVM_SET_SIGNAL_MASK` removed the corruption but then starved the
+guest. The fix was to stop injecting from userspace entirely and let the
+in-kernel APIC deliver the vector (see "The mechanism"). The two guest-side
+pieces still mattered, but as correctness, not as the crash fix: the kernel must
+be strictly non-preemptible (IF clear in ring 0), and a ring-3 preemption must
+land on the thread's own `rsp0` stack.
 
 ## Status
 
@@ -189,6 +200,16 @@ preemption is unaffected. This is the crux of P4.
   under JOTUN_PREEMPT) runs through the XSAVE path without fault. A strict "AVX
   survives a preemptive switch" test needs an AVX Linux program to be preempted,
   which arrives with P4.
-- P4 (preempt ring 3 safely): planned; the injection crash above is the first
-  thing it must fix.
+- P4 (preempt ring 3 safely): done. The host delivers the event vector through an
+  in-kernel APIC (`KVM_CREATE_IRQCHIP` + `KVM_SIGNAL_MSI`); the guest enables its
+  x2APIC and EOIs in the ISR. Linux user code runs with IF set (`linux_jump`
+  0x202), the libOS kernel runs strictly with IF clear (`stack_init` 0x2, no
+  `sti`), so ticks fire only in ring 3. `linux_on_resume` arms the per-thread
+  `rsp0`, and `irq_event` reschedules only ring-3 interrupts. Shutdown is a
+  `JOTUN_POWEROFF` store, since the in-kernel APIC keeps HLT from reaching the
+  host. Validated: example/linuxpreempt.c (a user thread spinning on a flag that
+  only another user thread can set) hangs without preemption and prints
+  "preempt ok" with it; the full spike suite is green with and without preemption
+  at HZ up to 1000; the clock still passes; the spin demo now runs cooperatively;
+  arm64 cross-compiles clean.
 - P5 (real sleeps and timers): planned.

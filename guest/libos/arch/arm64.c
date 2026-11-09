@@ -90,6 +90,19 @@ arch_traps_init(unsigned long id)
     __asm__ volatile ("msr vbar_el1, %0; isb" : : "r"(arm64_vectors));
 }
 
+/* No asynchronous interrupt controller is wired up yet (see above), so these are
+ * stubs that keep the arch interface uniform with x86. */
+void
+arch_apic_init(void)
+{
+}
+
+void
+arch_set_kstack(uint64_t top)
+{
+    (void)top;
+}
+
 /* Enable FP/SIMD at EL1: set CPACR_EL1.FPEN to 0b11 so FP and Advanced SIMD
  * instructions do not trap, then synchronize with an ISB. */
 void

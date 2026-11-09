@@ -165,12 +165,9 @@ rouse_vcpus(void *ctx)
     struct guest *gp = ctx;
 
     for (int i = 0; i < gp->nvcpus; i++) {
-        if (__atomic_load_n(&gp->ctx[i].live, __ATOMIC_SEQ_CST)) {
+        if (__atomic_load_n(&gp->ctx[i].live, __ATOMIC_SEQ_CST))
             vmm_vcpu_interrupt(gp->ctx[i].vcpu, JOTUN_EVENT_VECTOR);
-            if (gp->threads[i])
-                pthread_kill(gp->threads[i], SIGUSR1);
-        }
-        vcpu_wake(&gp->ctx[i]);
+        vcpu_wake(&gp->ctx[i]);     /* also leave the idle rendezvous */
     }
 }
 
@@ -479,14 +476,6 @@ run_vcpu(void *arg)
     return NULL;
 }
 
-/* An empty handler so a signal breaks a vcpu out of its run with EINTR rather
- * than terminating the process. */
-static void
-sig_noop(int sig)
-{
-    (void)sig;
-}
-
 /* Timer thread: tick at the configured rate and preempt each running vcpu by
  * queuing the event interrupt and signalling the thread out of its run. */
 struct timer_ctx {
@@ -527,8 +516,8 @@ run_timer(void *arg)
             for (int i = 0; i < gp->nvcpus; i++) {
                 if (!__atomic_load_n(&gp->ctx[i].live, __ATOMIC_SEQ_CST))
                     continue;
+                /* The in-kernel APIC delivers this and kicks the vcpu itself. */
                 vmm_vcpu_interrupt(gp->ctx[i].vcpu, JOTUN_EVENT_VECTOR);
-                pthread_kill(gp->threads[i], SIGUSR1);
             }
         }
     }
@@ -874,13 +863,6 @@ main(int argc, char **argv)
     g_timer_hz = hz;                /* so setup_bootinfo can tell the guest */
 
     uart_init(&uart);
-
-    /* SIGUSR1 breaks a running vcpu out of its run (no SA_RESTART, so KVM_RUN
-     * returns EINTR). The preemption timer and the net poll threads use it, so
-     * install it once for the process. */
-    struct sigaction sa = { 0 };
-    sa.sa_handler = sig_noop;
-    sigaction(SIGUSR1, &sa, NULL);
 
     /* One in-host switch backs the whole process, so guests can reach each
      * other by name. */

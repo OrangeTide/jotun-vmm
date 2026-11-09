@@ -41,9 +41,12 @@ arch_halt(void)
 
 /* The ctx_switch restore pops RFLAGS then six callee-saved registers (r15,
  * r14, r13, r12, rbp, rbx) and rets. Lay those down with the entry as the
- * return slot. RFLAGS starts with IF set (0x202) so a fresh task runs with
- * interrupts enabled and is preemptible. The entry slot is 16-aligned so that
- * after the ret, rsp is 8 mod 16, as the SysV ABI promises at entry. */
+ * return slot. RFLAGS starts with IF clear (0x2) so the libOS kernel runs
+ * non-preemptibly: the scheduler, context switches, and syscall handlers are
+ * never interrupted by the event timer, so they need no extra locking. Only a
+ * Linux process in user mode runs with IF set (linux_jump), so the timer
+ * preempts a user compute loop and nothing else. The entry slot is 16-aligned so
+ * that after the ret, rsp is 8 mod 16, as the SysV ABI promises at entry. */
 void *
 stack_init(void *stack, size_t size, void (*entry)(void))
 {
@@ -51,7 +54,7 @@ stack_init(void *stack, size_t size, void (*entry)(void))
     uint64_t *entry_slot = (uint64_t *)(top - 16);
     uint64_t *sp = entry_slot - 7;
 
-    sp[0] = 0x202;                  /* RFLAGS: IF set, reserved bit 1 */
+    sp[0] = 0x2;                    /* RFLAGS: IF clear, reserved bit 1 */
     for (int i = 1; i < 7; i++)
         sp[i] = 0;                  /* r15, r14, r13, r12, rbp, rbx */
     *entry_slot = (uint64_t)(uintptr_t)entry;
@@ -457,4 +460,66 @@ void
 arch_cpu_relax(void)
 {
     __asm__ volatile ("pause" ::: "memory");
+}
+
+/****************************************************************
+ * Local APIC (x2APIC mode). The host gives the VM an in-kernel APIC and
+ * delivers the event vector to it (preemption ticks and device events). In
+ * x2APIC mode the APIC is reached through MSRs, not an MMIO page, so a
+ * freestanding guest needs no device mapping: enabling it and sending EOI are
+ * just wrmsr. The event ISR writes EOI (see x86_64_isr.S, which reads
+ * apic_enabled) so the APIC will deliver the next interrupt.
+ ****************************************************************/
+#define MSR_APIC_BASE  0x1Bu
+#define MSR_X2APIC_SVR 0x80Fu       /* spurious-interrupt vector register */
+
+/* Nonzero once this build enabled the x2APIC; read by the ISR (plain global, so
+ * not static) to decide whether to send EOI. */
+uint8_t apic_enabled;
+
+static uint64_t
+rdmsr(uint32_t msr)
+{
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static void
+wrmsr(uint32_t msr, uint64_t v)
+{
+    __asm__ volatile ("wrmsr"
+                      : : "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
+}
+
+/* Enable this cpu's local APIC in x2APIC mode so it can receive the event
+ * vector. Called once per cpu during bring-up. If the CPU has no x2APIC the
+ * APIC stays off and the timer only advances the host-maintained clock. */
+void
+arch_apic_init(void)
+{
+    uint32_t a, b, c, d;
+    cpuid(1, 0, &a, &b, &c, &d);
+    if (!(c & (1u << 21)))              /* no x2APIC */
+        return;
+    wrmsr(MSR_APIC_BASE, rdmsr(MSR_APIC_BASE) | (1u << 10) | (1u << 11));
+    wrmsr(MSR_X2APIC_SVR, 0x1FF);       /* software enable, spurious vector 0xFF */
+    apic_enabled = 1;
+}
+
+/* Point this cpu's TSS.rsp0 at a thread's kernel stack, so an interrupt taken
+ * from ring 3 lands there rather than on the shared fault stack. Find the
+ * running cpu's TSS through the task register (TR) and the GDT descriptor it
+ * selects, so no cpu-id plumbing is needed. */
+void
+arch_set_kstack(uint64_t top)
+{
+    uint16_t tr;
+    __asm__ volatile ("str %0" : "=r"(tr));
+    unsigned slot = (unsigned)(tr >> 3);
+    uint64_t lo = gdt[slot], hi = gdt[slot + 1];
+    uint64_t base = ((lo >> 16) & 0xffffffULL)
+                  | (((lo >> 56) & 0xffULL) << 24)
+                  | ((hi & 0xffffffffULL) << 32);
+    ((struct tss *)(uintptr_t)base)->rsp[0] = top;
 }

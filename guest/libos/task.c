@@ -447,21 +447,28 @@ task_add_event_hook(void (*fn)(void))
         event_hooks[nhooks++] = fn;
 }
 
-/* Called from the event ISR. Give the event hooks a chance to ready their
- * parked tasks (net and draw waiters), then reschedule the running task; if
- * the scheduler itself was interrupted (cur is NULL) there is nothing to
- * preempt. */
+/* Called from the event ISR with the privilege level the interrupt came from
+ * (3 = a Linux process in user mode, 0 = the libOS kernel). Run the device
+ * hooks (net and draw waiters) on every tick, then preempt only when a Linux
+ * user thread was running.
+ *
+ * The kernel stays cooperative on purpose: it runs with interrupts masked
+ * throughout (IF clear from stack_init, and nothing in ring 0 runs sti), so the
+ * event vector is delivered only while a Linux thread is in user mode. The cpl
+ * check is belt-and-suspenders for that: were a tick ever taken in ring 0,
+ * rescheduling from it could re-enter the non-reentrant scheduler or a context
+ * switch, so it just runs the device hooks and returns. A tick taken in ring 3
+ * preempts that user thread safely: its interrupt frame is on the thread's own
+ * kernel stack (the per-thread TSS.rsp0 set by the resume hook), and no kernel
+ * critical section is in flight. */
 void
-irq_event(void)
+irq_event(unsigned cpl)
 {
     run_event_hooks();
+    if (cpl != 3)
+        return;
     struct percpu *pc = this_cpu();
-    /* Preempt a plain kernel task on a timer tick. A task that carries a proc (a
-     * Linux process thread) is not yet preempted here: a safe reschedule of it
-     * from interrupt context needs the FPU and per-thread stack handling that
-     * preemption stage P4 adds. Until then the timer only advances its clock
-     * (host-maintained) and the Linux path stays cooperative. */
-    if (pc->cur && !pc->cur->proc)
+    if (pc->cur)
         task_yield();
 }
 

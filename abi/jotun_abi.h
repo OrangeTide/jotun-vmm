@@ -27,6 +27,12 @@
 #define JOTUN_WAKE_DOORBELL 0x3a000018ull
 #define JOTUN_WAKE_ALL      0xffffffffu
 
+/* A store here stops the VMM (MMIO, faults out to the host). The guest uses it
+ * to shut down instead of halting: with the in-kernel APIC a HLT is serviced
+ * inside KVM and never reaches the host, so a clean exit needs an explicit
+ * store. Must match MMIO_POWEROFF in host/uart.h. */
+#define JOTUN_POWEROFF      0x39010000ull
+
 #define JOTUN_RING_SLOTS    8u
 #define JOTUN_SLOT_SIZE     256u                    /* bytes, header included */
 #define JOTUN_MSG_MAX       (JOTUN_SLOT_SIZE - 2u)  /* payload per slot */

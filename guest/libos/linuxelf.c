@@ -2706,6 +2706,11 @@ linux_on_resume(void *vp)
     lproc_cur = (struct lproc *)vp;
     vmspace_switch(lproc_cur->sh->vmspace);
     arch_load_tls(lproc_cur->tls);
+    /* A timer tick taken while this thread runs in user mode enters the kernel
+     * through TSS.rsp0; point it at this thread's own handler stack so the
+     * preemption frame lands there (private and idle while the thread is in
+     * user mode), which makes the reschedule reentrant across threads. */
+    arch_set_kstack(lproc_cur->kstack_top);
 }
 
 /* Threads that have exited but still hold a libOS task slot and kstack. They
@@ -4577,6 +4582,10 @@ linux_elf_run(const char *file)
     con_puts("[bin] stack built\n");
 
     con_puts("[bin] entering guest\n");
+    /* The resume hook sets TSS.rsp0 on a scheduler switch, but the main thread
+     * enters user mode here on the init task without going through it, so arm its
+     * per-thread kernel stack for a preemption tick now. */
+    arch_set_kstack(p->kstack_top);
     linux_jump(entry, rsp);             /* enter the program; exit ends the task */
 }
 

@@ -7,6 +7,7 @@
 #define LIBOS_ARCH_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* Write one byte to the console device, blocking until it accepts the byte.
  * This is the raw arch sink; the portable con_putc (print.h) funnels through
@@ -42,6 +43,17 @@ void arch_traps_init(unsigned long id);
  * switch saves the callee-saved vector registers). Must run once per cpu at
  * boot, before any task starts. */
 void arch_fpu_init(void);
+
+/* Enable this cpu's interrupt controller so it can receive the event vector
+ * (the preemption tick and device events) from the host's in-kernel APIC. On
+ * x86 this turns on the local APIC in x2APIC mode; the ISR sends EOI. Must run
+ * once per cpu at boot. On arm64 this is a stub for now. */
+void arch_apic_init(void);
+
+/* Set this cpu's ring-0 stack for an interrupt taken from ring 3 (TSS.rsp0), so
+ * a Linux user thread that is preempted lands on its own kernel stack. Called by
+ * the Linux resume hook with the thread's kstack top. x86 only; stub elsewhere. */
+void arch_set_kstack(uint64_t top);
 
 /* Enable and disable asynchronous interrupts on this cpu. */
 void arch_irq_enable(void);

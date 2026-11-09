@@ -18,6 +18,7 @@
 #include "print.h"
 #include "prog.h"
 #include "task.h"
+#include "jotun_abi.h"
 #include "threads.h"
 #include "triton.h"
 #include "vmspace.h"
@@ -910,6 +911,7 @@ kmain(unsigned long id)
     cpu_init(id);
     arch_traps_init(id);        /* each cpu loads its own trap tables */
     arch_fpu_init();            /* enable FP/SIMD so the rasterizer can run */
+    arch_apic_init();           /* enable the local APIC for the event vector */
 
     if (id == 0) {
         con_puts("libos up\n");
@@ -939,6 +941,10 @@ kmain(unsigned long id)
         con_puts("final table:\n");
         task_dump();
         con_puts("libos halting\n");
+        /* Stop the VMM. A plain HLT would be serviced by the in-kernel APIC and
+         * never reach the host (the timer keeps waking it), so signal shutdown
+         * explicitly. */
+        *(volatile uint32_t *)JOTUN_POWEROFF = 0;
     }
     arch_halt();
     for (;;)

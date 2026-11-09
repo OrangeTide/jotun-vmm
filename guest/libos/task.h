@@ -109,8 +109,10 @@ int task_recv_note(char *buf, int nbuf);
 /* Print the task table: id, state, name. Observability for bring-up. */
 void task_dump(void);
 
-/* The event-interrupt handler, called from the arch ISR. Preempts the running
- * task by rescheduling. */
-void irq_event(void);
+/* The event-interrupt handler, called from the arch ISR with the privilege
+ * level the interrupt came from (3 = ring 3 / a Linux user thread, 0 = the
+ * kernel). Runs the device-event hooks always, and preempts the running task
+ * only when it was a Linux user thread (ring 3); the kernel stays cooperative. */
+void irq_event(unsigned cpl);
 
 #endif /* LIBOS_TASK_H */

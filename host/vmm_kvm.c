@@ -49,6 +49,7 @@ struct vmm_vcpu {
     int mmap_size;
     volatile int irq_pending;   /* set by another thread, delivered by the run */
     uint8_t irq_vector;
+    uint32_t apic_id;           /* this vcpu's local-APIC id (= its index) */
 };
 
 // Lifecycle management functions
@@ -65,6 +66,18 @@ vmm_vm_t* vmm_init() {
         free(vm);
         return NULL;
     }
+#if defined(__x86_64__)
+    /* Give the VM an in-kernel irqchip (PIC, IOAPIC, and a per-vcpu local APIC).
+     * KVM then delivers interrupts to a running vcpu itself, atomically, which is
+     * how the preemption tick and device events reach the guest without the
+     * host racing a signal against KVM_RUN. The emulated chipset needs a TSS
+     * region in guest physical space (used only by KVM's real-mode emulation,
+     * which this long-mode guest never enters); place it high, above guest RAM.
+     * Both ioctls are best-effort: an older KVM without them still boots with the
+     * previous userspace-injection fallback compiled elsewhere. */
+    ioctl(vm->vm_fd, KVM_SET_TSS_ADDR, 0xfffbd000UL);
+    ioctl(vm->vm_fd, KVM_CREATE_IRQCHIP);
+#endif
     vm->next_slot = 0;
     vm->next_vcpu_id = 0;
     return vm;
@@ -112,6 +125,9 @@ vmm_vcpu_t* vmm_vcpu_create(vmm_vm_t* vm) {
         free(vcpu);
         return NULL;
     }
+    vcpu->irq_pending = 0;
+    vcpu->irq_vector = 0;
+    vcpu->apic_id = (uint32_t)vcpu_id;  /* KVM's default local-APIC id */
 
 #if defined(__x86_64__)
     // Put the vcpu directly into 64-bit long mode on the identity map built in
@@ -279,34 +295,33 @@ static uint64_t vcpu_pc(vmm_vcpu_t* vcpu) {
 }
 
 void vmm_vcpu_interrupt(vmm_vcpu_t* vcpu, uint8_t vector) {
+#if defined(__x86_64__)
+    /* Deliver an edge-triggered, fixed-delivery interrupt to this vcpu's local
+     * APIC as a message-signalled interrupt. With the in-kernel irqchip KVM
+     * routes it to the matching APIC id and kicks the vcpu out of guest mode to
+     * take it, so a running compute loop is preempted atomically with no signal
+     * and no injection race. Safe to call from any thread. */
+    struct kvm_msi msi = {
+        .address_lo = 0xfee00000u | (vcpu->apic_id << 12),
+        .address_hi = 0,
+        .data = vector,             /* fixed delivery, physical dest, edge */
+        .flags = 0,
+    };
+    ioctl(vcpu->vm_fd, KVM_SIGNAL_MSI, &msi);
+#else
     vcpu->irq_vector = vector;
     __atomic_store_n(&vcpu->irq_pending, 1, __ATOMIC_SEQ_CST);
+#endif
 }
 
 void vmm_vcpu_run(vmm_vcpu_t* vcpu, vmm_exit_info_t* exit_info) {
     struct kvm_run *run = vcpu->run;
 
-#if defined(__x86_64__)
-    /* Interrupt injection with no in-kernel irqchip. If a vector is queued and
-     * the guest can take it now (per the previous run), inject it. Otherwise
-     * ask KVM to exit when the interrupt window opens, so we can inject then. */
-    if (__atomic_load_n(&vcpu->irq_pending, __ATOMIC_SEQ_CST)) {
-        if (run->ready_for_interrupt_injection) {
-            struct kvm_interrupt intr = { .irq = vcpu->irq_vector };
-            if (ioctl(vcpu->vcpu_fd, KVM_INTERRUPT, &intr) == 0)
-                __atomic_store_n(&vcpu->irq_pending, 0, __ATOMIC_SEQ_CST);
-            run->request_interrupt_window = 0;
-        } else {
-            run->request_interrupt_window = 1;
-        }
-    } else {
-        run->request_interrupt_window = 0;
-    }
-#endif
-
+    /* The in-kernel irqchip delivers interrupts to this vcpu on its own (see
+     * vmm_vcpu_interrupt), so the run loop no longer injects or asks for an
+     * interrupt window; it just runs the guest. A signal that breaks the run
+     * (EINTR) is still reported so the caller loops and re-enters. */
     if (ioctl(vcpu->vcpu_fd, KVM_RUN, 0) < 0) {
-        /* A signal broke the run (used to preempt a spinning guest). Report it
-         * so the caller runs again, which re-attempts injection. */
         if (errno == EINTR) {
             exit_info->reason = VMM_EXIT_REASON_INTR;
             return;
