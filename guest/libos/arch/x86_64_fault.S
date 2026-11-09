@@ -14,9 +14,26 @@
  * can fault in ways the libOS never would, and a silent triple fault is the
  * alternative. */
 
-/* Offset of kstack_top (the handler stack) within struct lproc; mirrors
- * TF_KSTACK in x86_64_linuxsys.S. A CPL-3 fault is redirected to run the kill
- * trampoline on this stack. */
+/* Trapframe field offsets within struct lproc (mirrors x86_64_linuxsys.S). A
+ * CPL-3 fault saves the faulting user context here before its IRETQ redirect
+ * reuses the fault stack, so a signal handler or teardown can see it.
+ * kstack_top (the handler stack the redirect lands on) follows the trapframe. */
+#define TF_RAX    0
+#define TF_RBX    8
+#define TF_RCX    16        /* user rip */
+#define TF_RDX    24
+#define TF_RSI    32
+#define TF_RDI    40
+#define TF_RBP    48
+#define TF_R8     56
+#define TF_R9     64
+#define TF_R10    72
+#define TF_R11    80        /* user rflags */
+#define TF_R12    88
+#define TF_R13    96
+#define TF_R14    104
+#define TF_R15    112
+#define TF_RSP    120       /* user rsp */
 #define TF_KSTACK 128
 
 /* Kernel and user segment selectors (see the GDT in x86_64.c). */
@@ -109,22 +126,65 @@ exc_common:
     jmp 2b
 
 /* Shared tail for a CPU fault taken in CPL 3: redirect the CPU's return frame
- * so the IRETQ below re-enters the kernel at linux_fault_kill, running in ring 0
- * on the faulting process's handler stack, which terminates the process. On
- * entry the 15 saved GP registers sit at 0(%rsp) (r15) up to 112(%rsp) (rax),
- * then the uniform trap frame: vec(120) err(128) rip(136) cs(144) rflags(152)
- * rsp(160) ss(168). Reached from exc_common and pf_isr, which lay down the same
- * frame. */
+ * so the IRETQ below re-enters the kernel at linux_fault_entry, running in ring 0
+ * on the faulting process's handler stack. That C routine runs a handler if one
+ * is installed for the fault's signal, else terminates the process. On entry the
+ * 15 saved GP registers sit at 0(%rsp) (r15) up to 112(%rsp) (rax), then the
+ * uniform trap frame: vec(120) err(128) rip(136) cs(144) rflags(152) rsp(160)
+ * ss(168). Reached from exc_common and pf_isr, which lay down the same frame.
+ *
+ * The faulting user context must survive the redirect (the handler stack the
+ * IRETQ lands on is the same stack the fault frame sits atop, so running C there
+ * overwrites it). Copy the whole register set into lproc_cur->tf first; the
+ * trapframe is the first member of struct lproc, so lproc_cur is its address. */
 kill_user_fault:
-    movq 120(%rsp), %rax      /* vec -> the argument for linux_fault_kill */
-    movq %rax, 72(%rsp)       /* overwrite saved rdi (first C argument) */
-    movq lproc_cur(%rip), %rax
-    movq TF_KSTACK(%rax), %rax
+    movq lproc_cur(%rip), %rbx /* rbx = &tf; rax is the copy scratch */
+    movq 112(%rsp), %rax
+    movq %rax, TF_RAX(%rbx)
+    movq 104(%rsp), %rax
+    movq %rax, TF_RBX(%rbx)
+    movq 136(%rsp), %rax       /* user rip */
+    movq %rax, TF_RCX(%rbx)
+    movq 88(%rsp), %rax
+    movq %rax, TF_RDX(%rbx)
+    movq 80(%rsp), %rax
+    movq %rax, TF_RSI(%rbx)
+    movq 72(%rsp), %rax
+    movq %rax, TF_RDI(%rbx)
+    movq 64(%rsp), %rax
+    movq %rax, TF_RBP(%rbx)
+    movq 56(%rsp), %rax
+    movq %rax, TF_R8(%rbx)
+    movq 48(%rsp), %rax
+    movq %rax, TF_R9(%rbx)
+    movq 40(%rsp), %rax
+    movq %rax, TF_R10(%rbx)
+    movq 152(%rsp), %rax       /* user rflags */
+    movq %rax, TF_R11(%rbx)
+    movq 24(%rsp), %rax
+    movq %rax, TF_R12(%rbx)
+    movq 16(%rsp), %rax
+    movq %rax, TF_R13(%rbx)
+    movq 8(%rsp), %rax
+    movq %rax, TF_R14(%rbx)
+    movq 0(%rsp), %rax
+    movq %rax, TF_R15(%rbx)
+    movq 160(%rsp), %rax       /* user rsp */
+    movq %rax, TF_RSP(%rbx)
+
+    /* Arguments for linux_fault_entry(vec, cr2): overwrite the saved rdi and rsi
+     * slots, which the pops below load into rdi and rsi. */
+    movq 120(%rsp), %rax       /* vec -> first argument */
+    movq %rax, 72(%rsp)        /* saved rdi */
+    movq %cr2, %rax            /* faulting address -> second argument */
+    movq %rax, 80(%rsp)        /* saved rsi */
+
+    movq TF_KSTACK(%rbx), %rax
     movq %rax, 160(%rsp)      /* return rsp = the process handler stack */
     movq $KERN_SS, 168(%rsp)  /* return ss */
     movq $KERN_CS, 144(%rsp)  /* return cs */
     movq $0x2, 152(%rsp)      /* return rflags: reserved bit only, IF off */
-    leaq linux_fault_kill(%rip), %rax
+    leaq linux_fault_entry(%rip), %rax
     movq %rax, 136(%rsp)      /* return rip */
     pop %r15
     pop %r14

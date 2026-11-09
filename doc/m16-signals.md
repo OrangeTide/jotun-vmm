@@ -17,8 +17,9 @@ The pieces signals need already exist:
 - Blocking points that drop the giant lock (`lx_block`/`lx_yield` in pipe read
   and write, poll, wait4, futex) plus `task_wake(id)`. The hook for interrupting
   a parked thread.
-- Partial state already: `sh->exit_sig` and `linux_fault_kill` map a fatal fault
-  to a "terminated by signal N" that `wait4` reports as `WIFSIGNALED`.
+- A CPU fault path (`linux_fault_entry`, reached from arch/x86_64_fault.S) that
+  routes a CPL-3 fault to a handler or, failing that, to a "terminated by signal
+  N" that `wait4` reports as `WIFSIGNALED` through `sh->exit_sig`.
 
 ## The one hard constraint
 
@@ -67,7 +68,7 @@ Signal sets are 64-bit (bit `s-1` for signal `s`), which is the x86-64 kernel
 | B | Generation (`kill`, `tkill`, `tgkill`) and the default terminate action | done |
 | C | Blocking syscalls notice a fatal signal and terminate (killable while blocked) | done |
 | D | Handler delivery: build a frame on the user stack, divert the return, `rt_sigreturn`, `SA_RESTART`, userspace `EINTR` | done |
-| E | Catchable faults: save the user context in the fault stub so `SIGSEGV`/`SIGFPE`/`SIGILL` reach a handler | planned |
+| E | Catchable faults: save the user context in the fault stub so `SIGSEGV`/`SIGFPE`/`SIGILL` reach a handler | done |
 | F | Timers: syscall-gated `alarm`/`setitimer` -> `SIGALRM`, `timerfd` (coarse, boundary-checked) | planned |
 
 ## What stages A to C do
@@ -139,13 +140,41 @@ disposition after one delivery, a handler interrupts a blocked read as `EINTR`,
 `SA_RESTART` restarts the interrupted read instead, and `pause` returns `EINTR`
 after the handler runs.
 
-## What stage D deliberately does not do
+## What stage E does
 
-- Synchronous fault signals still terminate. A `SIGSEGV`/`SIGFPE`/`SIGILL` from a
-  CPU fault goes through `linux_fault_kill` and terminates the process; routing
-  it to a handler is stage E (it needs the fault stub to save the user context).
+Catchable faults route a synchronous CPU exception to a handler. The x86-64 fault
+stub (arch/x86_64_fault.S) already redirected a CPL-3 fault's IRETQ into a ring-0
+routine on the faulting process's handler stack. It now first copies the full
+faulting user register set (the 15 GP registers, the user rip, rsp, and rflags)
+from the fault frame into `lproc_cur->tf`, before the redirect reuses that stack,
+and passes the trap vector and `cr2` to `linux_fault_entry`.
+
+`linux_fault_entry` maps the vector to a signal and a fault `si_code`
+(`#DE`->SIGFPE, `#UD`->SIGILL, `#PF`/`#GP`/other->SIGSEGV, with `cr2` as the
+`si_addr` for a page fault). If a handler is installed for that signal and it is
+not blocked, `deliver_signal` builds the handler frame from the saved context
+(the fault `si_code` and address go into the siginfo) and `linux_resume` enters
+the handler. Otherwise the fault is forced to terminate: a synchronous fault that
+is ignored, defaulted, or blocked cannot be resumed past, so the process exits
+with the signal (reported `WIFSIGNALED`), as before. A handler that returns
+normally re-runs the faulting instruction, matching Linux; a recovering handler
+uses `siglongjmp` or exits.
+
+This is x86-64 only. The AArch64 fault path does not route to a handler yet (it
+never called the old terminate routine either).
+
+Proof: example/linuxfault.c. A SIGSEGV handler runs on an out-of-window access
+and reads the fault address from the siginfo, a SIGFPE handler catches an integer
+divide by zero, a SIGILL handler catches an illegal instruction (all recovering
+with `siglongjmp`), and an uncaught fault still terminates the process with
+SIGSEGV.
+
+## What stages D and E deliberately do not do
+
 - No `SIGCHLD` is generated on child exit, and `rt_sigsuspend` is not
   implemented.
 - Thread-group signal semantics are minimal: a process-directed signal is
   delivered to whichever thread next reaches a boundary, not steered to one that
   has it unblocked.
+- The AArch64 handler-delivery and fault-routing paths are not exercised (the
+  frame builder compiles, but the arm64 guest is not run).

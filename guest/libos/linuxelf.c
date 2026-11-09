@@ -562,15 +562,19 @@ static void signal_killpoint(void);
  * handler installed; signal_deliverable is the boolean form blocking syscalls
  * poll to break out so the handler runs at the dispatch boundary. */
 static int signal_deliverable(void);
+static void deliver_signal(int sig, long result, int restart, int si_code,
+                           uint64_t si_addr);
 /* linux_jump is declared by the arch backend (linux_arch.h); linux_resume takes
  * struct lproc, which is defined here, so it is declared here. */
 extern void linux_resume(struct lproc *p) __attribute__((noreturn));
 
 /* Called from the CPU fault path (x86_64_fault.S) when a process faults in
- * CPL 3: terminate just that process with the signal the trap vector maps to,
- * instead of halting the whole guest. Runs in ring 0 on the process's handler
- * stack, which the fault path redirects an IRETQ into. */
-void linux_fault_kill(long vec) __attribute__((noreturn));
+ * CPL 3. The fault path saves the faulting user context into lproc_cur->tf and
+ * redirects its IRETQ here, in ring 0 on the process's handler stack, with the
+ * trap vector and the faulting address. It runs a handler if one is installed
+ * for the signal, else terminates just that process instead of halting the
+ * guest. Defined with the signal code below. */
+void linux_fault_entry(long vec, uint64_t addr) __attribute__((noreturn));
 
 /* The giant lock for the Linux syscall layer. The scheduler is preemptive and
  * SMP-capable, but the syscall handlers share mutable tables (the fd table, the
@@ -3262,31 +3266,58 @@ do_exit(long code, int group)
     task_exits(NULL);
 }
 
-/* Terminate the running process after a CPU fault taken in CPL 3. The fault
- * path (x86_64_fault.S) redirects its IRETQ to land here, in ring 0 on this
- * process's handler stack, with the trap vector in the first argument. We were
- * in user mode when the fault hit, so no syscall held the giant lock; take it,
- * record the terminating signal (so the parent's wait4 reports WIFSIGNALED),
- * and exit the process. do_exit releases the lock and switches away, so one
- * process faulting no longer halts the guest. */
-void
-linux_fault_kill(long vec)
+/* Map a CPU exception vector to the signal and the fault si_code it raises. */
+static int
+fault_signal(long vec, int *si_code)
 {
-    int sig;
     switch (vec) {
-    case 0:  sig = 8;  break;           /* #DE divide error  -> SIGFPE */
-    case 6:  sig = 4;  break;           /* #UD invalid opcode -> SIGILL */
-    case 13: sig = 11; break;           /* #GP               -> SIGSEGV */
-    case 14: sig = 11; break;           /* #PF page fault    -> SIGSEGV */
-    default: sig = 11; break;           /* anything else     -> SIGSEGV */
+    case 0:  *si_code = 1; return 8;    /* #DE  -> SIGFPE, FPE_INTDIV */
+    case 6:  *si_code = 1; return 4;    /* #UD  -> SIGILL, ILL_ILLOPC */
+    case 14: *si_code = 1; return 11;   /* #PF  -> SIGSEGV, SEGV_MAPERR (addr=cr2) */
+    case 13: *si_code = 0x80; return 11;/* #GP  -> SIGSEGV, SI_KERNEL */
+    default: *si_code = 0x80; return 11;/* anything else -> SIGSEGV */
     }
+}
+
+/* A CPU fault taken in CPL 3. The fault path (x86_64_fault.S) saves the full
+ * faulting user context into lproc_cur->tf and redirects its IRETQ to land here,
+ * in ring 0 on this process's handler stack, with the trap vector and the
+ * faulting address (cr2) as arguments. We were in user mode when the fault hit,
+ * so no syscall held the giant lock; take it.
+ *
+ * If the process has a handler installed for the fault's signal and has not
+ * blocked it, the handler runs (deliver_signal builds its frame from the saved
+ * context, with the fault address in the siginfo), then we resume into it. A
+ * synchronous fault that is ignored, defaulted, or blocked is forced to
+ * terminate (you cannot resume past a faulting instruction), which sets exit_sig
+ * so the parent's wait4 reports WIFSIGNALED. do_exit releases the lock and
+ * switches away, so one process faulting no longer halts the guest. */
+void linux_fault_entry(long vec, uint64_t addr) __attribute__((noreturn));
+void
+linux_fault_entry(long vec, uint64_t addr)
+{
+    int si_code = 0;
+    int sig = fault_signal(vec, &si_code);
+    if (vec != 14)
+        addr = 0;                       /* cr2 is only meaningful for a page fault */
+
     giant_lock();
+    struct lproc *t = lproc_cur;
+    uint64_t h = t->sh->sigact[sig - 1].handler;
+    int caught = (h != SIG_DFL && h != SIG_IGN) && !(t->sig_blocked & SIGBIT(sig));
+    if (caught) {
+        /* The faulting return register is the context's own; preserve it. */
+        deliver_signal(sig, (long)tf_retval(&t->tf), 0, si_code, addr);
+        giant_unlock();
+        linux_resume(t);                /* enter the handler; does not return */
+    }
+
     con_puts("[bin] pid ");
-    put_dec(lproc_cur->sh->pid);
+    put_dec(t->sh->pid);
     con_puts(" killed by signal ");
     put_dec(sig);
     con_putc('\n');
-    lproc_cur->sh->exit_sig = sig;
+    t->sh->exit_sig = sig;
     do_exit(0, 1);                      /* noreturn: releases the lock, tears down */
 }
 
@@ -3396,13 +3427,15 @@ signal_deliverable(void)
     return next_caught_signal() != 0;
 }
 
-/* Deliver one caught signal: build a handler frame on the user stack and
- * re-point this thread's trapframe at the handler. `result` is the syscall
- * result the interrupted code would otherwise return; `restart` arranges the
- * trapped syscall to re-run after the handler (used for SA_RESTART). A bad user
+/* Deliver one signal: build a handler frame on the user stack and re-point this
+ * thread's trapframe at the handler. `result` is the syscall result the
+ * interrupted code would otherwise return (or the preserved register for a
+ * fault); `restart` arranges the trapped syscall to re-run after the handler
+ * (used for SA_RESTART). si_code/si_addr fill the siginfo: 0 for a sent signal
+ * (SI_USER), a fault code plus the fault address for a CPU fault. A bad user
  * stack turns into a fatal SIGSEGV, matching Linux. */
 static void
-deliver_signal(int sig, long result, int restart)
+deliver_signal(int sig, long result, int restart, int si_code, uint64_t si_addr)
 {
     struct lproc *t = lproc_cur;
     struct ksigaction *ka = &t->sh->sigact[sig - 1];
@@ -3430,7 +3463,7 @@ deliver_signal(int sig, long result, int restart)
 
     arch_sigframe_build(frame, &t->tf, sig, ka->handler, flags, ka->restorer,
                         (uint64_t)result, restart, t->sig_blocked,
-                        altsp, altsize, 0 /* SI_USER */, 0, 0);
+                        altsp, altsize, si_code, 0, 0, si_addr);
 
     /* Consume the signal and mask it (and the handler's sa_mask) for the handler,
      * unless SA_NODEFER. rt_sigreturn restores the saved mask. */
@@ -3471,7 +3504,7 @@ maybe_deliver_signal(long r)
         else
             result = -LERR_INTR;
     }
-    deliver_signal(sig, result, restart);
+    deliver_signal(sig, result, restart, 0 /* SI_USER */, 0);
     return r;
 }
 

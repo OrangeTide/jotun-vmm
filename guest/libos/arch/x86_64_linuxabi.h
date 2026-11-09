@@ -177,6 +177,13 @@ tf_user_sp(const struct trapframe *tf)
     return tf->rsp;
 }
 
+/* The syscall/return value register (rax), preserved when a fault is caught. */
+static inline uint64_t
+tf_retval(const struct trapframe *tf)
+{
+    return tf->rax;
+}
+
 /* On x86-64 the TLS base lives in lproc->tls and is loaded by the resume hook
  * (arch_load_tls), not in the trapframe, so recording it here is a no-op. */
 static inline void
@@ -353,7 +360,7 @@ arch_sigframe_build(uint64_t frame, struct trapframe *tf, int sig,
                     uint64_t handler, uint64_t flags, uint64_t restorer,
                     uint64_t result, int restart, uint64_t oldmask,
                     uint64_t altsp, uint64_t altsize,
-                    int si_code, int si_pid, int si_uid)
+                    int si_code, int si_pid, int si_uid, uint64_t si_addr)
 {
     (void)flags;
     struct linux_rt_sigframe *f = (struct linux_rt_sigframe *)(uintptr_t)frame;
@@ -361,8 +368,12 @@ arch_sigframe_build(uint64_t frame, struct trapframe *tf, int sig,
 
     f->info.si_signo = sig;
     f->info.si_code  = si_code;
-    f->info.si_pid   = si_pid;
-    f->info.si_uid   = si_uid;
+    if (si_code != 0)               /* a fault: _sigfault.si_addr at offset 16 */
+        *(uint64_t *)&f->info.si_pid = si_addr;
+    else {                          /* a sent signal: _kill.si_pid / si_uid */
+        f->info.si_pid = si_pid;
+        f->info.si_uid = si_uid;
+    }
 
     f->uc.uc_stack.ss_sp   = altsp;
     f->uc.uc_stack.ss_size = altsize;
