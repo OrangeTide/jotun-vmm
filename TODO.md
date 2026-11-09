@@ -155,13 +155,14 @@ Fixed on the way to Stage B (for the record):
 
 Open gaps and bugs, Stage C and general correctness:
 
-- [ ] Leaf-symlink following on `open`/`execve`/`stat`. Creation and `readlink`
-      exist, but a symlink is never resolved when traversed, so `exec` of
-      `out/tools/bin/python` (the link the make phase shells out through) will
-      not reach the real interpreter. Follow the leaf target with a small loop
-      limit in `resolve_path`/`do_open`/`do_execve`/`meta_path`. Needed for the
-      Node make phase; the Stage B configure never execs the link (gyp runs
-      in-process via `gyp.main`), which is why it was deferred.
+- [x] Leaf-symlink following on `open`/`execve`/`stat`/`statx`. `follow_link_key`
+      rewrites a resolved key when its final component is an overlay symlink
+      (absolute target from the root, relative target from the link's parent,
+      chained up to a depth limit). Wired into `do_open` (unless `O_NOFOLLOW`),
+      `do_execve`, stat, and statx; `lstat`/statx-`NOFOLLOW` report `S_IFLNK`;
+      readlink/symlink/unlink stay nofollow. Verified: `out/tools/bin/python`
+      (the link configure points at the interpreter) now execs through to
+      `Python 3.12.3`. Commit 84929ee.
 - [ ] No `/dev`. The guest has no device files at all. `/dev/null`,
       `/dev/zero`, `/dev/urandom` (back it with `getrandom`), `/dev/full`
       (`ENOSPC` on write), and `/dev/tty` are the useful set. A shell redirect
@@ -193,9 +194,45 @@ Open gaps and bugs, Stage C and general correctness:
       guest has no `/bin` unless the manifest mounts it. Decide whether to
       provide a default `/bin` (or a `/bin/sh` the loader always resolves) so
       every shell-using program does not need the operator to add the mount.
-- [ ] Full V8 build is almost certainly infeasible on a 256 MiB guest. Stage C
-      should target a single translation unit or a small subtarget, not the
-      whole binary, until the memory budget is understood.
+### Scaling to a full build (the point of the sandbox)
+
+Building and cross-compiling is the core purpose: a jotun sandbox is
+OS-agnostic but runs native-arch Linux binaries (Linux/x86-64 on an x86-64
+host, Linux/aarch64 on an aarch64 host), so the host's own toolchain compiles
+inside it. A real target like V8 is the goal, not a thing to declare out of
+scope. The guest is just undersized today; these are the expansions that make a
+large build work. Roughly in dependency order:
+
+- [ ] Raise guest RAM into the multi-GiB range, and scale the frame pool and the
+      user address-space window with it. A single `cc1plus` translation unit of
+      V8 can want 1 to 2 GiB, and the link step more; 256 MiB is the hard wall.
+      RAM is host-allocated at boot, so this is mostly picking a larger size and
+      widening the window/physmap layout (the window has already moved 32 ->
+      128 MiB and 108 MiB for gcc; this is the same lever, pushed much further).
+      Demand paging already covers the large sparse reservations compilers make.
+- [ ] A WRITABLE host-backed mount. `p9hostdir` is read-only; make a read-write
+      variant so a build's output tree (`out/`, object files, archives, the
+      linked binary) lands on the host filesystem instead of guest RAM. This is
+      the key architectural piece: it removes the in-RAM overlay as the ceiling
+      for build artifacts (a V8 build writes gigabytes), keeps guest RAM for
+      process memory, and persists the result on the host where it is wanted.
+      Needs p9 write/create/truncate/mkdir ops and the same path confinement
+      `p9hostdir` already enforces.
+- [ ] Scale (or remove) the in-RAM overlay caps. `RAMFS_FILE_MAX` (4 MiB) and
+      `RAMFS_MAX` (1024 entries) bound the transient overlay; a build produces
+      thousands of files and some large ones. Either raise both substantially
+      (the data is `kmalloc`'d from the growable kernel heap, so it is bounded
+      by guest RAM, not a fixed reservation) or lean on the writable mount above
+      for anything big, keeping the overlay for small scratch files.
+- [ ] Raise or auto-scale `LINUX_NPROC` (48) and `TASK_MAX` (64) for `make -j`.
+      Both are cheap `kmalloc`'d tables (commit cd04ef5); size them to the
+      parallelism a build driver asks for rather than a fixed small cap.
+- [ ] Cross-compilation note, not a blocker: producing aarch64 output on an
+      x86-64 host is just running a cross-toolchain, which the sandbox already
+      runs as ordinary native-arch binaries, so it needs no guest change. A
+      native aarch64 guest on an aarch64 host covers the other direction (the
+      arm64 backend exists but its Linux run path is still unexercised locally).
+      What scales a build is the memory and I/O work above, not the target arch.
 
 ## Investigations (unscheduled, feasibility unknown)
 

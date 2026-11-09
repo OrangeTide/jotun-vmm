@@ -56,7 +56,7 @@ Statuses used below:
 | 84 | rmdir | partial | removes an empty overlay directory (ENOTEMPTY otherwise); a read-only bundle directory is EROFS |
 | 86 | link | stub | EPERM (no hard links); callers fall back to copying |
 | 87 | unlink | partial | removes a writable overlay file (open-unlink: the inode is held until the last fd closes); a read-only path returns EROFS |
-| 88 | symlink | partial | creates an overlay symlink (target stored verbatim); not yet followed when traversed on open/exec |
+| 88 | symlink | partial | creates an overlay symlink (target verbatim); followed on open/exec/stat at the final component (leaf), overlay only |
 | 89 | readlink | partial | returns an overlay symlink's stored target; EINVAL for a non-link, ENOENT if absent |
 | 90 | chmod | stub | no permission bits to enforce; returns 0 |
 | 91 | fchmod | stub | as chmod |
@@ -70,7 +70,7 @@ Statuses used below:
 | 263 | unlinkat | partial | as unlink; AT_REMOVEDIR routes to rmdir; dirfd honored via at_path |
 | 264 | renameat | partial | as rename; dirfds honored via at_path |
 | 265 | linkat | stub | as link (EPERM); dirfds AT_FDCWD |
-| 266 | symlinkat | partial | as symlink (overlay link created; leaf not followed on traversal) |
+| 266 | symlinkat | partial | as symlink (overlay link created and followed at the leaf) |
 | 267 | readlinkat | partial | as readlink (returns an overlay symlink's stored target) |
 | 268 | fchmodat | stub | as chmod |
 | 269 | faccessat | full | existence check via meta_path; no permission bits, dirfd ignored |
