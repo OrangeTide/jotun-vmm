@@ -69,6 +69,7 @@
 #define SYS_tgkill          131
 #define SYS_rt_sigaction    134
 #define SYS_rt_sigprocmask  135
+#define SYS_rt_sigreturn    139
 #define SYS_uname           160
 #define SYS_getrusage       165
 #define SYS_umask           166
@@ -131,6 +132,7 @@
 #define SYS_link       (-18)
 #define SYS_symlink    (-19)
 #define SYS_poll       (-20)       /* AArch64 has ppoll (73), not poll */
+#define SYS_pause      (-21)       /* AArch64 has ppoll, not pause */
 
 /* arch_prctl is x86-only; defined so the shared case body compiles. */
 #define ARCH_SET_FS 0x1002
@@ -160,6 +162,13 @@ static inline void
 tf_set_sp(struct trapframe *tf, uint64_t sp)
 {
     tf->sp = sp;
+}
+
+/* The interrupted user stack pointer (where a signal frame is placed). */
+static inline uint64_t
+tf_user_sp(const struct trapframe *tf)
+{
+    return tf->sp;
 }
 
 /* A new thread's thread pointer. On AArch64 it rides in the trapframe (the SVC
@@ -203,6 +212,130 @@ extern void linux_jump(uint64_t entry, uint64_t user_sp) __attribute__((noreturn
 static inline void
 linux_trap_init(void)
 {
+}
+
+/****************************************************************
+ * Signal-handler delivery (the AArch64 rt_sigframe ABI).
+ *
+ * The AArch64 counterpart of the x86-64 frame in x86_64_linuxabi.h. The layout
+ * follows the arm64 kernel: the frame is siginfo then ucontext, and the machine
+ * state (uc_mcontext) is last in the ucontext. AArch64 has no SA_RESTORER; the
+ * kernel points the return address (x30) at a sigreturn trampoline in the VDSO.
+ * There is no VDSO here, so a two-instruction trampoline is written into the
+ * frame itself (the user stack is executable) and x30 points at it. The FP state
+ * is not saved, for the reason noted in the x86-64 header; a null terminator in
+ * __reserved stops the kernel FP walk.
+ *
+ * This path is cross-compiled and structurally complete, but the arm64 guest is
+ * not exercised at runtime yet.
+ ****************************************************************/
+
+struct linux_sigcontext {
+    uint64_t fault_address;
+    uint64_t regs[31];
+    uint64_t sp;
+    uint64_t pc;
+    uint64_t pstate;
+    uint8_t  __reserved[16] __attribute__((aligned(16)));    /* null FP terminator */
+};
+
+struct linux_siginfo {
+    int32_t si_signo, si_errno, si_code;
+    int32_t __pad0;
+    int32_t si_pid, si_uid;
+    uint8_t __pad[128 - 24];
+};
+_Static_assert(sizeof(struct linux_siginfo) == 128, "siginfo ABI");
+
+struct linux_ucontext {
+    uint64_t uc_flags;
+    uint64_t uc_link;
+    struct { uint64_t ss_sp; uint32_t ss_flags; uint32_t __pad; uint64_t ss_size; } uc_stack;
+    uint8_t  uc_sigmask[128];       /* sigset_t; low 8 bytes used, rest __unused */
+    struct linux_sigcontext uc_mcontext;    /* must be last */
+};
+
+struct linux_rt_sigframe {
+    struct linux_siginfo info;
+    struct linux_ucontext uc;
+    uint32_t tramp[2];              /* mov x8,#__NR_rt_sigreturn ; svc #0 */
+};
+
+static inline uint64_t
+arch_sigframe_size(void)
+{
+    return sizeof(struct linux_rt_sigframe);
+}
+
+static inline uint64_t
+arch_sigframe_place(uint64_t sp, int onstack)
+{
+    (void)onstack;                  /* no red zone on AArch64 */
+    sp -= sizeof(struct linux_rt_sigframe);
+    sp &= ~(uint64_t)15;            /* sp must be 16-aligned */
+    return sp;
+}
+
+static inline uint64_t
+arch_sigframe_ucaddr(const struct trapframe *tf)
+{
+    return tf->sp + __builtin_offsetof(struct linux_rt_sigframe, uc);
+}
+
+static inline void
+arch_sigframe_build(uint64_t frame, struct trapframe *tf, int sig,
+                    uint64_t handler, uint64_t flags, uint64_t restorer,
+                    uint64_t result, int restart, uint64_t oldmask,
+                    uint64_t altsp, uint64_t altsize,
+                    int si_code, int si_pid, int si_uid)
+{
+    (void)flags;
+    (void)restorer;                 /* AArch64 ignores sa_restorer */
+    struct linux_rt_sigframe *f = (struct linux_rt_sigframe *)(uintptr_t)frame;
+    memset(f, 0, sizeof *f);
+
+    f->info.si_signo = sig;
+    f->info.si_code  = si_code;
+    f->info.si_pid   = si_pid;
+    f->info.si_uid   = si_uid;
+
+    f->uc.uc_stack.ss_sp   = altsp;
+    f->uc.uc_stack.ss_size = altsize;
+
+    struct linux_sigcontext *sc = &f->uc.uc_mcontext;
+    for (int i = 0; i < 31; i++)
+        sc->regs[i] = tf->x[i];
+    sc->regs[0] = restart ? tf->x[0] : result;  /* restart: x0 = original arg0 */
+    sc->sp      = tf->sp;
+    sc->pc      = restart ? (tf->pc - 4) : tf->pc;      /* back to the 4-byte SVC */
+    sc->pstate  = tf->pstate;
+    *(uint64_t *)f->uc.uc_sigmask = oldmask;
+
+    /* The trampoline: MOVZ x8, #139 ; SVC #0. */
+    f->tramp[0] = 0xd2801168u;      /* mov x8, #0x8b (139 = __NR_rt_sigreturn) */
+    f->tramp[1] = 0xd4000001u;      /* svc #0 */
+
+    tf->pc = handler;
+    tf->sp = frame;
+    tf->x[0] = (uint64_t)sig;
+    tf->x[1] = frame + __builtin_offsetof(struct linux_rt_sigframe, info);
+    tf->x[2] = frame + __builtin_offsetof(struct linux_rt_sigframe, uc);
+    tf->x[30] = frame + __builtin_offsetof(struct linux_rt_sigframe, tramp);
+    tf->pstate = 0;                 /* EL0t, interrupts enabled */
+}
+
+static inline uint64_t
+arch_sigframe_restore(struct trapframe *tf, const struct linux_ucontext *uc,
+                      uint64_t *out_mask)
+{
+    const struct linux_sigcontext *sc = &uc->uc_mcontext;
+    for (int i = 0; i < 31; i++)
+        tf->x[i] = sc->regs[i];
+    tf->sp = sc->sp;
+    tf->pc = sc->pc;
+    tf->pstate = sc->pstate & ~(uint64_t)0xf;   /* force EL0t */
+    *out_mask = *(const uint64_t *)uc->uc_sigmask;
+    return sc->regs[0];
 }
 
 #endif /* ARM64_LINUXABI_H */

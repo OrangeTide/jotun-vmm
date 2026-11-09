@@ -225,7 +225,8 @@ land on the thread's own `rsp0` stack.
   the monotonic clock) prints "nanosleep ok" and "abssleep ok" at HZ 100 and 1000,
   returns at once with no timer, and the full suite stays green with and without
   preemption; arm64 cross-compiles clean.
-  Deferred: `setitimer`, `alarm`, and `timerfd`. These deliver a signal (SIGALRM)
-  or a readable fd to the running program, which needs caught-signal delivery
-  (handler dispatch, signal stage D) and poll/fd wiring that are not yet built.
-  They are a separate increment once that delivery path lands.
+  Deferred: `setitimer`, `alarm`, and `timerfd`. Caught-signal delivery (signal
+  stage D) has since landed, so `SIGALRM` can now reach a handler; what these
+  still need is a per-process interval-timer source armed off the host tick and,
+  for `timerfd`, the readable-fd/poll wiring. They are a separate increment (see
+  doc/m16-signals.md, stage F).

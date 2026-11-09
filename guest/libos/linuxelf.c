@@ -107,10 +107,15 @@
 #define DT_REG  8
 #define DT_CHR  2
 
-/* Signals. The guest tracks dispositions, masks, and pending sets, and acts on
- * the default-terminate action (so a process is killable, and a fatal signal
- * sets WIFSIGNALED). Invoking a user handler is a later stage; a caught signal
- * is recorded as pending but not yet delivered to its handler. */
+/* Signals. The guest tracks dispositions, masks, and pending sets, acts on the
+ * default-terminate action (so a process is killable, and a fatal signal sets
+ * WIFSIGNALED), and delivers a caught signal to its handler: at the syscall
+ * return boundary it builds a handler frame on the user stack and returns into
+ * the handler, which resumes the interrupted code through rt_sigreturn. The
+ * handler modes are supported: SA_SIGINFO, SA_ONSTACK (the alternate stack),
+ * SA_RESTART (restart an interrupted syscall instead of EINTR), SA_NODEFER, and
+ * SA_RESETHAND. Synchronous fault signals (SIGSEGV and the like) still terminate
+ * rather than invoking a handler. */
 #define NSIG         64         /* signals 1..64 (32 standard, the rest realtime) */
 #define SIG_DFL      0          /* default action */
 #define SIG_IGN      1          /* ignore */
@@ -124,6 +129,15 @@
 
 /* Bit for signal s (1-based) in a 64-bit signal set. */
 #define SIGBIT(s)    (1ULL << ((s) - 1))
+
+/* sigaction flags that affect delivery. */
+#define SA_SIGINFO   0x00000004u    /* 3-argument handler (sig, info, ucontext) */
+#define SA_RESTORER  0x04000000u    /* sa_restorer holds the return trampoline */
+#define SA_ONSTACK   0x08000000u    /* run the handler on the alternate stack */
+#define SA_RESTART   0x10000000u    /* restart an interrupted syscall, not EINTR */
+#define SA_NODEFER   0x40000000u    /* do not mask the signal inside its handler */
+#define SA_RESETHAND 0x80000000u    /* reset to SIG_DFL after one delivery */
+#define SS_DISABLE   2              /* sigaltstack is not installed */
 
 /* A few errnos, returned as negatives in rax the way the kernel does. */
 #define LERR_BADF   9
@@ -150,6 +164,13 @@
 #define LERR_NAMETOOLONG 36     /* ENAMETOOLONG: a user path did not fit the bounce buffer */
 #define LERR_NOSPC  28          /* ENOSPC: a write to /dev/full */
 #define LERR_SRCH   3           /* ESRCH: kill of a pid that does not exist */
+#define LERR_INTR   4           /* EINTR: a blocking call interrupted by a signal */
+
+/* An internal marker (never returned to user): a blocking syscall was cut short
+ * by a deliverable caught signal. The signal-delivery boundary turns it into a
+ * handler invocation, then either restarts the syscall (SA_RESTART) or reports
+ * EINTR. Matches the kernel's internal ERESTARTSYS value. */
+#define LERR_RESTARTSYS 512
 
 /* ELF auxv entry tags. */
 #define AT_NULL    0
@@ -441,8 +462,9 @@ struct lshared {
                                  * reports WIFSIGNALED instead of WIFEXITED) */
     /* Signal dispositions are per process (shared by its threads); the pending
      * set here holds process-directed signals (kill). sa_handler is SIG_DFL,
-     * SIG_IGN, or a user handler address (not yet invoked; see the signal code).
-     * Inherited across fork, reset to default (ignored kept) across execve. */
+     * SIG_IGN, or a user handler address (invoked at the syscall boundary by
+     * deliver_signal). Inherited across fork, reset to default (ignored kept)
+     * across execve. */
     struct ksigaction {
         uint64_t handler;
         uint64_t flags;
@@ -494,7 +516,7 @@ struct lproc {
     uint64_t tls;           /* thread pointer (FS base / TPIDR), restored on switch */
     uint64_t clear_ctid;    /* CLONE_CHILD_CLEARTID: zero + futex-wake on exit */
     /* The signal mask is per thread; sig_pending holds thread-directed signals
-     * (tgkill). The alt stack is stored for a future handler-delivery stage. */
+     * (tgkill). The alt stack is used when an SA_ONSTACK handler is delivered. */
     uint64_t sig_blocked;   /* blocked (masked) signals, inherited on clone */
     uint64_t sig_pending;   /* thread-directed signals awaiting action */
     uint64_t ss_sp, ss_size;
@@ -536,6 +558,10 @@ static vmspace_t linux_vmspace_setup(void);
  * syscall is killable. Defined with the signal code below. */
 static int take_fatal_signal(void);
 static void signal_killpoint(void);
+/* next_caught_signal reports the lowest pending, unblocked signal that has a user
+ * handler installed; signal_deliverable is the boolean form blocking syscalls
+ * poll to break out so the handler runs at the dispatch boundary. */
+static int signal_deliverable(void);
 /* linux_jump is declared by the arch backend (linux_arch.h); linux_resume takes
  * struct lproc, which is defined here, so it is declared here. */
 extern void linux_resume(struct lproc *p) __attribute__((noreturn));
@@ -2009,6 +2035,7 @@ do_poll(uint64_t ufds, uint64_t nfds, long timeout_ms)
         deadline = arch_cycles() + (uint64_t)timeout_ms * 1000000ULL;
 
     long ready;
+    int interrupted = 0;
     for (;;) {
         ready = 0;
         for (uint64_t i = 0; i < nfds; i++) {
@@ -2027,13 +2054,17 @@ do_poll(uint64_t ufds, uint64_t nfds, long timeout_ms)
             break;                      /* timed out with nothing ready */
         lx_yield();                     /* let a peer make a descriptor ready */
         signal_killpoint();             /* a fatal signal unblocks and terminates */
+        if (signal_deliverable()) {     /* a caught signal: run its handler */
+            interrupted = 1;
+            break;
+        }
     }
 
     if (nfds) {
         copy_to_user(ufds, pf, sz);     /* write back revents */
         kfree(pf);
     }
-    return ready;
+    return interrupted ? -LERR_RESTARTSYS : ready;
 }
 
 static long
@@ -2057,6 +2088,8 @@ do_read(long fd, void *buf, unsigned long count)
         while (p->count == 0 && p->writers > 0) {
             lx_yield();          /* empty pipe: let a writer fill it */
             signal_killpoint();  /* a fatal signal unblocks and terminates */
+            if (signal_deliverable())   /* a caught signal: run its handler */
+                return -LERR_RESTARTSYS;
         }
         return pipe_read(p, buf, count);
     }
@@ -2885,6 +2918,8 @@ do_futex(uint64_t uaddr, int op, int val)
          * clearing it would strand that waiter). */
         if (fwaiters[slot].used && fwaiters[slot].task_id == me)
             fwaiters[slot].used = 0;
+        if (signal_deliverable())       /* a caught signal interrupts the wait */
+            return -LERR_RESTARTSYS;
         return 0;
     }
     if (cmd == FUTEX_WAKE)
@@ -3168,6 +3203,8 @@ do_wait4(long pid, int *status)
             return -LERR_CHILD;
         lx_yield();                     /* a child is still running: let it run */
         signal_killpoint();             /* a fatal signal unblocks and terminates */
+        if (signal_deliverable())       /* a caught signal (e.g. SIGCHLD handler) */
+            return -LERR_RESTARTSYS;
     }
 }
 
@@ -3254,10 +3291,10 @@ linux_fault_kill(long vec)
 }
 
 /****************************************************************
- * Signals (stages A to C): disposition and mask state, generation (kill,
- * tgkill), and the default terminate action, which makes a process killable
- * even while blocked in a syscall. Invoking a user-installed handler is a later
- * stage; a caught signal is held pending here but not yet delivered.
+ * Signals: disposition and mask state, generation (kill, tgkill), the default
+ * terminate action (which makes a process killable even while blocked in a
+ * syscall), and caught-signal delivery (building a handler frame at the syscall
+ * boundary, and rt_sigreturn to resume the interrupted code).
  ****************************************************************/
 
 /* The default action for a signal: 1 to terminate the process, 0 to ignore.
@@ -3281,7 +3318,7 @@ sig_default_terminates(int s)
 /* The lowest pending, unblocked signal whose action is to terminate the
  * process, or 0 if none. Any pending signal that is ignored (SIG_IGN or a
  * default-ignore disposition) is consumed here. A caught signal (a handler is
- * installed) is left pending for a future delivery stage, not acted on. SIGKILL
+ * installed) is left pending for deliver_signal, not acted on here. SIGKILL
  * ignores the block mask and the disposition. */
 static int
 take_fatal_signal(void)
@@ -3301,7 +3338,7 @@ take_fatal_signal(void)
                 t->sig_pending &= ~SIGBIT(s);
                 continue;
             }
-            if (h != SIG_DFL)                   /* caught: hold for delivery (stage D) */
+            if (h != SIG_DFL)                   /* caught: delivered by deliver_signal */
                 continue;
         }
         if (!sig_default_terminates(s)) {       /* default-ignore: consume */
@@ -3325,6 +3362,147 @@ signal_killpoint(void)
         lproc_cur->sh->exit_sig = s;
         do_exit(0, 1);                  /* noreturn: releases the lock, tears down */
     }
+}
+
+/* The lowest pending, unblocked signal that has a user handler installed (a
+ * caught signal), or 0 if none. Unlike take_fatal_signal this neither consumes
+ * nor terminates; it only reports what is ready for handler delivery. SIGKILL
+ * and SIGSTOP are never caught. */
+static int
+next_caught_signal(void)
+{
+    struct lproc *t = lproc_cur;
+    struct lshared *sh = t->sh;
+    uint64_t pending = sh->sig_pending | t->sig_pending;
+    uint64_t ready = pending & ~t->sig_blocked;
+
+    for (int s = 1; s <= NSIG; s++) {
+        if (!(ready & SIGBIT(s)))
+            continue;
+        if (s == SIGKILL || s == SIGSTOP)
+            continue;
+        uint64_t h = sh->sigact[s - 1].handler;
+        if (h != SIG_DFL && h != SIG_IGN)
+            return s;                   /* a real handler address: deliver it */
+    }
+    return 0;
+}
+
+/* Whether a caught signal is ready to run. Blocking syscalls poll this to break
+ * out (with LERR_RESTARTSYS) so the handler runs at the dispatch boundary. */
+static int
+signal_deliverable(void)
+{
+    return next_caught_signal() != 0;
+}
+
+/* Deliver one caught signal: build a handler frame on the user stack and
+ * re-point this thread's trapframe at the handler. `result` is the syscall
+ * result the interrupted code would otherwise return; `restart` arranges the
+ * trapped syscall to re-run after the handler (used for SA_RESTART). A bad user
+ * stack turns into a fatal SIGSEGV, matching Linux. */
+static void
+deliver_signal(int sig, long result, int restart)
+{
+    struct lproc *t = lproc_cur;
+    struct ksigaction *ka = &t->sh->sigact[sig - 1];
+    uint64_t flags = ka->flags;
+
+    /* Pick the stack: the alternate stack if the handler asked for it and one is
+     * installed, otherwise the interrupted user stack. */
+    uint64_t sp;
+    int onstack = 0;
+    uint64_t altsp = 0, altsize = 0;
+    if ((flags & SA_ONSTACK) && t->ss_sp && !(t->ss_flags & SS_DISABLE)) {
+        sp = t->ss_sp + t->ss_size;
+        altsp = t->ss_sp;
+        altsize = t->ss_size;
+        onstack = 1;
+    } else {
+        sp = tf_user_sp(&t->tf);
+    }
+
+    uint64_t frame = arch_sigframe_place(sp, onstack);
+    if (!user_ok(frame, arch_sigframe_size())) {
+        t->sh->exit_sig = 11;           /* SIGSEGV: the handler stack is unusable */
+        do_exit(0, 1);
+    }
+
+    arch_sigframe_build(frame, &t->tf, sig, ka->handler, flags, ka->restorer,
+                        (uint64_t)result, restart, t->sig_blocked,
+                        altsp, altsize, 0 /* SI_USER */, 0, 0);
+
+    /* Consume the signal and mask it (and the handler's sa_mask) for the handler,
+     * unless SA_NODEFER. rt_sigreturn restores the saved mask. */
+    t->sh->sig_pending &= ~SIGBIT(sig);
+    t->sig_pending     &= ~SIGBIT(sig);
+    t->sig_blocked |= ka->mask;
+    if (!(flags & SA_NODEFER))
+        t->sig_blocked |= SIGBIT(sig);
+    t->sig_blocked &= ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+
+    if (flags & SA_RESETHAND)           /* one-shot: back to the default action */
+        ka->handler = SIG_DFL;
+}
+
+/* The caught-signal half of the syscall-return boundary (the fatal half is
+ * signal_killpoint). `r` is the dispatcher's result. If a handler is ready, this
+ * builds its frame so the return path enters the handler instead of the user's
+ * next instruction. It also resolves the LERR_RESTARTSYS marker a blocking
+ * syscall may have returned: restart the call for an SA_RESTART handler, else
+ * report EINTR. Returns the value to put in the return register (immaterial once
+ * a handler frame is in place, since the real result is saved in the frame). */
+static long
+maybe_deliver_signal(long r)
+{
+    int sig = next_caught_signal();
+    if (!sig) {
+        /* Nothing to deliver. A restart marker with no handler (the signal was a
+         * default/ignored one consumed by signal_killpoint) becomes EINTR so the
+         * blocking call still returns to the user. */
+        return r == -LERR_RESTARTSYS ? -LERR_INTR : r;
+    }
+
+    int restart = 0;
+    long result = r;
+    if (r == -LERR_RESTARTSYS) {
+        if (lproc_cur->sh->sigact[sig - 1].flags & SA_RESTART)
+            restart = 1;
+        else
+            result = -LERR_INTR;
+    }
+    deliver_signal(sig, result, restart);
+    return r;
+}
+
+/* rt_sigreturn: restore the context a handler frame saved and resume the
+ * interrupted code. The restorer left the user sp at the ucontext. */
+static long
+do_rt_sigreturn(void)
+{
+    struct lproc *t = lproc_cur;
+    uint64_t ucaddr = arch_sigframe_ucaddr(&t->tf);
+    struct linux_ucontext uc;
+    if (copy_from_user(&uc, ucaddr, sizeof uc) < 0) {
+        t->sh->exit_sig = 11;           /* a corrupt frame is fatal */
+        do_exit(0, 1);
+    }
+    uint64_t mask = 0;
+    long rax = (long)arch_sigframe_restore(&t->tf, &uc, &mask);
+    t->sig_blocked = mask & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+    return rax;                         /* the interrupted call's saved result */
+}
+
+/* Block until a caught signal is ready (pause). Returns EINTR after the handler
+ * is arranged; pause is never restarted, even under SA_RESTART. */
+static long
+do_pause(void)
+{
+    while (!signal_deliverable()) {
+        lx_block();
+        signal_killpoint();             /* a fatal signal terminates here */
+    }
+    return -LERR_INTR;
 }
 
 /* Timed sleep (nanosleep, clock_nanosleep). The clock is the host-maintained
@@ -3374,6 +3552,10 @@ sleep_until_ns(uint64_t target_ns)
     while (boot_timer_ticks() < deadline) {
         lx_block();                     /* drops the giant lock while parked */
         signal_killpoint();             /* a fatal signal unblocks and terminates */
+        if (signal_deliverable()) {     /* a caught signal cuts the sleep short */
+            lproc_cur->sleep_deadline = 0;
+            return -LERR_RESTARTSYS;
+        }
     }
     lproc_cur->sleep_deadline = 0;
     return 0;
@@ -4223,6 +4405,11 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_rt_sigaction((int)a1, (uint64_t)a2, (uint64_t)a3);
     case SYS_rt_sigprocmask:
         return do_rt_sigprocmask((int)a1, (uint64_t)a2, (uint64_t)a3);
+    case SYS_rt_sigreturn:
+        /* Return from a handler: restore the frame maybe_deliver_signal built. */
+        return do_rt_sigreturn();
+    case SYS_pause:
+        return do_pause();
     case SYS_uname: {
         /* struct utsname: six NUL-terminated 65-byte fields. */
         if (!a1)
@@ -4264,7 +4451,8 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
 {
     giant_lock();
     long r = linux_sys_dispatch_inner(nr, a1, a2, a3, a4, a5);
-    signal_killpoint();     /* a signal posted during the call terminates here */
+    signal_killpoint();     /* a default-fatal signal terminates here */
+    r = maybe_deliver_signal(r);    /* a caught signal runs its handler on return */
     giant_unlock();
     return r;
 }
