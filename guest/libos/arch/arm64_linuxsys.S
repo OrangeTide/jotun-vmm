@@ -241,6 +241,83 @@ abort_entry:
     eret
 
 9:
+    /* pf_handle declined to back the page. If the fault came from the app (it
+     * runs at EL1t, so SPSR_EL1.M[3:0] == 0b0100), deliver a signal to it; a
+     * fault from the kernel itself (EL1h) is unrecoverable. */
+    mrs     x0, spsr_el1
+    and     x0, x0, #0xf
+    cmp     x0, #0x4
+    b.ne    8f                      /* not EL1t: fatal */
+
+    /* Save the faulting app context into lproc_cur->tf (its first field), the
+     * way svc_entry does, so linux_fault_entry can run a handler against it. The
+     * app's x0..x30 are on the abort stack at sp+0..240. */
+    adrp    x1, lproc_cur
+    ldr     x1, [x1, #:lo12:lproc_cur]
+    ldp     x2, x3, [sp, #0]
+    stp     x2, x3, [x1, #0]
+    ldp     x2, x3, [sp, #16]
+    stp     x2, x3, [x1, #16]
+    ldp     x2, x3, [sp, #32]
+    stp     x2, x3, [x1, #32]
+    ldp     x2, x3, [sp, #48]
+    stp     x2, x3, [x1, #48]
+    ldp     x2, x3, [sp, #64]
+    stp     x2, x3, [x1, #64]
+    ldp     x2, x3, [sp, #80]
+    stp     x2, x3, [x1, #80]
+    ldp     x2, x3, [sp, #96]
+    stp     x2, x3, [x1, #96]
+    ldp     x2, x3, [sp, #112]
+    stp     x2, x3, [x1, #112]
+    ldp     x2, x3, [sp, #128]
+    stp     x2, x3, [x1, #128]
+    ldp     x2, x3, [sp, #144]
+    stp     x2, x3, [x1, #144]
+    ldp     x2, x3, [sp, #160]
+    stp     x2, x3, [x1, #160]
+    ldp     x2, x3, [sp, #176]
+    stp     x2, x3, [x1, #176]
+    ldp     x2, x3, [sp, #192]
+    stp     x2, x3, [x1, #192]
+    ldp     x2, x3, [sp, #208]
+    stp     x2, x3, [x1, #208]
+    ldp     x2, x3, [sp, #224]
+    stp     x2, x3, [x1, #224]
+    ldr     x2, [sp, #240]
+    str     x2, [x1, #240]
+    mrs     x2, sp_el0
+    str     x2, [x1, #TF_SP]
+    mrs     x2, elr_el1
+    str     x2, [x1, #TF_PC]
+    mrs     x2, spsr_el1
+    str     x2, [x1, #TF_PSTATE]
+    mrs     x2, tpidr_el0
+    str     x2, [x1, #TF_TPIDR]
+
+    /* Map the ESR exception class to the x86-style fault vector that
+     * fault_signal expects: an undefined instruction or a software breakpoint
+     * (BRK, what __builtin_trap emits) -> SIGILL (#UD, vec 6), a trapped
+     * floating-point exception -> SIGFPE (#DE, vec 0), everything else (data and
+     * instruction aborts) -> SIGSEGV (#PF, vec 14). Note an integer divide by
+     * zero does not trap on AArch64, so it raises no signal here. */
+    mrs     x3, esr_el1
+    lsr     x3, x3, #26
+    mov     x0, #14
+    cmp     x3, #0x00               /* unknown / undefined instruction */
+    b.eq    1f
+    cmp     x3, #0x3c               /* BRK (software breakpoint) */
+    b.eq    1f
+    cmp     x3, #0x2c               /* trapped floating-point exception */
+    b.ne    2f
+    mov     x0, #0
+    b       2f
+1:  mov     x0, #6
+2:  mrs     x1, far_el1
+    bl      linux_fault_entry       /* noreturn: runs the handler or kills */
+    b       .
+
+8:
     /* Unrecoverable: report and halt. arm64_fault_report does not return. */
     mrs     x0, far_el1
     mrs     x1, esr_el1

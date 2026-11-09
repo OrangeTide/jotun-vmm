@@ -332,7 +332,7 @@ arch_sigframe_build(uint64_t frame, struct trapframe *tf, int sig,
     tf->x[1] = frame + __builtin_offsetof(struct linux_rt_sigframe, info);
     tf->x[2] = frame + __builtin_offsetof(struct linux_rt_sigframe, uc);
     tf->x[30] = frame + __builtin_offsetof(struct linux_rt_sigframe, tramp);
-    tf->pstate = 0;                 /* EL0t, interrupts enabled */
+    tf->pstate = 0x3c4;             /* EL1t with DAIF masked: the app's own mode */
 }
 
 static inline uint64_t
@@ -344,7 +344,7 @@ arch_sigframe_restore(struct trapframe *tf, const struct linux_ucontext *uc,
         tf->x[i] = sc->regs[i];
     tf->sp = sc->sp;
     tf->pc = sc->pc;
-    tf->pstate = sc->pstate & ~(uint64_t)0xf;   /* force EL0t */
+    tf->pstate = (sc->pstate & ~(uint64_t)0xf) | 0x4;   /* force EL1t (the app's mode) */
     *out_mask = *(const uint64_t *)uc->uc_sigmask;
     return sc->regs[0];
 }
