@@ -107,6 +107,24 @@
 #define DT_REG  8
 #define DT_CHR  2
 
+/* Signals. The guest tracks dispositions, masks, and pending sets, and acts on
+ * the default-terminate action (so a process is killable, and a fatal signal
+ * sets WIFSIGNALED). Invoking a user handler is a later stage; a caught signal
+ * is recorded as pending but not yet delivered to its handler. */
+#define NSIG         64         /* signals 1..64 (32 standard, the rest realtime) */
+#define SIG_DFL      0          /* default action */
+#define SIG_IGN      1          /* ignore */
+#define SIGKILL      9          /* cannot be caught, blocked, or ignored */
+#define SIGSTOP      19         /* likewise; we have no stop state, so a no-op */
+#define SIGPIPE      13
+#define SIGCHLD      17
+#define SIGCONT      18
+#define SIGURG       23
+#define SIGWINCH     28
+
+/* Bit for signal s (1-based) in a 64-bit signal set. */
+#define SIGBIT(s)    (1ULL << ((s) - 1))
+
 /* A few errnos, returned as negatives in rax the way the kernel does. */
 #define LERR_BADF   9
 #define LERR_NOMEM  12
@@ -131,6 +149,7 @@
 #define LERR_FAULT  14          /* EFAULT: a user pointer fell outside the user window */
 #define LERR_NAMETOOLONG 36     /* ENAMETOOLONG: a user path did not fit the bounce buffer */
 #define LERR_NOSPC  28          /* ENOSPC: a write to /dev/full */
+#define LERR_SRCH   3           /* ESRCH: kill of a pid that does not exist */
 
 /* ELF auxv entry tags. */
 #define AT_NULL    0
@@ -406,9 +425,17 @@ struct lshared {
     long     exit_status;
     int      exit_sig;          /* if nonzero, terminated by this signal (wait4
                                  * reports WIFSIGNALED instead of WIFEXITED) */
-    int      sigpipe_ign;       /* SIGPIPE set to SIG_IGN or a handler: a write to
-                                 * a pipe with no readers returns EPIPE instead of
-                                 * terminating the process (the default action) */
+    /* Signal dispositions are per process (shared by its threads); the pending
+     * set here holds process-directed signals (kill). sa_handler is SIG_DFL,
+     * SIG_IGN, or a user handler address (not yet invoked; see the signal code).
+     * Inherited across fork, reset to default (ignored kept) across execve. */
+    struct ksigaction {
+        uint64_t handler;
+        uint64_t flags;
+        uint64_t restorer;
+        uint64_t mask;
+    } sigact[NSIG];
+    uint64_t sig_pending;       /* process-directed signals awaiting action */
     /* A posix_spawn child (clone with CLONE_VM|CLONE_VFORK) borrows its parent's
      * address space until it execs its own, so execve and wait4 must not destroy
      * it. While vforking, the parent is blocked on vfork_waiter and the child
@@ -452,6 +479,12 @@ struct lproc {
     long exit_status;
     uint64_t tls;           /* thread pointer (FS base / TPIDR), restored on switch */
     uint64_t clear_ctid;    /* CLONE_CHILD_CLEARTID: zero + futex-wake on exit */
+    /* The signal mask is per thread; sig_pending holds thread-directed signals
+     * (tgkill). The alt stack is stored for a future handler-delivery stage. */
+    uint64_t sig_blocked;   /* blocked (masked) signals, inherited on clone */
+    uint64_t sig_pending;   /* thread-directed signals awaiting action */
+    uint64_t ss_sp, ss_size;
+    int      ss_flags;
 };
 
 _Static_assert(__builtin_offsetof(struct lproc, tf) == 0, "trapframe first");
@@ -481,6 +514,13 @@ static long do_execve(const char *path, const char *const *argv,
 static struct lfd *fd_get(long fd);
 static void __attribute__((noreturn)) do_exit(long code, int group);
 static vmspace_t linux_vmspace_setup(void);
+/* Signals: take_fatal_signal reports the lowest pending signal whose action is
+ * to terminate (or 0), consuming any pending signal that is ignored.
+ * signal_killpoint acts on it by terminating the process; it is called at the
+ * syscall boundary and after each cooperative sleep, so a thread blocked in a
+ * syscall is killable. Defined with the signal code below. */
+static int take_fatal_signal(void);
+static void signal_killpoint(void);
 /* linux_jump is declared by the arch backend (linux_arch.h); linux_resume takes
  * struct lproc, which is defined here, so it is declared here. */
 extern void linux_resume(struct lproc *p) __attribute__((noreturn));
@@ -1507,8 +1547,8 @@ do_write(long fd, const char *buf, unsigned long len)
             if (p->readers == 0) {
                 if (done)
                     return (long)done;
-                if (!lproc_cur->sh->sigpipe_ign) {
-                    lproc_cur->sh->exit_sig = 13;   /* SIGPIPE */
+                if (lproc_cur->sh->sigact[SIGPIPE - 1].handler == SIG_DFL) {
+                    lproc_cur->sh->exit_sig = SIGPIPE;
                     do_exit(0, 1);                  /* does not return */
                 }
                 return -LERR_PIPE;
@@ -1517,6 +1557,7 @@ do_write(long fd, const char *buf, unsigned long len)
             done += (unsigned long)n;
             if (done < len)
                 lx_yield();          /* pipe full: let a reader drain it */
+            signal_killpoint();      /* a fatal signal unblocks and terminates */
         }
         return (long)done;
     }
@@ -1970,6 +2011,7 @@ do_poll(uint64_t ufds, uint64_t nfds, long timeout_ms)
         if (timeout_ms > 0 && arch_cycles() >= deadline)
             break;                      /* timed out with nothing ready */
         lx_yield();                     /* let a peer make a descriptor ready */
+        signal_killpoint();             /* a fatal signal unblocks and terminates */
     }
 
     if (nfds) {
@@ -1997,8 +2039,10 @@ do_read(long fd, void *buf, unsigned long count)
             return -LERR_BADF;
         struct lpipe *p = &pipes[f->pidx];
         /* Block until data arrives or every writer has closed (then EOF = 0). */
-        while (p->count == 0 && p->writers > 0)
+        while (p->count == 0 && p->writers > 0) {
             lx_yield();          /* empty pipe: let a writer fill it */
+            signal_killpoint();  /* a fatal signal unblocks and terminates */
+        }
         return pipe_read(p, buf, count);
     }
     if (f->isram) {
@@ -2815,6 +2859,7 @@ do_futex(uint64_t uaddr, int op, int val)
         fwaiters[slot].uaddr = uaddr;
         fwaiters[slot].task_id = me;
         lx_block();                     /* drops the giant lock while parked */
+        signal_killpoint();             /* a fatal signal unblocks and terminates */
         /* Reclaim the slot, unless a wake already freed it and another waiter
          * has since taken it (then used is set with a different task_id, and
          * clearing it would strand that waiter). */
@@ -2878,6 +2923,10 @@ do_fork(void)
     child->tf = parent->tf;
     tf_set_ret0(&child->tf);
     child->tls = parent->tls;
+    /* Signal dispositions are inherited across fork; the child starts with no
+     * pending signals and the parent's blocked mask. */
+    memcpy(csh->sigact, parent->sh->sigact, sizeof csh->sigact);
+    child->sig_blocked = parent->sig_blocked;
 
     int tid = task_spawn_proc("linux", process_entry, child);
     if (tid < 0) {
@@ -2926,6 +2975,7 @@ do_clone_thread(uint64_t flags, uint64_t child_stack, uint64_t ptid,
     tf_set_sp(&t->tf, child_stack);
     t->tls = (flags & CLONE_SETTLS) ? tls : parent->tls;
     tf_set_tls(&t->tf, t->tls);         /* where the arch keeps TLS in the frame */
+    t->sig_blocked = parent->sig_blocked;   /* a new thread inherits the mask */
     if (flags & CLONE_CHILD_SETTID)
         *(int *)(uintptr_t)ctid = t->tid;
     if (flags & CLONE_PARENT_SETTID)
@@ -2996,6 +3046,8 @@ do_spawn_vfork(uint64_t flags, uint64_t child_stack)
     csh->mmap_nhole = parent->sh->mmap_nhole;
     memcpy(csh->mmap_holes, parent->sh->mmap_holes,
            (size_t)csh->mmap_nhole * sizeof csh->mmap_holes[0]);
+    memcpy(csh->sigact, parent->sh->sigact, sizeof csh->sigact);
+    child->sig_blocked = parent->sig_blocked;
 
     csh->vforking = 1;
     csh->vfork_waiter = parent->task_id;
@@ -3095,6 +3147,7 @@ do_wait4(long pid, int *status)
         if (!haskid)
             return -LERR_CHILD;
         lx_yield();                     /* a child is still running: let it run */
+        signal_killpoint();             /* a fatal signal unblocks and terminates */
     }
 }
 
@@ -3178,6 +3231,222 @@ linux_fault_kill(long vec)
     con_putc('\n');
     lproc_cur->sh->exit_sig = sig;
     do_exit(0, 1);                      /* noreturn: releases the lock, tears down */
+}
+
+/****************************************************************
+ * Signals (stages A to C): disposition and mask state, generation (kill,
+ * tgkill), and the default terminate action, which makes a process killable
+ * even while blocked in a syscall. Invoking a user-installed handler is a later
+ * stage; a caught signal is held pending here but not yet delivered.
+ ****************************************************************/
+
+/* The default action for a signal: 1 to terminate the process, 0 to ignore.
+ * We have no stop state, so the stop signals are treated as ignored. */
+static int
+sig_default_terminates(int s)
+{
+    switch (s) {
+    case SIGCHLD:                       /* 17 */
+    case SIGCONT:                       /* 18 */
+    case SIGSTOP:                       /* 19: cannot stop, so a no-op */
+    case 20: case 21: case 22:          /* SIGTSTP/TTIN/TTOU: no stop state */
+    case SIGURG:                        /* 23 */
+    case SIGWINCH:                      /* 28 */
+        return 0;                       /* default action is ignore */
+    default:
+        return 1;                       /* term or core (we terminate for both) */
+    }
+}
+
+/* The lowest pending, unblocked signal whose action is to terminate the
+ * process, or 0 if none. Any pending signal that is ignored (SIG_IGN or a
+ * default-ignore disposition) is consumed here. A caught signal (a handler is
+ * installed) is left pending for a future delivery stage, not acted on. SIGKILL
+ * ignores the block mask and the disposition. */
+static int
+take_fatal_signal(void)
+{
+    struct lproc *t = lproc_cur;
+    struct lshared *sh = t->sh;
+    uint64_t pending = sh->sig_pending | t->sig_pending;
+    uint64_t ready = (pending & ~t->sig_blocked) | (pending & SIGBIT(SIGKILL));
+
+    for (int s = 1; s <= NSIG; s++) {
+        if (!(ready & SIGBIT(s)))
+            continue;
+        if (s != SIGKILL && s != SIGSTOP) {
+            uint64_t h = sh->sigact[s - 1].handler;
+            if (h == SIG_IGN) {                 /* explicitly ignored: consume */
+                sh->sig_pending &= ~SIGBIT(s);
+                t->sig_pending &= ~SIGBIT(s);
+                continue;
+            }
+            if (h != SIG_DFL)                   /* caught: hold for delivery (stage D) */
+                continue;
+        }
+        if (!sig_default_terminates(s)) {       /* default-ignore: consume */
+            sh->sig_pending &= ~SIGBIT(s);
+            t->sig_pending &= ~SIGBIT(s);
+            continue;
+        }
+        return s;                               /* default action is terminate */
+    }
+    return 0;
+}
+
+/* Act on a pending fatal signal by terminating the process. Called at the
+ * syscall boundary and after each cooperative sleep, so a thread blocked in a
+ * syscall becomes killable. Returns normally when nothing is pending. */
+static void
+signal_killpoint(void)
+{
+    int s = take_fatal_signal();
+    if (s) {
+        lproc_cur->sh->exit_sig = s;
+        do_exit(0, 1);                  /* noreturn: releases the lock, tears down */
+    }
+}
+
+/* Find a live process by pid, or NULL. A zombie (exited, not yet reaped) still
+ * counts as existing, so a signal to it is accepted and dropped. */
+static struct lshared *
+proc_by_pid(int pid)
+{
+    for (int i = 0; i < LINUX_NPROC; i++)
+        if (shareds[i].used && shareds[i].pid == pid)
+            return &shareds[i];
+    return NULL;
+}
+
+/* Find a live thread by tid, or NULL. */
+static struct lproc *
+thread_by_tid(int tid)
+{
+    for (int i = 0; i < LINUX_NPROC; i++)
+        if (procs[i].used && procs[i].tid == tid)
+            return &procs[i];
+    return NULL;
+}
+
+/* Wake every live thread of a process so a blocked one re-checks its signals. */
+static void
+wake_process_threads(const struct lshared *sh)
+{
+    for (int i = 0; i < LINUX_NPROC; i++)
+        if (procs[i].used && !procs[i].exited && procs[i].sh == sh)
+            task_wake(procs[i].task_id);
+}
+
+/* kill(pid, sig): post a process-directed signal. sig 0 is an existence probe.
+ * Only pid > 0 (a specific process) is supported; process-group forms are
+ * accepted as a no-op. */
+static long
+do_kill(int pid, int sig)
+{
+    if (sig < 0 || sig > NSIG)
+        return -LERR_INVAL;
+    if (pid <= 0)
+        return 0;                       /* group/broadcast forms: accept, no-op */
+    struct lshared *sh = proc_by_pid(pid);
+    if (!sh)
+        return -LERR_SRCH;
+    if (sig == 0)
+        return 0;                       /* existence check only */
+    sh->sig_pending |= SIGBIT(sig);
+    wake_process_threads(sh);           /* a blocked thread re-checks and may die */
+    return 0;
+}
+
+/* tgkill(tgid, tid, sig): post a thread-directed signal (raise and abort route
+ * here). tgid is accepted but not cross-checked against the thread's process. */
+static long
+do_tgkill(int tid, int sig)
+{
+    if (sig < 0 || sig > NSIG)
+        return -LERR_INVAL;
+    struct lproc *t = thread_by_tid(tid);
+    if (!t || t->exited)
+        return -LERR_SRCH;
+    if (sig == 0)
+        return 0;
+    t->sig_pending |= SIGBIT(sig);
+    task_wake(t->task_id);
+    return 0;
+}
+
+/* rt_sigaction(sig, act, oldact): store or retrieve a disposition. The x86-64
+ * kernel struct sigaction is { handler, flags, restorer, mask }, matching
+ * struct ksigaction. SIGKILL and SIGSTOP cannot be changed. */
+static long
+do_rt_sigaction(int sig, uint64_t act, uint64_t oldact)
+{
+    if (sig < 1 || sig > NSIG)
+        return -LERR_INVAL;
+    struct ksigaction *slot = &lproc_cur->sh->sigact[sig - 1];
+    if (oldact) {
+        if (copy_to_user(oldact, slot, sizeof *slot) < 0)
+            return -LERR_FAULT;
+    }
+    if (act) {
+        if (sig == SIGKILL || sig == SIGSTOP)
+            return -LERR_INVAL;
+        struct ksigaction ka;
+        if (copy_from_user(&ka, act, sizeof ka) < 0)
+            return -LERR_FAULT;
+        *slot = ka;
+    }
+    return 0;
+}
+
+/* rt_sigprocmask(how, set, oldset): update the thread's blocked mask. SIGKILL
+ * and SIGSTOP are never actually blocked. Only the low 64 bits matter. */
+static long
+do_rt_sigprocmask(int how, uint64_t set, uint64_t oldset)
+{
+    struct lproc *t = lproc_cur;
+    if (oldset) {
+        if (copy_to_user(oldset, &t->sig_blocked, sizeof t->sig_blocked) < 0)
+            return -LERR_FAULT;
+    }
+    if (set) {
+        uint64_t m;
+        if (copy_from_user(&m, set, sizeof m) < 0)
+            return -LERR_FAULT;
+        switch (how) {
+        case 0: t->sig_blocked |= m; break;             /* SIG_BLOCK */
+        case 1: t->sig_blocked &= ~m; break;            /* SIG_UNBLOCK */
+        case 2: t->sig_blocked = m; break;              /* SIG_SETMASK */
+        default: return -LERR_INVAL;
+        }
+        t->sig_blocked &= ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+    }
+    return 0;
+}
+
+/* sigaltstack(ss, old): store the alternate signal stack, used once handler
+ * delivery lands. Accepted and recorded now. */
+static long
+do_sigaltstack(uint64_t ss, uint64_t old)
+{
+    struct lproc *t = lproc_cur;
+    if (old) {
+        struct { uint64_t sp; int flags; uint64_t size; } o;
+        memset(&o, 0, sizeof o);        /* clear the padding hole before the copy */
+        o.sp = t->ss_sp;
+        o.flags = t->ss_flags;
+        o.size = t->ss_size;
+        if (copy_to_user(old, &o, sizeof o) < 0)
+            return -LERR_FAULT;
+    }
+    if (ss) {
+        struct { uint64_t sp; int flags; uint64_t size; } n;
+        if (copy_from_user(&n, ss, sizeof n) < 0)
+            return -LERR_FAULT;
+        t->ss_sp = n.sp;
+        t->ss_flags = n.flags;
+        t->ss_size = n.size;
+    }
+    return 0;
 }
 
 /* The body of the SYSCALL handler, run with the giant lock held (see
@@ -3451,7 +3720,7 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return 0;
     }
     case SYS_sigaltstack:
-        return 0;                       /* no signal delivery: accept and ignore */
+        return do_sigaltstack((uint64_t)a1, (uint64_t)a2);
     case SYS_umask:
         return 022;                     /* report a conventional prior mask */
     case SYS_chmod:
@@ -3833,24 +4102,18 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return lproc_cur->sh->parent;
     case SYS_gettid:
         return lproc_cur->tid;
+    case SYS_kill:
+        return do_kill((int)a1, (int)a2);
+    case SYS_tkill:
+        /* tkill(tid, sig): the two-argument form musl's raise and abort use. */
+        return do_tgkill((int)a1, (int)a2);
     case SYS_tgkill:
-        return 0;                       /* no signal delivery: accept and ignore */
+        /* tgkill(tgid, tid, sig): the three-argument thread-directed form. */
+        return do_tgkill((int)a2, (int)a3);
     case SYS_rt_sigaction:
-        /* No signal delivery, with one exception that matters for pipelines:
-         * track whether SIGPIPE is left at its default. sa_handler is the first
-         * field of struct sigaction; SIG_DFL is 0. If the program sets a handler
-         * or SIG_IGN, a broken-pipe write returns EPIPE rather than terminating
-         * (see do_write). */
-        if (a1 == 13 && a2) {           /* SIGPIPE */
-            void *handler;
-            long e = copy_from_user(&handler, (uint64_t)a2, sizeof handler);
-            if (e < 0)
-                return e;
-            lproc_cur->sh->sigpipe_ign = (handler != 0);
-        }
-        return 0;
+        return do_rt_sigaction((int)a1, (uint64_t)a2, (uint64_t)a3);
     case SYS_rt_sigprocmask:
-        return 0;                       /* no signal delivery: accept and ignore */
+        return do_rt_sigprocmask((int)a1, (uint64_t)a2, (uint64_t)a3);
     case SYS_uname: {
         /* struct utsname: six NUL-terminated 65-byte fields. */
         if (!a1)
@@ -3892,6 +4155,7 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
 {
     giant_lock();
     long r = linux_sys_dispatch_inner(nr, a1, a2, a3, a4, a5);
+    signal_killpoint();     /* a signal posted during the call terminates here */
     giant_unlock();
     return r;
 }
@@ -4156,6 +4420,12 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     for (int i = 0; i < LINUX_NFD; i++)
         if (fds[i].used && fds[i].cloexec)
             do_close(i);
+
+    /* execve resets caught signals to the default action but keeps those set to
+     * SIG_IGN; the blocked mask and pending signals are preserved. */
+    for (int s = 0; s < NSIG; s++)
+        if (lproc_cur->sh->sigact[s].handler != SIG_IGN)
+            memset(&lproc_cur->sh->sigact[s], 0, sizeof lproc_cur->sh->sigact[s]);
 
     arena_init(image_top(&exe, &interp));   /* fresh heap above the new image */
     uint64_t rsp = build_stack_vec(na, argc, ne, envc, &exe, &interp);

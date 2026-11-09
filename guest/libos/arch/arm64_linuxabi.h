@@ -63,6 +63,8 @@
 #define SYS_sched_getaffinity 123
 #define SYS_clock_gettime   113
 #define SYS_sched_yield     124
+#define SYS_kill            129
+#define SYS_tkill           130
 #define SYS_tgkill          131
 #define SYS_rt_sigaction    134
 #define SYS_rt_sigprocmask  135

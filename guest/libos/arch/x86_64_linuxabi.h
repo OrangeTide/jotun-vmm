@@ -49,6 +49,8 @@
 #define SYS_clone           56
 #define SYS_fork            57
 #define SYS_vfork           58
+#define SYS_kill            62
+#define SYS_tkill           200
 #define SYS_execve          59
 #define SYS_exit            60
 #define SYS_wait4           61

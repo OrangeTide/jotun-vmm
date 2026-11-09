@@ -26,7 +26,7 @@ Statuses used below:
 - **stub**: accepted and ignored (returns 0 or a fixed value) with no real
   effect; present so startup and common idioms do not fail.
 
-## Implemented (112 calls)
+## Implemented (114 calls)
 
 ### File and directory I/O
 
@@ -144,13 +144,23 @@ preserved across execve.
 | 204 | sched_getaffinity | stub | reports a single online cpu (cpu 0) so a tool sizes its pool to one |
 | 230 | clock_nanosleep | stub | returns 0 (no timers; a cooperative guest has nothing to sleep on) |
 
-### Signals (minimal)
+### Signals (generation and default actions; no handler delivery yet)
+
+Stages A to C: real disposition and mask state, signal generation, and the
+default terminate action, so a process is killable (even while blocked in a
+syscall) and a fatal signal is reported as `WIFSIGNALED`. Invoking a
+user-installed handler, and returning `EINTR` to a caught syscall, are a later
+stage; a caught signal is recorded as pending but not yet delivered. See
+doc/m16-signals.md.
 
 | nr | name | status | notes |
 |----|------|--------|-------|
-| 13 | rt_sigaction | stub | returns 0; no delivery |
-| 14 | rt_sigprocmask | stub | returns 0; no delivery |
-| 234 | tgkill | stub | returns 0; no delivery |
+| 13 | rt_sigaction | partial | stores the per-process disposition (handler/flags/restorer/mask); reset to default on execve; no handler invocation yet |
+| 14 | rt_sigprocmask | partial | maintains the per-thread blocked mask; SIGKILL/SIGSTOP cannot be blocked |
+| 131 | sigaltstack | partial | stores the alternate stack for a future delivery stage |
+| 62 | kill | partial | posts a process-directed signal and wakes the target; acts on the default terminate action; pid>0 only (group forms are a no-op); sig 0 is an existence probe (ESRCH if absent) |
+| 200 | tkill | partial | thread-directed, two-argument form (musl raise/abort) |
+| 234 | tgkill | partial | thread-directed, three-argument form |
 
 ### Sockets
 
@@ -392,12 +402,16 @@ New state or a new mechanism, but inside the cooperative single-vcpu model.
 
 Whole subsystems. Each is a project; land only when a target workload needs it.
 
-- **Signals.** The big one. `rt_sigaction`, `rt_sigprocmask`, `sigaltstack`,
-  `kill`, and `tgkill` are all stubs with no delivery. Only `SIGPIPE` (terminate)
-  and the CPU-fault `SIGSEGV` are special-cased. No handlers are invoked, no
-  `sigreturn`, no masking, no `SIGCHLD`, no `SIGINT`/Ctrl-C, no
-  `SIGALRM`/`alarm`/`setitimer`. Anything with a signal handler or an interactive
-  interrupt is affected. Requires a delivery mechanism on the SYSCALL-return path.
+- **Signals.** Stages A to C have landed: real disposition and mask state,
+  generation (`kill`/`tkill`/`tgkill`), and the default terminate action, so a
+  process is killable even while blocked in a syscall and a fatal signal reports
+  `WIFSIGNALED` (see doc/m16-signals.md). What remains is the harder half:
+  invoking a user-installed handler (stage D: build a frame on the user stack,
+  divert the return, implement `rt_sigreturn`, honor `SA_RESTART`), catchable
+  faults (stage E: save the user context in the fault stub so `SIGSEGV` can reach
+  a handler), and timers (`SIGALRM`/`setitimer`). Still absent regardless:
+  `SIGCHLD` generation, `SIGINT`/Ctrl-C (no async console input), and
+  interrupting a no-syscall compute loop (no preemption timer).
 - **Sockets in the Linux ABI.** `socket`, `bind`, `listen`, `accept`, `connect`,
   the `send*` and `recv*` family all stub `ENOSYS`. The guest has a net layer
   (net.c, dial strings, vswitch); it is just not bridged to the Linux socket
