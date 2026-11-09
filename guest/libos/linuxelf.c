@@ -1504,6 +1504,111 @@ do_open(const char *path, long flags)
     return fd;
 }
 
+/* poll(2) event bits. POLLHUP, POLLERR, and POLLNVAL are output only: poll
+ * reports them in revents whether or not the caller asked for them. */
+#define POLLIN   0x001
+#define POLLPRI  0x002
+#define POLLOUT  0x004
+#define POLLERR  0x008
+#define POLLHUP  0x010
+#define POLLNVAL 0x020
+
+struct pollfd {
+    int   fd;
+    short events;
+    short revents;
+};
+
+/* The readiness of one descriptor for poll. A read or write that would not
+ * block counts as ready. The only descriptor that can block is a pipe: its
+ * read end is readable once it holds data or every writer has closed (EOF, a
+ * read that returns 0), and its write end is writable while the ring has room.
+ * The console, ram files, 9P files, and directories never block, so they are
+ * always ready for whichever direction the caller asked about. */
+static short
+poll_ready(struct lfd *f, short events)
+{
+    if (!f)
+        return POLLNVAL;
+    short r = 0;
+    if (f->ispipe) {
+        struct lpipe *p = &pipes[f->pidx];
+        if (f->wr) {
+            if (p->readers == 0)
+                r |= POLLERR;               /* no reader: a write is broken */
+            if (p->count < PIPE_CAP)
+                r |= (short)(events & POLLOUT);
+        } else {
+            if (p->count > 0)
+                r |= (short)(events & POLLIN);
+            if (p->writers == 0)
+                r |= POLLHUP;               /* EOF: a read returns 0, not block */
+        }
+        return r;
+    }
+    /* Console, ram, 9P, directory: never block. */
+    if (events & POLLIN)
+        r |= POLLIN;
+    if (events & POLLOUT)
+        r |= POLLOUT;
+    return r;
+}
+
+/* poll(fds, nfds, timeout_ms). Cooperative: scan the set, and if nothing is
+ * ready yet drop the giant lock and yield so a writer or child can make a pipe
+ * ready, then rescan. timeout 0 is a non-blocking single scan; a negative
+ * timeout waits indefinitely; a positive timeout is bounded with the cycle
+ * counter (about 1 GHz, the same rough clock the time syscalls use), since
+ * there is no real timer. Returns the number of ready descriptors, 0 on
+ * timeout. */
+static long
+do_poll(uint64_t ufds, uint64_t nfds, long timeout_ms)
+{
+    if (nfds > 1024)
+        return -LERR_INVAL;             /* far past anything the guest needs */
+    struct pollfd *pf = NULL;
+    uint64_t sz = nfds * sizeof *pf;
+    if (nfds) {
+        pf = kmalloc(sz);
+        if (!pf)
+            return -LERR_NOMEM;
+        if (copy_from_user(pf, ufds, sz) < 0) {
+            kfree(pf);
+            return -LERR_FAULT;
+        }
+    }
+
+    uint64_t deadline = 0;
+    if (timeout_ms > 0)
+        deadline = arch_cycles() + (uint64_t)timeout_ms * 1000000ULL;
+
+    long ready;
+    for (;;) {
+        ready = 0;
+        for (uint64_t i = 0; i < nfds; i++) {
+            pf[i].revents = 0;
+            if (pf[i].fd < 0)
+                continue;               /* a negative fd is skipped, revents 0 */
+            short re = poll_ready(fd_get(pf[i].fd), pf[i].events);
+            if (re) {
+                pf[i].revents = re;
+                ready++;
+            }
+        }
+        if (ready > 0 || timeout_ms == 0)
+            break;
+        if (timeout_ms > 0 && arch_cycles() >= deadline)
+            break;                      /* timed out with nothing ready */
+        lx_yield();                     /* let a peer make a descriptor ready */
+    }
+
+    if (nfds) {
+        copy_to_user(ufds, pf, sz);     /* write back revents */
+        kfree(pf);
+    }
+    return ready;
+}
+
 static long
 do_read(long fd, void *buf, unsigned long count)
 {
@@ -2684,6 +2789,8 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     }
     case SYS_ioctl:
         return -LERR_NOTTY;             /* no tty: musl falls back */
+    case SYS_poll:
+        return do_poll((uint64_t)a1, (uint64_t)a2, (long)a3);
     case SYS_read:
         return do_read(a1, (void *)a2, (unsigned long)a3);
     case SYS_pread64:

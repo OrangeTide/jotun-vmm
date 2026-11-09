@@ -126,6 +126,7 @@
 #define SYS_rename     (-17)
 #define SYS_link       (-18)
 #define SYS_symlink    (-19)
+#define SYS_poll       (-20)       /* AArch64 has ppoll (73), not poll */
 
 /* arch_prctl is x86-only; defined so the shared case body compiles. */
 #define ARCH_SET_FS 0x1002
