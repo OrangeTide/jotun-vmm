@@ -1,8 +1,15 @@
-/* p9hostdir.c : a read-only 9P backend over a live host directory. */
+/* p9hostdir.c : a 9P backend over a live host directory.
+ *
+ * Read-only by default. A writable mount also serves create, write, truncate,
+ * and remove, so a guest's build output lands on the host filesystem instead of
+ * guest RAM. The same realpath confinement bounds every op to the mount root. */
 
 #include "p9hostdir.h"
 
+#include "jotun_9p.h"
+
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -13,10 +20,16 @@
 
 struct p9hostdir {
     char root[PATH_MAX];                /* canonical host directory root */
+    int  writable;                      /* serve create/write/truncate/remove */
     /* A one-entry read cache: a library is read sequentially, so keeping the
      * last file open turns a run of reads into a single open. */
     char cur_handle[P9_HANDLE_MAX];
     int  cur_fd;
+    /* A one-entry write cache, the write counterpart: a build tool writes a
+     * file in a run of small chunks, so keeping it open avoids an open per
+     * Twrite. */
+    char cur_whandle[P9_HANDLE_MAX];
+    int  cur_wfd;
 };
 
 /* A walk accepts only a single path component, never one that could escape the
@@ -164,15 +177,141 @@ hd_readf(void *vctx, const struct p9_node *file, uint64_t off, void *buf,
     return r < 0 ? -1 : r;
 }
 
+/* Build root/<handle> into full. Returns 0, or -1 if it does not fit. */
+static int
+host_path(const struct p9hostdir *c, const char *handle, char *full,
+          size_t cap)
+{
+    int n = handle[0] ? snprintf(full, cap, "%s/%s", c->root, handle)
+                      : snprintf(full, cap, "%s", c->root);
+    return (n < 0 || (size_t)n >= cap) ? -1 : 0;
+}
+
+/* Drop a cached fd (read or write) that names this handle, so a later read or
+ * stat does not see a stale descriptor after the file changed or went away. */
+static void
+invalidate(struct p9hostdir *c, const char *handle)
+{
+    if (c->cur_fd >= 0 && strcmp(c->cur_handle, handle) == 0) {
+        close(c->cur_fd);
+        c->cur_fd = -1;
+        c->cur_handle[0] = '\0';
+    }
+    if (c->cur_wfd >= 0 && strcmp(c->cur_whandle, handle) == 0) {
+        close(c->cur_wfd);
+        c->cur_wfd = -1;
+        c->cur_whandle[0] = '\0';
+    }
+}
+
+static long
+hd_writef(void *vctx, const struct p9_node *file, uint64_t off, const void *buf,
+          uint32_t nbytes)
+{
+    struct p9hostdir *c = vctx;
+    if (!c->writable)
+        return -1;
+
+    if (c->cur_wfd < 0 || strcmp(c->cur_whandle, file->handle) != 0) {
+        if (c->cur_wfd >= 0)
+            close(c->cur_wfd);
+        c->cur_wfd = -1;
+        c->cur_whandle[0] = '\0';
+        char full[PATH_MAX];
+        if (host_path(c, file->handle, full, sizeof full) != 0)
+            return -1;
+        c->cur_wfd = open(full, O_WRONLY);
+        if (c->cur_wfd < 0)
+            return -1;
+        strncpy(c->cur_whandle, file->handle, sizeof c->cur_whandle - 1);
+        c->cur_whandle[sizeof c->cur_whandle - 1] = '\0';
+    }
+
+    ssize_t w = pwrite(c->cur_wfd, buf, nbytes, (off_t)off);
+    return w < 0 ? -1 : w;
+}
+
+static int
+hd_create(void *vctx, const struct p9_node *dir, const char *name,
+          uint32_t perm, struct p9_node *out)
+{
+    struct p9hostdir *c = vctx;
+    if (!c->writable || !valid_name(name))
+        return -1;
+
+    /* A single leaf name joined onto an already-confined directory handle stays
+     * within the root (valid_name rejects "/", "." and ".."), so the new path
+     * needs no realpath (the target may not exist yet). */
+    char rel[P9_HANDLE_MAX];
+    int rl = dir->handle[0]
+        ? snprintf(rel, sizeof rel, "%s/%s", dir->handle, name)
+        : snprintf(rel, sizeof rel, "%s", name);
+    if (rl < 0 || rl >= (int)sizeof rel || (size_t)rl >= sizeof out->handle)
+        return -1;
+
+    char full[PATH_MAX];
+    if (host_path(c, rel, full, sizeof full) != 0)
+        return -1;
+
+    unsigned mode = perm & 0777u;
+    if (perm & P9_DMDIR) {
+        if (mkdir(full, mode ? mode : 0755) != 0 && errno != EEXIST)
+            return -1;
+    } else {
+        int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, mode ? mode : 0644);
+        if (fd < 0)
+            return -1;
+        close(fd);
+    }
+
+    struct stat st;
+    if (stat(full, &st) != 0)
+        return -1;
+    fill_node(out, rel, name, &st);
+    return 0;
+}
+
+static int
+hd_truncate(void *vctx, const struct p9_node *file, uint64_t len)
+{
+    struct p9hostdir *c = vctx;
+    if (!c->writable)
+        return -1;
+    char full[PATH_MAX];
+    if (host_path(c, file->handle, full, sizeof full) != 0)
+        return -1;
+    invalidate(c, file->handle);
+    return truncate(full, (off_t)len) == 0 ? 0 : -1;
+}
+
+static int
+hd_removef(void *vctx, const struct p9_node *node)
+{
+    struct p9hostdir *c = vctx;
+    if (!c->writable)
+        return -1;
+    char full[PATH_MAX];
+    if (host_path(c, node->handle, full, sizeof full) != 0)
+        return -1;
+    invalidate(c, node->handle);
+    if (node->is_dir)
+        return rmdir(full) == 0 ? 0 : -1;
+    return unlink(full) == 0 ? 0 : -1;
+}
+
 static const struct p9_backend hostdir_backend = {
     .root = hd_root,
     .walk = hd_walk,
     .list = hd_list,
     .readf = hd_readf,
+    .writef = hd_writef,
+    .create = hd_create,
+    .truncate = hd_truncate,
+    .removef = hd_removef,
 };
 
 const struct p9_backend *
-p9hostdir_open(const char *path, void **ctxout)
+p9hostdir_open(const char *path, int writable, void **ctxout)
 {
     char real[PATH_MAX];
     struct stat st;
@@ -184,7 +323,9 @@ p9hostdir_open(const char *path, void **ctxout)
         return NULL;
     strncpy(c->root, real, sizeof c->root - 1);
     c->root[sizeof c->root - 1] = '\0';
+    c->writable = writable;
     c->cur_fd = -1;
+    c->cur_wfd = -1;
     *ctxout = c;
     return &hostdir_backend;
 }
@@ -197,5 +338,7 @@ p9hostdir_close(void *ctx)
         return;
     if (c->cur_fd >= 0)
         close(c->cur_fd);
+    if (c->cur_wfd >= 0)
+        close(c->cur_wfd);
     free(c);
 }

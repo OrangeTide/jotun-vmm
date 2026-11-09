@@ -37,9 +37,13 @@ enum {
     P9_RERROR   = 107,
     P9_TWALK    = 110, P9_RWALK    = 111,
     P9_TOPEN    = 112, P9_ROPEN    = 113,
+    P9_TCREATE  = 114, P9_RCREATE  = 115,
     P9_TREAD    = 116, P9_RREAD    = 117,
+    P9_TWRITE   = 118, P9_RWRITE   = 119,
     P9_TCLUNK   = 120, P9_RCLUNK   = 121,
+    P9_TREMOVE  = 122, P9_RREMOVE  = 123,
     P9_TSTAT    = 124, P9_RSTAT    = 125,
+    P9_TWSTAT   = 126, P9_RWSTAT   = 127,
 };
 
 /* qid.type and stat.mode high bits. */
@@ -50,6 +54,9 @@ enum {
 #define P9_NOFID    0xffffffffu
 #define P9_NOTAG    0xffffu
 #define P9_OREAD    0u              /* open mode: read only */
+#define P9_OWRITE   1u              /* open mode: write only */
+#define P9_ORDWR    2u              /* open mode: read and write */
+#define P9_OTRUNC   0x10u           /* open mode flag: truncate on open */
 #define P9_MAXWELEM 16              /* max walk name elements */
 
 /* A qid is 13 wire bytes: type[1] version[4] path[8]. */

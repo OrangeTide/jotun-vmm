@@ -239,11 +239,56 @@ ov_readf(void *ctx, const struct p9_node *file, uint64_t off, void *buf,
     return (long)n;
 }
 
+/* The write ops forward to the backend below for a real file, and refuse a
+ * synthetic /net node (those are read-only). A read-only backend below leaves
+ * its op NULL, which these guard. */
+static long
+ov_writef(void *ctx, const struct p9_node *file, uint64_t off, const void *buf,
+          uint32_t n)
+{
+    struct p9overlay *ov = ctx;
+    if (is_synth(file) || !ov->under->writef)
+        return -1;
+    return ov->under->writef(ov->under_ctx, file, off, buf, n);
+}
+
+static int
+ov_create(void *ctx, const struct p9_node *dir, const char *name, uint32_t perm,
+          struct p9_node *out)
+{
+    struct p9overlay *ov = ctx;
+    if (is_synth(dir) || !ov->under->create)
+        return -1;
+    return ov->under->create(ov->under_ctx, dir, name, perm, out);
+}
+
+static int
+ov_truncate(void *ctx, const struct p9_node *file, uint64_t len)
+{
+    struct p9overlay *ov = ctx;
+    if (is_synth(file) || !ov->under->truncate)
+        return -1;
+    return ov->under->truncate(ov->under_ctx, file, len);
+}
+
+static int
+ov_removef(void *ctx, const struct p9_node *node)
+{
+    struct p9overlay *ov = ctx;
+    if (is_synth(node) || !ov->under->removef)
+        return -1;
+    return ov->under->removef(ov->under_ctx, node);
+}
+
 static const struct p9_backend overlay_backend = {
     .root = ov_root,
     .walk = ov_walk,
     .list = ov_list,
     .readf = ov_readf,
+    .writef = ov_writef,
+    .create = ov_create,
+    .truncate = ov_truncate,
+    .removef = ov_removef,
 };
 
 struct p9overlay *

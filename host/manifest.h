@@ -29,6 +29,7 @@ struct manifest_mount {
     char ref[64];                       /* ref name, default "root" */
     char subtree[256];                  /* subtree within that bundle, or "" */
     int  is_host;                       /* source is a live host directory */
+    int  writable;                      /* host mount serves writes (rw) */
 };
 
 struct manifest {

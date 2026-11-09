@@ -225,10 +225,23 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
     }
     case P9_TOPEN: {
         uint32_t fid = p9i_u32(&in);
-        (void)p9i_u8(&in);          /* mode; read-only server ignores it */
+        uint8_t mode = p9i_u8(&in);
         int fi = find_fid(s, fid);
         if (fi < 0)
             return reply_error(rsp, rspcap, tag, "bad fid");
+        /* A write-intent open needs a writable backend. OTRUNC empties an
+         * existing file here, since the overlay's create path only reaches a
+         * file that already exists through a plain open. */
+        int wants_write = (mode & 3) == P9_OWRITE || (mode & 3) == P9_ORDWR
+                          || (mode & P9_OTRUNC);
+        if (wants_write && !s->be->writef)
+            return reply_error(rsp, rspcap, tag, "read-only");
+        if ((mode & P9_OTRUNC) && !s->fids[fi].node.is_dir) {
+            if (!s->be->truncate ||
+                s->be->truncate(s->ctx, &s->fids[fi].node, 0) != 0)
+                return reply_error(rsp, rspcap, tag, "truncate failed");
+            s->fids[fi].node.length = 0;
+        }
         s->fids[fi].open = 1;
         reply_hdr(&o, rsp, rspcap, P9_ROPEN, tag);
         put_qid(&o, &s->fids[fi].node);
@@ -305,6 +318,69 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
         uint16_t namelen = (uint16_t)strlen(name);
         p9o_u16(&o, (uint16_t)(49 + namelen));
         put_stat(&o, name, n->is_dir, n->mode, n->length, n->qid_path);
+        return p9o_finish(&o);
+    }
+    case P9_TCREATE: {
+        /* Create a child of the directory fid points at, then make fid refer to
+         * the new file, open for writing (9P2000 semantics). perm's P9_DMDIR
+         * bit selects a directory. */
+        uint32_t fid = p9i_u32(&in);
+        char name[256];
+        p9i_str(&in, name, sizeof name);
+        uint32_t perm = p9i_u32(&in);
+        (void)p9i_u8(&in);          /* mode; we always open the result writable */
+        if (!in.ok)
+            return reply_error(rsp, rspcap, tag, "bad Tcreate");
+        int fi = find_fid(s, fid);
+        if (fi < 0)
+            return reply_error(rsp, rspcap, tag, "bad fid");
+        if (!s->be->create)
+            return reply_error(rsp, rspcap, tag, "read-only");
+        struct p9_node nn;
+        if (s->be->create(s->ctx, &s->fids[fi].node, name, perm, &nn) != 0)
+            return reply_error(rsp, rspcap, tag, "create failed");
+        s->fids[fi].node = nn;
+        s->fids[fi].open = 1;
+        reply_hdr(&o, rsp, rspcap, P9_RCREATE, tag);
+        put_qid(&o, &s->fids[fi].node);
+        p9o_u32(&o, 0);             /* iounit */
+        return p9o_finish(&o);
+    }
+    case P9_TWRITE: {
+        uint32_t fid = p9i_u32(&in);
+        uint64_t offset = p9i_u64(&in);
+        uint32_t count = p9i_u32(&in);
+        if (!in.ok || in.p + count > in.len)
+            return reply_error(rsp, rspcap, tag, "bad Twrite");
+        const uint8_t *data = in.b + in.p;      /* the payload follows count */
+        int fi = find_fid(s, fid);
+        if (fi < 0)
+            return reply_error(rsp, rspcap, tag, "bad fid");
+        if (!s->be->writef)
+            return reply_error(rsp, rspcap, tag, "read-only");
+        long wrote = s->be->writef(s->ctx, &s->fids[fi].node, offset, data, count);
+        if (wrote < 0)
+            return reply_error(rsp, rspcap, tag, "write failed");
+        if (offset + (uint64_t)wrote > s->fids[fi].node.length)
+            s->fids[fi].node.length = offset + (uint64_t)wrote;
+        reply_hdr(&o, rsp, rspcap, P9_RWRITE, tag);
+        p9o_u32(&o, (uint32_t)wrote);
+        return p9o_finish(&o);
+    }
+    case P9_TREMOVE: {
+        /* Remove the file the fid names, then clunk the fid (9P2000: Tremove
+         * always clunks, success or not). */
+        uint32_t fid = p9i_u32(&in);
+        int fi = find_fid(s, fid);
+        if (fi < 0)
+            return reply_error(rsp, rspcap, tag, "bad fid");
+        int rc = s->be->removef ? s->be->removef(s->ctx, &s->fids[fi].node) : -1;
+        s->fids[fi].used = 0;
+        if (s->dir_valid && s->dir_fid == fid)
+            s->dir_valid = 0;
+        if (rc != 0)
+            return reply_error(rsp, rspcap, tag, "remove failed");
+        reply_hdr(&o, rsp, rspcap, P9_RREMOVE, tag);
         return p9o_finish(&o);
     }
     default:

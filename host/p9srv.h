@@ -41,7 +41,12 @@ struct p9_dirent {
 typedef int (*p9_emit_fn)(void *emit_ctx, const struct p9_dirent *de);
 
 /* The backend interface. root and walk return 0 or -1; list emits each entry
- * and returns 0 or -1; readf returns a byte count or -1. */
+ * and returns 0 or -1; readf returns a byte count or -1.
+ *
+ * The write ops (writef, create, truncate, removef) are NULL for a read-only
+ * backend; the server reports a read-only error when a T-message needs one that
+ * is absent. create makes a child of dir: a directory when perm has P9_DMDIR,
+ * else a regular file, and fills out with the new node. */
 struct p9_backend {
     int  (*root)(void *ctx, struct p9_node *out);
     int  (*walk)(void *ctx, const struct p9_node *dir, const char *name,
@@ -50,6 +55,12 @@ struct p9_backend {
                  p9_emit_fn emit, void *emit_ctx);
     long (*readf)(void *ctx, const struct p9_node *file, uint64_t off,
                   void *buf, uint32_t n);
+    long (*writef)(void *ctx, const struct p9_node *file, uint64_t off,
+                   const void *buf, uint32_t n);
+    int  (*create)(void *ctx, const struct p9_node *dir, const char *name,
+                   uint32_t perm, struct p9_node *out);
+    int  (*truncate)(void *ctx, const struct p9_node *file, uint64_t len);
+    int  (*removef)(void *ctx, const struct p9_node *node);
 };
 
 /* Must cover the guest's 9P fid pool (GFID_MAX in guest/libos/linuxelf.c) plus

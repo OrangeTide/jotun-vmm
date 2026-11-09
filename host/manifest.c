@@ -104,6 +104,12 @@ manifest_load(const char *path, struct manifest *m)
                 if (strncmp(tok[1], "host:", 5) == 0) {
                     mo->is_host = 1;
                     copy_field(mo->bundle, sizeof mo->bundle, tok[1] + 5);
+                    /* A trailing "rw" token marks the host mount writable, so
+                     * the guest's writes land on the host directory. Any other
+                     * following token (or none) leaves it read-only. */
+                    for (int t = 2; t < nt; t++)
+                        if (strcmp(tok[t], "rw") == 0)
+                            mo->writable = 1;
                 } else {
                     mo->is_host = 0;
                     copy_field(mo->bundle, sizeof mo->bundle, tok[1]);

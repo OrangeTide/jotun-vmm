@@ -217,6 +217,26 @@ setup_bootinfo(struct guest *gp, int gargc, char **gargv)
     }
     b->argc = (uint32_t)n;
     b->blob_len = off;
+
+    /* List each writable host mount's guest prefix ("/<name>") so the guest
+     * routes writes under it to the host instead of its in-RAM overlay. */
+    uint32_t nrw = 0;
+    for (int mi = 0; mi < gp->manifest.nmount &&
+         nrw < JOTUN_BOOT_RWMOUNT_MAX; mi++) {
+        struct manifest_mount *mo = &gp->manifest.mount[mi];
+        if (!mo->is_host || !mo->writable)
+            continue;
+        char *dst = b->rwmount[nrw];
+        dst[0] = '/';
+        size_t j = 0;
+        while (mo->name[j] && j < JOTUN_BOOT_RWMOUNT_LEN - 2) {
+            dst[1 + j] = mo->name[j];
+            j++;
+        }
+        dst[1 + j] = '\0';
+        nrw++;
+    }
+    b->nrwmount = nrw;
 }
 
 /* Doorbell handler: drain the request ring, echo each message into the
@@ -717,7 +737,7 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
                 struct manifest_mount *mo = &gp->manifest.mount[mi];
                 void *gctx = NULL;
                 const struct p9_backend *gbe = mo->is_host
-                    ? p9hostdir_open(mo->bundle, &gctx)
+                    ? p9hostdir_open(mo->bundle, mo->writable, &gctx)
                     : p9smolvfs_open(mo->bundle, mo->ref, mo->subtree,
                                      JOTUN_ARCH, &gctx);
                 if (!gbe) {
@@ -736,8 +756,9 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
                     continue;
                 }
                 if (mo->is_host)
-                    fprintf(stderr, "[9p] guest %d: grafted host:%s at /%s\n",
-                            gid, mo->bundle, mo->name);
+                    fprintf(stderr, "[9p] guest %d: grafted host:%s at /%s (%s)\n",
+                            gid, mo->bundle, mo->name,
+                            mo->writable ? "rw" : "ro");
                 else
                     fprintf(stderr, "[9p] guest %d: grafted %s (ref %s) at /%s\n",
                             gid, mo->bundle, mo->ref, mo->name);

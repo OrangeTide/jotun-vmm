@@ -190,11 +190,72 @@ gr_readf(void *ctx, const struct p9_node *file, uint64_t off, void *buf,
     return g->base->readf(g->base_ctx, file, off, buf, n);
 }
 
+/* Pick the backend and context that own a node, by its tree id. */
+static const struct p9_backend *
+owner(struct p9graft *g, const struct p9_node *n, void **bctx)
+{
+    unsigned id = tree_id(n);
+    if (id != 0) {
+        *bctx = g->g[id - 1].ctx;
+        return g->g[id - 1].be;
+    }
+    *bctx = g->base_ctx;
+    return g->base;
+}
+
+static long
+gr_writef(void *ctx, const struct p9_node *file, uint64_t off, const void *buf,
+          uint32_t n)
+{
+    void *bctx;
+    const struct p9_backend *be = owner(ctx, file, &bctx);
+    if (!be->writef)
+        return -1;
+    return be->writef(bctx, file, off, buf, n);
+}
+
+static int
+gr_create(void *ctx, const struct p9_node *dir, const char *name, uint32_t perm,
+          struct p9_node *out)
+{
+    void *bctx;
+    const struct p9_backend *be = owner(ctx, dir, &bctx);
+    unsigned id = tree_id(dir);
+    if (!be->create || be->create(bctx, dir, name, perm, out) != 0)
+        return -1;
+    set_tree_id(out, id);           /* the new node lives in the same tree */
+    return 0;
+}
+
+static int
+gr_truncate(void *ctx, const struct p9_node *file, uint64_t len)
+{
+    void *bctx;
+    const struct p9_backend *be = owner(ctx, file, &bctx);
+    if (!be->truncate)
+        return -1;
+    return be->truncate(bctx, file, len);
+}
+
+static int
+gr_removef(void *ctx, const struct p9_node *node)
+{
+    void *bctx;
+    const struct p9_backend *be = owner(ctx, node, &bctx);
+    if (!be->removef)
+        return -1;
+    return be->removef(bctx, node);
+}
+
 static const struct p9_backend graft_backend = {
     .root = gr_root,
     .walk = gr_walk,
     .list = gr_list,
     .readf = gr_readf,
+    .writef = gr_writef,
+    .create = gr_create,
+    .truncate = gr_truncate,
+    .removef = gr_removef,
 };
 
 struct p9graft *
