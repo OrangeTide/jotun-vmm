@@ -86,6 +86,7 @@
 #define O_TRUNC     0x0200
 #define O_APPEND    0x0400
 #define O_DIRECTORY 0x10000
+#define O_NOFOLLOW  0x20000     /* do not follow a symlink at the final component */
 #define O_LARGEFILE 0x8000      /* the kernel sets this on every 64-bit open */
 #define O_CLOEXEC   0x80000     /* close this fd on execve */
 #define FD_CLOEXEC  1           /* the fcntl F_GETFD/F_SETFD close-on-exec bit */
@@ -1027,6 +1028,53 @@ ramfs_find(const char *name)
     return -1;
 }
 
+/* Follow an overlay symlink at the final path component. If key names an
+ * overlay symlink, replace it in place with the link's target resolved to a
+ * key, repeating for a chain of links up to a small limit. An absolute target
+ * re-normalizes from the root; a relative target resolves against the link's
+ * parent directory. This is leaf-only: a symlink in an interior component is
+ * not followed, which suits the overlay (it holds only the links a program
+ * creates, and those are the tail of the path, e.g. out/tools/bin/python). A
+ * non-link key, a bundle path, or a chain that exceeds the limit is left as is.
+ * Callers that must act on the link itself (lstat, readlink, symlink, unlink)
+ * do not call this. */
+static void
+follow_link_key(char *key, size_t n)
+{
+    for (int depth = 0; depth < 16; depth++) {
+        int ri = ramfs_find(key);
+        if (ri < 0 || !ramfs[ri].is_link)
+            return;
+        char target[UPATH_MAX];
+        uint32_t tl = ramfs[ri].len;
+        if (tl >= sizeof target)
+            tl = sizeof target - 1;
+        memcpy(target, ramfs[ri].data, tl);
+        target[tl] = 0;
+        if (target[0] == '/') {
+            norm_key(target, key, n);
+        } else {
+            /* Join the target onto the link's parent directory (key up to its
+             * last slash), then normalize so "." and ".." resolve. */
+            char joined[UPATH_MAX];
+            size_t cut = strlen(key);
+            while (cut > 0 && key[cut - 1] != '/')
+                cut--;
+            if (cut > 0)
+                cut--;                      /* drop the slash */
+            size_t w = 0;
+            for (size_t i = 0; i < cut && w < sizeof joined - 1; i++)
+                joined[w++] = key[i];
+            if (w < sizeof joined - 1)
+                joined[w++] = '/';
+            for (size_t i = 0; target[i] && w < sizeof joined - 1; i++)
+                joined[w++] = target[i];
+            joined[w] = 0;
+            norm_key(joined, key, n);
+        }
+    }
+}
+
 /* Release a destroyed slot's backing buffer and mark it free. The buffer is
  * kmalloc'd by ram_grow, so it must be returned here; leaving it attached to a
  * freed slot leaks it, since ramfs_create clears data without freeing. */
@@ -1425,6 +1473,8 @@ do_open(const char *path, long flags)
 {
     char key[RAMFS_NAME];
     resolve_path(path, key, sizeof key);
+    if (!(flags & O_NOFOLLOW))
+        follow_link_key(key, sizeof key);
     int writing = (flags & (O_WRONLY | O_RDWR)) != 0;
 
     int ri = ramfs_find(key);               /* overlay entry (file or dir) */
@@ -1811,23 +1861,28 @@ meta_path(const char *path, int *isdir, uint64_t *size, uint64_t *ino)
     return meta_key(key, isdir, size, ino);
 }
 
-/* stat a path (stat/lstat/newfstatat with AT_FDCWD). */
+/* stat a path. follow=1 (stat) resolves a final-component symlink to its
+ * target; follow=0 (lstat) stats the link itself and reports it as S_IFLNK. */
 static long
-do_stat_path(const char *path, struct linux_stat *out)
+do_stat_path(const char *path, struct linux_stat *out, int follow)
 {
     if (!user_ok((uint64_t)(uintptr_t)out, sizeof *out))
         return -LERR_FAULT;
+    char key[RAMFS_NAME];
+    resolve_path(path, key, sizeof key);
+    if (follow)
+        follow_link_key(key, sizeof key);
     int isdir = 0;
     uint64_t size = 0, ino = 1;
-    long rc = meta_path(path, &isdir, &size, &ino);
+    long rc = meta_key(key, &isdir, &size, &ino);
 
     if (rc == 0) {
         fill_stat(out, isdir, size, ino);
-        char key[RAMFS_NAME];
-        resolve_path(path, key, sizeof key);
-        int ri = ramfs_find(key);
-        if (ri >= 0 && ramfs[ri].is_link)
-            out->st_mode = S_IFLNK | 0777;  /* lstat sees the link, not its target */
+        if (!follow) {
+            int ri = ramfs_find(key);
+            if (ri >= 0 && ramfs[ri].is_link)
+                out->st_mode = S_IFLNK | 0777;  /* lstat sees the link, not its target */
+        }
     }
     return rc;
 }
@@ -2017,6 +2072,7 @@ struct linux_statx {
 
 #define STATX_BASIC_STATS 0x000007ffu
 #define AT_EMPTY_PATH     0x1000
+#define AT_SYMLINK_NOFOLLOW 0x100
 
 static void
 fill_statx(struct linux_statx *s, int isdir, uint64_t size, uint64_t ino)
@@ -2039,15 +2095,23 @@ fill_statx(struct linux_statx *s, int isdir, uint64_t size, uint64_t ino)
 static long
 do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
 {
-    int isdir = 0;
+    int isdir = 0, islink = 0;
     uint64_t size = 0, ino = 1;
 
     if (!user_ok((uint64_t)(uintptr_t)out, sizeof *out))
         return -LERR_FAULT;
     if (path && path[0]) {
-        long rc = meta_path(path, &isdir, &size, &ino);
+        char key[RAMFS_NAME];
+        resolve_path(path, key, sizeof key);
+        if (!(flags & AT_SYMLINK_NOFOLLOW))
+            follow_link_key(key, sizeof key);
+        long rc = meta_key(key, &isdir, &size, &ino);
         if (rc != 0)
             return rc;
+        if (flags & AT_SYMLINK_NOFOLLOW) {
+            int ri = ramfs_find(key);       /* lstat-style: see the link itself */
+            islink = ri >= 0 && ramfs[ri].is_link;
+        }
     } else if (flags & AT_EMPTY_PATH) {
         struct lfd *f = fd_get(dirfd);
         if (!f)
@@ -2064,6 +2128,8 @@ do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
         return -LERR_NOENT;
     }
     fill_statx(out, isdir, size, ino);
+    if (islink)
+        out->stx_mode = S_IFLNK | 0777;
     return 0;
 }
 
@@ -2925,7 +2991,7 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         const char *up = user_path((uint64_t)a1, pb, &e);
         if (!up)
             return e;
-        return do_stat_path(up, (struct linux_stat *)a2);
+        return do_stat_path(up, (struct linux_stat *)a2, nr == SYS_stat);
     }
     case SYS_newfstatat: {
         /* An empty path with AT_EMPTY_PATH means the dirfd itself (fstat);
@@ -2940,7 +3006,8 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         const char *p = at_path(a1, up, ab, sizeof ab, &e);
         if (e)
             return e;
-        return do_stat_path(p, (struct linux_stat *)a3);
+        return do_stat_path(p, (struct linux_stat *)a3,
+                            !(a4 & AT_SYMLINK_NOFOLLOW));
     }
     case SYS_fstat:
         return do_fstat(a1, (struct linux_stat *)a2);
@@ -3647,6 +3714,7 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
 {
     char relbuf[RAMFS_NAME];
     resolve_path(path, relbuf, sizeof relbuf);
+    follow_link_key(relbuf, sizeof relbuf);
     const char *rel = relbuf;
 
     /* A program built in the writable overlay (configure's ./conftest, a linked
