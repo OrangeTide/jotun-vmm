@@ -9,6 +9,12 @@
 
 #include <stdint.h>
 
+/* The backend handle buffer. It holds either a 64-hex content hash (the CAS
+ * backends) or a path relative to the mount root (the host-directory backend).
+ * A real source tree nests deep, so this must be large enough for a full
+ * relative path, not just a hash: Node's checkout reaches past 170 bytes. */
+#define P9_HANDLE_MAX 1024
+
 /* A resolved node. The backend fills every field when it resolves a node; the
  * server treats handle as opaque and hands it back on later calls. */
 struct p9_node {
@@ -16,7 +22,7 @@ struct p9_node {
     uint32_t mode;                  /* permission bits, low 9 */
     uint64_t length;                /* file size, 0 for directories */
     uint64_t qid_path;              /* stable unique id for the qid */
-    char     handle[65];            /* backend handle (a 64-hex hash fits) */
+    char     handle[P9_HANDLE_MAX]; /* backend handle (hash or relative path) */
     char     name[256];             /* leaf name, for stat */
 };
 

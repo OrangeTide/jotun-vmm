@@ -15,7 +15,7 @@ struct p9hostdir {
     char root[PATH_MAX];                /* canonical host directory root */
     /* A one-entry read cache: a library is read sequentially, so keeping the
      * last file open turns a run of reads into a single open. */
-    char cur_handle[65];
+    char cur_handle[P9_HANDLE_MAX];
     int  cur_fd;
 };
 
@@ -77,7 +77,7 @@ hd_walk(void *vctx, const struct p9_node *dir, const char *name,
     if (!valid_name(name))
         return -1;
 
-    char rel[256];
+    char rel[P9_HANDLE_MAX];
     int rl = dir->handle[0]
         ? snprintf(rel, sizeof rel, "%s/%s", dir->handle, name)
         : snprintf(rel, sizeof rel, "%s", name);
