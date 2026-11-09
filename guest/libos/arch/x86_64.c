@@ -339,10 +339,33 @@ arch_traps_init(unsigned long id)
     __asm__ volatile ("lidt %0" : : "m"(ip));
 }
 
-/* Enable SSE: clear CR0.EM (no x87 emulation), set CR0.MP, and set CR4.OSFXSR
- * so SSE instructions and FXSAVE/FXRSTOR work. SSE exceptions stay masked in
- * MXCSR and CR4.OSXMMEXCPT is left clear, so no #XM handler is needed. FNINIT
- * puts the x87/MMX state in a known state. */
+/* Whether the interrupt save path uses XSAVE (wider vector state, including
+ * AVX) rather than FXSAVE. Read by the interrupt stub in x86_64_isr.S, so it is
+ * a plain global, not static. Set by arch_fpu_init when XSAVE is available. */
+uint8_t fpu_use_xsave;
+/* The XSAVE area size for the enabled XCR0 state, for a sanity check against the
+ * fixed buffer the interrupt stub carves. */
+static uint32_t xsave_area_size;
+
+static void
+cpuid(uint32_t leaf, uint32_t subleaf,
+      uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d)
+{
+    __asm__ volatile ("cpuid"
+                      : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d)
+                      : "a"(leaf), "c"(subleaf));
+}
+
+/* Enable SSE and, where the CPU supports it, AVX. Clear CR0.EM (no x87
+ * emulation) and set CR0.MP; set CR4.OSFXSR so SSE and FXSAVE/FXRSTOR work. SSE
+ * exceptions stay masked in MXCSR and CR4.OSXMMEXCPT is left clear, so no #XM
+ * handler is needed. FNINIT puts the x87/MMX state in a known state.
+ *
+ * When XSAVE is present, also set CR4.OSXSAVE and enable x87, SSE, and (if the
+ * CPU has it) AVX in XCR0. That lets a Linux program's glibc pick its AVX code
+ * paths, and tells the interrupt save path to use XSAVE so the wider vector
+ * state survives a preemptive switch (the fallback is SSE-only FXSAVE). AVX-512
+ * is intentionally left out of XCR0 to keep the save area small and bounded. */
 void
 arch_fpu_init(void)
 {
@@ -357,6 +380,32 @@ arch_fpu_init(void)
     __asm__ volatile ("fninit");
     unsigned int mxcsr = 0x1f80;    /* all SSE exceptions masked */
     __asm__ volatile ("ldmxcsr %0" : : "m"(mxcsr));
+
+    uint32_t a, b, c, d;
+    cpuid(1, 0, &a, &b, &c, &d);
+    if (!(c & (1u << 26)))          /* no XSAVE: SSE-only FXSAVE path stands */
+        return;
+
+    cr4 |= (1UL << 18);             /* OSXSAVE: XSAVE/XGETBV/XSETBV and AVX */
+    __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4));
+
+    uint64_t xcr0 = 0x3;            /* x87 + SSE */
+    if (c & (1u << 28))             /* AVX */
+        xcr0 |= 0x4;
+    __asm__ volatile ("xsetbv"
+                      : : "c"(0u), "a"((uint32_t)xcr0), "d"((uint32_t)(xcr0 >> 32)));
+
+    cpuid(0xD, 0, &a, &b, &c, &d);
+    xsave_area_size = b;            /* bytes needed for the enabled XCR0 state */
+    /* The interrupt stub carves a fixed 1024-byte, 64-byte-aligned area. x87 +
+     * SSE + AVX needs 832, so this always fits; guard anyway, and if some CPU
+     * ever reports more, drop AVX and keep the SSE-only FXSAVE path. */
+    if (xsave_area_size > 1024) {
+        __asm__ volatile ("xsetbv"
+                          : : "c"(0u), "a"(3u), "d"(0u));   /* XCR0 = x87 + SSE */
+        return;                     /* fpu_use_xsave stays 0 */
+    }
+    fpu_use_xsave = 1;
 }
 
 void

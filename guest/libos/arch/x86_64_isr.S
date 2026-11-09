@@ -8,11 +8,14 @@
  * may reschedule; when this task is resumed the stack is restored exactly, so
  * the iretq returns where the task left off.
  *
- * It also saves and restores the full FPU/SSE state with FXSAVE/FXRSTOR around
- * the handler. The handler may switch to another task that uses the FPU, so
- * without this an interrupt would not be transparent to an interrupted task
- * that was mid-computation in floating point. The 512-byte save area is carved
- * from the stack, 16-byte aligned as FXSAVE requires. */
+ * It also saves and restores the full FPU/vector state around the handler. The
+ * handler may switch to another task that uses the FPU, so without this an
+ * interrupt would not be transparent to a task that was mid-computation in
+ * floating point or SIMD. When XSAVE is enabled (fpu_use_xsave, set by
+ * arch_fpu_init once AVX is on) the wider state is saved with XSAVE/XRSTOR;
+ * otherwise FXSAVE/FXRSTOR covers x87 and SSE. The area is carved from the
+ * stack, 64-byte aligned (XSAVE's requirement, which also satisfies FXSAVE's
+ * 16), and sized for x87 + SSE + AVX; arch_fpu_init keeps the state within it. */
 
     .text
     .global isr_event
@@ -34,16 +37,30 @@ isr_event:
     push %r15
 
     mov %rsp, %rbp             /* rbp: top of the saved GP frame, call-preserved */
-    sub $512, %rsp             /* carve the FXSAVE area */
-    and $-16, %rsp             /* FXSAVE needs 16-byte alignment */
-    fxsave (%rsp)
-    mov %rsp, %r12             /* r12: FXSAVE area, call-preserved */
+    sub $1024, %rsp            /* carve the FPU save area */
+    and $-64, %rsp             /* XSAVE needs 64-byte alignment (FXSAVE wants 16) */
+    mov %rsp, %r12             /* r12: save area, call-preserved */
 
+    cmpb $0, fpu_use_xsave(%rip)
+    je 1f
+    mov $0xffffffff, %eax      /* XSAVE/XRSTOR component mask: all enabled state */
+    mov $0xffffffff, %edx
+    xsave (%r12)
+    jmp 2f
+1:  fxsave (%r12)
+2:
     cld
     call irq_event
 
-    fxrstor (%r12)
-    mov %rbp, %rsp             /* drop the FXSAVE area back to the GP frame */
+    cmpb $0, fpu_use_xsave(%rip)
+    je 3f
+    mov $0xffffffff, %eax
+    mov $0xffffffff, %edx
+    xrstor (%r12)
+    jmp 4f
+3:  fxrstor (%r12)
+4:
+    mov %rbp, %rsp             /* drop the save area back to the GP frame */
 
     pop %r15
     pop %r14

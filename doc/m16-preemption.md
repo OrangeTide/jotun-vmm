@@ -178,9 +178,17 @@ preemption is unaffected. This is the crux of P4.
 
 - P1 (timer tick and clock plumbing): done.
 - P2 (real clock from the tick): done.
-- P3 (FPU state on the switch path): planned. Note `isr_event` already does
-  FXSAVE/FXRSTOR, so the main remaining piece is XSAVE for AVX if a preemptive
-  user-to-user switch needs the wider state.
+- P3 (FPU and vector state on the switch path): done. `arch_fpu_init` now
+  enables XSAVE and AVX (CR4.OSXSAVE, XCR0 = x87 + SSE + AVX, guarded by CPUID,
+  AVX-512 left out to bound the area), so a Linux program's glibc uses its AVX
+  code paths. `isr_event` saves and restores the wider state with XSAVE/XRSTOR
+  when it is enabled (fpu_use_xsave), falling back to FXSAVE otherwise, from a
+  fixed 1024-byte 64-byte-aligned area that x87 + SSE + AVX (832 bytes) fits.
+  Validated: the glibc gcc toolchain compiles and links end to end with AVX on
+  (AVX2 routines run with no #UD), and kernel-task preemption (the spin demo
+  under JOTUN_PREEMPT) runs through the XSAVE path without fault. A strict "AVX
+  survives a preemptive switch" test needs an AVX Linux program to be preempted,
+  which arrives with P4.
 - P4 (preempt ring 3 safely): planned; the injection crash above is the first
   thing it must fix.
 - P5 (real sleeps and timers): planned.
