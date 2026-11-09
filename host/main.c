@@ -506,18 +506,18 @@ run_timer(void *arg)
                 gpa_to_host(gp, JOTUN_BOOT_BASE, sizeof *b);
             if (b)
                 __atomic_fetch_add(&b->timer_ticks, 1, __ATOMIC_RELAXED);
-            /* Injecting the event interrupt is what preempts a running vcpu. It
-             * is opt-in (JOTUN_PREEMPT): the clock needs only the tick above, and
-             * preempting a guest that is executing a Linux process is not yet
-             * safe (see doc/m16-preemption.md, stage P4). Without it the counter
-             * still advances, so the clock works. */
-            if (!t->preempt)
-                continue;
             for (int i = 0; i < gp->nvcpus; i++) {
                 if (!__atomic_load_n(&gp->ctx[i].live, __ATOMIC_SEQ_CST))
                     continue;
-                /* The in-kernel APIC delivers this and kicks the vcpu itself. */
-                vmm_vcpu_interrupt(gp->ctx[i].vcpu, JOTUN_EVENT_VECTOR);
+                /* Rouse an idle vcpu every tick so a guest whose only work is a
+                 * timed sleep still wakes to check its deadline (it re-parks at
+                 * once if nothing is due). A running vcpu just notes the wake. */
+                vcpu_wake(&gp->ctx[i]);
+                /* Preemption is opt-in (JOTUN_PREEMPT): deliver the event vector
+                 * through the in-kernel APIC to preempt a running Linux user
+                 * loop. The clock and the sleep wake above need only the tick. */
+                if (t->preempt)
+                    vmm_vcpu_interrupt(gp->ctx[i].vcpu, JOTUN_EVENT_VECTOR);
             }
         }
     }

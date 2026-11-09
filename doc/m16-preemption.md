@@ -118,7 +118,7 @@ even during an interrupts-masked user loop.
 | P2 | Real clock: calibrate the cycle-counter frequency against the timer period and report measured time from `clock_gettime`, `time`, and `gettimeofday`. No preemption yet. | low |
 | P3 | FPU and vector state on the switch path: a per-thread save area, saved and restored on a preemptive switch. Land this before P4 so the first preemptive switch is FPU-safe. | medium to high |
 | P4 | Preempt ring 3: user runs interrupts-enabled, `linux_on_resume` sets per-thread `rsp0`, the ISR reschedules on quantum expiry for ring-3 interrupts only. The core. | medium |
-| P5 | Real sleeps and timers: `nanosleep` and `clock_nanosleep` block until a deadline tick; `setitimer`, `alarm`, and `timerfd`. Feeds signal stage F. | medium |
+| P5 | Real sleeps and timers: `nanosleep` and `clock_nanosleep` block until a deadline tick (done); `setitimer`, `alarm`, and `timerfd` (deferred, need caught-signal delivery). Feeds signal stage F. | medium |
 
 P1 and P2 are independently shippable and low risk. P3 is the prerequisite that
 makes P4 correct. P4 is the keystone.
@@ -212,4 +212,20 @@ land on the thread's own `rsp0` stack.
   "preempt ok" with it; the full spike suite is green with and without preemption
   at HZ up to 1000; the clock still passes; the spin demo now runs cooperatively;
   arm64 cross-compiles clean.
-- P5 (real sleeps and timers): planned.
+- P5 (real sleeps and timers): blocking sleeps done; interval timers deferred.
+  `nanosleep` and `clock_nanosleep` (relative and `TIMER_ABSTIME`, CLOCK_MONOTONIC
+  and CLOCK_REALTIME) now really block. A thread records a deadline tick in
+  `lproc->sleep_deadline` and parks with `lx_block` (dropping the giant lock); a
+  `sleep_wake_hook` registered as an event hook wakes due sleepers, running both
+  on ring-3 ticks and at scheduler idle. The host's `run_timer` rouses each idle
+  vcpu once per tick, so a fully-asleep guest still wakes at its deadline rather
+  than only when some other event arrives. Each sleep calls `signal_killpoint`
+  after the block, so a fatal signal cuts it short. Validated: example/linuxsleep.c
+  (a 100 ms `nanosleep` and an 80 ms absolute `clock_nanosleep`, checked against
+  the monotonic clock) prints "nanosleep ok" and "abssleep ok" at HZ 100 and 1000,
+  returns at once with no timer, and the full suite stays green with and without
+  preemption; arm64 cross-compiles clean.
+  Deferred: `setitimer`, `alarm`, and `timerfd`. These deliver a signal (SIGALRM)
+  or a readable fd to the running program, which needs caught-signal delivery
+  (handler dispatch, signal stage D) and poll/fd wiring that are not yet built.
+  They are a separate increment once that delivery path lands.

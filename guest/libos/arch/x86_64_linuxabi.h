@@ -100,6 +100,7 @@
 #define SYS_set_tid_address 218
 #define SYS_fadvise64       221
 #define SYS_sched_getaffinity 204
+#define SYS_nanosleep       35
 #define SYS_clock_gettime   228
 #define SYS_clock_nanosleep 230
 #define SYS_exit_group      231

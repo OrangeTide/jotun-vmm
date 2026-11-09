@@ -499,6 +499,7 @@ struct lproc {
     uint64_t sig_pending;   /* thread-directed signals awaiting action */
     uint64_t ss_sp, ss_size;
     int      ss_flags;
+    uint64_t sleep_deadline;/* nonzero: this thread sleeps until this timer tick */
 };
 
 _Static_assert(__builtin_offsetof(struct lproc, tf) == 0, "trapframe first");
@@ -3326,6 +3327,89 @@ signal_killpoint(void)
     }
 }
 
+/* Timed sleep (nanosleep, clock_nanosleep). The clock is the host-maintained
+ * tick counter, so a sleep is a wait until the counter reaches a deadline tick.
+ * The sleeper parks (lx_block, dropping the giant lock) and sleep_wake_hook,
+ * registered as a scheduler event hook, wakes it once the deadline passes; the
+ * hook runs on each timer tick (a ring-3 preemption) and whenever the scheduler
+ * idles, and the host rouses an idle vcpu each tick so a fully asleep guest still
+ * wakes on time. Without a host timer (hz 0) there is no tick to wait on, so a
+ * sleep returns at once, as it did before. */
+static uint64_t
+ns_to_deadline_tick(uint64_t target_ns)
+{
+    uint32_t hz = boot_timer_hz();
+    uint64_t per_tick_ns = 1000000000ULL / hz;      /* hz != 0 checked by caller */
+    /* Round up so the counter reaching the deadline means at least target_ns of
+     * clock time has elapsed. */
+    return (target_ns + per_tick_ns - 1) / per_tick_ns;
+}
+
+/* Wake any thread whose sleep deadline has passed. Runs from the event ISR and
+ * at scheduler idle. */
+static void
+sleep_wake_hook(void)
+{
+    uint64_t now = boot_timer_ticks();
+    for (int i = 0; i < LINUX_NPROC; i++) {
+        struct lproc *t = &procs[i];
+        if (t->used && t->sleep_deadline && now >= t->sleep_deadline)
+            task_wake(t->task_id);
+    }
+}
+
+/* Block until the clock reaches target_ns (in the monotonic nanosecond base), or
+ * return 0 at once if there is no host timer. Returns 0 on completion; a fatal
+ * signal terminates the thread inside the loop and never returns. */
+static long
+sleep_until_ns(uint64_t target_ns)
+{
+    if (boot_timer_hz() == 0)
+        return 0;                       /* no clock to wait on */
+    uint64_t deadline = ns_to_deadline_tick(target_ns);
+    if (boot_timer_ticks() >= deadline)
+        return 0;                       /* already elapsed */
+
+    lproc_cur->sleep_deadline = deadline;
+    while (boot_timer_ticks() < deadline) {
+        lx_block();                     /* drops the giant lock while parked */
+        signal_killpoint();             /* a fatal signal unblocks and terminates */
+    }
+    lproc_cur->sleep_deadline = 0;
+    return 0;
+}
+
+/* nanosleep / clock_nanosleep. relative requests (and nanosleep) sleep for req
+ * past now; an absolute (TIMER_ABSTIME) request sleeps until req on its clock.
+ * rem is left untouched: the only wakeups are the deadline or a fatal signal
+ * (which terminates), so a short count is never reported. */
+#define LINUX_TIMER_ABSTIME 1
+static long
+do_nanosleep(int clockid, int flags, uint64_t req_ptr)
+{
+    if (!req_ptr)
+        return -LERR_INVAL;
+    uint64_t ts[2];
+    long e = copy_from_user(ts, req_ptr, sizeof ts);
+    if (e < 0)
+        return e;
+    if (ts[1] >= 1000000000ULL)
+        return -LERR_INVAL;
+    uint64_t req_ns = ts[0] * 1000000000ULL + ts[1];
+
+    uint64_t target_ns;
+    if (flags & LINUX_TIMER_ABSTIME) {
+        /* Absolute: req is on the named clock. Convert a realtime deadline into
+         * the monotonic base the tick counter uses. */
+        int realtime = (clockid == 0);          /* CLOCK_REALTIME */
+        uint64_t epoch_ns = GUEST_EPOCH * 1000000000ULL;
+        target_ns = (realtime && req_ns > epoch_ns) ? req_ns - epoch_ns : req_ns;
+    } else {
+        target_ns = guest_mono_ns() + req_ns;
+    }
+    return sleep_until_ns(target_ns);
+}
+
 /* Find a live process by pid, or NULL. A zombie (exited, not yet reaped) still
  * counts as existing, so a signal to it is accepted and dropped. */
 static struct lshared *
@@ -4115,10 +4199,12 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
             return e;
         return (long)sizeof mask;
     }
+    case SYS_nanosleep:
+        /* nanosleep(req, rem): a relative sleep on the monotonic clock. */
+        return do_nanosleep(1, 0, (uint64_t)a1);
     case SYS_clock_nanosleep:
-        /* No timers and a cooperative scheduler: treat a sleep as elapsed. A
-         * TIMER_ABSTIME request is already in the past from our clock's view. */
-        return 0;
+        /* clock_nanosleep(clockid, flags, req, rem). */
+        return do_nanosleep((int)a1, (int)a2, (uint64_t)a3);
     case SYS_getpid:
         return lproc_cur->sh->pid;
     case SYS_getppid:
@@ -4499,6 +4585,7 @@ linux_phys_init(void)
         phys_init(LINUX_PROG_BASE, VM_USER_HI);
         linux_tables_init();
         kheap_init();           /* heap now grows past the bootstrap band */
+        task_add_event_hook(sleep_wake_hook);   /* wake timed sleepers on a tick */
         phys_ready = 1;
     }
 }
