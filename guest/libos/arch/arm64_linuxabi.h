@@ -194,6 +194,19 @@ tf_arg6(struct trapframe *tf)
     return tf->x[5];
 }
 
+/* clone() passes the new TLS and the child-tid pointer in different argument
+ * slots on different architectures. AArch64 is a CLONE_BACKWARDS architecture
+ * and uses the order clone(flags, stack, ptid, tls, ctid), so the fourth
+ * argument is the TLS and the fifth is the child-tid pointer. (x86-64 swaps the
+ * two.) This normalizes the fourth and fifth syscall arguments for the
+ * dispatcher. */
+static inline void
+clone_split_tls_ctid(uint64_t a4, uint64_t a5, uint64_t *tls, uint64_t *ctid)
+{
+    *tls = a4;
+    *ctid = a5;
+}
+
 /* Load the thread pointer into TPIDR_EL0. The SVC restore also sets it from the
  * trapframe, so this mainly keeps the register sane while kernel code runs. */
 static inline void

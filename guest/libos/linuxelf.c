@@ -4389,9 +4389,14 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
          * CLONE_VM). */
         if (((uint64_t)a1 & CLONE_VM) && ((uint64_t)a1 & CLONE_VFORK))
             return do_spawn_vfork((uint64_t)a1, (uint64_t)a2);
-        if ((uint64_t)a1 & CLONE_VM)
+        if ((uint64_t)a1 & CLONE_VM) {
+            /* The TLS and child-tid pointer swap argument slots across
+             * architectures (aarch64 is CLONE_BACKWARDS); normalize them. */
+            uint64_t tls, ctid;
+            clone_split_tls_ctid((uint64_t)a4, (uint64_t)a5, &tls, &ctid);
             return do_clone_thread((uint64_t)a1, (uint64_t)a2, (uint64_t)a3,
-                                   (uint64_t)a4, (uint64_t)a5);
+                                   ctid, tls);
+        }
         return do_fork();
     case SYS_clone3:
         return do_clone3((uint64_t)a1, (uint64_t)a2);

@@ -201,6 +201,19 @@ tf_arg6(struct trapframe *tf)
     return tf->r9;
 }
 
+/* clone() passes the new TLS and the child-tid pointer in different argument
+ * slots on different architectures. x86-64 uses the order
+ * clone(flags, stack, ptid, ctid, tls), so the fourth argument is the child-tid
+ * pointer and the fifth is the TLS. (aarch64 is CLONE_BACKWARDS and swaps the
+ * two.) This normalizes the fourth and fifth syscall arguments for the
+ * dispatcher. */
+static inline void
+clone_split_tls_ctid(uint64_t a4, uint64_t a5, uint64_t *tls, uint64_t *ctid)
+{
+    *ctid = a4;
+    *tls = a5;
+}
+
 /* x86-64 MSRs for the SYSCALL path. */
 #define MSR_EFER     0xC0000080u
 #define MSR_STAR     0xC0000081u
