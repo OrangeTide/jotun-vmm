@@ -29,6 +29,24 @@ ifeq ($(OS),)
 endif
 ARCH := $(shell uname -m)
 
+# Linker selection for freestanding ELF links (the Darwin native guest and every
+# cross-built arch go through clang + lld). Apple's clang rejects the bare
+# "-fuse-ld=lld" name and wants a path, and Homebrew installs lld keg-only so its
+# ld.lld is off PATH. Resolve an absolute ld.lld when one is findable, which both
+# Apple and LLVM clang accept, and fall back to the bare name for toolchains that
+# resolve it themselves (an LLVM clang with lld already on PATH). Override by
+# passing FUSE_LD= on the command line.
+LLD := $(shell command -v ld.lld 2>/dev/null)
+ifeq ($(LLD),)
+    LLD := $(firstword $(wildcard /opt/homebrew/opt/lld/bin/ld.lld \
+                                  /usr/local/opt/lld/bin/ld.lld))
+endif
+ifeq ($(LLD),)
+    FUSE_LD := -fuse-ld=lld
+else
+    FUSE_LD := -fuse-ld=$(LLD)
+endif
+
 # Common freestanding guest flags; per-host blocks add the compiler, the
 # source, and the text base.
 # -mgeneral-regs-only keeps the compiler from emitting FP/SIMD (SSE on x86, NEON
@@ -59,8 +77,8 @@ ifeq ($(OS), Darwin)
     # outline-atomic helpers, which are absent under -nostdlib.
     GUEST_CFLAGS += -mno-outline-atomics
     # Apple's toolchain emits Mach-O; produce an ELF with an LLVM ELF target
-    # and lld (install with e.g. `brew install lld`).
-    GUEST_CC = clang --target=aarch64-unknown-none-elf -fuse-ld=lld
+    # and lld (install with e.g. `brew install lld`). See FUSE_LD above.
+    GUEST_CC = clang --target=aarch64-unknown-none-elf $(FUSE_LD)
     # At or above lld's default image base, so no linker-specific flag is needed.
     GUEST_TEXT = 0x200000
 else
@@ -239,8 +257,8 @@ GUEST_BASE_OBJ = $(filter-out -Wl%,$(GUEST_BASE)) -ffunction-sections \
     -fdata-sections
 GUEST_BASE_OBJ_FP = $(filter-out -mgeneral-regs-only,$(GUEST_BASE_OBJ))
 
-CROSSCC_x86_64  ?= clang --target=x86_64-unknown-none-elf -fuse-ld=lld
-CROSSCC_aarch64 ?= clang --target=aarch64-unknown-none-elf -fuse-ld=lld
+CROSSCC_x86_64  ?= clang --target=x86_64-unknown-none-elf $(FUSE_LD)
+CROSSCC_aarch64 ?= clang --target=aarch64-unknown-none-elf $(FUSE_LD)
 TEXT_x86_64  := 0x100000
 TEXT_aarch64 := 0x200000
 AFLAGS_x86_64  :=
