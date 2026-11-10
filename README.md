@@ -14,6 +14,9 @@ Native only, guest architecture equals host architecture:
 - linux/arm64 (KVM, arm64 guest)
 - macos/arm64 (Hypervisor.framework, arm64 guest)
 
+To build the sandbox and run unmodified Linux binaries inside it, including the
+per-architecture toolchain setup, see `doc/sandbox-build.md`.
+
 ## Prerequisites
 
 ### linux/x86-64
