@@ -157,7 +157,20 @@ phys_free(uint64_t frame)
 {
     if (frame == 0)
         return;
-    *(uint64_t *)phys_to_virt(frame) = free_head;
+    uint8_t *v = phys_to_virt(frame);
+    /* A frame returned here through the physmap may have been a process page: its
+     * cacheable user mapping could have left dirty lines over it that the teardown
+     * did not flush. The free-list link below is written through the non-cacheable
+     * physmap straight to RAM, so a stale dirty line evicting afterwards would
+     * clobber it and splice a live frame into the list. Clean and invalidate the
+     * frame by address first (the caches are physically tagged, so this reaches
+     * the lines whatever VA dirtied them), then write the link into clean RAM. */
+    if (physmap_on && frame >= VM_USER_LO && frame < VM_USER_HI) {
+        for (uint64_t off = 0; off < VM_PAGE; off += 64)
+            __asm__ volatile ("dc civac, %0" : : "r"(v + off) : "memory");
+        __asm__ volatile ("dsb ish" ::: "memory");
+    }
+    *(uint64_t *)v = free_head;
     free_head = frame;
 }
 
