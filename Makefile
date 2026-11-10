@@ -359,7 +359,10 @@ malloc-test: $(TARGET) libos.elf build/malloctest
 ## SPIKE_CC (x86-64: musl-gcc; aarch64: aarch64-linux-musl-gcc). A host with no
 ## musl cross-compiler can instead point SPIKE_BIN_DIR at a directory of
 ## pre-built binaries (static non-PIE ET_EXEC at 0x400000, matching this arch).
-LINUX_SPIKE_SRCS := $(wildcard example/linux*.c)
+## linuxtmp is excluded from the wildcard suite: it needs a writable host mount
+## supplied by a manifest ("mount tmp host:<dir> rw"), which the bin-guest smoke
+## harness does not provide. It has its own target, linux-tmp-mount, below.
+LINUX_SPIKE_SRCS := $(filter-out example/linuxtmp.c,$(wildcard example/linux*.c))
 LINUX_SPIKE_BINS := $(patsubst example/%.c,build/%,$(LINUX_SPIKE_SRCS))
 LINUX_SPIKE_PROGS := $(patsubst build/%,%,$(LINUX_SPIKE_BINS))
 SPIKE_CC_x86_64  ?= musl-gcc
@@ -397,6 +400,30 @@ linux-spike: $(TARGET) libos.elf $(LINUX_SPIKE_BINS)
 	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="$(LINUX_SPIKE_BINS)"
 	$(SPIKE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
 	    ./$(TARGET) libos.elf bin $(SPIKE_PROG)
+
+## Writable-host-mount test. A manifest maps the guest's /tmp to a fresh host
+## directory ("mount tmp host:<dir> rw"); linuxtmp then stats /tmp, creates a
+## file under it, and reads the bytes back. The test passes only when the guest
+## prints "tmp ok" AND the file lands on the host with the right contents, which
+## proves a create/write under /tmp routes to the host directory rather than the
+## in-RAM overlay. Separate from linux-smoke because it needs a manifest.
+linux-tmp-mount: $(TARGET) libos.elf build/linuxtmp
+	@set -e; \
+	hostdir=`mktemp -d`; \
+	mf=build/tmp-mount.manifest; \
+	printf 'bundle %s\nref root\nsubtree /\ninit bin linuxtmp\nmount tmp host:%s rw\n' \
+	    "$(BUNDLE_DEPOT)" "$$hostdir" > $$mf; \
+	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="build/linuxtmp"; \
+	out=`$(SPIKE_ENV) $(if $(TIMEOUT),$(TIMEOUT) $(SPIKE_SECS)) \
+	    ./$(TARGET) -m $$mf libos.elf 2>&1`; \
+	echo "$$out"; \
+	ok=1; \
+	echo "$$out" | grep -q 'tmp ok' || { echo "FAIL: guest did not print 'tmp ok'"; ok=0; }; \
+	[ "`cat $$hostdir/jotest.txt 2>/dev/null`" = "tmp-mount-ok" ] || \
+	    { echo "FAIL: host file missing or wrong contents"; ok=0; }; \
+	rm -rf $$hostdir $$mf; \
+	if [ $$ok -eq 1 ]; then echo "linux-tmp-mount: ok"; \
+	else echo "linux-tmp-mount: FAILED"; exit 1; fi
 
 ## Run the whole suite and report pass/fail. A program passes when the guest
 ## reaches a clean halt with no unhandled trap; a hang (caught by the timeout)
@@ -574,4 +601,4 @@ clean:
 	    brokerd authd jmint
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test linux-progs linux-spike linux-smoke linux-run malloc-test
+.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test linux-progs linux-spike linux-smoke linux-tmp-mount linux-run malloc-test
