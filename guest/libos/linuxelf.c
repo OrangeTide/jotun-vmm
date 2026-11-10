@@ -2071,6 +2071,50 @@ do_poll(uint64_t ufds, uint64_t nfds, long timeout_ms)
     return interrupted ? -LERR_RESTARTSYS : ready;
 }
 
+/* ppoll(fds, nfds, tmo_p, sigmask, sigsetsize): poll with a timespec timeout and
+ * an optional signal mask applied for the wait. AArch64 has no poll or pause
+ * syscall, so musl routes both poll() and pause() (ppoll with no fds) through
+ * here. The timeout is a timespec by pointer, or NULL to wait indefinitely. */
+static long
+do_ppoll(uint64_t ufds, uint64_t nfds, uint64_t tmo_ptr, uint64_t sigmask_ptr)
+{
+    long timeout_ms = -1;               /* NULL timespec: wait indefinitely */
+    if (tmo_ptr) {
+        uint64_t ts[2];                 /* tv_sec, tv_nsec */
+        long e = copy_from_user(ts, tmo_ptr, sizeof ts);
+        if (e < 0)
+            return e;
+        if (ts[1] >= 1000000000ULL)
+            return -LERR_INVAL;
+        /* Round the nanoseconds up to a whole millisecond so a sub-millisecond
+         * timeout still polls at least once rather than returning at once. */
+        timeout_ms = (long)(ts[0] * 1000ULL + (ts[1] + 999999ULL) / 1000000ULL);
+    }
+
+    /* Apply the caller's signal mask for the wait so a signal it unblocks can
+     * interrupt the poll, then restore it before returning, so a delivered
+     * handler runs under the thread's original mask. The atomic pselect-style
+     * guarantee for a signal unblocked only by this temporary mask is not
+     * modelled; the common callers (a NULL mask, as in pause and plain poll)
+     * do not need it. */
+    uint64_t saved = lproc_cur->sig_blocked;
+    int swapped = 0;
+    if (sigmask_ptr) {
+        uint64_t m;
+        long e = copy_from_user(&m, sigmask_ptr, sizeof m);
+        if (e < 0)
+            return e;
+        lproc_cur->sig_blocked = m;
+        swapped = 1;
+    }
+
+    long r = do_poll(ufds, nfds, timeout_ms);
+
+    if (swapped)
+        lproc_cur->sig_blocked = saved;
+    return r;
+}
+
 static long
 do_read(long fd, void *buf, unsigned long count)
 {
@@ -3887,6 +3931,8 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return -LERR_NOTTY;             /* no tty: musl falls back */
     case SYS_poll:
         return do_poll((uint64_t)a1, (uint64_t)a2, (long)a3);
+    case SYS_ppoll:
+        return do_ppoll((uint64_t)a1, (uint64_t)a2, (uint64_t)a3, (uint64_t)a4);
     case SYS_read:
         return do_read(a1, (void *)a2, (unsigned long)a3);
     case SYS_pread64:
