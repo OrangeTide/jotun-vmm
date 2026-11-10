@@ -187,10 +187,14 @@ Open gaps and bugs, Stage C and general correctness:
       not found". Likely a `#!`-interpreter or missing-interp issue on that
       specific file. Minor (nothing depends on it yet), but it points at an
       `execve` or shebang-resolution corner worth pinning down.
-- [ ] Live-process / task ceiling under `make -j`. `LINUX_NPROC` is 48 and
-      `TASK_MAX` is 64; a parallel make can exceed them. Both are cheap
-      kmalloc'd tables (see the capacity work, commit cd04ef5); watch for
-      `fork: Cannot allocate memory` under Stage C and raise them together.
+- [x] Live-process / task ceiling under `make -j`. `LINUX_NPROC` is now 256
+      (was 48) and `TASK_MAX` 320 (was 64), raised together so a parallel make
+      no longer hits `fork: Cannot allocate memory` early. The procs/shareds
+      tables are kmalloc'd from the growable heap (a slot's ~15 KiB lshared is
+      the dominant cost); the `.bss` arrays that scale with these caps are small
+      per entry, so the kernel image stays well under the 4 MiB VM_USER_LO floor.
+      TASK_MAX stays above LINUX_NPROC (every Linux thread runs on a libOS task).
+      linuxforkmax reaches its 200-live self-cap on all three configs (was ~62).
 - [ ] `mount bin host:/bin` is a manual run-config requirement: Node's gyp
       shells out to `/bin/sh` (python `subprocess` with `shell=True`), and the
       guest has no `/bin` unless the manifest mounts it. Decide whether to

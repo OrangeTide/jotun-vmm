@@ -17,8 +17,11 @@ typedef void (*task_fn)(void);
  * "fork: Cannot allocate memory". The per-slot cost is a small struct here plus
  * the per-task arrays in task.c, draw.c, net.c, and threads.c; a task's kernel
  * stacks are allocated from the growable kernel heap only when it spawns, so an
- * unused slot costs almost nothing. */
-#define TASK_MAX    64
+ * unused slot costs almost nothing. It must stay above LINUX_NPROC (the Linux
+ * process/thread ceiling in linuxelf.c): every Linux thread runs on one libOS
+ * task, and the libOS service tasks (init, net, draw, webterm) need slots too,
+ * so this is sized a little above that cap. */
+#define TASK_MAX    320
 
 /* Bind this vcpu's per-cpu state and make arch_get_percpu return it. Each vcpu
  * calls this once, with its vcpu id, before touching any task primitive. */

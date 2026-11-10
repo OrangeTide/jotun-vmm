@@ -421,11 +421,15 @@ struct lpipe {
 
 /* The pipe pool is shared across processes: a pipe inherited across fork is the
  * same buffer in parent and child. File tables and heaps are per process. */
-/* Enough live processes (and zombies awaiting reap) for a real build: configure
- * nests subshells and pipelines, and gcc fans out to cc1/as/ld. Each slot costs
- * one struct lshared (its fd table dominates), so this stays well under the
- * kernel's bss budget below VM_USER_LO. */
-#define LINUX_NPROC  48
+/* Enough live threads (processes and their threads, plus zombies awaiting reap)
+ * for a real parallel build: configure nests subshells and pipelines, gcc fans
+ * out to cc1/as/ld, and a `make -j` holds many such pipelines live at once. The
+ * procs and shareds tables are kmalloc'd from the growable kernel heap at init
+ * (see linux_tables_init), so a slot costs one struct lshared (~15 KiB, its fd
+ * table and mmap-hole list dominate) off the heap, not the sub-VM_USER_LO
+ * kernel image. TASK_MAX must stay above this (every thread runs on a libOS
+ * task); see task.h. */
+#define LINUX_NPROC  256
 #define LINUX_MMAP_HOLES 256            /* freed mmap spans tracked per address space */
 #define LINUX_KSTACK (16u * 1024)       /* per-process syscall handler stack */
 #define CLONE_VM     0x00000100u        /* clone shares the address space (thread) */
