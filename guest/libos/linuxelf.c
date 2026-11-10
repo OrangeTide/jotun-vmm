@@ -3549,7 +3549,12 @@ maybe_deliver_signal(long r)
             result = -LERR_INTR;
     }
     deliver_signal(sig, result, restart, 0 /* SI_USER */, 0);
-    return r;
+    /* The return path stores this into the syscall's return register. On arm64
+     * that register (x0) is also the handler's first argument, so it must be the
+     * signal number; arch_sigframe_build has saved the interrupted call's real
+     * result into the frame for rt_sigreturn to restore. On x86 the handler's
+     * argument is a separate register, so there this value is only scratch. */
+    return sig;
 }
 
 /* rt_sigreturn: restore the context a handler frame saved and resume the
