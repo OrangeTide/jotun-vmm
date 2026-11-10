@@ -22,8 +22,6 @@ per-architecture toolchain setup, see `doc/sandbox-build.md`.
 ### linux/x86-64
 
 - `make` and `gcc`
-- 32-bit toolchain support to build the x86 guest (`-m32`):
-  Debian/Ubuntu `gcc-multilib`, Fedora `glibc-devel.i686 libgcc.i686`
 - access to `/dev/kvm` (see KVM permissions below)
 
 ### linux/arm64
