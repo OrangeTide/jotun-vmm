@@ -226,12 +226,14 @@ large build work. Roughly in dependency order:
       in-RAM overlay (`under_rw_mount`/`is9w` in linuxelf.c). Commit 0362fbd.
       Verified end to end: a guest write to `/out/proof.txt` lands on the host
       directory with the right contents.
-- [ ] Scale (or remove) the in-RAM overlay caps. `RAMFS_FILE_MAX` (4 MiB) and
-      `RAMFS_MAX` (1024 entries) bound the transient overlay; a build produces
-      thousands of files and some large ones. Either raise both substantially
-      (the data is `kmalloc`'d from the growable kernel heap, so it is bounded
-      by guest RAM, not a fixed reservation) or lean on the writable mount above
-      for anything big, keeping the overlay for small scratch files.
+- [x] Scale the in-RAM overlay caps. `RAMFS_FILE_MAX` is now 128 MiB (was 4 MiB)
+      and `RAMFS_MAX` 8192 entries (was 1024). The buffers are `kmalloc`'d on
+      demand from the growable kernel heap, so the real ceiling is guest RAM, not
+      these numbers; the table cap stays below 0x10000 so overlay inodes
+      (0x10000+index) never collide with the pipe range (0x20000). The strategy
+      is to lean on a writable host mount for anything big (build output trees,
+      and `/tmp` via `mount tmp host:/tmp/<dir> rw`), keeping the overlay for
+      scratch and generated sources. Validated 26/26 linux-smoke on all three.
 - [ ] Raise or auto-scale `LINUX_NPROC` (48) and `TASK_MAX` (64) for `make -j`.
       Both are cheap `kmalloc`'d tables (commit cd04ef5); size them to the
       parallelism a build driver asks for rather than a fixed small cap.

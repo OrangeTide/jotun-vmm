@@ -287,10 +287,19 @@ struct linux_dirent64 {
 /* The writable in-memory overlay: files and directories created or written by
  * the guest, keyed by normalized bundle-relative path ("" is the root). A
  * compiler toolchain and a configure run create many files across a few
- * directories, so the table is generous and names hold a nested path. */
-#define RAMFS_MAX     1024
+ * directories, so the table is generous and names hold a nested path. The
+ * overlay is the fallback for anything not under a writable host mount; a real
+ * build directs its large outputs (object files, archives, the linked binary)
+ * to such a mount, so the overlay holds scratch and generated sources. Both
+ * caps are sized for that: the per-file cap clears a medium generated file
+ * (ICU's data is ~30 MiB), and the table holds a configure/compile run's files.
+ * The buffers are kmalloc'd on demand from the growable kernel heap, so the
+ * real ceiling is guest RAM, not these numbers. RAMFS_MAX must stay below
+ * 0x10000: an overlay inode is 0x10000+index and the pipe inode range starts
+ * at 0x20000 (see the inode comments below), so the two must not overlap. */
+#define RAMFS_MAX     8192
 #define RAMFS_NAME    192
-#define RAMFS_FILE_MAX (4u * 1024u * 1024u)     /* per-file cap */
+#define RAMFS_FILE_MAX (128u * 1024u * 1024u)   /* per-file cap */
 
 struct ofile;                   /* shared open-file description, defined below */
 
