@@ -18,7 +18,7 @@
 /* Sentinel and version, so the guest can tell a block was placed and that the
  * two sides agree on the layout. */
 #define JOTUN_BOOT_MAGIC    0x4a4f5442u     /* a fixed sentinel, "JOTB" */
-#define JOTUN_BOOT_VERSION  3u
+#define JOTUN_BOOT_VERSION  4u
 
 /* Byte budget for the packed string blob. The whole block is one page. */
 #define JOTUN_BOOT_BLOB_MAX 3440u
@@ -50,6 +50,12 @@ struct jotun_bootinfo {
     uint32_t timer_hz;
     uint32_t _pad_timer;
     uint64_t timer_ticks;
+    /* How an asynchronous interrupt (the preemption tick) reaches an arm64
+     * guest, chosen by the host backend. JOTUN_IRQ_* in jotun_abi.h. x86 guests
+     * ignore it (they use the local APIC). 0 (JOTUN_IRQ_LINE) is the safe
+     * default a pre-v4 or line-model host leaves. */
+    uint32_t irq_model;
+    uint32_t _pad_irq;
     uint8_t  blob[JOTUN_BOOT_BLOB_MAX];
 };
 

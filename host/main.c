@@ -207,6 +207,11 @@ setup_bootinfo(struct guest *gp, int gargc, char **gargv)
     b->ram_size = gp->gm.size;
     b->timer_hz = g_timer_hz;       /* 0 when no preemption timer is running */
 
+    /* Tell an arm64 guest how the preemption tick reaches it, which the backend
+     * decides: an in-kernel GIC (v3 or v2) the guest drives on Linux/KVM, or the
+     * bare line model on Hypervisor.framework (x86 guests ignore it). */
+    b->irq_model = (uint32_t)vmm_vm_irq_model(gp->vm, gp->nvcpus);
+
     uint32_t off = 0;
     int n = 0;
     for (int i = 0; i < gargc; i++) {
@@ -381,6 +386,11 @@ run_vcpu(void *arg)
     vmm_vcpu_set_reg(vcpu, VMM_REG_PC, c->entry);
     vmm_vcpu_set_reg(vcpu, VMM_REG_SP, c->sp);
     vmm_vcpu_set_reg(vcpu, VMM_REG_ARG, (uint64_t)c->index);    /* vcpu id */
+
+    /* Set up interrupt delivery before the first run (creates the in-kernel
+     * GICv3 on Linux/arm64; a no-op elsewhere). On the vcpu's own thread, which
+     * is where KVM requires the vcpu and its vGIC to be set up. */
+    vmm_vcpu_irq_setup(vcpu, gp->nvcpus);
 
     /* Publish the vcpu so the timer can interrupt it, and mark it running. */
     c->vcpu = vcpu;

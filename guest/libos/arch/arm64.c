@@ -5,6 +5,7 @@
  * sees as an MMIO exit that stops the run. */
 #include "arch.h"
 #include "print.h"
+#include "boot.h"
 #include "jotun_abi.h"
 
 #include <stdint.h>
@@ -110,25 +111,164 @@ arch_traps_init(unsigned long id)
 /* The scheduler's event entry (task.c), reached from the IRQ vector. */
 extern void irq_event(unsigned cpl);
 
-/* IRQ handler body (called from el1t_irq in arm64_linuxsys.S). The host asserts
- * the IRQ line and holds it until acknowledged, so first store to the event-EOI
- * register to make the host lower it; otherwise the interrupt would be re-taken
- * the instant we return to user with IRQs unmasked. The vector is only reached
- * from EL1t, so the interrupted level is always user (cpl 3): run the device
- * hooks and preempt the running thread. */
+/* ---- GIC, used only on the KVM host ---------------------------------------
+ * KVM's only interrupt-injection path is an in-kernel GIC, so on that host the
+ * guest drives a minimal slice of it: enable the distributor and CPU interface,
+ * configure the one shared peripheral interrupt the host pulses for the
+ * preemption tick, and acknowledge each one. Two GIC generations are supported,
+ * chosen by the host (boot_irq_model): GICv3 reaches the CPU interface through
+ * system registers (ICC_*) and a per-cpu redistributor; GICv2 (for example the
+ * GIC-400 on a Raspberry Pi) has an MMIO CPU interface (GICC) instead.
+ * Hypervisor.framework has no in-guest controller and uses JOTUN_IRQ_LINE, so
+ * none of this runs there.
+ *
+ * The GICv3 CPU interface is reached through system registers; spell them with
+ * the raw S<op0>_<op1>_<Cn>_<Cm>_<op2> encodings so the code builds under either
+ * assembler without a GIC-specific -march. */
+#define ICC_IAR1_EL1    "S3_0_C12_C12_0"    /* acknowledge: read the pending INTID */
+#define ICC_EOIR1_EL1   "S3_0_C12_C12_1"    /* end of interrupt: write the INTID */
+#define ICC_PMR_EL1     "S3_0_C4_C6_0"      /* priority mask */
+#define ICC_CTLR_EL1    "S3_0_C12_C12_4"    /* CPU interface control (EOImode) */
+#define ICC_SRE_EL1     "S3_0_C12_C12_5"    /* system register enable */
+#define ICC_IGRPEN1_EL1 "S3_0_C12_C12_7"    /* group 1 interrupt enable */
+
+/* Distributor (GICD) registers, shared by both generations. */
+#define GICD_CTLR       0x0000
+#define GICD_IGROUPR    0x0080              /* 1 bit per intid (v3 grouping) */
+#define GICD_ISENABLER  0x0100             /* 1 bit per intid */
+#define GICD_IPRIORITYR 0x0400             /* 1 byte per intid */
+#define GICD_ITARGETSR  0x0800             /* 1 byte per intid (v2 cpu mask) */
+#define GICD_ICFGR      0x0c00             /* 2 bits per intid */
+#define GICD_IROUTER    0x6000             /* 8 bytes per intid (v3 SPI routing) */
+
+/* GICv3 redistributor. */
+#define GICR_WAKER      0x0014
+#define GICR_WAKER_PS   (1u << 1)          /* ProcessorSleep */
+#define GICR_WAKER_CA   (1u << 2)          /* ChildrenAsleep */
+#define GICD_CTLR_ARE        (1u << 4)     /* affinity routing enable (v3) */
+#define GICD_CTLR_ENABLE_G1  (1u << 1)     /* enable group 1 (v3 single security) */
+
+/* GICv2 MMIO CPU interface (GICC). */
+#define GICC_CTLR       0x0000
+#define GICC_PMR        0x0004
+#define GICC_IAR        0x000c
+#define GICC_EOIR       0x0010
+
+#define SPI_INTID       JOTUN_EVENT_SPI
+
+static inline void
+mmio32(uint64_t addr, uint32_t v)
+{
+    *(volatile uint32_t *)(uintptr_t)addr = v;
+}
+
+static inline uint32_t
+mmio32_r(uint64_t addr)
+{
+    return *(volatile uint32_t *)(uintptr_t)addr;
+}
+
+/* The interrupt-delivery model this host uses (boot_irq_model), cached so the
+ * hot IRQ path does not reread the boot block each time. */
+static uint32_t irq_model = JOTUN_IRQ_LINE;
+
+/* Configure the tick SPI in the distributor: edge-triggered, a mid priority, and
+ * enabled. Routing and grouping differ by generation, so the caller sets those. */
+static void
+gicd_spi_common(uint64_t gicd, unsigned id)
+{
+    uint64_t cfg = gicd + GICD_ICFGR + (id / 16) * 4;   /* 2 bits, edge == 0b10 */
+    unsigned sh = (id % 16) * 2;
+    mmio32(cfg, (mmio32_r(cfg) & ~(3u << sh)) | (2u << sh));
+    *(volatile uint8_t *)(uintptr_t)(gicd + GICD_IPRIORITYR + id) = 0xa0;
+    mmio32(gicd + GICD_ISENABLER + (id / 32) * 4, 1u << (id % 32));
+}
+
+/* GICv3: wake the redistributor, enable the distributor with affinity routing,
+ * route the SPI to this cpu, and enable the system-register CPU interface. */
+static void
+gic_v3_init(void)
+{
+    uint64_t gicd = JOTUN_GICD_BASE, gicr = JOTUN_GICR_BASE;
+    unsigned id = SPI_INTID;
+
+    uint32_t w = mmio32_r(gicr + GICR_WAKER);
+    mmio32(gicr + GICR_WAKER, w & ~GICR_WAKER_PS);
+    while (mmio32_r(gicr + GICR_WAKER) & GICR_WAKER_CA)
+        ;
+
+    mmio32(gicd + GICD_CTLR, GICD_CTLR_ARE | GICD_CTLR_ENABLE_G1);
+    mmio32(gicd + GICD_IGROUPR + (id / 32) * 4,
+           mmio32_r(gicd + GICD_IGROUPR + (id / 32) * 4) | (1u << (id % 32)));
+    *(volatile uint64_t *)(uintptr_t)(gicd + GICD_IROUTER + id * 8) = 0;
+    gicd_spi_common(gicd, id);
+
+    uint64_t v;
+    __asm__ volatile ("mrs %0, " ICC_SRE_EL1 : "=r"(v));
+    __asm__ volatile ("msr " ICC_SRE_EL1 ", %0; isb" : : "r"(v | 1));
+    __asm__ volatile ("msr " ICC_PMR_EL1 ", %0" : : "r"((uint64_t)0xff));
+    __asm__ volatile ("mrs %0, " ICC_CTLR_EL1 : "=r"(v));
+    __asm__ volatile ("msr " ICC_CTLR_EL1 ", %0" : : "r"(v & ~(uint64_t)2)); /* EOImode=0 */
+    __asm__ volatile ("msr " ICC_IGRPEN1_EL1 ", %0; isb" : : "r"((uint64_t)1));
+}
+
+/* GICv2: enable the distributor, route the SPI to cpu 0 through ITARGETSR, and
+ * enable the MMIO CPU interface with all priorities unmasked. No security
+ * extensions are presented, so every interrupt is group 0, delivered as an IRQ. */
+static void
+gic_v2_init(void)
+{
+    uint64_t gicd = JOTUN_GICD_BASE, gicc = JOTUN_GICC_BASE;
+    unsigned id = SPI_INTID;
+
+    mmio32(gicd + GICD_CTLR, 1);                        /* enable the distributor */
+    *(volatile uint8_t *)(uintptr_t)(gicd + GICD_ITARGETSR + id) = 0x01;  /* cpu 0 */
+    gicd_spi_common(gicd, id);
+
+    mmio32(gicc + GICC_PMR, 0xf0);                      /* unmask all priorities */
+    mmio32(gicc + GICC_CTLR, 1);                        /* enable the CPU interface */
+}
+
+/* IRQ handler body (called from el1t_irq in arm64_linuxsys.S). The vector is
+ * only reached from EL1t, so the interrupted level is always user (cpl 3): run
+ * the device hooks and preempt the running thread. Acknowledge the interrupt
+ * first, before any reschedule, so the tick is not re-taken the instant we
+ * return to user with IRQs unmasked and so the next tick can be delivered.
+ *   GICV3: read ICC_IAR1_EL1 to acknowledge, write ICC_EOIR1_EL1 to end it.
+ *   GICV2: read GICC_IAR to acknowledge, write GICC_EOIR to end it.
+ *   LINE : store to the event-EOI register so the host lowers the line it holds. */
 void
 arm64_irq_entry(void)
 {
-    *(volatile uint32_t *)JOTUN_EVENT_EOI = 1;
+    if (irq_model == JOTUN_IRQ_GICV3) {
+        uint64_t iar;
+        __asm__ volatile ("mrs %0, " ICC_IAR1_EL1 : "=r"(iar));
+        if ((iar & 0xffffff) >= 1020)       /* spurious / no pending */
+            return;
+        __asm__ volatile ("msr " ICC_EOIR1_EL1 ", %0" : : "r"(iar));
+    } else if (irq_model == JOTUN_IRQ_GICV2) {
+        uint32_t iar = mmio32_r(JOTUN_GICC_BASE + GICC_IAR);
+        if ((iar & 0x3ff) >= 1020)          /* spurious / no pending */
+            return;
+        mmio32(JOTUN_GICC_BASE + GICC_EOIR, iar);
+    } else {
+        *(volatile uint32_t *)JOTUN_EVENT_EOI = 1;
+    }
     irq_event(3);
 }
 
-/* arm64 has no in-guest interrupt controller: the host asserts the IRQ line
- * directly (see host/vmm_hvf.c) rather than through an emulated APIC, so there
- * is nothing to enable here. Kept to match the x86 arch interface. */
+/* Enable the interrupt controller for the preemption tick. On a KVM host bring
+ * up the GIC of the generation the host created; on the line model
+ * (Hypervisor.framework) there is no in-guest controller and nothing to do.
+ * Matches the x86 arch_apic_init hook. */
 void
 arch_apic_init(void)
 {
+    irq_model = boot_irq_model();
+    if (irq_model == JOTUN_IRQ_GICV3)
+        gic_v3_init();
+    else if (irq_model == JOTUN_IRQ_GICV2)
+        gic_v2_init();
 }
 
 void

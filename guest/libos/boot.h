@@ -39,4 +39,9 @@ uint32_t boot_timer_hz(void);
  * Zero when no timer is running. */
 uint64_t boot_timer_ticks(void);
 
+/* How the preemption tick is delivered to this (arm64) guest: JOTUN_IRQ_LINE or
+ * JOTUN_IRQ_GICV3 (jotun_abi.h). Chosen by the host backend; the arm64 IRQ path
+ * reads it to pick its acknowledge mechanism. */
+uint32_t boot_irq_model(void);
+
 #endif /* LIBOS_BOOT_H */

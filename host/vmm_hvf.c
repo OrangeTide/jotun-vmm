@@ -3,6 +3,7 @@
 #ifdef __APPLE__
 
 #include "vmm.h"
+#include "jotun_abi.h"
 
 #include <Hypervisor/Hypervisor.h>
 #include <stdio.h>
@@ -137,6 +138,25 @@ void
 vmm_vcpu_interrupt_clear(vmm_vcpu_t *vcpu)
 {
     __atomic_store_n(&vcpu->irq_pending, 0, __ATOMIC_SEQ_CST);
+}
+
+/* Hypervisor.framework delivers the preemption tick as a bare virtual IRQ line
+ * (set_pending_interrupt), with no in-guest interrupt controller to set up. */
+void
+vmm_vcpu_irq_setup(vmm_vcpu_t *vcpu, int nvcpus)
+{
+    (void)vcpu;
+    (void)nvcpus;
+}
+
+/* Hypervisor.framework asserts a bare virtual IRQ line, so the guest uses the
+ * line model (acknowledge through the event-EOI MMIO register). */
+int
+vmm_vm_irq_model(vmm_vm_t *vm, int nvcpus)
+{
+    (void)vm;
+    (void)nvcpus;
+    return JOTUN_IRQ_LINE;
 }
 
 /* Finish the MMIO access the previous run faulted on: deliver a load result

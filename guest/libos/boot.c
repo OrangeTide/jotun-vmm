@@ -8,6 +8,7 @@
 #include <stddef.h>
 
 #include "jotun_boot.h"
+#include "jotun_abi.h"
 
 #define MAX_ARGV    32
 
@@ -83,6 +84,12 @@ uint32_t
 boot_timer_hz(void)
 {
     return info ? info->timer_hz : 0;
+}
+
+uint32_t
+boot_irq_model(void)
+{
+    return info ? info->irq_model : JOTUN_IRQ_LINE;
 }
 
 uint64_t

@@ -72,6 +72,17 @@ void vmm_vcpu_interrupt(vmm_vcpu_t *vcpu, uint8_t vector);
  * interrupt controller to do its own end-of-interrupt; a no-op on backends
  * (x86) whose guest acknowledges in its local APIC. */
 void vmm_vcpu_interrupt_clear(vmm_vcpu_t *vcpu);
+/* Set up interrupt delivery for this vcpu once it exists, before its first run.
+ * nvcpus is the guest's vcpu count. On Linux/arm64 this creates the in-kernel
+ * GICv3 for a single-vcpu guest (the only configuration wired for preemption);
+ * on other backends it is a no-op (x86 made its irqchip at VM creation, and
+ * Hypervisor.framework asserts a bare IRQ line with no controller). */
+void vmm_vcpu_irq_setup(vmm_vcpu_t *vcpu, int nvcpus);
+/* The interrupt-delivery model to advertise to an arm64 guest (a JOTUN_IRQ_*
+ * value), decided by what this backend and host can do: GICv3 or GICv2 on
+ * Linux/KVM for a single-vcpu guest, otherwise the bare line model. The host
+ * writes it into the boot block so the guest sets up the matching path. */
+int vmm_vm_irq_model(vmm_vm_t *vm, int nvcpus);
 void vmm_vcpu_destroy(vmm_vcpu_t *vcpu);
 void vmm_vm_destroy(vmm_vm_t *vm);
 

@@ -1,6 +1,7 @@
 #ifdef __linux__
 
 #include "vmm.h"
+#include "jotun_abi.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -50,6 +51,8 @@ struct vmm_vcpu {
     volatile int irq_pending;   /* set by another thread, delivered by the run */
     uint8_t irq_vector;
     uint32_t apic_id;           /* this vcpu's local-APIC id (= its index) */
+    volatile int gic_ready;     /* arm64: the vGIC is up and can take injections */
+    int gic_dev_fd;             /* arm64: the vGIC device handle, -1 when none */
 };
 
 // Lifecycle management functions
@@ -128,6 +131,8 @@ vmm_vcpu_t* vmm_vcpu_create(vmm_vm_t* vm) {
     vcpu->irq_pending = 0;
     vcpu->irq_vector = 0;
     vcpu->apic_id = (uint32_t)vcpu_id;  /* KVM's default local-APIC id */
+    vcpu->gic_ready = 0;
+    vcpu->gic_dev_fd = -1;
 
 #if defined(__x86_64__)
     // Put the vcpu directly into 64-bit long mode on the identity map built in
@@ -308,6 +313,22 @@ void vmm_vcpu_interrupt(vmm_vcpu_t* vcpu, uint8_t vector) {
         .flags = 0,
     };
     ioctl(vcpu->vm_fd, KVM_SIGNAL_MSI, &msi);
+#elif defined(__aarch64__)
+    /* Pulse the shared peripheral interrupt the guest configured for the tick.
+     * KVM's in-kernel GICv3 delivers it and kicks the running vcpu out of
+     * KVM_RUN, so a user compute loop is preempted; the guest acknowledges
+     * through the GIC CPU interface. A 0->1->0 edge matches the edge-triggered
+     * config, so each tick is one interrupt with no line to lower afterward.
+     * Only meaningful once the vGIC is up (single-vcpu guest). */
+    (void)vector;
+    if (!__atomic_load_n(&vcpu->gic_ready, __ATOMIC_SEQ_CST))
+        return;
+    unsigned irq = ((unsigned)KVM_ARM_IRQ_TYPE_SPI << KVM_ARM_IRQ_TYPE_SHIFT)
+                 | ((unsigned)JOTUN_EVENT_SPI << KVM_ARM_IRQ_NUM_SHIFT);
+    struct kvm_irq_level lvl = { { .irq = irq }, .level = 1 };
+    ioctl(vcpu->vm_fd, KVM_IRQ_LINE, &lvl);
+    lvl.level = 0;
+    ioctl(vcpu->vm_fd, KVM_IRQ_LINE, &lvl);
 #else
     vcpu->irq_vector = vector;
     __atomic_store_n(&vcpu->irq_pending, 1, __ATOMIC_SEQ_CST);
@@ -319,6 +340,101 @@ void vmm_vcpu_interrupt(vmm_vcpu_t* vcpu, uint8_t vector) {
  * here. Present to satisfy the backend interface. */
 void vmm_vcpu_interrupt_clear(vmm_vcpu_t* vcpu) {
     (void)vcpu;
+}
+
+#if defined(__aarch64__)
+/* Which in-kernel vGIC this host can emulate: a GICv3, or failing that a GICv2
+ * (for example the GIC-400 on a Raspberry Pi), or none. Probed with the
+ * KVM_CREATE_DEVICE test flag, which reports support without creating anything,
+ * so it can run before the vcpu exists. Preemption is wired for a single-vcpu
+ * guest only, so a larger guest reports none. */
+static int kvm_vgic_type(int vm_fd, int nvcpus) {
+    if (nvcpus != 1)
+        return -1;
+    struct kvm_create_device t = {
+        .type = KVM_DEV_TYPE_ARM_VGIC_V3,
+        .flags = KVM_CREATE_DEVICE_TEST,
+    };
+    if (ioctl(vm_fd, KVM_CREATE_DEVICE, &t) == 0)
+        return KVM_DEV_TYPE_ARM_VGIC_V3;
+    t.type = KVM_DEV_TYPE_ARM_VGIC_V2;
+    if (ioctl(vm_fd, KVM_CREATE_DEVICE, &t) == 0)
+        return KVM_DEV_TYPE_ARM_VGIC_V2;
+    return -1;
+}
+#endif
+
+int vmm_vm_irq_model(vmm_vm_t* vm, int nvcpus) {
+#if defined(__aarch64__)
+    switch (kvm_vgic_type(vm->vm_fd, nvcpus)) {
+    case KVM_DEV_TYPE_ARM_VGIC_V3: return JOTUN_IRQ_GICV3;
+    case KVM_DEV_TYPE_ARM_VGIC_V2: return JOTUN_IRQ_GICV2;
+    default:                       return JOTUN_IRQ_LINE;
+    }
+#else
+    (void)vm;
+    (void)nvcpus;
+    return JOTUN_IRQ_LINE;       /* x86 uses the local APIC; the guest ignores this */
+#endif
+}
+
+void vmm_vcpu_irq_setup(vmm_vcpu_t* vcpu, int nvcpus) {
+#if defined(__aarch64__)
+    /* Create the in-kernel vGIC now that the vcpu exists: KVM_DEV_ARM_VGIC_CTRL_INIT
+     * must run after all vcpus are created, which for a single-vcpu guest is
+     * exactly here, on the vcpu's own thread. A multi-vcpu guest would need a
+     * barrier across its vcpu threads before init; those guests are cooperative,
+     * so preemption there is simply left off. Each step is checked: on any
+     * failure the guest still runs, just without preemption. The generation must
+     * match what vmm_vm_irq_model told the guest, so probe the same way. */
+    int type = kvm_vgic_type(vcpu->vm_fd, nvcpus);
+    if (type < 0)
+        return;
+
+    struct kvm_create_device cd = { .type = (uint32_t)type };
+    if (ioctl(vcpu->vm_fd, KVM_CREATE_DEVICE, &cd) < 0) {
+        fprintf(stderr, "kvm: vGIC create failed (%s); preemption off\n",
+                strerror(errno));
+        return;
+    }
+
+    /* Place the distributor, plus the redistributor (v3) or CPU interface (v2),
+     * at the guest-physical addresses the guest driver expects. */
+    uint64_t dist = JOTUN_GICD_BASE;
+    uint64_t second = (type == KVM_DEV_TYPE_ARM_VGIC_V3)
+                    ? JOTUN_GICR_BASE : JOTUN_GICC_BASE;
+    struct kvm_device_attr addr = {
+        .group = KVM_DEV_ARM_VGIC_GRP_ADDR,
+        .attr = (type == KVM_DEV_TYPE_ARM_VGIC_V3)
+              ? KVM_VGIC_V3_ADDR_TYPE_DIST : KVM_VGIC_V2_ADDR_TYPE_DIST,
+        .addr = (uint64_t)(uintptr_t)&dist,
+    };
+    if (ioctl(cd.fd, KVM_SET_DEVICE_ATTR, &addr) < 0)
+        goto fail;
+    addr.attr = (type == KVM_DEV_TYPE_ARM_VGIC_V3)
+              ? KVM_VGIC_V3_ADDR_TYPE_REDIST : KVM_VGIC_V2_ADDR_TYPE_CPU;
+    addr.addr = (uint64_t)(uintptr_t)&second;
+    if (ioctl(cd.fd, KVM_SET_DEVICE_ATTR, &addr) < 0)
+        goto fail;
+
+    struct kvm_device_attr init = {
+        .group = KVM_DEV_ARM_VGIC_GRP_CTRL,
+        .attr = KVM_DEV_ARM_VGIC_CTRL_INIT,
+    };
+    if (ioctl(cd.fd, KVM_SET_DEVICE_ATTR, &init) < 0)
+        goto fail;
+
+    vcpu->gic_dev_fd = cd.fd;
+    __atomic_store_n(&vcpu->gic_ready, 1, __ATOMIC_SEQ_CST);
+    return;
+fail:
+    fprintf(stderr, "kvm: vGIC setup failed (%s); preemption off\n",
+            strerror(errno));
+    close(cd.fd);
+#else
+    (void)vcpu;
+    (void)nvcpus;
+#endif
 }
 
 void vmm_vcpu_run(vmm_vcpu_t* vcpu, vmm_exit_info_t* exit_info) {
@@ -400,6 +516,8 @@ void vmm_vcpu_run(vmm_vcpu_t* vcpu, vmm_exit_info_t* exit_info) {
 void vmm_vcpu_destroy(vmm_vcpu_t* vcpu) {
     if (!vcpu)
         return;
+    if (vcpu->gic_dev_fd >= 0)
+        close(vcpu->gic_dev_fd);
     if (vcpu->run && vcpu->run != MAP_FAILED)
         munmap(vcpu->run, vcpu->mmap_size);
     close(vcpu->vcpu_fd);

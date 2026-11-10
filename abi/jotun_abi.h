@@ -54,8 +54,34 @@
  * interrupt controller, so the host asserts the IRQ line directly and keeps it
  * asserted until the guest's IRQ handler stores here. The store makes the host
  * lower the line, so it is not re-taken the instant the guest returns to user
- * with IRQs unmasked. Unused on x86. */
+ * with IRQs unmasked. Unused on x86. Used only by the JOTUN_IRQ_LINE model. */
 #define JOTUN_EVENT_EOI     0x3a000030ull
+
+/* How the preemption tick reaches an arm64 guest (jotun_bootinfo.irq_model).
+ * The same guest image runs on more than one host backend, so the host states
+ * which mechanism is in play:
+ *   LINE  - the host asserts a bare virtual IRQ line and the guest acknowledges
+ *           with an MMIO store to JOTUN_EVENT_EOI (Hypervisor.framework, which
+ *           has no in-guest interrupt controller).
+ *   GICV3 - a real in-kernel GICv3 delivers the interrupt and the guest
+ *           acknowledges through the GIC CPU interface, ICC_IAR1_EL1 /
+ *           ICC_EOIR1_EL1 (Linux/KVM, whose only injection path is the vGIC).
+ * x86 guests ignore this and use their local APIC. */
+#define JOTUN_IRQ_LINE      0u
+#define JOTUN_IRQ_GICV3     1u
+#define JOTUN_IRQ_GICV2     2u          /* GICv2 (e.g. GIC-400): MMIO CPU interface */
+
+/* Guest-physical layout of the KVM vGIC, used by the host to place it and by the
+ * guest driver to reach it. All sit in the unbacked device MMIO band (above
+ * guest RAM, below the physmap), which the guest maps as Device memory and KVM
+ * intercepts for the vGIC. The distributor (GICD) is shared by both GIC
+ * generations. GICv3 adds a redistributor (GICR, two 64 KiB frames per cpu);
+ * GICv2 instead has an MMIO CPU interface (GICC). JOTUN_EVENT_SPI is the shared
+ * peripheral interrupt the host pulses for the tick (the first SPI, INTID 32). */
+#define JOTUN_GICD_BASE     0x3b000000ull
+#define JOTUN_GICR_BASE     0x3b100000ull   /* GICv3 redistributor */
+#define JOTUN_GICC_BASE     0x3b200000ull   /* GICv2 CPU interface */
+#define JOTUN_EVENT_SPI     32u
 
 struct jotun_msg {
     uint16_t len;                   /* payload length, <= JOTUN_MSG_MAX */
