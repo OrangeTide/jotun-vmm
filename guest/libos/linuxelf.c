@@ -226,7 +226,31 @@ struct iovec {
     unsigned long len;
 };
 
-/* The x86-64 Linux struct stat the stat/fstat/newfstatat syscalls fill. */
+/* The Linux struct stat the stat/fstat/newfstatat syscalls fill. Its layout is
+ * architecture-specific: x86-64 orders st_nlink before st_mode, while the
+ * generic layout AArch64 uses puts a 32-bit st_mode first, so the field offsets
+ * up to st_size differ. The field names match across both, so fill_stat and the
+ * stat handlers are written once against them. */
+#if defined(__aarch64__)
+struct linux_stat {
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint32_t st_mode;
+    uint32_t st_nlink;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint64_t st_rdev;
+    uint64_t __pad1;
+    int64_t  st_size;
+    int32_t  st_blksize;
+    int32_t  __pad2;
+    int64_t  st_blocks;
+    uint64_t st_atime;  uint64_t st_atime_nsec;
+    uint64_t st_mtime;  uint64_t st_mtime_nsec;
+    uint64_t st_ctime;  uint64_t st_ctime_nsec;
+    uint32_t __unused4; uint32_t __unused5;
+};
+#else
 struct linux_stat {
     uint64_t st_dev;
     uint64_t st_ino;
@@ -244,6 +268,7 @@ struct linux_stat {
     uint64_t st_ctime;  uint64_t st_ctime_nsec;
     int64_t  __unused[3];
 };
+#endif
 
 /* The getdents64 record. d_name is NUL-terminated and the record is padded so
  * d_reclen is 8-aligned. */
