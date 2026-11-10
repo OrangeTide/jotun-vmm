@@ -328,49 +328,92 @@ bundle: castool jbundle $(BUNDLE_DEPS)
 ## the bundle program allocator (guest/prog/libc/jmalloc.c + jsbrk.c).
 malloc-test: $(TARGET) libos.elf build/malloctest
 	printf 'malloctest\n' > build/mtrun
-	$(MAKE) bundle BUNDLE_ARCHS=$(ARCH) EXTRA_BUNDLE_FILES="build/malloctest build/mtrun"
+	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="build/malloctest build/mtrun"
 	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./$(TARGET) libos.elf mtrun
 
-## Experimental M16 Linux binary-compat spike: build the static musl test
-## programs (example/linux*.c) for this host's arch, stage them into a
-## single-arch bundle, and run one under the libOS trap (the `bin` guest).
-## Runs natively, so on x86-64 (KVM) and on macos/arm64 (HVF). The compiler is
-## a static musl toolchain, picked by arch and overridable with SPIKE_CC
-## (x86-64: musl-gcc; aarch64: aarch64-linux-musl-gcc). SPIKE_PROG selects which
-## program to run (default linuxhello); e.g. make linux-spike SPIKE_PROG=linuxcat.
-## See guest/libos/linuxelf.c and doc/m16-linux-spike.md.
+## --- Linux binary-compat test programs (example/linux*.c) ------------------
+## These run unmodified static Linux binaries in the `bin` guest, exercising the
+## VFS, heap, fork/exec, signals, threads, mmap, and preemption. They run
+## natively, so on x86-64 (KVM) and on macos/arm64 (HVF). See
+## guest/libos/linuxelf.c and doc/m16-linux-spike.md.
+##
+## Build with a static musl toolchain, picked by arch and overridable with
+## SPIKE_CC (x86-64: musl-gcc; aarch64: aarch64-linux-musl-gcc). A host with no
+## musl cross-compiler can instead point SPIKE_BIN_DIR at a directory of
+## pre-built binaries (static non-PIE ET_EXEC at 0x400000, matching this arch).
 LINUX_SPIKE_SRCS := $(wildcard example/linux*.c)
 LINUX_SPIKE_BINS := $(patsubst example/%.c,build/%,$(LINUX_SPIKE_SRCS))
-SPIKE_PROG ?= linuxhello
+LINUX_SPIKE_PROGS := $(patsubst build/%,%,$(LINUX_SPIKE_BINS))
 SPIKE_CC_x86_64  ?= musl-gcc
 SPIKE_CC_aarch64 ?= aarch64-linux-musl-gcc
 SPIKE_CC ?= $(SPIKE_CC_$(ARCH))
-linux-spike: $(TARGET) libos.elf
-	@test -n "$(SPIKE_CC)" || \
-	    { echo "linux-spike: no musl compiler known for $(ARCH); set SPIKE_CC="; exit 1; }
-	@command -v $(SPIKE_CC) >/dev/null 2>&1 || \
-	    { echo "linux-spike needs $(SPIKE_CC) on PATH (override with SPIKE_CC=)"; exit 1; }
-	for s in $(LINUX_SPIKE_SRCS); do \
-	    $(SPIKE_CC) -static -no-pie -O2 -o build/`basename $$s .c` $$s || exit 1; \
-	done
-	$(MAKE) bundle BUNDLE_ARCHS=$(ARCH) EXTRA_BUNDLE_FILES="$(LINUX_SPIKE_BINS)"
-	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./$(TARGET) libos.elf bin $(SPIKE_PROG)
-
-## Run the spike from pre-built static musl binaries, no musl toolchain needed.
-## For a host that cannot cross-compile (e.g. macos/arm64 without a toolchain):
-## build the linux* binaries for this arch elsewhere, copy them into a directory,
-## and point SPIKE_BIN_DIR at it. The binaries must match this host's arch and be
-## static non-PIE ET_EXEC at 0x400000, as `make linux-spike` produces.
 SPIKE_BIN_DIR ?=
-linux-spike-prebuilt: $(TARGET) libos.elf
-	@test -n "$(SPIKE_BIN_DIR)" || \
-	    { echo "set SPIKE_BIN_DIR=<dir of pre-built linux* binaries>"; exit 1; }
-	mkdir -p build
-	for b in $(LINUX_SPIKE_BINS); do \
-	    cp "$(SPIKE_BIN_DIR)/`basename $$b`" "$$b" || exit 1; \
-	done
-	$(MAKE) bundle BUNDLE_ARCHS=$(ARCH) EXTRA_BUNDLE_FILES="$(LINUX_SPIKE_BINS)"
-	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./$(TARGET) libos.elf bin $(SPIKE_PROG)
+
+## Preemption on by default so the preemptible-loop test makes progress; the
+## rest tolerate the timer. SPIKE_SECS caps a run through a timeout command when
+## one is on PATH, so a regression that hangs still fails the suite.
+SPIKE_ENV  ?= JOTUN_HZ=100 JOTUN_PREEMPT=1
+SPIKE_SECS ?= 20
+TIMEOUT    := $(shell command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null)
+
+## Build one test program. A pattern rule, so editing one source rebuilds only
+## that binary (the old rule rebuilt all of them on every run). With
+## SPIKE_BIN_DIR set, copy a pre-built binary instead of compiling.
+build/linux%: example/linux%.c | build
+	@if [ -n "$(SPIKE_BIN_DIR)" ]; then \
+	    cp "$(SPIKE_BIN_DIR)/$(@F)" "$@"; \
+	else \
+	    command -v $(SPIKE_CC) >/dev/null 2>&1 || \
+	        { echo "need a static musl compiler on PATH (SPIKE_CC=, default $(SPIKE_CC)), or set SPIKE_BIN_DIR="; exit 1; }; \
+	    $(SPIKE_CC) -static -no-pie -O2 -o "$@" "$<"; \
+	fi
+
+## Build every test program.
+linux-progs: $(LINUX_SPIKE_BINS)
+
+## Run one test program in the bin guest (default linuxhello):
+##   make linux-spike SPIKE_PROG=linuxcat
+## All programs are bundled, because some (linuxexec) run their peers.
+SPIKE_PROG ?= linuxhello
+linux-spike: $(TARGET) libos.elf $(LINUX_SPIKE_BINS)
+	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="$(LINUX_SPIKE_BINS)"
+	$(SPIKE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
+	    ./$(TARGET) libos.elf bin $(SPIKE_PROG)
+
+## Run the whole suite and report pass/fail. A program passes when the guest
+## reaches a clean halt with no unhandled trap; a hang (caught by the timeout)
+## or a guest fault fails. Exits nonzero if any program fails, so it works as a
+## regression check.
+linux-smoke: $(TARGET) libos.elf $(LINUX_SPIKE_BINS)
+	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="$(LINUX_SPIKE_BINS)"
+	@fail=0; \
+	for p in $(LINUX_SPIKE_PROGS); do \
+	    out=`$(SPIKE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
+	        $(if $(TIMEOUT),$(TIMEOUT) $(SPIKE_SECS)) \
+	        ./$(TARGET) libos.elf bin $$p 2>&1`; \
+	    if echo "$$out" | grep -q 'libos halting' && \
+	       ! echo "$$out" | grep -Eq 'unhandled|EL1 fault|panic'; then \
+	        echo "  ok    $$p"; \
+	    else \
+	        echo "  FAIL  $$p"; fail=1; \
+	    fi; \
+	done; \
+	if [ $$fail -eq 0 ]; then echo "linux-smoke: all $(words $(LINUX_SPIKE_PROGS)) passed"; \
+	else echo "linux-smoke: FAILURES above"; exit 1; fi
+
+## Run an arbitrary host-built static Linux binary in the bin guest, for build
+## experiments: build or copy an ELF elsewhere, then
+##   make linux-run BIN=path/to/prog ARGS="a b c"
+## The binary must match this host's arch (static non-PIE, loads at 0x400000).
+BIN ?=
+ARGS ?=
+linux-run: $(TARGET) libos.elf | build
+	@test -n "$(BIN)" || { echo "set BIN=<path to a static Linux ELF>"; exit 1; }
+	@test -f "$(BIN)" || { echo "no such file: $(BIN)"; exit 1; }
+	@[ "$(BIN)" -ef "build/$(notdir $(BIN))" ] || cp "$(BIN)" "build/$(notdir $(BIN))"
+	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="build/$(notdir $(BIN))"
+	$(SPIKE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
+	    ./$(TARGET) libos.elf bin $(notdir $(BIN)) $(ARGS)
 
 # macsyntax: syntax-check the macOS-only net path from a Linux dev box, so the
 # kqueue backend does not rot between real macOS builds. It compiles host/net.c
@@ -386,14 +429,14 @@ macsyntax:
 
 ## Run the web terminal guest with the draw server open on port 9230. Front it
 ## with Caddy for TLS (see example/web/Caddyfile and doc/web-hosting.md) and open
-## https://localhost:8443/. Needs a bundle first: make bundle BUNDLE_ARCHS=$(ARCH)
+## https://localhost:8443/. Needs a bundle first: make bundle BUNDLE_ARCHS=$(GUEST_ARCH)
 web: $(TARGET) libos.elf
 	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root JOTUN_DRAW_PORT=9230 \
 	    ./$(TARGET) libos.elf webterm
 
 ## Smoke-test the web path end to end. The test binary spawns the webterm guest
 ## with the draw server, drives it over a WebSocket, and checks the shell
-## round-trip. Needs a bundle: make bundle BUNDLE_ARCHS=$(ARCH)
+## round-trip. Needs a bundle: make bundle BUNDLE_ARCHS=$(GUEST_ARCH)
 build/websmoke: tools/websmoke.c | build
 	$(CC) $(CFLAGS) -o $@ $<
 web-smoke: $(TARGET) libos.elf build/websmoke
@@ -405,7 +448,7 @@ brokerd: host/brokerd.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 ## Multi-user web hosting: run the supervisor, front it with Caddy for TLS the
-## same way as make web. Needs a bundle: make bundle BUNDLE_ARCHS=$(ARCH)
+## same way as make web. Needs a bundle: make bundle BUNDLE_ARCHS=$(GUEST_ARCH)
 web-multi: brokerd $(TARGET) libos.elf
 	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./brokerd
 
@@ -458,7 +501,7 @@ broker-smoke: brokerd $(TARGET) libos.elf build/brokersmoke
 
 ## TLS front-end smoke test: run brokerd behind Caddy (the make web-multi recipe)
 ## and reach it over TLS with openssl s_client, checking two sessions get routed
-## through the proxy. Needs caddy on PATH and a bundle: make bundle BUNDLE_ARCHS=$(ARCH)
+## through the proxy. Needs caddy on PATH and a bundle: make bundle BUNDLE_ARCHS=$(GUEST_ARCH)
 build/caddysmoke: tools/caddysmoke.c | build
 	$(CC) $(CFLAGS) -o $@ $<
 caddy-smoke: brokerd $(TARGET) libos.elf build/caddysmoke
@@ -466,7 +509,7 @@ caddy-smoke: brokerd $(TARGET) libos.elf build/caddysmoke
 
 ## Admission + auth smoke test: mints two users, starts authd and brokerd with a
 ## shared secret, checks authd's token validation and brokerd's per-user session
-## caps and identity gate. Needs a bundle: make bundle BUNDLE_ARCHS=$(ARCH)
+## caps and identity gate. Needs a bundle: make bundle BUNDLE_ARCHS=$(GUEST_ARCH)
 build/authsmoke: tools/authsmoke.c | build
 	$(CC) $(CFLAGS) -o $@ $<
 auth-smoke: brokerd authd jmint $(TARGET) libos.elf build/authsmoke
@@ -513,4 +556,4 @@ clean:
 	    brokerd authd jmint
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test linux-spike linux-spike-prebuilt malloc-test
+.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test linux-progs linux-spike linux-smoke linux-run malloc-test
