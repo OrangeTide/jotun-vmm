@@ -345,7 +345,7 @@ arch_sigframe_build(uint64_t frame, struct trapframe *tf, int sig,
     tf->x[1] = frame + __builtin_offsetof(struct linux_rt_sigframe, info);
     tf->x[2] = frame + __builtin_offsetof(struct linux_rt_sigframe, uc);
     tf->x[30] = frame + __builtin_offsetof(struct linux_rt_sigframe, tramp);
-    tf->pstate = 0x344;             /* EL1t, IRQ unmasked: a handler is preemptible too */
+    tf->pstate = 0x304;             /* EL1t, IRQ and FIQ unmasked: a handler is preemptible too */
 }
 
 static inline uint64_t

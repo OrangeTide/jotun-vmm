@@ -213,8 +213,10 @@ gic_v3_init(void)
 }
 
 /* GICv2: enable the distributor, route the SPI to cpu 0 through ITARGETSR, and
- * enable the MMIO CPU interface with all priorities unmasked. No security
- * extensions are presented, so every interrupt is group 0, delivered as an IRQ. */
+ * enable the MMIO CPU interface with all priorities unmasked. KVM's in-kernel
+ * vGICv2 presents every interrupt as group 0 and signals group 0 to the cpu as
+ * an FIQ, so the guest keeps FIQ unmasked and the EL1t FIQ vector also routes to
+ * the preemption handler (see arm64_linuxsys.S). */
 static void
 gic_v2_init(void)
 {

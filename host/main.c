@@ -719,6 +719,10 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
         return -1;
     }
 
+    /* Set the vcpu count before building the boot block: setup_bootinfo asks the
+     * backend for the interrupt model, and on Linux/arm64 that answer depends on
+     * the count (the in-kernel vGIC is wired for a single-vcpu guest). */
+    gp->nvcpus = nvcpus;
     setup_bootinfo(gp, gargc, gargv);
 
     /* Build the net policy from the manifest rules. With no rules the provider
@@ -799,7 +803,6 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
     else
         p9srv_init(&gp->p9, be, p9ctx);     /* fallback: no /net overlay */
 
-    gp->nvcpus = nvcpus;
     for (int i = 0; i < nvcpus; i++) {
         gp->ctx[i].index = i;
         gp->ctx[i].owner = gp;

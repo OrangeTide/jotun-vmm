@@ -53,7 +53,8 @@ arm64_vectors:
     .balign 0x80
     b   el1t_irq                /* 0x080 IRQ: a preemption tick in user code */
     .balign 0x80
-    b   hang                    /* 0x100 FIQ (masked) */
+    b   el1t_irq                /* 0x100 FIQ: KVM's vGICv2 signals the group-0
+                                   preemption SPI as an FIQ, so take it here too */
     .balign 0x80
     b   serror_entry            /* 0x180 SError */
 
@@ -398,7 +399,7 @@ linux_jump:
     msr     daifset, #0xf
     msr     sp_el0, x1
     msr     elr_el1, x0
-    mov     x2, #0x344             /* SPSR: EL1t (M=0b0100), DAIF=0b1011 (I clear) */
+    mov     x2, #0x304             /* SPSR: EL1t (M=0b0100), DAIF=0b1001 (I and F clear) */
     msr     spsr_el1, x2
 
     adrp    x2, lproc_cur

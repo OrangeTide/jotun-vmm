@@ -21,10 +21,13 @@ boot_init(void)
 {
     const struct jotun_bootinfo *b = (const struct jotun_bootinfo *)(uintptr_t)JOTUN_BOOT_BASE;
 
+    if (info)
+        return 0;               /* already parsed; safe to call more than once */
     if (b->magic != JOTUN_BOOT_MAGIC || b->version != JOTUN_BOOT_VERSION)
         return -1;
 
     info = b;
+    argc = 0;
 
     /* Walk the blob, recording the start of each of the first argc strings.
      * blob_len bounds the walk so a malformed block cannot run off the page. */
