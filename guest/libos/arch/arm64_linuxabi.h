@@ -338,6 +338,13 @@ arch_sigframe_build(uint64_t frame, struct trapframe *tf, int sig,
     /* The trampoline: MOVZ x8, #139 ; SVC #0. */
     f->tramp[0] = 0xd2801168u;      /* mov x8, #0x8b (139 = __NR_rt_sigreturn) */
     f->tramp[1] = 0xd4000001u;      /* svc #0 */
+    /* These two words are code the handler returns through, just written as data.
+     * On a core whose caches are not coherent the instruction cache would fetch
+     * stale lines for this stack address, so clean the writes to the point of
+     * unification and drop any stale instruction-cache lines for them. This runs
+     * with the process's own address space active, so the trampoline VA resolves. */
+    __asm__ volatile ("dc cvau, %0; dsb ish; ic ivau, %0; dsb ish; isb"
+                      : : "r"(&f->tramp[0]) : "memory");
 
     tf->pc = handler;
     tf->sp = frame;
