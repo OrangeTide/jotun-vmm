@@ -23,12 +23,20 @@
 
 #if defined(__x86_64__)
 /* Identity-map page tables for the guest's long mode, placed low in guest RAM
- * below the ring and the guest image. A single page directory of 512 2 MiB
- * pages covers the first 1 GiB, which spans all guest RAM and the MMIO
- * addresses above it (present but unbacked, so they fault out as MMIO). */
+ * below the ring and the guest image. Three page directories of 512 2 MiB pages
+ * each cover [0, 3 GiB): the first two span all 2 GiB of guest RAM, and the
+ * third spans the device MMIO band at 2 GiB (present but unbacked, so stores
+ * there fault out as MMIO). The guest runs the native libOS on this map until
+ * its first vmspace_switch, so the map must reach the top-of-RAM stack, the
+ * kernel heap band, the free-list threading up to RAM top, and the device band.
+ * The two extra PDs sit above the channel pages (the highest is the broker at
+ * 0x14000) and below the guest image at 0x100000. 2 MiB pages, not 1 GiB, so no
+ * PDPE1GB CPUID dependency. */
 #define PT_PML4   0x1000
 #define PT_PDPT   0x2000
-#define PT_PD     0x3000
+#define PT_PD0    0x3000    /* [0, 1 GiB) */
+#define PT_PD1    0x20000   /* [1 GiB, 2 GiB) */
+#define PT_PD2    0x21000   /* [2 GiB, 3 GiB): device band */
 #define PTE_P     0x1       /* present */
 #define PTE_RW    0x2       /* writable */
 #define PTE_PS    0x80      /* 2 MiB page */
@@ -109,11 +117,18 @@ void vmm_vm_map_memory(vmm_vm_t* vm, void* host_addr, uint64_t guest_addr, size_
         uint8_t *base = (uint8_t*)host_addr;
         uint64_t *pml4 = (uint64_t*)(base + PT_PML4);
         uint64_t *pdpt = (uint64_t*)(base + PT_PDPT);
-        uint64_t *pd = (uint64_t*)(base + PT_PD);
+        uint64_t *pd0 = (uint64_t*)(base + PT_PD0);
+        uint64_t *pd1 = (uint64_t*)(base + PT_PD1);
+        uint64_t *pd2 = (uint64_t*)(base + PT_PD2);
         pml4[0] = PT_PDPT | PTE_P | PTE_RW;
-        pdpt[0] = PT_PD | PTE_P | PTE_RW;
-        for (int i = 0; i < 512; i++)
-            pd[i] = ((uint64_t)i << 21) | PTE_P | PTE_RW | PTE_PS;
+        pdpt[0] = PT_PD0 | PTE_P | PTE_RW;   /* [0, 1 GiB) */
+        pdpt[1] = PT_PD1 | PTE_P | PTE_RW;   /* [1 GiB, 2 GiB) */
+        pdpt[2] = PT_PD2 | PTE_P | PTE_RW;   /* [2 GiB, 3 GiB): device band */
+        for (int i = 0; i < 512; i++) {
+            pd0[i] = ((uint64_t)i << 21) | PTE_P | PTE_RW | PTE_PS;
+            pd1[i] = (0x40000000ull + ((uint64_t)i << 21)) | PTE_P | PTE_RW | PTE_PS;
+            pd2[i] = (0x80000000ull + ((uint64_t)i << 21)) | PTE_P | PTE_RW | PTE_PS;
+        }
     }
 #endif
 }

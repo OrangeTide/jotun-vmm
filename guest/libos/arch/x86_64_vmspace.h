@@ -9,10 +9,12 @@
  *
  * Layout in every process address space (RAM is VM_RAM_SIZE, mapped at 0):
  *   [0, 0x400000)            kernel image: identity, shared
- *   [0x400000, VM_USER_HI)   the user window: private 4 KiB pages per process
+ *   [0x400000, VM_USER_HI)   the user window: private 4 KiB pages per process,
+ *                            now crossing 1 GiB, so it spans two page directories
  *   [VM_KHEAP_LO, VM_KHEAP_HI)  the kernel heap bootstrap band: identity, shared
  *   [VM_KHEAP_HI, RAM top)   vcpu stacks: identity, shared
- *   [1 GiB, 1 GiB + RAM)     physmap: all RAM, so the kernel can reach any
+ *   [VM_DEV_LO, VM_DEV_HI)   the device MMIO band: identity, shared, unbacked
+ *   [4 GiB, 4 GiB + RAM)     physmap: all RAM, so the kernel can reach any
  *                            frame by physical address regardless of CR3
  *   [VM_KHEAP_VA, ...)       the kernel heap growth window: shared, demand-grown
  *
@@ -38,7 +40,7 @@
 #include <stdint.h>
 
 #define VM_PAGE      0x1000ULL
-#define VM_RAM_SIZE  0x10000000ULL           /* 256 MiB; must match the host */
+#define VM_RAM_SIZE  0x80000000ULL           /* 2 GiB; must match the host */
 #define VM_USER_LO   0x400000ULL
 #define VM_USER_HI   (VM_RAM_SIZE - 0x1000000ULL)  /* RAM top less 16 MiB */
 /* The kernel heap: 8 MiB directly above the user window. The vcpu stacks take
@@ -46,12 +48,17 @@
  * 2 MiB aligned so the identity map covers them with whole large pages. */
 #define VM_KHEAP_LO  VM_USER_HI
 #define VM_KHEAP_HI  (VM_USER_HI + 0x800000ULL)
-#define VM_PHYSMAP   0x40000000ULL           /* 1 GiB */
+/* The device MMIO band: 32 MiB just above RAM, holding the doorbells, console,
+ * poweroff, and vGIC (see jotun_abi.h). Unbacked, so stores fault out as MMIO;
+ * mapped identity-present in every space so the guest reaches it under any CR3. */
+#define VM_DEV_LO    0x80000000ULL           /* 2 GiB, == RAM top */
+#define VM_DEV_HI    0x82000000ULL           /* 2 GiB + 32 MiB */
+#define VM_PHYSMAP   0x100000000ULL          /* 4 GiB */
 #define VM_PHYSMAP_PAGES (VM_RAM_SIZE / 0x200000ULL)  /* RAM in 2 MiB pages */
-/* The demand-grown kernel heap window: 2 GiB, a whole PDPT entry (1 GiB of VA,
- * far more than RAM) above the physmap. Backed by scattered pool frames mapped
+/* The demand-grown kernel heap window at 8 GiB, well above the physmap (which
+ * spans [4 GiB, 4 GiB + RAM)). Backed by scattered pool frames mapped
  * contiguously here, so a single large allocation still gets contiguous VA. */
-#define VM_KHEAP_VA  0x80000000ULL
+#define VM_KHEAP_VA  0x200000000ULL
 
 /* Page-table entry flags. */
 #define VM_P   0x1ULL                       /* present */

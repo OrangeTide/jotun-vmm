@@ -83,41 +83,75 @@ pte_frame(uint64_t e)
 vmspace_t
 vmspace_new(void)
 {
+    /* The 2 GiB user window crosses 1 GiB, so it spans two page directories:
+     * pd_low covers [0,1GiB) and pd_high covers [1GiB,2GiB). pd_dev identity-maps
+     * the device MMIO band at 2 GiB; pd_phys0/pd_phys1 are the 2 GiB physmap at
+     * 4 GiB. The heap window (pdpt[8]) is a shared directory installed below. */
     uint64_t pml4 = phys_alloc();
     uint64_t pdpt = phys_alloc();
     uint64_t pd_low = phys_alloc();
-    uint64_t pd_phys = phys_alloc();
+    uint64_t pd_high = phys_alloc();
+    uint64_t pd_dev = phys_alloc();
+    uint64_t pd_phys0 = phys_alloc();
+    uint64_t pd_phys1 = phys_alloc();
 
-    if (!pml4 || !pdpt || !pd_low || !pd_phys) {
-        phys_free(pml4); phys_free(pdpt);
-        phys_free(pd_low); phys_free(pd_phys);
+    if (!pml4 || !pdpt || !pd_low || !pd_high || !pd_dev || !pd_phys0 || !pd_phys1) {
+        phys_free(pml4); phys_free(pdpt); phys_free(pd_low); phys_free(pd_high);
+        phys_free(pd_dev); phys_free(pd_phys0); phys_free(pd_phys1);
         return 0;
     }
 
     tbl(pml4)[0] = pdpt | VM_P | VM_W | VM_U;
-    tbl(pdpt)[0] = pd_low | VM_P | VM_W | VM_U;     /* [0, 1 GiB) */
-    tbl(pdpt)[1] = pd_phys | VM_P | VM_W;           /* [1 GiB, 2 GiB): physmap */
+    tbl(pdpt)[0] = pd_low   | VM_P | VM_W | VM_U;   /* [0, 1 GiB) */
+    tbl(pdpt)[1] = pd_high  | VM_P | VM_W | VM_U;   /* [1 GiB, 2 GiB) */
+    tbl(pdpt)[2] = pd_dev   | VM_P | VM_W;          /* [2 GiB, 3 GiB): device band */
+    tbl(pdpt)[4] = pd_phys0 | VM_P | VM_W;          /* [4 GiB, 5 GiB): physmap GPA 0 */
+    tbl(pdpt)[5] = pd_phys1 | VM_P | VM_W;          /* [5 GiB, 6 GiB): physmap GPA 1 GiB */
     if (kheap_pd)
-        tbl(pdpt)[2] = kheap_pd | VM_P | VM_W;      /* [2 GiB, 3 GiB): heap window */
+        tbl(pdpt)[VM_KHEAP_VA >> 30] = kheap_pd | VM_P | VM_W;   /* [8 GiB, ...) */
 
-    /* Everything in [0, 1 GiB) outside the user window is shared identity as
-     * 2 MiB pages: the kernel, page tables, vcpu stacks, and the device MMIO
-     * band (the 9P and SMP doorbells near 0x3a000000). Only the user window
-     * [0x400000, 0x1C00000) is left unmapped, to be demand-paged per process. */
+    /* Identity-map every 2 MiB block of [0, 2 GiB) outside the user window: the
+     * kernel, page tables, the kernel heap band, and the vcpu stacks. The window
+     * [VM_USER_LO, VM_USER_HI) is left unmapped for per-process demand paging. */
     uint64_t *pdl = tbl(pd_low);
+    uint64_t *pdh = tbl(pd_high);
     for (uint64_t i = 0; i < 512; i++) {
-        uint64_t base = i << 21;
-        if (base < VM_USER_LO || base >= VM_USER_HI)
-            pdl[i] = base | VM_P | VM_W | VM_PS;
+        uint64_t lo_base = i << 21;                     /* [0, 1 GiB) */
+        uint64_t hi_base = 0x40000000ULL + (i << 21);   /* [1 GiB, 2 GiB) */
+        if (lo_base < VM_USER_LO || lo_base >= VM_USER_HI)
+            pdl[i] = lo_base | VM_P | VM_W | VM_PS;
+        if (hi_base < VM_USER_LO || hi_base >= VM_USER_HI)
+            pdh[i] = hi_base | VM_P | VM_W | VM_PS;
     }
 
-    /* physmap: all of RAM as 2 MiB pages at VM_PHYSMAP, so the kernel reaches
-     * any frame by physical address regardless of the active CR3. */
-    uint64_t *pdp = tbl(pd_phys);
-    for (uint64_t i = 0; i < VM_PHYSMAP_PAGES; i++)
-        pdp[i] = (i << 21) | VM_P | VM_W | VM_PS;
+    /* The device MMIO band [VM_DEV_LO, VM_DEV_HI): present identity, unbacked, so
+     * a store faults out as an MMIO exit (the doorbells, console, and vGIC). */
+    uint64_t *pdd = tbl(pd_dev);
+    for (uint64_t i = 0; i < 512; i++) {
+        uint64_t base = 0x80000000ULL + (i << 21);
+        if (base >= VM_DEV_LO && base < VM_DEV_HI)
+            pdd[i] = base | VM_P | VM_W | VM_PS;
+    }
+
+    /* physmap: all of RAM as 2 MiB pages at VM_PHYSMAP, so the kernel reaches any
+     * frame by physical address regardless of the active CR3. 2 GiB = two PDs. */
+    uint64_t *pp0 = tbl(pd_phys0);
+    uint64_t *pp1 = tbl(pd_phys1);
+    for (uint64_t i = 0; i < 512; i++) {
+        pp0[i] = (i << 21) | VM_P | VM_W | VM_PS;                    /* GPA [0,1GiB) */
+        pp1[i] = (0x40000000ULL + (i << 21)) | VM_P | VM_W | VM_PS;  /* GPA [1,2GiB) */
+    }
 
     return pml4;
+}
+
+/* The page directory covering vaddr's GiB. The user window spans pdpt[0]
+ * ([0,1GiB)) and pdpt[1] ([1,2GiB)), so select by bits [31:30]. */
+static uint64_t *
+user_pd(vmspace_t as, uint64_t vaddr)
+{
+    uint64_t *pdpt = tbl(pte_frame(tbl(as)[0]));
+    return tbl(pte_frame(pdpt[(vaddr >> 30) & 0x1FF]));
 }
 
 /* Walk to the PT entry for a user-window vaddr, allocating a PT if needed.
@@ -125,8 +159,7 @@ vmspace_new(void)
 static uint64_t *
 walk_user(vmspace_t as, uint64_t vaddr, int create)
 {
-    uint64_t *pdpt = tbl(pte_frame(tbl(as)[0]));
-    uint64_t *pd = tbl(pte_frame(pdpt[0]));
+    uint64_t *pd = user_pd(as, vaddr);
     uint64_t pdi = (vaddr >> 21) & 0x1FF;
     uint64_t e = pd[pdi];
 
@@ -302,21 +335,23 @@ vmspace_unmap(vmspace_t as, uint64_t vaddr)
     return 1;
 }
 
-/* Visit every present user-window PT entry, calling fn(vaddr, entry-ptr). */
+/* Visit every present user-window PT entry, calling fn(vaddr, entry-ptr). The
+ * window spans two page directories, so step by 2 MiB block over the whole VA
+ * range and select the directory per block. */
 static void
 user_walk(vmspace_t as, void (*fn)(uint64_t, uint64_t *, void *), void *arg)
 {
     uint64_t *pdpt = tbl(pte_frame(tbl(as)[0]));
-    uint64_t *pd = tbl(pte_frame(pdpt[0]));
 
-    for (uint64_t pdi = VM_USER_LO >> 21; pdi < (VM_USER_HI >> 21); pdi++) {
-        uint64_t e = pd[pdi];
+    for (uint64_t base = VM_USER_LO; base < VM_USER_HI; base += 0x200000ULL) {
+        uint64_t *pd = tbl(pte_frame(pdpt[(base >> 30) & 0x1FF]));
+        uint64_t e = pd[(base >> 21) & 0x1FF];
         if (!(e & VM_P) || (e & VM_PS))
             continue;
         uint64_t *pt = tbl(pte_frame(e));
         for (uint64_t pti = 0; pti < 512; pti++) {
             if (pt[pti] & VM_P) {
-                uint64_t va = (pdi << 21) | (pti << 12);
+                uint64_t va = base | (pti << 12);
                 fn(va, &pt[pti], arg);
             }
         }
@@ -339,17 +374,22 @@ vmspace_destroy(vmspace_t as)
         return;
     user_walk(as, free_one, NULL);
 
-    /* Free the user-window page tables, then the top-level tables. The shared
-     * kernel 2 MiB mappings own no per-process frames. */
+    /* Free the per-process user-window page tables across both directories, then
+     * the directories themselves and the top-level tables. The shared kernel
+     * 2 MiB mappings own no per-process frames, and the heap window directory
+     * (pdpt[8]) is shared, so it is not freed here. */
     uint64_t *pdpt = tbl(pte_frame(tbl(as)[0]));
-    uint64_t pd_lo = pte_frame(pdpt[0]);
-    uint64_t *pd = tbl(pd_lo);
-    for (uint64_t pdi = VM_USER_LO >> 21; pdi < (VM_USER_HI >> 21); pdi++) {
+    for (uint64_t base = VM_USER_LO; base < VM_USER_HI; base += 0x200000ULL) {
+        uint64_t *pd = tbl(pte_frame(pdpt[(base >> 30) & 0x1FF]));
+        uint64_t pdi = (base >> 21) & 0x1FF;
         if ((pd[pdi] & VM_P) && !(pd[pdi] & VM_PS))
             phys_free(pte_frame(pd[pdi]));
     }
-    phys_free(pte_frame(pdpt[1]));      /* pd_phys */
-    phys_free(pd_lo);
+    phys_free(pte_frame(pdpt[0]));      /* pd_low */
+    phys_free(pte_frame(pdpt[1]));      /* pd_high */
+    phys_free(pte_frame(pdpt[2]));      /* pd_dev */
+    phys_free(pte_frame(pdpt[4]));      /* pd_phys0 */
+    phys_free(pte_frame(pdpt[5]));      /* pd_phys1 */
     phys_free(pte_frame(tbl(as)[0]));   /* pdpt */
     phys_free(as);                      /* pml4 */
 }

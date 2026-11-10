@@ -33,7 +33,7 @@
 #include <stdint.h>
 
 #define JOTUN_BROKER_BASE       0x14000u
-#define JOTUN_BROKER_DOORBELL   0x3a000028ull
+#define JOTUN_BROKER_DOORBELL   0x80100028ull
 #define JOTUN_BROKER_BUNDLEMAX  256u        /* bundle ref / name */
 #define JOTUN_BROKER_PARAMMAX   512u        /* init params passed to the guest */
 #define JOTUN_BROKER_TOKENMAX   64u         /* session routing token */

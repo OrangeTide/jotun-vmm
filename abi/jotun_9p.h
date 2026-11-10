@@ -20,7 +20,7 @@
  * below the guest image. The doorbell is an unmapped MMIO address near the
  * ring doorbell (jotun_abi.h). */
 #define JOTUN_P9_BASE       0x8000u
-#define JOTUN_P9_DOORBELL   0x3a000008ull
+#define JOTUN_P9_DOORBELL   0x80100008ull
 #define JOTUN_P9_MSIZE      8192u
 
 struct jotun_p9 {

@@ -11,11 +11,13 @@
 #define UART_BASE 0x3f8
 
 /* MMIO console for arm64 guests, which have no port I/O. A small PL011 subset
- * sits at MMIO_UART_BASE; a store to MMIO_POWEROFF stops the VMM. Both regions
- * are left unmapped in the guest so accesses fault out as MMIO exits. */
-#define MMIO_UART_BASE 0x39000000ull
+ * sits at MMIO_UART_BASE; a store to MMIO_POWEROFF stops the VMM. Both sit in the
+ * device MMIO band just above guest RAM (see jotun_abi.h) and are left unbacked
+ * in the guest so accesses fault out as MMIO exits. MMIO_POWEROFF must equal
+ * JOTUN_POWEROFF in jotun_abi.h. */
+#define MMIO_UART_BASE 0x80000000ull
 #define MMIO_UART_SIZE 0x1000
-#define MMIO_POWEROFF  0x39010000ull
+#define MMIO_POWEROFF  0x80010000ull
 
 /* Device state. Only the handful of latched registers a polling driver reads
  * back are kept; transmit goes straight to stdout and there is no receive

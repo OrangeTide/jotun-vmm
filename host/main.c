@@ -43,15 +43,15 @@
 
 /* Guest physical RAM mapped at address 0. 8 MiB is ample for the native demo
  * guests, but a Linux binary-compat guest (M16) needs a real heap for the
- * foreign program's malloc arenas, and real tools are large: the GNU C compiler
- * proper (cc1) is a ~30 MiB image on its own. 256 MiB gives the per-process user
- * window room for such a binary plus its libraries and heap, and leaves the top
- * 16 MiB for the vcpu stacks. The device MMIO band sits well above RAM (near
- * 0x3a000000, ~928 MiB) and below the physmap at 1 GiB, so RAM can use the whole
- * space below it and a doorbell store still faults out to the host instead of
- * landing in RAM. This must match VM_RAM_SIZE in the guest's
- * arch/x86_64_vmspace.h, which derives the window and physmap from it. */
-#define GUEST_RAM_SIZE (256u * 1024 * 1024)
+ * foreign program's malloc arenas, and real build tools are large: a single
+ * cc1plus or V8 translation unit can want 1 to 2 GiB. 2 GiB gives the per-process
+ * user window (RAM less 16 MiB) that much room and leaves the top 16 MiB for the
+ * vcpu stacks. The device MMIO band sits just above RAM at 2 GiB, in
+ * [2 GiB, 2 GiB + 32 MiB), and the physmap is at 4 GiB, so a doorbell store still
+ * faults out to the host instead of landing in RAM, and RAM stays below the x86
+ * in-kernel local-APIC MMIO at 0xfee00000. This must match VM_RAM_SIZE in the
+ * guest's per-arch vmspace headers, which derive the window and physmap from it. */
+#define GUEST_RAM_SIZE (2ull * 1024 * 1024 * 1024)
 
 /* Each vcpu gets its own 512 KiB stack, carved from the top of RAM downward, so
  * vcpus sharing one guest image do not clobber each other's stacks. */

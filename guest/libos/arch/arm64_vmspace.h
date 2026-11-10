@@ -6,11 +6,12 @@
  * just reload TTBR0 and flush. The layout matches the x86 backend:
  *
  *   [0, 0x400000)            kernel image: identity, shared
- *   [0x400000, VM_USER_HI)   the user window: private 16 KiB pages per process
+ *   [0x400000, VM_USER_HI)   the user window: private 16 KiB pages per process,
+ *                            now crossing 1 GiB, so on 4 KiB it spans two L1 entries
  *   [VM_KHEAP_LO, VM_KHEAP_HI)  the kernel heap bootstrap band: identity, shared
  *   [VM_KHEAP_HI, RAM top)   vcpu stacks: identity, shared
- *   [RAM top, 0x40000000)    the device band (MMU as device): identity, shared
- *   [1 GiB, 1 GiB + RAM)     physmap: all RAM, reached by physical address
+ *   [VM_DEV_LO, VM_DEV_HI)   the device band (MMU as device): identity, shared
+ *   [4 GiB, 4 GiB + RAM)     physmap: all RAM, reached by physical address
  *   [VM_KHEAP_VA, ...)       the kernel heap growth window: shared, demand-grown
  *
  * 36-bit VA, 16 KiB granule (Apple Silicon's native page): the walk starts at
@@ -22,7 +23,7 @@
  * coherent. The low RAM is mapped as 32 MiB level-2 blocks with the two blocks
  * that straddle the user window (the first, holding the kernel image, and the
  * last, holding the heap band and stacks) punched out into level-3 tables; the
- * physmap is eight 32 MiB blocks sitting directly in the root table, with no
+ * physmap is RAM/32 MiB blocks sitting directly in the root table, with no
  * second-level table to go stale. The kernel heap starts in the bootstrap band
  * above the user window (see x86_64_vmspace.h) and grows on demand into the
  * window at VM_KHEAP_VA, a run of shared level-3 tables vmspace_new installs in
@@ -35,18 +36,23 @@
 #include <stdint.h>
 
 #define VM_PAGE      0x4000ULL                /* 16 KiB: the translation granule */
-#define VM_RAM_SIZE  0x10000000ULL           /* 256 MiB; must match the host */
+#define VM_RAM_SIZE  0x80000000ULL           /* 2 GiB; must match the host */
 #define VM_USER_LO   0x400000ULL
 #define VM_USER_HI   (VM_RAM_SIZE - 0x1000000ULL)  /* RAM top less 16 MiB */
 /* The kernel heap: 8 MiB above the user window, with the vcpu stacks taking
  * what remains up to RAM top. Both 2 MiB aligned. See x86_64_vmspace.h. */
 #define VM_KHEAP_LO  VM_USER_HI
 #define VM_KHEAP_HI  (VM_USER_HI + 0x800000ULL)
-#define VM_PHYSMAP   0x40000000ULL           /* 1 GiB */
-/* The demand-grown kernel heap window: 2 GiB, a whole L1 entry (1 GiB of VA)
- * above the physmap. Scattered pool frames are mapped contiguously here, so a
- * single large allocation still gets contiguous VA. */
-#define VM_KHEAP_VA  0x80000000ULL
+/* The device MMIO band: 32 MiB just above RAM, holding the doorbells, console,
+ * poweroff, and vGIC (see jotun_abi.h). Mapped as Device, unbacked, so stores
+ * fault out as MMIO. 32 MiB == one 16 KiB-granule level-2 block. */
+#define VM_DEV_LO    0x80000000ULL           /* 2 GiB, == RAM top */
+#define VM_DEV_HI    0x82000000ULL           /* 2 GiB + 32 MiB */
+#define VM_PHYSMAP   0x100000000ULL          /* 4 GiB */
+/* The demand-grown kernel heap window at 8 GiB, well above the physmap (which
+ * spans [4 GiB, 4 GiB + RAM)). Scattered pool frames are mapped contiguously
+ * here, so a single large allocation still gets contiguous VA. */
+#define VM_KHEAP_VA  0x200000000ULL
 
 /* The arch-neutral core passes these to vmspace_map; the AArch64 backend maps
  * every user page the same way (RW at EL1), so the flags carry no bits here. */
