@@ -56,6 +56,23 @@ simple_handler(int sig)
     siglongjmp(recover, 1);
 }
 
+#if defined(__aarch64__)
+/* Whether this core implements trapped floating-point exceptions. Integer divide
+ * never traps on AArch64, so a divide can raise SIGFPE only through a trapping FP
+ * divide, and the trap-enable bits are an optional feature (RES0 where absent, as
+ * on Cortex-A72 and Apple cores). Set the divide-by-zero enable (FPCR.DZE) and see
+ * if it reads back. */
+static int
+fp_divzero_traps(void)
+{
+    uint64_t v, back;
+    __asm__ volatile ("mrs %0, fpcr" : "=r"(v));
+    __asm__ volatile ("msr fpcr, %0; isb" : : "r"(v | (1u << 9)));
+    __asm__ volatile ("mrs %0, fpcr" : "=r"(back));
+    return (int)((back >> 9) & 1);
+}
+#endif
+
 int
 main(void)
 {
@@ -77,11 +94,30 @@ main(void)
         check(fault_addr == (void *)BADADDR, "siginfo si_addr is the fault address");
     }
 
-    /* 2. A SIGFPE handler catches an integer divide by zero. */
+    /* 2. A SIGFPE handler catches a divide by zero. On x86 an integer divide by
+     * zero traps (#DE). AArch64's integer divide never traps (sdiv returns 0), so
+     * there a divide can raise SIGFPE only through a trapping floating-point
+     * divide, and only where the core implements trapped FP exceptions. Where it
+     * does not (Cortex-A72, Apple cores), confirm the architectural behavior
+     * instead: the divide completes and no signal is raised. */
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = simple_handler;
     sigaction(SIGFPE, &sa, NULL);
     caught = 0;
+#if defined(__aarch64__)
+    if (!fp_divzero_traps()) {
+        volatile int a = 7, b = 0;
+        volatile int q = a / b;             /* sdiv: returns 0, no trap */
+        check(caught == 0 && q == 0, "divide by zero does not trap on this core");
+    } else if (sigsetjmp(recover, 1) == 0) {
+        volatile double a = 1.0, b = 0.0;
+        volatile double q = a / b;          /* trapped FP divide by zero -> SIGFPE */
+        (void)q;
+        check(0, "SIGFPE handler ran (no fault taken)");
+    } else {
+        check(caught == SIGFPE, "SIGFPE handler ran on divide by zero");
+    }
+#else
     if (sigsetjmp(recover, 1) == 0) {
         /* Both operands are volatile so the compiler emits a real idiv rather
          * than folding a constant dividend into comparisons. */
@@ -92,6 +128,7 @@ main(void)
     } else {
         check(caught == SIGFPE, "SIGFPE handler ran on divide by zero");
     }
+#endif
 
     /* 3. A SIGILL handler catches an illegal instruction. */
     memset(&sa, 0, sizeof sa);
