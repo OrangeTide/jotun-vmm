@@ -212,14 +212,20 @@ large build work. Roughly in dependency order:
       widening the window/physmap layout (the window has already moved 32 ->
       128 MiB and 108 MiB for gcc; this is the same lever, pushed much further).
       Demand paging already covers the large sparse reservations compilers make.
-- [ ] A WRITABLE host-backed mount. `p9hostdir` is read-only; make a read-write
-      variant so a build's output tree (`out/`, object files, archives, the
-      linked binary) lands on the host filesystem instead of guest RAM. This is
-      the key architectural piece: it removes the in-RAM overlay as the ceiling
-      for build artifacts (a V8 build writes gigabytes), keeps guest RAM for
-      process memory, and persists the result on the host where it is wanted.
-      Needs p9 write/create/truncate/mkdir ops and the same path confinement
-      `p9hostdir` already enforces.
+- [x] A WRITABLE host-backed mount. A build's output tree (`out/`, object files,
+      archives, the linked binary) now lands on the host filesystem instead of
+      guest RAM. This was the key architectural piece: it removes the in-RAM
+      overlay as the ceiling for build artifacts (a V8 build writes gigabytes),
+      keeps guest RAM for process memory, and persists the result on the host.
+      `p9hostdir` takes a `writable` flag and serves write/create/truncate/
+      remove (mkdir via create with `P9_DMDIR`), under the same realpath
+      confinement it already enforced. A manifest marks a host mount writable
+      with a trailing `rw` token (`mount out host:/path rw`); the host
+      advertises each writable mount's guest prefix in the boot block, and the
+      guest routes a create or write under that prefix to 9P instead of the
+      in-RAM overlay (`under_rw_mount`/`is9w` in linuxelf.c). Commit 0362fbd.
+      Verified end to end: a guest write to `/out/proof.txt` lands on the host
+      directory with the right contents.
 - [ ] Scale (or remove) the in-RAM overlay caps. `RAMFS_FILE_MAX` (4 MiB) and
       `RAMFS_MAX` (1024 entries) bound the transient overlay; a build produces
       thousands of files and some large ones. Either raise both substantially
