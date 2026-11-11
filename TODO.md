@@ -133,10 +133,13 @@ about a dozen startup syscalls, and a static musl hello world exiting cleanly.
 The milestone drifted well past the static-only scope above: the guest now runs
 unmodified dynamic glibc binaries, and the live goal (2026-11-08) is building a
 complex project, a NodeJS v26.13.0 checkout at `REF/node`. Staged A (run
-python3), B (run `./configure`), C (compile a target). Stage B is done:
-`./configure --with-intl=none --without-npm` runs end to end and generates
-`out/Makefile`. The items below are the gaps and bugs that surfaced getting
-there, plus what Stage C needs next.
+python3), B (run `./configure`), C (compile a target). Stages B and C both work:
+`./configure --with-intl=none` runs end to end and generates `out/Makefile`, and
+`make -j2` then compiles real translation units in-guest with the host toolchain
+(a V8 third-party C++ unit, then libuv, then OpenSSL; 127 objects and climbing in
+one bounded run, no toolchain errors). The working manifest, build environment,
+and the gcc/python gotchas are written up in doc/m16-dynamic.md ("Compiling Node
+(Stage C)"). The items below are the gaps and bugs that surfaced getting there.
 
 Fixed on the way to Stage B (for the record):
 
@@ -173,16 +176,20 @@ Open gaps and bugs, Stage C and general correctness:
       listing. Proof: example/linuxdev.c. Still missing: `/dev/fd/N` and
       `/dev/stdin`-as-symlink semantics (the std* nodes route to the console,
       not to the process's actual fd 0/1/2), `ptmx`/`pts`, and a real `rdev`.
-- [ ] Overlay large-file cap. `RAMFS_FILE_MAX` is 4 MiB, so any generated file
-      bigger than that fails. It forced `--with-intl=none` (ICU's data file is
-      ~30 MiB) and will block real build outputs (object files, archives, the
-      linked binary). Raise the per-file cap and review the overall overlay
-      size budget; a build writes a lot.
-- [ ] `epoll_create1` (291) returns `ENOSYS`. Tolerated for now because
-      CPython falls back to a `PollSelector`, but it is the last unhandled
-      syscall Node's configure touches and is wanted for Stage C and for the
-      M16.6 network poller. Implement `epoll_create1`/`epoll_ctl`/`epoll_wait`
-      over the cooperative readiness model already used by `poll`.
+- [x] Overlay large-file cap raised to 128 MiB (was 4 MiB), with the table at
+      8192 entries (was 1024). Build outputs land on a writable host mount, not
+      the overlay, so the cap now bounds only scratch and generated sources. See
+      the "Scaling to a full build" section below.
+- [x] `utimensat` (280/88) implemented, and `unlink`/`rmdir` route a writable
+      host-mount path to a 9P `Tremove` instead of returning `EROFS`. gyp's
+      compile rule writes an object, `touch`es its `.d.raw` dependency file, then
+      removes it; both steps needed these. The same remove fix clears the ICU
+      cleanup `unlinkat` that `--with-intl` hit. Commit 2619203.
+- [ ] `epoll_create1` (291) returns `ENOSYS`. Tolerated through configure and the
+      Stage C compile (CPython falls back to a `PollSelector`), but it is the last
+      unhandled syscall the Node build touches and is wanted for the M16.6 network
+      poller. Implement `epoll_create1`/`epoll_ctl`/`epoll_wait` over the
+      cooperative readiness model already used by `poll`.
 - [ ] `/usr/bin/which` fails in the guest with "cannot execute: required file
       not found". Likely a `#!`-interpreter or missing-interp issue on that
       specific file. Minor (nothing depends on it yet), but it points at an

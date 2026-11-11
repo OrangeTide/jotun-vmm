@@ -1086,6 +1086,79 @@ set and launched on its own with `SPIKE_PROG=linuxstackov`. `linuxsegv` is the
 positive companion: a child faults the same way while the parent survives and
 its `wait4` reports the signal, which is the containment the split buys.
 
+## Compiling Node (Stage C)
+
+With the guest scaled up (2 GiB RAM and user window, a 128 MiB overlay file
+cap, 256 processes and 320 tasks, a writable host mount), the native host
+toolchain compiles the real Node v26.13.0 checkout inside the sandbox. The
+build runs from a manifest that grafts the host toolchain and the Node tree:
+
+```
+init bin /bin/sh /j/node-make.sh
+mount lib64 host:/usr/lib/x86_64-linux-gnu
+mount lib   host:/usr/lib
+mount usr   host:/usr
+mount bin   host:/bin
+mount node  host:/abs/path/to/node rw
+mount j     host:/abs/path/to/scripts rw
+mount tmp   host:/abs/path/to/tmp rw
+```
+
+The driver script sets an environment that the compat layer does not supply on
+its own (the first program is handed no environment, so `/bin/sh` and this
+script establish it):
+
+```
+export PATH=/usr/bin:/bin
+export COMPILER_PATH=/usr/libexec/gcc/x86_64-linux-gnu/13:/usr/bin
+export PYTHON=/usr/bin/python3
+export TMPDIR=/tmp
+export HOME=/tmp
+```
+
+Four points were not obvious:
+
+- **`COMPILER_PATH`.** The gcc driver finds `cc1`/`cc1plus`/`as`/`ld` relative
+  to its own path, which it derives from `argv[0]`. Invoked by a bare name from
+  `PATH`, that discovery fails in the guest and the driver reports "cannot
+  execute 'cc1plus'". Setting `COMPILER_PATH` to the gcc libexec directory and
+  `/usr/bin` makes a bare `g++` resolve every subprogram, which the build needs
+  because gyp invokes the compiler by bare name. `cc1plus` lives under
+  `/usr/libexec`, reached by the single `mount usr host:/usr`.
+- **Python by absolute path.** Python sets `sys.executable` from `argv[0]` or
+  `/proc/self/exe`; with neither available for a bare `python3`, it comes out
+  empty and gyp calls `"" -c ...`, which fails. Running `configure.py` as
+  `/usr/bin/python3` fixes it.
+- **`configure.py` directly.** The `configure` wrapper is a sh/python polyglot
+  that needs shebang support and a `python3.NN` on `PATH`; running
+  `python3 configure.py` sidesteps both.
+- **`--with-intl=none`.** ICU setup unpacks a data file and rewrites a tree
+  whose cleanup the guest could not serve until `unlink`/`rmdir` routed to the
+  host mount; it is also beside the point for a compile test.
+
+`./configure --with-intl=none` completes and writes `out/Makefile`, and
+`make -j2` then compiles real translation units: a V8 third-party C++ unit
+(`simdutf`), then `libuv`, then OpenSSL, at a steady cadence with no toolchain
+errors. Bringing it up fixed three gaps, each a separate concern folded into one
+commit:
+
+- **`utimensat`** was unimplemented; gyp `touch`es each object's `.d.raw`
+  dependency file. A host-mount file keeps its real host mtime, so the call
+  succeeds without pushing times back over 9P; an overlay file's mtime is
+  stamped. Its buffers live in a helper frame, not the one `-O0` stack frame the
+  whole syscall dispatch shares, where an extra kilobyte overflowed the syscall
+  kstack under a preemption interrupt and corrupted the interrupt handler's
+  `xsave` area (a `#GP` on `xrstor`) - a latent fragility the first draft
+  exposed.
+- **`unlink`/`rmdir` on a writable mount** returned `EROFS`: they only consulted
+  the overlay and never routed to a 9P `Tremove`. gyp removes each `.d.raw`
+  after folding it into the `.d`, and those files live on the host mount, out of
+  the overlay's reach. The same fix clears the ICU cleanup `unlinkat`.
+
+One syscall is still unimplemented but tolerated: `epoll_create1` (291) returns
+`ENOSYS`, which Python's selector and the build step that touches it fall back
+from cleanly. It stays on the list for the network poller (M16.6).
+
 ## Planned work: real privilege separation
 
 Today the guest kernel and the Linux process share ring 0. User code runs with
