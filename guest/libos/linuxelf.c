@@ -2498,6 +2498,48 @@ do_pread(long fd, void *buf, unsigned long count, uint64_t off)
     return n < 0 ? -LERR_INVAL : n;
 }
 
+/* pwrite: write at an explicit offset without disturbing the fd's own
+ * position, the mirror of do_pread. A ram file grows to fit; a writable 9P
+ * file writes through to the host at off. Pipes, the console and directories
+ * have no position, so they are rejected, as on Linux. */
+static long
+do_pwrite(long fd, const void *buf, unsigned long count, uint64_t off)
+{
+    struct lfd *f = fd_get(fd);
+
+    if (!f || f->iscon || f->ispipe || f->isdir)
+        return -LERR_BADF;
+    if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
+        return -LERR_FAULT;
+    if (f->isdev)
+        return dev_write(f->devno, buf, count);  /* char device: offset ignored */
+    if (f->isram) {
+        struct ramfile *rf = &ramfs[f->ridx];
+        uint64_t end = off + count;
+        if (end > RAMFS_FILE_MAX || ramfs_grow(rf, (uint32_t)end) < 0)
+            return -LERR_NOMEM;
+        memcpy(rf->data + off, buf, count);
+        if ((uint32_t)end > rf->len)
+            rf->len = (uint32_t)end;
+        rf->mtime = fs_stamp();
+        return (long)count;
+    }
+    if (f->is9w) {
+        unsigned long done = 0;
+        while (done < count) {
+            long n = p9_write(f->p9fid, off + done,
+                              (const char *)buf + done, (uint32_t)(count - done));
+            if (n <= 0)
+                break;
+            done += (unsigned long)n;
+        }
+        if (done == 0 && count > 0)
+            return -LERR_ROFS;
+        return (long)done;
+    }
+    return -LERR_BADF;                  /* read-only bundle file */
+}
+
 static long
 do_close(long fd)
 {
@@ -4289,6 +4331,8 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_read(a1, (void *)a2, (unsigned long)a3);
     case SYS_pread64:
         return do_pread(a1, (void *)a2, (unsigned long)a3, (uint64_t)a4);
+    case SYS_pwrite64:
+        return do_pwrite(a1, (const void *)a2, (unsigned long)a3, (uint64_t)a4);
     case SYS_write:
         return do_write(a1, (const char *)a2, (unsigned long)a3);
     case SYS_writev:

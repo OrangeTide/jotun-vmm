@@ -31,6 +31,7 @@
 #define SYS_pause           34
 #define SYS_ioctl           16
 #define SYS_pread64         17
+#define SYS_pwrite64        18
 #define SYS_writev          20
 #define SYS_access          21
 #define SYS_pipe            22

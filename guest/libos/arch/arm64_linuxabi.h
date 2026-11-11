@@ -49,6 +49,7 @@
 #define SYS_lseek           62
 #define SYS_read            63
 #define SYS_pread64         67
+#define SYS_pwrite64        68
 #define SYS_write           64
 #define SYS_writev          66
 #define SYS_readlinkat      78
