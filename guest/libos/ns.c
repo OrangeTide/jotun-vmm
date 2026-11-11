@@ -100,50 +100,61 @@ ns_resolve(const char *path, char *out, int cap)
     out[n] = '\0';
 }
 
-/* Split a slash-separated path into components; returns the count. */
-static int
-split_path(const char *path, char comps[][NS_NAMELEN], int maxc)
-{
-    int n = 0;
-    const char *p = path;
-
-    while (*p && n < maxc) {
-        while (*p == '/')
-            p++;
-        if (!*p)
-            break;
-        int i = 0;
-        while (*p && *p != '/') {
-            if (i < NS_NAMELEN - 1)
-                comps[n][i++] = *p;
-            p++;
-        }
-        comps[n][i] = '\0';
-        /* Normalize "." (current dir: drop) and ".." (parent: pop one), so a
-         * path such as .../13/. or a/b/../c walks correctly. A ".." at the root
-         * is clamped. gcc's is_directory() stats "<dir>/." this way. */
-        if (comps[n][0] == '.' && comps[n][1] == '\0')
-            continue;
-        if (comps[n][0] == '.' && comps[n][1] == '.' && comps[n][2] == '\0') {
-            if (n > 0)
-                n--;
-            continue;
-        }
-        n++;
-    }
-    return n;
-}
-
+/* Walk a server path into `fid`. A 9P Twalk carries at most P9_MAXWELEM (16)
+ * path elements, so a deeper path (a build tree reaches 17+: .deps mirrors the
+ * absolute object path) is walked in several messages, each continuing from the
+ * fid the previous one established by walking it in place (the server reuses the
+ * same fid slot when newfid == fid). Without this, a path past 16 components
+ * walked only its first 16 and stopped at an interior directory, so a create
+ * under it reported EISDIR. Components are taken 16 at a time, reusing one
+ * buffer rather than storing the whole path, so the stack stays small. A ".."
+ * that pops across a chunk boundary is not modelled; callers pass keys already
+ * normalized (resolve_path/norm_key collapse "." and ".."), so this does not
+ * arise for real paths. */
 int
 ns_walk(const char *path, uint32_t fid)
 {
-    char eff[128];
+    char eff[256];
     char comps[P9_MAXWELEM][NS_NAMELEN];
     const char *names[P9_MAXWELEM];
 
     ns_resolve(path, eff, sizeof eff);
-    int n = split_path(eff, comps, P9_MAXWELEM);
-    for (int i = 0; i < n; i++)
-        names[i] = comps[i];
-    return (p9_walk(P9_ROOT_FID, fid, n, names) == n) ? 0 : -1;
+
+    uint32_t base = P9_ROOT_FID;
+    int any = 0;
+    const char *p = eff;
+    for (;;) {
+        int n = 0;
+        while (*p && n < P9_MAXWELEM) {
+            while (*p == '/')
+                p++;
+            if (!*p)
+                break;
+            int i = 0;
+            while (*p && *p != '/') {
+                if (i < NS_NAMELEN - 1)
+                    comps[n][i++] = *p;
+                p++;
+            }
+            comps[n][i] = '\0';
+            if (comps[n][0] == '.' && comps[n][1] == '\0')
+                continue;                       /* "." : current directory */
+            if (comps[n][0] == '.' && comps[n][1] == '.' && comps[n][2] == '\0') {
+                if (n > 0)                      /* ".." within this chunk */
+                    n--;
+                continue;
+            }
+            names[n] = comps[n];
+            n++;
+        }
+        if (n == 0)
+            break;                              /* no (more) components */
+        if (p9_walk(base, fid, n, names) != n)
+            return -1;                          /* a component was not found */
+        base = fid;                             /* continue in place from here */
+        any = 1;
+    }
+    if (!any)                                   /* empty path: clone the root */
+        return p9_walk(P9_ROOT_FID, fid, 0, names) == 0 ? 0 : -1;
+    return 0;
 }
