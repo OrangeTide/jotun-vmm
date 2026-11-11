@@ -40,7 +40,7 @@
 #include <stdint.h>
 
 #define VM_PAGE      0x1000ULL
-#define VM_RAM_SIZE  0x80000000ULL           /* 2 GiB; must match the host */
+#define VM_RAM_SIZE  0xE0000000ULL           /* 3.5 GiB; must match the host */
 #define VM_USER_LO   0x400000ULL
 #define VM_USER_HI   (VM_RAM_SIZE - 0x1000000ULL)  /* RAM top less 16 MiB */
 /* The kernel heap: 8 MiB directly above the user window. The vcpu stacks take
@@ -51,8 +51,8 @@
 /* The device MMIO band: 32 MiB just above RAM, holding the doorbells, console,
  * poweroff, and vGIC (see jotun_abi.h). Unbacked, so stores fault out as MMIO;
  * mapped identity-present in every space so the guest reaches it under any CR3. */
-#define VM_DEV_LO    0x80000000ULL           /* 2 GiB, == RAM top */
-#define VM_DEV_HI    0x82000000ULL           /* 2 GiB + 32 MiB */
+#define VM_DEV_LO    0xE0000000ULL           /* 3.5 GiB, == RAM top */
+#define VM_DEV_HI    0xE2000000ULL           /* 3.5 GiB + 32 MiB */
 #define VM_PHYSMAP   0x100000000ULL          /* 4 GiB */
 #define VM_PHYSMAP_PAGES (VM_RAM_SIZE / 0x200000ULL)  /* RAM in 2 MiB pages */
 /* The demand-grown kernel heap window at 8 GiB, well above the physmap (which

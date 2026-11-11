@@ -20,7 +20,7 @@
 /* The channel sits above the net channel (which ends near 0x120A0) and below
  * the guest image at 1 MiB. The doorbell follows the net doorbell. */
 #define JOTUN_DRAW_BASE      0x13000u
-#define JOTUN_DRAW_DOORBELL  0x80100028ull
+#define JOTUN_DRAW_DOORBELL  0xE0100028ull
 #define JOTUN_DRAW_MSIZE     8192u      /* op bytes per submit, event bytes per poll */
 
 /* Channel operations (guest to host). */

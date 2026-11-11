@@ -46,12 +46,13 @@
  * foreign program's malloc arenas, and real build tools are large: a single
  * cc1plus or V8 translation unit can want 1 to 2 GiB. 2 GiB gives the per-process
  * user window (RAM less 16 MiB) that much room and leaves the top 16 MiB for the
- * vcpu stacks. The device MMIO band sits just above RAM at 2 GiB, in
- * [2 GiB, 2 GiB + 32 MiB), and the physmap is at 4 GiB, so a doorbell store still
- * faults out to the host instead of landing in RAM, and RAM stays below the x86
- * in-kernel local-APIC MMIO at 0xfee00000. This must match VM_RAM_SIZE in the
- * guest's per-arch vmspace headers, which derive the window and physmap from it. */
-#define GUEST_RAM_SIZE (2ull * 1024 * 1024 * 1024)
+ * vcpu stacks. The device MMIO band sits just above RAM at 3.5 GiB, in
+ * [3.5 GiB, 3.5 GiB + 32 MiB), and the physmap is at 4 GiB, so a doorbell store
+ * still faults out to the host instead of landing in RAM, and RAM plus the band
+ * stay below the x86 in-kernel IOAPIC/local-APIC MMIO at 0xfec00000/0xfee00000.
+ * This must match VM_RAM_SIZE in the guest's per-arch vmspace headers, which
+ * derive the window and physmap from it. */
+#define GUEST_RAM_SIZE (7ull * 512 * 1024 * 1024)      /* 3.5 GiB */
 
 /* Each vcpu gets its own 512 KiB stack, carved from the top of RAM downward, so
  * vcpus sharing one guest image do not clobber each other's stacks. */

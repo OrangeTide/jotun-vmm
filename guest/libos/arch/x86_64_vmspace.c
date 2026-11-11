@@ -83,70 +83,69 @@ pte_frame(uint64_t e)
 vmspace_t
 vmspace_new(void)
 {
-    /* The 2 GiB user window crosses 1 GiB, so it spans two page directories:
-     * pd_low covers [0,1GiB) and pd_high covers [1GiB,2GiB). pd_dev identity-maps
-     * the device MMIO band at 2 GiB; pd_phys0/pd_phys1 are the 2 GiB physmap at
-     * 4 GiB. The heap window (pdpt[8]) is a shared directory installed below. */
+    /* The 3.5 GiB user window crosses 1, 2 and 3 GiB, so it spans four page
+     * directories (pdpt[0..3], one per GiB). The device MMIO band sits at RAM top
+     * (3.5 GiB), inside the fourth GiB, so pd_user[3] carries both the top of the
+     * user window and, above it, the identity map of the kernel-heap band, vcpu
+     * stacks and device band. The physmap (3.5 GiB) is four PDs at pdpt[4..7]; the
+     * heap window (pdpt[8]) is a shared directory installed below. */
     uint64_t pml4 = phys_alloc();
     uint64_t pdpt = phys_alloc();
-    uint64_t pd_low = phys_alloc();
-    uint64_t pd_high = phys_alloc();
-    uint64_t pd_dev = phys_alloc();
-    uint64_t pd_phys0 = phys_alloc();
-    uint64_t pd_phys1 = phys_alloc();
+    uint64_t pd_user[4], pd_phys[4];
+    int ok = pml4 && pdpt;
 
-    if (!pml4 || !pdpt || !pd_low || !pd_high || !pd_dev || !pd_phys0 || !pd_phys1) {
-        phys_free(pml4); phys_free(pdpt); phys_free(pd_low); phys_free(pd_high);
-        phys_free(pd_dev); phys_free(pd_phys0); phys_free(pd_phys1);
+    for (int i = 0; i < 4; i++) {
+        pd_user[i] = phys_alloc();
+        pd_phys[i] = phys_alloc();
+        ok = ok && pd_user[i] && pd_phys[i];
+    }
+    if (!ok) {
+        phys_free(pml4); phys_free(pdpt);
+        for (int i = 0; i < 4; i++) { phys_free(pd_user[i]); phys_free(pd_phys[i]); }
         return 0;
     }
 
     tbl(pml4)[0] = pdpt | VM_P | VM_W | VM_U;
-    tbl(pdpt)[0] = pd_low   | VM_P | VM_W | VM_U;   /* [0, 1 GiB) */
-    tbl(pdpt)[1] = pd_high  | VM_P | VM_W | VM_U;   /* [1 GiB, 2 GiB) */
-    tbl(pdpt)[2] = pd_dev   | VM_P | VM_W;          /* [2 GiB, 3 GiB): device band */
-    tbl(pdpt)[4] = pd_phys0 | VM_P | VM_W;          /* [4 GiB, 5 GiB): physmap GPA 0 */
-    tbl(pdpt)[5] = pd_phys1 | VM_P | VM_W;          /* [5 GiB, 6 GiB): physmap GPA 1 GiB */
+    for (int g = 0; g < 4; g++) {
+        tbl(pdpt)[g]     = pd_user[g] | VM_P | VM_W | VM_U;  /* [g GiB, g+1 GiB) */
+        tbl(pdpt)[4 + g] = pd_phys[g] | VM_P | VM_W;         /* physmap GPA g GiB */
+    }
     if (kheap_pd)
         tbl(pdpt)[VM_KHEAP_VA >> 30] = kheap_pd | VM_P | VM_W;   /* [8 GiB, ...) */
 
-    /* Identity-map every 2 MiB block of [0, 2 GiB) outside the user window: the
-     * kernel, page tables, the kernel heap band, and the vcpu stacks. The window
-     * [VM_USER_LO, VM_USER_HI) is left unmapped for per-process demand paging. */
-    uint64_t *pdl = tbl(pd_low);
-    uint64_t *pdh = tbl(pd_high);
-    for (uint64_t i = 0; i < 512; i++) {
-        uint64_t lo_base = i << 21;                     /* [0, 1 GiB) */
-        uint64_t hi_base = 0x40000000ULL + (i << 21);   /* [1 GiB, 2 GiB) */
-        if (lo_base < VM_USER_LO || lo_base >= VM_USER_HI)
-            pdl[i] = lo_base | VM_P | VM_W | VM_PS;
-        if (hi_base < VM_USER_LO || hi_base >= VM_USER_HI)
-            pdh[i] = hi_base | VM_P | VM_W | VM_PS;
+    /* Identity-map every 2 MiB block of [0, 4 GiB) that is outside the user
+     * window but backing something the kernel reaches under any CR3: the kernel
+     * image and page tables below VM_USER_LO, and above the window the kernel
+     * heap band, the vcpu stacks, and the unbacked device MMIO band (present but
+     * faulting out as an MMIO exit on access). [VM_USER_LO, VM_USER_HI) is left
+     * unmapped for per-process demand paging. The device band carries no user
+     * bit, so user code cannot reach it even though its PDPT slot allows user. */
+    for (int g = 0; g < 4; g++) {
+        uint64_t *pd = tbl(pd_user[g]);
+        for (uint64_t i = 0; i < 512; i++) {
+            uint64_t base = ((uint64_t)g << 30) + (i << 21);
+            if (base < VM_USER_LO || (base >= VM_USER_HI && base < VM_DEV_HI))
+                pd[i] = base | VM_P | VM_W | VM_PS;
+        }
     }
 
-    /* The device MMIO band [VM_DEV_LO, VM_DEV_HI): present identity, unbacked, so
-     * a store faults out as an MMIO exit (the doorbells, console, and vGIC). */
-    uint64_t *pdd = tbl(pd_dev);
-    for (uint64_t i = 0; i < 512; i++) {
-        uint64_t base = 0x80000000ULL + (i << 21);
-        if (base >= VM_DEV_LO && base < VM_DEV_HI)
-            pdd[i] = base | VM_P | VM_W | VM_PS;
-    }
-
-    /* physmap: all of RAM as 2 MiB pages at VM_PHYSMAP, so the kernel reaches any
-     * frame by physical address regardless of the active CR3. 2 GiB = two PDs. */
-    uint64_t *pp0 = tbl(pd_phys0);
-    uint64_t *pp1 = tbl(pd_phys1);
-    for (uint64_t i = 0; i < 512; i++) {
-        pp0[i] = (i << 21) | VM_P | VM_W | VM_PS;                    /* GPA [0,1GiB) */
-        pp1[i] = (0x40000000ULL + (i << 21)) | VM_P | VM_W | VM_PS;  /* GPA [1,2GiB) */
+    /* physmap: all of backed RAM as 2 MiB pages at VM_PHYSMAP, so the kernel
+     * reaches any frame by physical address regardless of the active CR3. 3.5 GiB
+     * fills pd_phys[0..2] whole and the first 256 entries of pd_phys[3]. */
+    for (int g = 0; g < 4; g++) {
+        uint64_t *pp = tbl(pd_phys[g]);
+        for (uint64_t i = 0; i < 512; i++) {
+            uint64_t gpa = ((uint64_t)g << 30) + (i << 21);
+            if (gpa < VM_RAM_SIZE)
+                pp[i] = gpa | VM_P | VM_W | VM_PS;
+        }
     }
 
     return pml4;
 }
 
-/* The page directory covering vaddr's GiB. The user window spans pdpt[0]
- * ([0,1GiB)) and pdpt[1] ([1,2GiB)), so select by bits [31:30]. */
+/* The page directory covering vaddr's GiB. The user window spans pdpt[0..3]
+ * (one per GiB up to RAM top), so select by the GiB index bits [31:30]. */
 static uint64_t *
 user_pd(vmspace_t as, uint64_t vaddr)
 {
@@ -336,7 +335,7 @@ vmspace_unmap(vmspace_t as, uint64_t vaddr)
 }
 
 /* Visit every present user-window PT entry, calling fn(vaddr, entry-ptr). The
- * window spans two page directories, so step by 2 MiB block over the whole VA
+ * window spans four page directories, so step by 2 MiB block over the whole VA
  * range and select the directory per block. */
 static void
 user_walk(vmspace_t as, void (*fn)(uint64_t, uint64_t *, void *), void *arg)
@@ -385,11 +384,10 @@ vmspace_destroy(vmspace_t as)
         if ((pd[pdi] & VM_P) && !(pd[pdi] & VM_PS))
             phys_free(pte_frame(pd[pdi]));
     }
-    phys_free(pte_frame(pdpt[0]));      /* pd_low */
-    phys_free(pte_frame(pdpt[1]));      /* pd_high */
-    phys_free(pte_frame(pdpt[2]));      /* pd_dev */
-    phys_free(pte_frame(pdpt[4]));      /* pd_phys0 */
-    phys_free(pte_frame(pdpt[5]));      /* pd_phys1 */
+    for (int g = 0; g < 4; g++) {
+        phys_free(pte_frame(pdpt[g]));      /* pd_user[g]: [g GiB, g+1 GiB) */
+        phys_free(pte_frame(pdpt[4 + g]));  /* pd_phys[g]: physmap GPA g GiB */
+    }
     phys_free(pte_frame(tbl(as)[0]));   /* pdpt */
     phys_free(as);                      /* pml4 */
 }

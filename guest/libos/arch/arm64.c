@@ -12,11 +12,11 @@
 
 /* The device MMIO band just above guest RAM; see JOTUN_* in abi/jotun_abi.h and
  * MMIO_UART_BASE/MMIO_POWEROFF in host/uart.h, which these must match. */
-#define UART_BASE   0x80000000ull
+#define UART_BASE   0xE0000000ull
 #define UART_DR     (UART_BASE + 0x00)      /* data register */
 #define UART_FR     (UART_BASE + 0x18)      /* flag register */
 #define FR_TXFF     (1u << 5)               /* transmit FIFO full */
-#define POWEROFF    0x80010000ull
+#define POWEROFF    0xE0010000ull
 
 void
 con_raw_putc(char c)

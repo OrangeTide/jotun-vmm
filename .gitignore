@@ -14,3 +14,6 @@ image-depot
 bundle-staging
 bundle-cache
 build/
+
+# Cross-built aarch64 test binaries (regenerate with aarch64-linux-musl-gcc)
+a64bins/

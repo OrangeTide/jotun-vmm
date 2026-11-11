@@ -13,26 +13,27 @@
 /* Fixed guest-physical layout the two sides agree on. The ring sits low in
  * guest RAM, below the guest image. The doorbell is an unmapped MMIO address,
  * so a store to it faults out to the host as an MMIO exit. The device MMIO band
- * sits just above guest RAM (which reaches GUEST_RAM_SIZE = 2 GiB) in
- * [2 GiB, 2 GiB + 32 MiB), below the physmap at 4 GiB, so the addresses stay
- * unbacked and keep faulting out. The guest maps the band as Device memory. */
+ * sits just above guest RAM (which reaches GUEST_RAM_SIZE = 3.5 GiB) in
+ * [3.5 GiB, 3.5 GiB + 32 MiB), below the physmap at 4 GiB and below the x86
+ * local-APIC MMIO at 0xfee00000, so the addresses stay unbacked and keep
+ * faulting out. The guest maps the band as Device memory. */
 #define JOTUN_RING_BASE     0x4000u
-#define JOTUN_DOORBELL      0x80100000ull
+#define JOTUN_DOORBELL      0xE0100000ull
 
 /* SMP coordination doorbells (MMIO, so a store faults out to the host). A
  * store to IDLE blocks the calling vcpu in the host until another vcpu stores
  * to WAKE; a WAKE store carries the target vcpu id, or JOTUN_WAKE_ALL to wake
  * every vcpu. This is how an idle cpu halts and a cpu with new work rouses it,
  * without injecting an interrupt into a halted guest. */
-#define JOTUN_IDLE_DOORBELL 0x80100010ull
-#define JOTUN_WAKE_DOORBELL 0x80100018ull
+#define JOTUN_IDLE_DOORBELL 0xE0100010ull
+#define JOTUN_WAKE_DOORBELL 0xE0100018ull
 #define JOTUN_WAKE_ALL      0xffffffffu
 
 /* A store here stops the VMM (MMIO, faults out to the host). The guest uses it
  * to shut down instead of halting: with the in-kernel APIC a HLT is serviced
  * inside KVM and never reaches the host, so a clean exit needs an explicit
  * store. Must match MMIO_POWEROFF in host/uart.h. */
-#define JOTUN_POWEROFF      0x80010000ull
+#define JOTUN_POWEROFF      0xE0010000ull
 
 #define JOTUN_RING_SLOTS    8u
 #define JOTUN_SLOT_SIZE     256u                    /* bytes, header included */
@@ -56,7 +57,7 @@
  * asserted until the guest's IRQ handler stores here. The store makes the host
  * lower the line, so it is not re-taken the instant the guest returns to user
  * with IRQs unmasked. Unused on x86. Used only by the JOTUN_IRQ_LINE model. */
-#define JOTUN_EVENT_EOI     0x80100030ull
+#define JOTUN_EVENT_EOI     0xE0100030ull
 
 /* How the preemption tick reaches an arm64 guest (jotun_bootinfo.irq_model).
  * The same guest image runs on more than one host backend, so the host states
@@ -74,15 +75,15 @@
 
 /* Guest-physical layout of the KVM vGIC, used by the host to place it and by the
  * guest driver to reach it. All sit in the unbacked device MMIO band (just
- * above guest RAM, below the physmap), which the guest maps as Device memory and
+ * above guest RAM at 3.5 GiB, below the physmap), which the guest maps as Device memory and
  * KVM intercepts for the vGIC. The distributor (GICD) is shared by both GIC
  * generations. GICv3 adds a redistributor (GICR, two 64 KiB frames per cpu, so
  * 1 MiB of room before GICC covers 8 cpus); GICv2 instead has an MMIO CPU
  * interface (GICC). JOTUN_EVENT_SPI is the shared peripheral interrupt the host
  * pulses for the tick (the first SPI, INTID 32). */
-#define JOTUN_GICD_BASE     0x80200000ull
-#define JOTUN_GICR_BASE     0x80300000ull   /* GICv3 redistributor */
-#define JOTUN_GICC_BASE     0x80400000ull   /* GICv2 CPU interface */
+#define JOTUN_GICD_BASE     0xE0200000ull
+#define JOTUN_GICR_BASE     0xE0300000ull   /* GICv3 redistributor */
+#define JOTUN_GICC_BASE     0xE0400000ull   /* GICv2 CPU interface */
 #define JOTUN_EVENT_SPI     32u
 
 struct jotun_msg {

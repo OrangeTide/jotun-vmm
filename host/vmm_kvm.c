@@ -36,7 +36,8 @@
 #define PT_PDPT   0x2000
 #define PT_PD0    0x3000    /* [0, 1 GiB) */
 #define PT_PD1    0x20000   /* [1 GiB, 2 GiB) */
-#define PT_PD2    0x21000   /* [2 GiB, 3 GiB): device band */
+#define PT_PD2    0x21000   /* [2 GiB, 3 GiB) */
+#define PT_PD3    0x22000   /* [3 GiB, 4 GiB): RAM top (3.5 GiB) + device band */
 #define PTE_P     0x1       /* present */
 #define PTE_RW    0x2       /* writable */
 #define PTE_PS    0x80      /* 2 MiB page */
@@ -120,14 +121,17 @@ void vmm_vm_map_memory(vmm_vm_t* vm, void* host_addr, uint64_t guest_addr, size_
         uint64_t *pd0 = (uint64_t*)(base + PT_PD0);
         uint64_t *pd1 = (uint64_t*)(base + PT_PD1);
         uint64_t *pd2 = (uint64_t*)(base + PT_PD2);
+        uint64_t *pd3 = (uint64_t*)(base + PT_PD3);
         pml4[0] = PT_PDPT | PTE_P | PTE_RW;
         pdpt[0] = PT_PD0 | PTE_P | PTE_RW;   /* [0, 1 GiB) */
         pdpt[1] = PT_PD1 | PTE_P | PTE_RW;   /* [1 GiB, 2 GiB) */
-        pdpt[2] = PT_PD2 | PTE_P | PTE_RW;   /* [2 GiB, 3 GiB): device band */
+        pdpt[2] = PT_PD2 | PTE_P | PTE_RW;   /* [2 GiB, 3 GiB) */
+        pdpt[3] = PT_PD3 | PTE_P | PTE_RW;   /* [3 GiB, 4 GiB): RAM top + device band */
         for (int i = 0; i < 512; i++) {
             pd0[i] = ((uint64_t)i << 21) | PTE_P | PTE_RW | PTE_PS;
             pd1[i] = (0x40000000ull + ((uint64_t)i << 21)) | PTE_P | PTE_RW | PTE_PS;
             pd2[i] = (0x80000000ull + ((uint64_t)i << 21)) | PTE_P | PTE_RW | PTE_PS;
+            pd3[i] = (0xc0000000ull + ((uint64_t)i << 21)) | PTE_P | PTE_RW | PTE_PS;
         }
     }
 #endif

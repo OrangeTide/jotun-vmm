@@ -244,9 +244,10 @@ tbl_clean(uint64_t frame)
 /* ---- the user-window level-2 table -------------------------------------- */
 /* The level-2 table covering va. On 16 KiB the root is a single level-2 table
  * spanning the whole window (64 GiB of VA), so va picks nothing. On 4 KiB each
- * level-1 entry is one 1 GiB level-2 table, and the 2 GiB user window spans
- * L1[0] and L1[1]; va selects which, allocated on demand. Returns NULL only on a
- * create failure. */
+ * level-1 entry is one 1 GiB level-2 table, and the 3.5 GiB user window spans
+ * L1[0..3]; va selects which, allocated on demand (L1[0] and L1[3] are preset by
+ * vmspace_new, L1[1] and L1[2] come in here). Returns NULL only on a create
+ * failure. */
 static uint64_t *
 user_l2(vmspace_t as, uint64_t va, int create)
 {
@@ -383,15 +384,18 @@ fill_low_l2(uint64_t l2)
         p[L2I(va)] = (va & g_addr) | BLOCK_NORMAL;          /* kernel image */
 }
 
-/* 4 KiB path: the high-GiB level-2 table (L1[1], [1 GiB,2 GiB)) carries the
- * kernel heap band and the vcpu stacks identity in [VM_KHEAP_LO, RAM top); the
- * rest is user window, left invalid for demand paging. */
+/* 4 KiB path: the top-GiB level-2 table (L1[3], [3 GiB,4 GiB)) carries the
+ * kernel heap band and the vcpu stacks identity in [VM_KHEAP_LO, RAM top) and,
+ * just above RAM, the unbacked device MMIO band as Device blocks. The rest of
+ * the GiB below VM_USER_HI is user window, left invalid for demand paging. */
 static void
 fill_high_l2(uint64_t l2)
 {
     uint64_t *p = tbl(l2);
     for (uint64_t va = VM_KHEAP_LO; va < VM_RAM_SIZE; va += L2_BLK)
         p[L2I(va)] = (va & g_addr) | BLOCK_NORMAL;          /* heap band + stacks */
+    for (uint64_t va = VM_DEV_LO; va < VM_DEV_HI; va += L2_BLK)
+        p[L2I(va)] = (va & g_addr) | BLOCK_DEVICE;          /* device MMIO band */
 }
 
 vmspace_t
@@ -403,29 +407,37 @@ vmspace_new(void)
     uint64_t *r = tbl(root);
 
     if (g_three) {
-        /* 4 KiB granule: a level-1 root (1 GiB per entry). The 2 GiB user window
-         * spans L1[0] (low level-2) and L1[1] (high level-2, also carrying the
-         * heap band and stacks identity). L1[2] is a 1 GiB Device block for the
-         * MMIO band at 2 GiB; L1[4]/L1[5] are two 1 GiB blocks mapping RAM
-         * non-cacheably as the physmap at 4 GiB; L1[8] points at the shared heap
-         * level-2 table. No L1 indices collide. */
+        /* 4 KiB granule: a level-1 root (1 GiB per entry). The 3.5 GiB user window
+         * spans L1[0..3]. L1[0] (low level-2) carries the kernel image identity;
+         * L1[1] and L1[2] are pure user, allocated on demand by user_l2; L1[3]
+         * (top level-2) carries the user-window top plus the heap band, stacks and
+         * device MMIO band identity. The physmap at 4 GiB is three 1 GiB blocks
+         * for the whole GiBs (L1[4..6], GPA [0,3 GiB)) and a level-2 table (L1[7])
+         * for the partial last GiB (GPA [3 GiB, RAM top)). L1[8] points at the
+         * shared heap level-2 table. No L1 indices collide. */
         uint64_t l2lo = phys_alloc();
         uint64_t l2hi = phys_alloc();
-        if (!l2lo || !l2hi) {
-            phys_free(root); phys_free(l2lo); phys_free(l2hi);
+        uint64_t pp3 = phys_alloc();
+        if (!l2lo || !l2hi || !pp3) {
+            phys_free(root); phys_free(l2lo); phys_free(l2hi); phys_free(pp3);
             return 0;
         }
         fill_low_l2(l2lo);
         fill_high_l2(l2hi);
+        uint64_t *pp = tbl(pp3);                /* GPA [3 GiB, RAM top), 2 MiB blocks */
+        for (uint64_t gpa = 0xC0000000ULL; gpa < VM_RAM_SIZE; gpa += L2_BLK)
+            pp[L2I(gpa)] = (gpa & g_addr) | BLOCK_PHYS;
         r[0] = l2lo | D_TABLE;
-        r[1] = l2hi | D_TABLE;
-        r[L1I(VM_DEV_LO)] = (VM_DEV_LO & g_addr) | BLOCK_DEVICE;     /* [2,3 GiB) */
+        r[L1I(VM_USER_HI)] = l2hi | D_TABLE;                          /* L1[3] */
         r[L1I(VM_PHYSMAP)]     = (0ULL & g_addr) | BLOCK_PHYS;        /* GPA [0,1 GiB) */
         r[L1I(VM_PHYSMAP) + 1] = (0x40000000ULL & g_addr) | BLOCK_PHYS; /* GPA [1,2 GiB) */
+        r[L1I(VM_PHYSMAP) + 2] = (0x80000000ULL & g_addr) | BLOCK_PHYS; /* GPA [2,3 GiB) */
+        r[L1I(VM_PHYSMAP) + 3] = pp3 | D_TABLE;                       /* GPA [3,RAM top) */
         if (kheap_l2)
             r[L1I(VM_KHEAP_VA)] = kheap_l2 | D_TABLE;
         tbl_clean(l2lo);
         tbl_clean(l2hi);
+        tbl_clean(pp3);
     } else {
         /* 16 KiB granule: the root is the level-2 table (64 GiB of VA). The two
          * blocks that straddle the user window (the first, holding the kernel
@@ -467,6 +479,9 @@ vmspace_new(void)
 static uint64_t boot_root[TBL_MAX] __attribute__((aligned(0x4000)));
 static uint64_t boot_ta[TBL_MAX]   __attribute__((aligned(0x4000)));
 static uint64_t boot_tb[TBL_MAX]   __attribute__((aligned(0x4000)));
+/* 4 KiB only: the partial last-GiB physmap level-2 table (GPA [3 GiB, RAM top)),
+ * mirroring the per-process pp3 in vmspace_new. Unused on the 16 KiB granule. */
+static uint64_t boot_tc[TBL_MAX]   __attribute__((aligned(0x4000)));
 
 /* Detect the granule the CPU supports and set the geometry. 16 KiB is preferred
  * where available (Apple Silicon needs it for walker coherency); otherwise 4 KiB.
@@ -503,19 +518,24 @@ arch_mmu_init(void)
     if (g_three) {
         /* 4 KiB: L1 root. The boot map needs no user window (the kernel runs
          * identity until the first switch), only the kernel image, the heap band
-         * and stacks near 2 GiB, the device band, and the physmap. boot_ta is the
-         * low-GiB level-2 (kernel image), boot_tb the high-GiB level-2 (heap band
-         * + stacks); the device band is one 1 GiB L1 block and the physmap is two
-         * 1 GiB L1 blocks. */
+         * and stacks near RAM top, the device band, and the physmap. boot_ta is the
+         * low-GiB level-2 (kernel image, L1[0]); boot_tb the top-GiB level-2 (L1[3],
+         * heap band + stacks + device band). The physmap is three 1 GiB L1 blocks
+         * for the whole GiBs and boot_tc, a level-2 table, for the partial last. */
         for (uint64_t va = 0; va < VM_USER_LO; va += L2_BLK)
             boot_ta[L2I(va)] = (va & g_addr) | BLOCK_NORMAL;
         for (uint64_t va = VM_KHEAP_LO; va < VM_RAM_SIZE; va += L2_BLK)
             boot_tb[L2I(va)] = (va & g_addr) | BLOCK_NORMAL;
+        for (uint64_t va = VM_DEV_LO; va < VM_DEV_HI; va += L2_BLK)
+            boot_tb[L2I(va)] = (va & g_addr) | BLOCK_DEVICE;
+        for (uint64_t gpa = 0xC0000000ULL; gpa < VM_RAM_SIZE; gpa += L2_BLK)
+            boot_tc[L2I(gpa)] = (gpa & g_addr) | BLOCK_PHYS;
         boot_root[0] = (uint64_t)(uintptr_t)boot_ta | D_TABLE;
-        boot_root[1] = (uint64_t)(uintptr_t)boot_tb | D_TABLE;
-        boot_root[L1I(VM_DEV_LO)] = (VM_DEV_LO & g_addr) | BLOCK_DEVICE;
+        boot_root[L1I(VM_USER_HI)] = (uint64_t)(uintptr_t)boot_tb | D_TABLE;  /* L1[3] */
         boot_root[L1I(VM_PHYSMAP)]     = (0ULL & g_addr) | BLOCK_PHYS;
         boot_root[L1I(VM_PHYSMAP) + 1] = (0x40000000ULL & g_addr) | BLOCK_PHYS;
+        boot_root[L1I(VM_PHYSMAP) + 2] = (0x80000000ULL & g_addr) | BLOCK_PHYS;
+        boot_root[L1I(VM_PHYSMAP) + 3] = (uint64_t)(uintptr_t)boot_tc | D_TABLE;
     } else {
         /* 16 KiB: the root is the level-2 table; boot_ta/boot_tb are the two
          * straddle level-3 tables carrying only the kernel identity. The device
@@ -727,10 +747,12 @@ vmspace_destroy(vmspace_t as)
     }
     if (g_three) {
         uint64_t *r = tbl(as);
-        if (r[0] & 1)
-            phys_free(pte_frame(r[0]));      /* the low-GiB level-2 table */
-        if (r[1] & 1)
-            phys_free(pte_frame(r[1]));      /* the high-GiB level-2 table */
+        for (int i = 0; i <= 3; i++)         /* the user-window level-2 tables */
+            if ((r[i] & 1) && (r[i] & 0x3) == D_TABLE)
+                phys_free(pte_frame(r[i]));
+        if ((r[L1I(VM_PHYSMAP) + 3] & 1) &&
+            (r[L1I(VM_PHYSMAP) + 3] & 0x3) == D_TABLE)
+            phys_free(pte_frame(r[L1I(VM_PHYSMAP) + 3]));   /* partial physmap L2 */
     }
     asid_free((as >> 48) & 0xFF);
     phys_free(as & g_addr);                  /* the root table */

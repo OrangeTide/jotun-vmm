@@ -1,8 +1,9 @@
 /* linuxbigmem.c : a static Linux test that a single process can map and use more
- * than 1 GiB. Before the guest RAM and user window grew to 2 GiB this could not
- * be satisfied (the window was sub-1-GiB), so mmap returned MAP_FAILED. Now it
- * maps a large anonymous region, writes a known byte at every 64 KiB stride
- * across the whole span, reads them back, and reports. An ordinary Linux binary. */
+ * than 2 GiB. The guest RAM and user window grew to 3.5 GiB precisely so a heavy
+ * translation unit (V8's pipeline.cc needs ~2.4 GiB in cc1plus) fits; a 2.5 GiB
+ * mapping here exceeds the old 2 GiB window and proves the new one. It maps a
+ * large anonymous region, writes a known byte at every 64 KiB stride across the
+ * whole span, reads them back, and reports. An ordinary Linux binary. */
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -14,9 +15,9 @@ puts2(const char *s)
     write(1, s, strlen(s));
 }
 
-/* 1.25 GiB: comfortably over 1 GiB, with headroom under the ~2 GiB window for
- * the program image, its stack, and the page tables backing the mapping. */
-#define SPAN   (1280ull * 1024 * 1024)
+/* 2.5 GiB: over the old 2 GiB window, with headroom under the ~3.48 GiB window
+ * for the program image, its stack, and the page tables backing the mapping. */
+#define SPAN   (2560ull * 1024 * 1024)
 #define STRIDE (64 * 1024)
 
 int

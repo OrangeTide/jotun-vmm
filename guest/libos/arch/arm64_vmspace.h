@@ -36,7 +36,7 @@
 #include <stdint.h>
 
 #define VM_PAGE      0x4000ULL                /* 16 KiB: the translation granule */
-#define VM_RAM_SIZE  0x80000000ULL           /* 2 GiB; must match the host */
+#define VM_RAM_SIZE  0xE0000000ULL           /* 3.5 GiB; must match the host */
 #define VM_USER_LO   0x400000ULL
 #define VM_USER_HI   (VM_RAM_SIZE - 0x1000000ULL)  /* RAM top less 16 MiB */
 /* The kernel heap: 8 MiB above the user window, with the vcpu stacks taking
@@ -46,8 +46,8 @@
 /* The device MMIO band: 32 MiB just above RAM, holding the doorbells, console,
  * poweroff, and vGIC (see jotun_abi.h). Mapped as Device, unbacked, so stores
  * fault out as MMIO. 32 MiB == one 16 KiB-granule level-2 block. */
-#define VM_DEV_LO    0x80000000ULL           /* 2 GiB, == RAM top */
-#define VM_DEV_HI    0x82000000ULL           /* 2 GiB + 32 MiB */
+#define VM_DEV_LO    0xE0000000ULL           /* 3.5 GiB, == RAM top */
+#define VM_DEV_HI    0xE2000000ULL           /* 3.5 GiB + 32 MiB */
 #define VM_PHYSMAP   0x100000000ULL          /* 4 GiB */
 /* The demand-grown kernel heap window at 8 GiB, well above the physmap (which
  * spans [4 GiB, 4 GiB + RAM)). Scattered pool frames are mapped contiguously
