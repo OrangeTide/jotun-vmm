@@ -134,7 +134,12 @@
 #define SYS_symlink    (-19)
 #define SYS_poll       (-20)       /* AArch64 has ppoll (73), not poll */
 #define SYS_pause      (-21)       /* AArch64 has ppoll, not pause */
+#define SYS_epoll_create (-22)     /* AArch64 has epoll_create1 (20), not this */
+#define SYS_epoll_wait (-23)       /* AArch64 has epoll_pwait (22), not this */
 #define SYS_ppoll           73     /* musl's poll() and pause() both use this */
+#define SYS_epoll_create1   20
+#define SYS_epoll_ctl       21
+#define SYS_epoll_pwait     22
 
 /* arch_prctl is x86-only; defined so the shared case body compiles. */
 #define ARCH_SET_FS 0x1002

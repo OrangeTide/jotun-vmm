@@ -120,6 +120,11 @@
 #define SYS_faccessat       269
 #define SYS_set_robust_list 273
 #define SYS_utimensat       280
+#define SYS_epoll_create    213
+#define SYS_epoll_wait      232
+#define SYS_epoll_ctl       233
+#define SYS_epoll_pwait     281
+#define SYS_epoll_create1   291
 #define SYS_dup3            292
 #define SYS_pipe2           293
 #define SYS_prlimit64       302

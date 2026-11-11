@@ -312,6 +312,8 @@ struct lfd {
     int      is9w;              /* this fd is a writable 9P file (host rw mount) */
     int      isdev;             /* this fd is a synthetic /dev character device */
     int      devno;             /* which device (a DEV_* kind) when isdev */
+    int      isepoll;           /* this fd is an epoll instance */
+    int      epidx;             /* epoll pool index when isepoll */
     int      pidx;              /* pipe pool index when ispipe */
     int      ridx;              /* ramfs index when isram */
     int      wr;                /* pipe write end when set, else read end */
@@ -434,6 +436,28 @@ struct lpipe {
 #define LINUX_KSTACK (16u * 1024)       /* per-process syscall handler stack */
 #define CLONE_VM     0x00000100u        /* clone shares the address space (thread) */
 static struct lpipe pipes[LINUX_NPIPE];
+
+/* The epoll pool. An epoll fd owns an interest list of (fd, events, data)
+ * entries that epoll_wait scans for readiness the same way poll does. The pool
+ * is global and refcounted so dup and fork can share one instance, freed when
+ * the last fd across all processes closes. Level-triggered: a watched fd is
+ * reported every time it is ready, which matches poll's model; EPOLLET is
+ * accepted but treated as level-triggered. */
+#define EPOLL_MAX   16              /* concurrent epoll instances, all processes */
+#define EPOLL_NINT  256             /* interest-list entries per epoll */
+struct epitem {
+    int      used;
+    int      fd;                    /* the watched descriptor */
+    int      armed;                 /* 0 after a ONESHOT report, until re-MOD'd */
+    uint32_t events;                /* requested EPOLL* mask */
+    uint64_t data;                  /* opaque epoll_data the caller gets back */
+};
+struct epoll {
+    int      used;
+    int      nref;                  /* open fds referencing this instance */
+    struct epitem items[EPOLL_NINT];
+};
+static struct epoll epolls[EPOLL_MAX];
 
 /* A shared open-file description: the offset state that several descriptors can
  * share. One is made per open(); dup and fork copy the pointer, not the offset,
@@ -1069,6 +1093,8 @@ clone_fd(int dst, struct lfd *src)
             p->readers++;
     } else if (src->isram) {
         ramfs[src->ridx].nref++;        /* another fd references the ramfile */
+    } else if (src->isepoll) {
+        epolls[src->epidx].nref++;      /* another fd references the epoll */
     } else if (src->p9fid) {
         gfidref[src->p9fid - LINUX_FID_BASE]++;
     }
@@ -2207,6 +2233,199 @@ do_ppoll(uint64_t ufds, uint64_t nfds, uint64_t tmo_ptr, uint64_t sigmask_ptr)
     return r;
 }
 
+/* epoll. The event bits below the output-only ones match the poll bits exactly
+ * (EPOLLIN==POLLIN, EPOLLOUT==POLLOUT, ...), so epoll readiness reuses
+ * poll_ready. EPOLLET (edge-triggered) is accepted but treated as level, which
+ * is correct but may wake more often than a strict edge; EPOLLONESHOT disables
+ * an entry after one report until a later EPOLL_CTL_MOD re-arms it. On x86-64
+ * struct epoll_event is packed (12 bytes); on aarch64 it is naturally aligned
+ * (16 bytes), so the layout is selected by arch. */
+#define EPOLLONESHOT 0x40000000u
+#define EPOLLET      0x80000000u
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+#define EPOLL_CLOEXEC 02000000          /* == O_CLOEXEC */
+
+#if defined(__x86_64__)
+struct epoll_event {
+    uint32_t events;
+    uint64_t data;
+} __attribute__((packed));
+#else
+struct epoll_event {
+    uint32_t events;
+    uint32_t _pad;
+    uint64_t data;
+};
+#endif
+
+static long
+do_epoll_create1(long flags)
+{
+    int ei = -1;
+    for (int i = 0; i < EPOLL_MAX; i++)
+        if (!epolls[i].used) {
+            ei = i;
+            break;
+        }
+    if (ei < 0)
+        return -LERR_NOMEM;             /* EMFILE-ish: no instance free */
+    int fd = fd_alloc();
+    if (fd < 0)
+        return -LERR_NOMEM;
+    struct epoll *ep = &epolls[ei];
+    memset(ep, 0, sizeof *ep);
+    ep->used = 1;
+    ep->nref = 1;
+    memset(&fds[fd], 0, sizeof fds[fd]);
+    fds[fd].used = 1;
+    fds[fd].isepoll = 1;
+    fds[fd].epidx = ei;
+    fds[fd].cloexec = (flags & EPOLL_CLOEXEC) ? 1 : 0;
+    return fd;
+}
+
+/* Find the interest entry for a watched fd, or NULL. */
+static struct epitem *
+ep_find(struct epoll *ep, int fd)
+{
+    for (int i = 0; i < EPOLL_NINT; i++)
+        if (ep->items[i].used && ep->items[i].fd == fd)
+            return &ep->items[i];
+    return NULL;
+}
+
+static long
+do_epoll_ctl(long epfd, long op, long fd, uint64_t uev)
+{
+    struct lfd *ef = fd_get(epfd);
+    if (!ef || !ef->isepoll)
+        return -LERR_BADF;
+    if (!fd_get(fd))
+        return -LERR_BADF;              /* the watched fd must be open */
+    if (fd == epfd)
+        return -LERR_INVAL;             /* an epoll cannot watch itself here */
+    struct epoll *ep = &epolls[ef->epidx];
+
+    struct epoll_event ev;
+    if (op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD) {
+        if (!uev)
+            return -LERR_FAULT;
+        if (copy_from_user(&ev, uev, sizeof ev) < 0)
+            return -LERR_FAULT;
+    }
+
+    struct epitem *it = ep_find(ep, (int)fd);
+    switch (op) {
+    case EPOLL_CTL_ADD:
+        if (it)
+            return -LERR_EXIST;
+        for (int i = 0; i < EPOLL_NINT; i++)
+            if (!ep->items[i].used) {
+                ep->items[i].used = 1;
+                ep->items[i].fd = (int)fd;
+                ep->items[i].armed = 1;
+                ep->items[i].events = ev.events;
+                ep->items[i].data = ev.data;
+                return 0;
+            }
+        return -LERR_NOMEM;             /* interest list full */
+    case EPOLL_CTL_MOD:
+        if (!it)
+            return -LERR_NOENT;
+        it->events = ev.events;
+        it->data = ev.data;
+        it->armed = 1;                  /* a MOD re-arms a ONESHOT entry */
+        return 0;
+    case EPOLL_CTL_DEL:
+        if (!it)
+            return -LERR_NOENT;
+        it->used = 0;
+        return 0;
+    default:
+        return -LERR_INVAL;
+    }
+}
+
+/* One scan of an epoll's interest list into the caller's event array. Returns
+ * the number of ready descriptors written (at most maxevents). A closed watched
+ * fd reports EPOLLHUP|EPOLLERR, as Linux does, rather than being skipped. */
+static int
+ep_scan(struct epoll *ep, struct epoll_event *out, int maxevents)
+{
+    int n = 0;
+    for (int i = 0; i < EPOLL_NINT && n < maxevents; i++) {
+        struct epitem *it = &ep->items[i];
+        if (!it->used || !it->armed)
+            continue;
+        struct lfd *f = fd_get(it->fd);
+        short want = (short)(it->events & (POLLIN | POLLPRI | POLLOUT));
+        short re;
+        if (!f)
+            re = POLLHUP | POLLERR;     /* the watched fd was closed */
+        else
+            re = poll_ready(f, want);
+        if (!re)
+            continue;
+        out[n].events = (uint32_t)(re & 0xffff);
+        out[n].data = it->data;
+        n++;
+        if (it->events & EPOLLONESHOT)
+            it->armed = 0;              /* disabled until a later MOD re-arms */
+    }
+    return n;
+}
+
+static long
+do_epoll_wait(long epfd, uint64_t uevents, long maxevents, long timeout_ms)
+{
+    struct lfd *ef = fd_get(epfd);
+    if (!ef || !ef->isepoll)
+        return -LERR_BADF;
+    if (maxevents <= 0)
+        return -LERR_INVAL;
+    if (maxevents > EPOLL_NINT)
+        maxevents = EPOLL_NINT;
+    struct epoll *ep = &epolls[ef->epidx];
+
+    /* The output buffer is kmalloc'd, not on the stack: this runs atop the giant
+     * -O0 syscall-dispatch frame, and a kilobytes-wide array here could overflow
+     * the syscall kstack under a preemption interrupt. */
+    uint64_t sz = (uint64_t)maxevents * sizeof(struct epoll_event);
+    struct epoll_event *evs = kmalloc(sz);
+    if (!evs)
+        return -LERR_NOMEM;
+    memset(evs, 0, sz);                 /* zero the aarch64 pad as the kernel does */
+
+    uint64_t deadline = 0;
+    if (timeout_ms > 0)
+        deadline = arch_cycles() + (uint64_t)timeout_ms * 1000000ULL;
+
+    int interrupted = 0;
+    int n;
+    for (;;) {
+        n = ep_scan(ep, evs, (int)maxevents);
+        if (n > 0 || timeout_ms == 0)
+            break;
+        if (timeout_ms > 0 && arch_cycles() >= deadline)
+            break;                      /* timed out with nothing ready */
+        lx_yield();                     /* let a peer make a descriptor ready */
+        signal_killpoint();
+        if (signal_deliverable()) {
+            interrupted = 1;
+            break;
+        }
+    }
+    long rc = n;
+    if (interrupted)
+        rc = -LERR_RESTARTSYS;
+    else if (n > 0 && copy_to_user(uevents, evs, (uint64_t)n * sizeof evs[0]) < 0)
+        rc = -LERR_FAULT;
+    kfree(evs);
+    return rc;
+}
+
 static long
 do_read(long fd, void *buf, unsigned long count)
 {
@@ -2288,6 +2507,13 @@ do_close(long fd)
         return -LERR_BADF;
     if (f->iscon || f->isdev) {
         f->used = 0;                    /* drop the fd; the device is stateless */
+        return 0;
+    }
+    if (f->isepoll) {
+        struct epoll *ep = &epolls[f->epidx];
+        if (ep->nref > 0 && --ep->nref == 0)
+            ep->used = 0;               /* last reference: free the instance */
+        f->used = 0;
         return 0;
     }
     if (f->isram) {
@@ -4034,6 +4260,31 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_poll((uint64_t)a1, (uint64_t)a2, (long)a3);
     case SYS_ppoll:
         return do_ppoll((uint64_t)a1, (uint64_t)a2, (uint64_t)a3, (uint64_t)a4);
+    case SYS_epoll_create:
+        return do_epoll_create1(0);     /* legacy; the size hint is ignored */
+    case SYS_epoll_create1:
+        return do_epoll_create1((long)a1);
+    case SYS_epoll_ctl:
+        return do_epoll_ctl((long)a1, (long)a2, (long)a3, (uint64_t)a4);
+    case SYS_epoll_wait:
+        return do_epoll_wait((long)a1, (uint64_t)a2, (long)a3, (long)a4);
+    case SYS_epoll_pwait: {
+        /* Apply the caller's signal mask for the wait, as ppoll does, so a
+         * signal it unblocks can interrupt epoll_wait; restore it after. */
+        uint64_t saved = lproc_cur->sig_blocked;
+        int swapped = 0;
+        if (a5) {
+            uint64_t m;
+            if (copy_from_user(&m, (uint64_t)a5, sizeof m) < 0)
+                return -LERR_FAULT;
+            lproc_cur->sig_blocked = m;
+            swapped = 1;
+        }
+        long r = do_epoll_wait((long)a1, (uint64_t)a2, (long)a3, (long)a4);
+        if (swapped)
+            lproc_cur->sig_blocked = saved;
+        return r;
+    }
     case SYS_read:
         return do_read(a1, (void *)a2, (unsigned long)a3);
     case SYS_pread64:
