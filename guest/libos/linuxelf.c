@@ -1765,6 +1765,41 @@ at_path(long dirfd, const char *path, char *buf, size_t n, long *err)
     return buf;
 }
 
+/* utimensat/futimens: set a file's timestamps. A host-mount file keeps its own
+ * host mtime (times are not pushed back over 9P), so for those this succeeds
+ * without changing anything, which is all a build's `touch` of a freshly
+ * written dependency file needs. An overlay file's mtime is stamped so a later
+ * make still sees it as current. Both forms are accepted: the path form (a
+ * dirfd and a user path pointer) and the fd form (a NULL user path, i.e.
+ * futimens on the dirfd). The requested times are not honored precisely, only
+ * "now". Kept out of the syscall dispatch so its path buffers do not add to
+ * that function's single -O0 stack frame. */
+static long
+do_utimensat(long dirfd, uint64_t upath)
+{
+    if (upath == 0) {                           /* futimens(fd) */
+        struct lfd *f = fd_get(dirfd);
+        if (!f)
+            return -LERR_BADF;
+        if (f->isram)
+            ramfs[f->ridx].mtime = fs_stamp();
+        return 0;
+    }
+    char pb[UPATH_MAX], ab[RAMFS_NAME], kb[RAMFS_NAME];
+    long e;
+    const char *up = user_path(upath, pb, &e);
+    if (!up)
+        return e;
+    const char *p = at_path(dirfd, up, ab, sizeof ab, &e);
+    if (e)
+        return e;
+    resolve_path(p, kb, sizeof kb);
+    int ri = ramfs_find(kb);
+    if (ri >= 0)
+        ramfs[ri].mtime = fs_stamp();
+    return 0;                                   /* host/bundle files keep mtime */
+}
+
 /* Open a file on a writable host mount over 9P: Topen an existing file (with
  * OTRUNC when asked), or Tcreate a new one in its parent directory. The fd is
  * is9w, so do_read/do_write go to the host, not the overlay. Returns the fd or
@@ -1884,6 +1919,25 @@ create_9p_dir(const char *key)
         return -LERR_ACCES;
     }
     p9_clunk(fid);
+    return 0;
+}
+
+/* Remove a file or empty directory on a writable host mount over 9P. The key is
+ * already normalized and known to be under a writable mount. Tremove clunks the
+ * fid on the server, so no clunk follows. A build removes its own intermediate
+ * files (gyp drops each .o.d.raw after folding it into the .o.d), and those live
+ * on the host mount, not the overlay, so the overlay remove path cannot reach
+ * them. */
+static long
+remove_9p(const char *key)
+{
+    uint32_t fid = fid_alloc();
+    if (fid == 0)
+        return -LERR_NOMEM;
+    if (ns_walk(key, fid) != 0)
+        return -LERR_NOENT;
+    if (p9_remove(fid) != 0)
+        return -LERR_ACCES;
     return 0;
 }
 
@@ -2489,7 +2543,11 @@ do_rmdir(const char *path)
     uint64_t sz, ino;
     if (meta_key(key, &isdir, &sz, &ino) != 0)
         return -LERR_NOENT;
-    return isdir ? -LERR_ROFS : -LERR_NOTDIR;
+    if (!isdir)
+        return -LERR_NOTDIR;
+    if (under_rw_mount(key))            /* remove the host-mount directory */
+        return remove_9p(key);
+    return -LERR_ROFS;
 }
 
 /* Overwrite entry index i's stored name with `name` (assumed normalized). */
@@ -4138,6 +4196,12 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_fchmod:
     case SYS_fchmodat:
         return 0;                       /* no permission bits to enforce */
+    case SYS_utimensat:
+        /* The path buffers live in the helper's own frame, not this giant
+         * dispatch function's (-O0 sums every case's locals onto one frame, so
+         * an extra kilobyte here can overflow the syscall kstack under a
+         * preemption interrupt). */
+        return do_utimensat(a1, (uint64_t)a2);
     case SYS_dup: {
         struct lfd *f = fd_get(a1);
         if (!f || a1 < 3)
@@ -4333,6 +4397,11 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
             return 0;
         int isdir;
         uint64_t size, ino;
+        if (under_rw_mount(ukey)) {     /* land the removal on the host mount */
+            if (meta_key(ukey, &isdir, &size, &ino) != 0)
+                return -LERR_NOENT;
+            return isdir ? -LERR_ISDIR : remove_9p(ukey);
+        }
         if (meta_path(upath, &isdir, &size, &ino) == 0)
             return isdir ? -LERR_ISDIR : -LERR_ROFS;
         return -LERR_NOENT;

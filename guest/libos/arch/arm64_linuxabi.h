@@ -54,6 +54,7 @@
 #define SYS_readlinkat      78
 #define SYS_newfstatat      79
 #define SYS_fstat           80
+#define SYS_utimensat       88
 #define SYS_exit            93
 #define SYS_exit_group      94
 #define SYS_set_tid_address 96

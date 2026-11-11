@@ -119,6 +119,7 @@
 #define SYS_fchmodat        268
 #define SYS_faccessat       269
 #define SYS_set_robust_list 273
+#define SYS_utimensat       280
 #define SYS_dup3            292
 #define SYS_pipe2           293
 #define SYS_prlimit64       302
