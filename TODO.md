@@ -185,11 +185,14 @@ Open gaps and bugs, Stage C and general correctness:
       compile rule writes an object, `touch`es its `.d.raw` dependency file, then
       removes it; both steps needed these. The same remove fix clears the ICU
       cleanup `unlinkat` that `--with-intl` hit. Commit 2619203.
-- [ ] `epoll_create1` (291) returns `ENOSYS`. Tolerated through configure and the
-      Stage C compile (CPython falls back to a `PollSelector`), but it is the last
-      unhandled syscall the Node build touches and is wanted for the M16.6 network
-      poller. Implement `epoll_create1`/`epoll_ctl`/`epoll_wait` over the
-      cooperative readiness model already used by `poll`.
+- [x] `epoll` implemented over the poll readiness model (commit 8d5a7c9).
+      `epoll_create1`/`epoll_create`/`epoll_ctl`/`epoll_wait`/`epoll_pwait` serve
+      a refcounted per-epoll interest list that `epoll_wait` scans with the same
+      `poll_ready` + cooperative rescan-and-yield loop as `poll`. Level-triggered
+      (EPOLLET accepted as level), EPOLLONESHOT honored, EPOLLHUP on a closed
+      watched fd; `struct epoll_event` packed on x86-64, aligned on aarch64. The
+      Node configure no longer logs an unhandled syscall 291. New linuxepoll test;
+      linux-smoke 27/27 on x86 and arm64 KVM. Still useful for the M16.6 poller.
 - [ ] `/usr/bin/which` fails in the guest with "cannot execute: required file
       not found". Likely a `#!`-interpreter or missing-interp issue on that
       specific file. Minor (nothing depends on it yet), but it points at an
