@@ -6298,7 +6298,7 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
             kfree(sbuf);
             return -LERR_NOEXEC;
         }
-        if (shoff + (size_t)ilen + (size_t)alen + (size_t)slen + 3 > 2048) {
+        if (shoff + (size_t)ilen + (size_t)alen + (size_t)slen + 4 > 2048) {
             kfree(shbuf);
             kfree(sbuf);
             return -LERR_NOMEM;
@@ -6315,10 +6315,15 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
             iarg[alen] = '\0';
             shoff += (size_t)alen + 1;
         }
+        /* The interpreter resolves this path against its own cwd, which need not
+         * be the guest root, so pass an absolute guest path (rel is the resolved
+         * key with no leading slash). "#!" exec via a relative path (make's bare
+         * ./configure) otherwise fails to open in the interpreter. */
         char *script = shbuf + shoff;   /* copy before relbuf is rewritten */
-        memcpy(script, rel, (size_t)slen);
-        script[slen] = '\0';
-        shoff += (size_t)slen + 1;
+        script[0] = '/';
+        memcpy(script + 1, rel, (size_t)slen);
+        script[slen + 1] = '\0';
+        shoff += (size_t)slen + 2;
 
         /* Rewrite argv to: interp [iarg] script  then the script's own argv[1..].
          * The script's argv[0] is dropped; the script path takes its place. */
