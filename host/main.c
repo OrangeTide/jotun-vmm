@@ -530,9 +530,12 @@ run_timer(void *arg)
                  * timed sleep still wakes to check its deadline (it re-parks at
                  * once if nothing is due). A running vcpu just notes the wake. */
                 vcpu_wake(&gp->ctx[i]);
-                /* Preemption is opt-in (JOTUN_PREEMPT): deliver the event vector
-                 * through the in-kernel APIC to preempt a running Linux user
-                 * loop. The clock and the sleep wake above need only the tick. */
+                /* Preemption is on by default (JOTUN_NO_PREEMPT disables it):
+                 * deliver the event vector through the in-kernel APIC to preempt
+                 * a running Linux user loop. The kernel runs with interrupts off,
+                 * so the vector stays pending until the next return to ring 3 and
+                 * never interrupts a kernel critical section. The clock and the
+                 * sleep wake above need only the tick. */
                 if (t->preempt)
                     vmm_vcpu_interrupt(gp->ctx[i].vcpu, JOTUN_EVENT_VECTOR);
             }
@@ -912,7 +915,10 @@ main(int argc, char **argv)
     }
 
     pthread_t timer_thread = 0;
-    int preempt = getenv("JOTUN_PREEMPT") != NULL;
+    /* Preempt running Linux user loops by default; the mechanism (in-kernel
+     * APIC event vector, per-thread TSS.rsp0, ring-3-only yield) is proven.
+     * JOTUN_NO_PREEMPT turns it off for debugging a cooperative-only run. */
+    int preempt = getenv("JOTUN_NO_PREEMPT") == NULL;
     struct timer_ctx tctx = { guests, nguests, hz, preempt, 0 };
     if (hz > 0)
         pthread_create(&timer_thread, NULL, run_timer, &tctx);

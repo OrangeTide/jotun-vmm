@@ -370,11 +370,14 @@ SPIKE_CC_aarch64 ?= aarch64-linux-musl-gcc
 SPIKE_CC ?= $(SPIKE_CC_$(ARCH))
 SPIKE_BIN_DIR ?=
 
-## Preemption on by default so the preemptible-loop test makes progress; the
-## rest tolerate the timer. SPIKE_SECS caps a run through a timeout command when
-## one is on PATH, so a regression that hangs still fails the suite.
-SPIKE_ENV  ?= JOTUN_HZ=100 JOTUN_PREEMPT=1
-SPIKE_SECS ?= 20
+## The guest preempts Linux user loops by default now, so the preemptible-loop
+## test makes progress and the rest tolerate the timer. SPIKE_SECS caps a run
+## through a timeout command when one is on PATH, so a regression that hangs
+## still fails the suite. The cap holds for the slowest supported host: linuxbigmem
+## demand-pages 2.5 GiB and takes low-20s seconds on a Raspberry Pi 4, so 20 was
+## too tight there; 45 leaves margin while still catching a real hang.
+SPIKE_ENV  ?= JOTUN_HZ=100
+SPIKE_SECS ?= 45
 TIMEOUT    := $(shell command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null)
 
 ## Build one test program. A pattern rule, so editing one source rebuilds only

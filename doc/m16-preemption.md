@@ -61,8 +61,8 @@ scheduler's own non-locked windows, so the kernel is kept strictly cooperative.
    (`KVM_SIGNAL_MSI`, address `0xFEE00000 | apic_id<<12`, data = vector 0x20);
    KVM routes it to the vcpu's APIC and kicks it out of guest mode to take it. No
    userspace injection, no signal, so nothing races `KVM_RUN`. The host timer
-   thread still keeps the wall-clock tick counter in the boot block (P1/P2); with
-   `JOTUN_PREEMPT` it also sends the MSI each tick.
+   thread still keeps the wall-clock tick counter in the boot block (P1/P2);
+   unless `JOTUN_NO_PREEMPT` is set it also sends the MSI each tick.
 2. Guest APIC in x2APIC mode. `arch_apic_init` enables the local APIC through the
    `IA32_APIC_BASE` MSR and the spurious-vector register, all by `wrmsr`, so a
    freestanding guest needs no APIC MMIO mapping. The ISR ends with an x2APIC EOI
@@ -161,11 +161,12 @@ separated the clock from preemption:
   returns nanoseconds from it. `clock_gettime` (realtime and monotonic),
   `gettimeofday`, and `time` now report measured time; file mtimes share the same
   source. Without a timer they fall back to the cycle counter as before.
-- Injection (the actual preemption) is now opt-in behind `JOTUN_PREEMPT`. The
-  clock needs only the tick counter, so `JOTUN_HZ` alone gives a Linux guest a
-  real clock with no injection and no reschedule. `JOTUN_PREEMPT` additionally
-  injects the vector, which preempts plain kernel tasks (the spin demo), and is
-  the switch stage P4 will make safe for Linux threads.
+- Injection (the actual preemption) is on by default now; `JOTUN_NO_PREEMPT`
+  disables it. The clock needs only the tick counter, so `JOTUN_HZ` with
+  `JOTUN_NO_PREEMPT` gives a Linux guest a real clock with no injection and no
+  reschedule. By default the timer also injects the vector, which preempts a
+  running Linux user loop (P4 made this safe for Linux threads: the vector is
+  delivered only on a return to ring 3, never inside a kernel critical section).
 
 Proof: example/linuxtime.c, run as `JOTUN_HZ=1000 make linux-spike
 SPIKE_PROG=linuxtime`. All 16 spikes stay green, arm64 cross-compiles clean.

@@ -145,12 +145,12 @@ The make targets wrap a direct invocation. After `libos.elf` and a bundle exist,
 you can run a bundled program yourself:
 
 ```sh
-JOTUN_HZ=100 JOTUN_PREEMPT=1 JOTUN_BUNDLE=bundle-depot JOTUN_REF=root \
+JOTUN_HZ=100 JOTUN_BUNDLE=bundle-depot JOTUN_REF=root \
     ./jotun libos.elf bin <program> [args...]
 ```
 
-- `JOTUN_PREEMPT=1` with `JOTUN_HZ=100` enables preemptive scheduling at 100 Hz.
-  Without it the guest scheduler is cooperative.
+- With `JOTUN_HZ=100` the guest preempts running Linux user loops at 100 Hz by
+  default. Set `JOTUN_NO_PREEMPT` to force a cooperative-only run for debugging.
 - `JOTUN_BUNDLE` points at the content-addressed store; `JOTUN_REF` names the
   root to serve (the targets use `root`).
 - `bin` is the guest that runs Linux binaries; `<program>` is a program name in
@@ -184,7 +184,8 @@ run `jotun` directly, so prefix the whole command, for example
   `aarch64-linux-musl-gcc` on arm64).
 - `SPIKE_BIN_DIR` copies pre-built test binaries instead of compiling them.
 - `SPIKE_PROG` picks the program for `make linux-spike` (default `linuxhello`).
-- `SPIKE_ENV` sets the run environment (default `JOTUN_HZ=100 JOTUN_PREEMPT=1`).
+- `SPIKE_ENV` sets the run environment (default `JOTUN_HZ=100`; preemption is on
+  by default, disable with `JOTUN_NO_PREEMPT`).
 - `SPIKE_SECS` caps each `linux-smoke` run when a `timeout` command is on PATH.
 - `BUNDLE_ARCHS` selects which arches go into a bundle.
 - `FUSE_LD` overrides the resolved linker flag for the clang ELF links.
