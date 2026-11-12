@@ -1322,6 +1322,36 @@ exits 0, and the built `hello` prints its line and exits 0. The build uses the
 unmodified host autoconf-generated `configure`, the host `bash`, `make` and `gcc`
 from live host mounts, and a writable host mount for the build tree.
 
+## A real autotools project: jemalloc
+
+`amhello` is a toy. The next target was jemalloc, the allocator Redis bundles in
+`deps/jemalloc`, whose `./configure` is a real 440 KB autoconf script that runs
+hundreds of compile, link and run feature tests. Redis builds it with
+`cd deps && make jemalloc`, which runs the configure and then compiles the static
+library. Two more gaps surfaced, both general.
+
+The first was how Redis drives it: the Makefile runs `./configure` directly, a
+script with a `#!/bin/sh` line. The `#!` exec path handed the interpreter the
+resolved key, which has no leading slash, and `/bin/sh` then opened it relative
+to its own working directory and failed. `amhello` had dodged this by invoking
+`bash ./configure` explicitly. The fix is to pass the interpreter an absolute
+guest path, which is what the kernel resolves the execve filename to anyway.
+
+The second was `splice`, which was unimplemented and returned ENOSYS. configure
+validates the version string with `echo "$v" | grep PATTERN 2>&1 1>/dev/null`,
+and GNU grep, when its output goes to `/dev/null`, uses `splice` to drain the
+rest of its input. A real kernel always has `splice`, so grep treated the ENOSYS
+as a fatal input error ("Function not implemented") and exited 2, which failed
+the check. `splice` now bounces one chunk through a kernel buffer, reading and
+writing each end through its backend (so the pipe side blocks and reports EOF as
+a normal read does).
+
+With those, jemalloc configures and builds completely in-guest: `make jemalloc`
+exits 0 and produces a 42 MB `libjemalloc.a` from about 70 compiled objects. The
+build logs a few `unhandled syscall 196` lines (`flistxattr`), which is harmless:
+a filesystem with no extended attributes returns the same ENOSYS, and the
+toolchain ignores it.
+
 ## Planned work: real privilege separation
 
 Today the guest kernel and the Linux process share ring 0. User code runs with
