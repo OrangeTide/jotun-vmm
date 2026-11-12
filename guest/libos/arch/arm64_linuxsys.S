@@ -234,7 +234,64 @@ el1t_irq:
     mrs     x2, tpidr_el0
     str     x2, [x0, #TF_TPIDR]
 
+    /* Save the full FP/SIMD state around the handler. This is an asynchronous
+     * preemption, so every vector register is live user state; the handler may
+     * switch to another task that uses NEON, which would otherwise clobber it
+     * (the cooperative ctx_switch spills only the callee-saved d8-d15, enough
+     * for a synchronous yield but not for a preemption). Carve a 528-byte area
+     * on the kernel handler stack (SP_EL1), 16-byte aligned, holding q0-q31 and
+     * FPSR/FPCR. SP stays on the area across the call, so a reschedule that
+     * parks and resumes this stack finds it intact, mirroring the x86 ISR. */
+    /* The kernel is assembled -mgeneral-regs-only, so enable FP+SIMD encodings
+     * for the save/restore here; this only lets the assembler emit them. */
+    .arch_extension fp
+    .arch_extension simd
+    sub     sp, sp, #528
+    stp     q0,  q1,  [sp, #0]
+    stp     q2,  q3,  [sp, #32]
+    stp     q4,  q5,  [sp, #64]
+    stp     q6,  q7,  [sp, #96]
+    stp     q8,  q9,  [sp, #128]
+    stp     q10, q11, [sp, #160]
+    stp     q12, q13, [sp, #192]
+    stp     q14, q15, [sp, #224]
+    stp     q16, q17, [sp, #256]
+    stp     q18, q19, [sp, #288]
+    stp     q20, q21, [sp, #320]
+    stp     q22, q23, [sp, #352]
+    stp     q24, q25, [sp, #384]
+    stp     q26, q27, [sp, #416]
+    stp     q28, q29, [sp, #448]
+    stp     q30, q31, [sp, #480]
+    mrs     x1, fpsr
+    mrs     x2, fpcr
+    add     x3, sp, #512            /* GP stp cannot reach a 512 offset directly */
+    stp     x1, x2, [x3]
+
     bl      arm64_irq_entry         /* ack the host line; may switch tasks */
+
+    /* Restore the FP/SIMD state (SP still points at the save area). */
+    ldp     q0,  q1,  [sp, #0]
+    ldp     q2,  q3,  [sp, #32]
+    ldp     q4,  q5,  [sp, #64]
+    ldp     q6,  q7,  [sp, #96]
+    ldp     q8,  q9,  [sp, #128]
+    ldp     q10, q11, [sp, #160]
+    ldp     q12, q13, [sp, #192]
+    ldp     q14, q15, [sp, #224]
+    ldp     q16, q17, [sp, #256]
+    ldp     q18, q19, [sp, #288]
+    ldp     q20, q21, [sp, #320]
+    ldp     q22, q23, [sp, #352]
+    ldp     q24, q25, [sp, #384]
+    ldp     q26, q27, [sp, #416]
+    ldp     q28, q29, [sp, #448]
+    ldp     q30, q31, [sp, #480]
+    add     x3, sp, #512
+    ldp     x1, x2, [x3]
+    msr     fpsr, x1
+    msr     fpcr, x2
+    add     sp, sp, #528
 
     /* A reschedule may have run other tasks and returned here, so reload
      * lproc_cur before restoring this process's frame. */
