@@ -427,6 +427,29 @@ arch_fpu_init(void)
     fpu_use_xsave = 1;
 }
 
+/* Enable the CPU's ring-3 containment features that back privilege separation.
+ * SMEP (CR4 bit 20) stops ring 0 from executing an instruction fetched from a
+ * page mapped user, so corrupted kernel control flow cannot jump into
+ * user-controlled code. All kernel code lives below VM_USER_LO in supervisor
+ * pages, so nothing the kernel executes carries the user bit and SMEP changes no
+ * legitimate behavior. SMAP (CR4 bit 21) would also stop ring 0 reading or
+ * writing user pages outside a stac/clac window; it is left off until every
+ * kernel access to user memory is bracketed, or it would fault immediately.
+ * Each feature is gated on its CPUID.7.0:EBX bit so a CPU without it still
+ * boots. Per-cpu; call once on each. */
+void
+arch_cpu_harden(void)
+{
+    uint32_t a, b, c, d;
+    cpuid(7, 0, &a, &b, &c, &d);
+    if (b & (1u << 7)) {                /* SMEP supported */
+        unsigned long cr4;
+        __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= (1UL << 20);             /* SMEP */
+        __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4));
+    }
+}
+
 void
 arch_irq_enable(void)
 {

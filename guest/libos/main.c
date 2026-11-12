@@ -912,6 +912,7 @@ kmain(unsigned long id)
     cpu_init(id);
     arch_traps_init(id);        /* each cpu loads its own trap tables */
     arch_fpu_init();            /* enable FP/SIMD so the rasterizer can run */
+    arch_cpu_harden();          /* SMEP: ring 0 cannot execute a user page */
     boot_init();                /* parse the boot block before anything reads it;
                                    arch_apic_init needs the interrupt model */
     arch_apic_init();           /* enable the local APIC for the event vector */

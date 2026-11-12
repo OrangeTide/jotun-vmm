@@ -59,6 +59,9 @@ void arch_traps_init(unsigned long id);
  * switch saves the callee-saved vector registers). Must run once per cpu at
  * boot, before any task starts. */
 void arch_fpu_init(void);
+/* Enable the CPU ring-3 containment features (SMEP, and SMAP once the kernel's
+ * user accesses are all bracketed). Per-cpu; a no-op where unsupported. */
+void arch_cpu_harden(void);
 
 /* Enable this cpu's interrupt controller so it can receive the event vector
  * (the preemption tick and device events) from the host's in-kernel APIC. On

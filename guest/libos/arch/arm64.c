@@ -292,6 +292,14 @@ arch_fpu_init(void)
     __asm__ volatile ("msr cpacr_el1, %0; isb" : : "r"(v));
 }
 
+/* arm64 has no SMEP/SMAP. The EL0/EL1 split already keeps EL1 from executing an
+ * EL0-only page, and user-memory containment would use PAN, a separate track
+ * mirrored after the x86 sweep. A no-op for now so the shared init path links. */
+void
+arch_cpu_harden(void)
+{
+}
+
 void
 arch_irq_enable(void)
 {
