@@ -169,6 +169,11 @@
 #define LERR_INTR   4           /* EINTR: a blocking call interrupted by a signal */
 #define LERR_NOEXEC 8           /* ENOEXEC: not an executable (bad "#!" line) */
 #define LERR_LOOP   40          /* ELOOP: too many nested "#!" interpreters */
+#define LERR_NOTSOCK   88       /* ENOTSOCK: a socket op on a non-socket fd */
+#define LERR_ADDRINUSE 98       /* EADDRINUSE: bind to a name already in use */
+#define LERR_ISCONN    106      /* EISCONN: connect on a connected socket */
+#define LERR_NOTCONN   107      /* ENOTCONN: op needs a connected socket */
+#define LERR_CONNREFUSED 111    /* ECONNREFUSED: no listener at the address */
 
 /* An internal marker (never returned to user): a blocking syscall was cut short
  * by a deliverable caught signal. The signal-delivery boundary turns it into a
@@ -324,22 +329,46 @@ struct linux_dirent64 {
 #define RAMFS_FILE_MAX (128u * 1024u * 1024u)   /* per-file cap */
 
 struct ofile;                   /* shared open-file description, defined below */
+struct lfd;
+
+/* Every descriptor has a kind that names its backend. The kind selects an ops
+ * table (read/write/poll/ref/close), so the generic syscall paths dispatch
+ * through the backend instead of testing a pile of per-type booleans, and a new
+ * backend is added by giving it a kind and an ops entry. Fields below the kind
+ * are backend-private (a pipe's direction, a device number, a pool index). */
+enum fd_kind {
+    FD_NONE = 0,                /* an unused slot */
+    FD_CON,                     /* the console (stdin/out/err) */
+    FD_PIPE,                    /* a pipe end (wr picks the direction) */
+    FD_RAM,                     /* a writable-overlay file */
+    FD_9P,                      /* a 9P-backed file (bundle ro, or host mount) */
+    FD_DIR,                     /* a directory (9P-backed or overlay-only) */
+    FD_DEV,                     /* a synthetic /dev character device */
+    FD_EPOLL,                   /* an epoll instance */
+    FD_EVENTFD,                 /* an eventfd counter */
+    FD_SOCK,                    /* an AF_UNIX socket endpoint */
+};
+
+struct fd_ops {
+    const char *name;
+    long  (*read)(struct lfd *f, void *buf, unsigned long n);
+    long  (*write)(struct lfd *f, const void *buf, unsigned long n);
+    short (*poll)(struct lfd *f, short events);
+    void  (*ref)(struct lfd *f);        /* dup/fork: take one backend reference */
+    void  (*close)(struct lfd *f);      /* drop one; free the backing when last */
+};
 
 struct lfd {
     int      used;
-    int      iscon;             /* this fd is the console (stdin/out/err) */
-    int      isdir;
-    int      ispipe;            /* this fd is a pipe end */
-    int      isram;             /* this fd is a ramfs file */
-    int      is9w;              /* this fd is a writable 9P file (host rw mount) */
-    int      isdev;             /* this fd is a synthetic /dev character device */
-    int      devno;             /* which device (a DEV_* kind) when isdev */
-    int      isepoll;           /* this fd is an epoll instance */
-    int      epidx;             /* epoll pool index when isepoll */
-    int      iseventfd;         /* this fd is an eventfd counter */
-    int      efdidx;            /* eventfd pool index when iseventfd */
-    int      pidx;              /* pipe pool index when ispipe */
-    int      ridx;              /* ramfs index when isram */
+    enum fd_kind kind;          /* the backend this descriptor speaks to */
+    const struct fd_ops *ops;   /* kind's ops table (set with the kind) */
+    int      is9w;              /* FD_9P opened writable (a host rw mount) */
+    int      devno;             /* which device (a DEV_* kind) when FD_DEV */
+    int      epidx;             /* epoll pool index when FD_EPOLL */
+    int      efdidx;            /* eventfd pool index when FD_EVENTFD */
+    int      sidx;              /* usock pool index when FD_SOCK */
+    int      pidx;              /* pipe pool index when FD_PIPE */
+    int      ridx;              /* ramfs index when FD_RAM */
     int      wr;                /* pipe write end when set, else read end */
     int      cloexec;           /* close this fd on execve (O_CLOEXEC/FD_CLOEXEC);
                                  * subprocess marks its exec-error pipe this way
@@ -360,6 +389,9 @@ struct lfd {
                                  * the dynamic linker relies on to dedup a
                                  * library it has already mapped */
 };
+
+/* Bind a descriptor to a kind and its ops table (defined with the backends). */
+static void fd_set_kind(struct lfd *f, enum fd_kind k);
 
 /* A writable overlay entry: a file (buffer grows on write, persists across
  * close for the run) or a directory. The read-only 9P bundle and host mounts
@@ -502,6 +534,46 @@ struct leventfd {
     uint64_t count;
 };
 static struct leventfd eventfds[EVENTFD_MAX];
+
+/* AF_UNIX stream sockets, entirely in-guest. A socket endpoint is one of three
+ * shapes: fresh (just socket()), a passive listener (bind + listen), or a
+ * connected stream with a peer endpoint. A connection is a pair of stream
+ * endpoints, each holding the receive ring the other writes into, so a write on
+ * one appends to the peer's buf and a read drains this endpoint's own buf. The
+ * pool is global and refcounted like pipes so an endpoint inherited across fork
+ * or dup is the same object. connect() finds a listener by its bound path (a
+ * plain in-guest name, no filesystem node), makes the server-side endpoint, and
+ * queues it for accept(). Readiness feeds poll/epoll through poll_ready, so the
+ * sockets work under an event loop. */
+#define AF_UNIX         1
+#define SOCK_STREAM     1
+#define SOCK_TYPE_MASK  0x0f            /* type is the low bits; flags are high */
+#define SOCK_NONBLOCK   0x800           /* == O_NONBLOCK */
+#define SOCK_CLOEXEC    0x80000         /* == O_CLOEXEC */
+#define USOCK_MAX       64              /* concurrent endpoints, all processes */
+#define USOCK_BUF       16384           /* per-direction stream buffer */
+#define USOCK_BACKLOG   64              /* pending connections a listener holds */
+#define USOCK_PATHMAX   108             /* sun_path */
+#define SHUT_RD         0
+#define SHUT_WR         1
+#define SHUT_RDWR       2
+struct usock {
+    int      used;
+    int      nref;                  /* open fds referencing this endpoint */
+    int      listening;             /* a passive (listen) socket */
+    int      bound;                 /* bind() gave it a path */
+    char     path[USOCK_PATHMAX];   /* the bound/listen address */
+    int      backlog;
+    int      acceptq[USOCK_BACKLOG];/* server endpoint indices awaiting accept */
+    int      acceptq_n;
+    int      acceptq_head;
+    int      peer;                  /* connected: peer endpoint index, else -1 */
+    int      peer_closed;           /* the peer endpoint has gone away (read EOF) */
+    int      shut_rd, shut_wr;      /* shutdown() halves */
+    uint32_t head, count;           /* receive ring: bytes the peer wrote to us */
+    uint8_t  buf[USOCK_BUF];
+};
+static struct usock *usocks;            /* [USOCK_MAX], kmalloc'd at init */
 
 /* A shared open-file description: the offset state that several descriptors can
  * share. One is made per open(); dup and fork copy the pointer, not the offset,
@@ -965,10 +1037,10 @@ static long
 mmap_fill(long fd, uint64_t va, uint64_t off, uint64_t len)
 {
     struct lfd *f = fd_get(fd);
-    if (!f || f->iscon || f->ispipe || f->isdir)
+    if (!f || f->kind == FD_CON || f->kind == FD_PIPE || f->kind == FD_DIR)
         return -LERR_BADF;
     uint8_t *dst = (uint8_t *)(uintptr_t)va;
-    if (f->isram) {                     /* ramfs file: copy from its buffer */
+    if (f->kind == FD_RAM) {                     /* ramfs file: copy from its buffer */
         struct ramfile *rf = &ramfs[f->ridx];
         for (uint64_t i = 0; i < len && off + i < rf->len; i++)
             dst[i] = rf->data[off + i];
@@ -1170,24 +1242,11 @@ clone_fd(int dst, struct lfd *src)
     fds[dst].used = 1;
     fds[dst].cloexec = 0;               /* dup clears close-on-exec; the F_DUPFD_
                                          * CLOEXEC and dup3 callers set it back */
-    if (src->of)
-        src->of->nref++;                /* share the offset with the new fd */
-    if (src->ispipe) {
-        struct lpipe *p = &pipes[src->pidx];
-        if (src->wr)
-            p->writers++;
-        else
-            p->readers++;
-    } else if (src->isram) {
-        ramfs[src->ridx].nref++;        /* another fd references the ramfile */
-    } else if (src->isepoll) {
-        epolls[src->epidx].nref++;      /* another fd references the epoll */
-    } else if (src->iseventfd) {
-        eventfds[src->efdidx].nref++;   /* another fd references the counter */
-    } else if (src->p9fid) {
-        gfidref[src->p9fid - LINUX_FID_BASE]++;
-    }
-    /* a bare console fd (no backing) needs no refcount */
+    /* Take one reference on the backend (the shared offset, pipe end, 9P fid,
+     * epoll/eventfd/socket object) so a later close releases it exactly once. A
+     * console or device fd has no backing and no ref op. */
+    if (fds[dst].ops && fds[dst].ops->ref)
+        fds[dst].ops->ref(&fds[dst]);
 }
 
 static void
@@ -1195,7 +1254,8 @@ fds_init(void)
 {
     memset(fds, 0, sizeof(lproc_cur->sh->fdtab));
     for (int i = 0; i < 3; i++) {                   /* stdin/out/err: console */
-        fds[i].used = fds[i].iscon = 1;
+        fds[i].used = 1;
+        fd_set_kind(&fds[i], FD_CON);
         fds[i].oflags = O_RDWR;                     /* readable and writable */
     }
 }
@@ -1322,7 +1382,7 @@ open_dev(int kind, long flags)
         return -LERR_NOMEM;
     memset(&fds[fd], 0, sizeof fds[fd]);
     fds[fd].used = 1;
-    fds[fd].isdev = 1;
+    fd_set_kind(&fds[fd], FD_DEV);
     fds[fd].devno = kind;
     fds[fd].ino = DEV_INO_BASE + (uint64_t)kind;
     fds[fd].oflags = (int)(flags & (O_ACCMODE | O_APPEND));
@@ -1663,7 +1723,8 @@ do_pipe2(int *pfd, int flags)
     memset(&fds[rfd], 0, sizeof fds[rfd]);
     memset(&fds[wfd], 0, sizeof fds[wfd]);
     fds[rfd].used = fds[wfd].used = 1;
-    fds[rfd].ispipe = fds[wfd].ispipe = 1;
+    fd_set_kind(&fds[rfd], FD_PIPE);
+    fd_set_kind(&fds[wfd], FD_PIPE);
     fds[rfd].pidx = fds[wfd].pidx = pidx;
     fds[rfd].wr = 0;
     fds[wfd].wr = 1;
@@ -1718,6 +1779,9 @@ bundle_path(const char *p)
 static long eventfd_read(struct lfd *f, void *buf, unsigned long count);
 static long eventfd_write(struct lfd *f, const void *buf, unsigned long count);
 
+/* read/write go through the fd's backend ops. The common argument checks stay
+ * here; the per-kind body lives in the backend (con_*, pipe_*, ram_*, p9_*,
+ * dev_*, eventfd_*, sock_*), selected by fd_set_kind. */
 static long
 do_write(long fd, const char *buf, unsigned long len)
 {
@@ -1727,70 +1791,7 @@ do_write(long fd, const char *buf, unsigned long len)
         return -LERR_BADF;
     if (len && !user_ok((uint64_t)(uintptr_t)buf, len))
         return -LERR_FAULT;
-    if (f->isdev)
-        return dev_write(f->devno, buf, len);
-    if (f->iseventfd)
-        return eventfd_write(f, buf, len);
-    if (f->iscon) {                     /* console stdout/stderr */
-        for (unsigned long i = 0; i < len; i++)
-            con_putc(buf[i]);
-        return (long)len;
-    }
-    if (f->ispipe && f->wr) {
-        struct lpipe *p = &pipes[f->pidx];
-        unsigned long done = 0;
-        /* Write everything, yielding when the ring fills so a reader in another
-         * process can drain it. When every reader has closed, a write hits a
-         * broken pipe: deliver SIGPIPE's default action (terminate the process),
-         * which is what stops a producer looping forever once its consumer has
-         * quit. A process that ignores or handles SIGPIPE gets EPIPE instead. A
-         * partial write already done is reported; the SIGPIPE lands on the next
-         * write, as on Linux. */
-        while (done < len) {
-            if (p->readers == 0) {
-                if (done)
-                    return (long)done;
-                if (lproc_cur->sh->sigact[SIGPIPE - 1].handler == SIG_DFL) {
-                    lproc_cur->sh->exit_sig = SIGPIPE;
-                    do_exit(0, 1);                  /* does not return */
-                }
-                return -LERR_PIPE;
-            }
-            long n = pipe_write(p, (const uint8_t *)buf + done, len - done);
-            done += (unsigned long)n;
-            if (done < len)
-                lx_yield();          /* pipe full: let a reader drain it */
-            signal_killpoint();      /* a fatal signal unblocks and terminates */
-        }
-        return (long)done;
-    }
-    if (f->isram) {
-        struct ramfile *rf = &ramfs[f->ridx];
-        uint64_t end = f->of->pos + len;
-        if (end > RAMFS_FILE_MAX || ramfs_grow(rf, (uint32_t)end) < 0)
-            return -LERR_NOMEM;
-        memcpy(rf->data + f->of->pos, buf, len);
-        f->of->pos += len;
-        if (f->of->pos > rf->len)
-            rf->len = (uint32_t)f->of->pos;
-        rf->mtime = fs_stamp();
-        return (long)len;
-    }
-    if (f->is9w) {                      /* writable 9P file on a host rw mount */
-        unsigned long done = 0;
-        while (done < len) {
-            long n = p9_write(f->p9fid, f->of->pos + done,
-                              buf + done, (uint32_t)(len - done));
-            if (n <= 0)
-                break;
-            done += (unsigned long)n;
-        }
-        if (done == 0 && len > 0)
-            return -LERR_ROFS;          /* the host refused the write */
-        f->of->pos += done;
-        return (long)done;
-    }
-    return -LERR_BADF;                  /* the bundle is read-only */
+    return f->ops->write(f, buf, len);
 }
 
 static long
@@ -1823,7 +1824,7 @@ open_ram(int ri, long flags)
         return -LERR_NOMEM;
     memset(&fds[fd], 0, sizeof fds[fd]);
     fds[fd].used = 1;
-    fds[fd].isram = 1;
+    fd_set_kind(&fds[fd], FD_RAM);
     fds[fd].ridx = ri;
     fds[fd].of = of;
     fds[fd].oflags = (int)(flags & (O_ACCMODE | O_APPEND));
@@ -1869,7 +1870,7 @@ at_path(long dirfd, const char *path, char *buf, size_t n, long *err)
         *err = -LERR_BADF;
         return NULL;
     }
-    if (!f->isdir || !f->of) {
+    if (f->kind != FD_DIR || !f->of) {
         *err = -LERR_NOTDIR;
         return NULL;
     }
@@ -1901,7 +1902,7 @@ do_utimensat(long dirfd, uint64_t upath)
         struct lfd *f = fd_get(dirfd);
         if (!f)
             return -LERR_BADF;
-        if (f->isram)
+        if (f->kind == FD_RAM)
             ramfs[f->ridx].mtime = fs_stamp();
         return 0;
     }
@@ -2002,6 +2003,7 @@ open_9p_write(const char *key, long flags, long mode)
     }
     memset(&fds[fd], 0, sizeof fds[fd]);
     fds[fd].used = 1;
+    fd_set_kind(&fds[fd], FD_9P);
     fds[fd].is9w = 1;
     fds[fd].p9fid = p9fid;
     fds[fd].of = of;
@@ -2148,7 +2150,7 @@ do_open(const char *path, long flags, long mode)
     }
     memset(&fds[fd], 0, sizeof fds[fd]);
     fds[fd].used = 1;
-    fds[fd].isdir = isdir;
+    fd_set_kind(&fds[fd], isdir ? FD_DIR : FD_9P);
     fds[fd].size = size;
     fds[fd].ino = ino;
     fds[fd].of = of;
@@ -2198,36 +2200,7 @@ poll_ready(struct lfd *f, short events)
 {
     if (!f)
         return POLLNVAL;
-    short r = 0;
-    if (f->iseventfd) {
-        struct leventfd *e = &eventfds[f->efdidx];
-        if (e->count > 0)
-            r |= (short)(events & POLLIN);
-        if (e->count < EVENTFD_MAXVAL)
-            r |= (short)(events & POLLOUT);
-        return r;
-    }
-    if (f->ispipe) {
-        struct lpipe *p = &pipes[f->pidx];
-        if (f->wr) {
-            if (p->readers == 0)
-                r |= POLLERR;               /* no reader: a write is broken */
-            if (p->count < PIPE_CAP)
-                r |= (short)(events & POLLOUT);
-        } else {
-            if (p->count > 0)
-                r |= (short)(events & POLLIN);
-            if (p->writers == 0)
-                r |= POLLHUP;               /* EOF: a read returns 0, not block */
-        }
-        return r;
-    }
-    /* Console, ram, 9P, directory: never block. */
-    if (events & POLLIN)
-        r |= POLLIN;
-    if (events & POLLOUT)
-        r |= POLLOUT;
-    return r;
+    return f->ops->poll(f, events);
 }
 
 /* poll(fds, nfds, timeout_ms). Cooperative: scan the set, and if nothing is
@@ -2382,7 +2355,7 @@ do_epoll_create1(long flags)
     ep->nref = 1;
     memset(&fds[fd], 0, sizeof fds[fd]);
     fds[fd].used = 1;
-    fds[fd].isepoll = 1;
+    fd_set_kind(&fds[fd], FD_EPOLL);
     fds[fd].epidx = ei;
     fds[fd].cloexec = (flags & EPOLL_CLOEXEC) ? 1 : 0;
     return fd;
@@ -2402,7 +2375,7 @@ static long
 do_epoll_ctl(long epfd, long op, long fd, uint64_t uev)
 {
     struct lfd *ef = fd_get(epfd);
-    if (!ef || !ef->isepoll)
+    if (!ef || ef->kind != FD_EPOLL)
         return -LERR_BADF;
     if (!fd_get(fd))
         return -LERR_BADF;              /* the watched fd must be open */
@@ -2483,7 +2456,7 @@ static long
 do_epoll_wait(long epfd, uint64_t uevents, long maxevents, long timeout_ms)
 {
     struct lfd *ef = fd_get(epfd);
-    if (!ef || !ef->isepoll)
+    if (!ef || ef->kind != FD_EPOLL)
         return -LERR_BADF;
     if (maxevents <= 0)
         return -LERR_INVAL;
@@ -2551,7 +2524,7 @@ do_eventfd(unsigned initval, int flags)
     eventfds[ei].count = initval;
     memset(&fds[fd], 0, sizeof fds[fd]);
     fds[fd].used = 1;
-    fds[fd].iseventfd = 1;
+    fd_set_kind(&fds[fd], FD_EVENTFD);
     fds[fd].efdidx = ei;
     fds[fd].oflags = O_RDWR;
     if (flags & EFD_NONBLOCK)
@@ -2638,6 +2611,676 @@ eventfd_write(struct lfd *f, const void *buf, unsigned long count)
     return (long)sizeof add;
 }
 
+/* ------------------------------------------------------------------------- *
+ * Backend ops. Each descriptor kind provides read/write/poll and, when it has
+ * backing state, ref/close. fd_set_kind binds a kind to its table. The generic
+ * do_read/do_write/do_close/poll_ready/clone_fd/fork paths dispatch here.
+ * ------------------------------------------------------------------------- */
+
+/* A kind with no real read or write side rejects it rather than crashing. */
+static long rd_einval(struct lfd *f, void *b, unsigned long n)
+{ (void)f; (void)b; (void)n; return -LERR_INVAL; }
+static long wr_ebadf(struct lfd *f, const void *b, unsigned long n)
+{ (void)f; (void)b; (void)n; return -LERR_BADF; }
+
+/* Files and devices never block a poll: they are always reported ready. */
+static short dflt_poll(struct lfd *f, short ev)
+{
+    (void)f;
+    short r = 0;
+    if (ev & POLLIN)  r |= POLLIN;
+    if (ev & POLLOUT) r |= POLLOUT;
+    return r;
+}
+
+/* Console. */
+static long con_read(struct lfd *f, void *buf, unsigned long n)
+{ (void)f; (void)buf; (void)n; return 0; }   /* stdin: EOF */
+static long con_write(struct lfd *f, const void *buf, unsigned long n)
+{
+    (void)f;
+    const char *b = buf;
+    for (unsigned long i = 0; i < n; i++)
+        con_putc(b[i]);
+    return (long)n;
+}
+
+/* Pipe. */
+static long pipe_fd_read(struct lfd *f, void *buf, unsigned long count)
+{
+    if (f->wr)
+        return -LERR_BADF;
+    struct lpipe *p = &pipes[f->pidx];
+    while (p->count == 0 && p->writers > 0) {
+        lx_yield();
+        signal_killpoint();
+        if (signal_deliverable())
+            return -LERR_RESTARTSYS;
+    }
+    return pipe_read(p, buf, count);
+}
+static long pipe_fd_write(struct lfd *f, const void *buf, unsigned long len)
+{
+    if (!f->wr)
+        return -LERR_BADF;
+    struct lpipe *p = &pipes[f->pidx];
+    unsigned long done = 0;
+    while (done < len) {
+        if (p->readers == 0) {
+            if (done)
+                return (long)done;
+            if (lproc_cur->sh->sigact[SIGPIPE - 1].handler == SIG_DFL) {
+                lproc_cur->sh->exit_sig = SIGPIPE;
+                do_exit(0, 1);
+            }
+            return -LERR_PIPE;
+        }
+        long n = pipe_write(p, (const uint8_t *)buf + done, len - done);
+        done += (unsigned long)n;
+        if (done < len)
+            lx_yield();
+        signal_killpoint();
+    }
+    return (long)done;
+}
+static short pipe_poll(struct lfd *f, short ev)
+{
+    struct lpipe *p = &pipes[f->pidx];
+    short r = 0;
+    if (f->wr) {
+        if (p->readers == 0)
+            r |= POLLERR;
+        if (p->count < PIPE_CAP)
+            r |= (short)(ev & POLLOUT);
+    } else {
+        if (p->count > 0)
+            r |= (short)(ev & POLLIN);
+        if (p->writers == 0)
+            r |= POLLHUP;
+    }
+    return r;
+}
+static void pipe_ref(struct lfd *f)
+{
+    struct lpipe *p = &pipes[f->pidx];
+    if (f->wr) p->writers++; else p->readers++;
+}
+static void pipe_close(struct lfd *f)
+{
+    struct lpipe *p = &pipes[f->pidx];
+    if (f->wr && p->writers > 0) p->writers--;
+    else if (!f->wr && p->readers > 0) p->readers--;
+    if (p->readers == 0 && p->writers == 0) p->used = 0;
+}
+
+/* Overlay (ramfs) file. */
+static long ram_read(struct lfd *f, void *buf, unsigned long count)
+{
+    struct ramfile *rf = &ramfs[f->ridx];
+    if (f->of->pos >= rf->len)
+        return 0;
+    uint32_t avail = rf->len - (uint32_t)f->of->pos;
+    uint32_t n = count < avail ? (uint32_t)count : avail;
+    memcpy(buf, rf->data + f->of->pos, n);
+    f->of->pos += n;
+    return n;
+}
+static long ram_write(struct lfd *f, const void *buf, unsigned long len)
+{
+    struct ramfile *rf = &ramfs[f->ridx];
+    uint64_t end = f->of->pos + len;
+    if (end > RAMFS_FILE_MAX || ramfs_grow(rf, (uint32_t)end) < 0)
+        return -LERR_NOMEM;
+    memcpy(rf->data + f->of->pos, buf, len);
+    f->of->pos += len;
+    if (f->of->pos > rf->len)
+        rf->len = (uint32_t)f->of->pos;
+    rf->mtime = fs_stamp();
+    return (long)len;
+}
+static void ram_ref(struct lfd *f)
+{
+    ramfs[f->ridx].nref++;
+    if (f->of) f->of->nref++;
+}
+static void ram_close(struct lfd *f)
+{
+    ramfs_unref(f->ridx);
+    ofile_unref(f->of);
+}
+
+/* 9P-backed file (also the ref/close for a directory, which shares the fid and
+ * open-file description). */
+static long p9_fd_read(struct lfd *f, void *buf, unsigned long count)
+{
+    long n = p9_read(f->p9fid, f->of->pos, buf, (uint32_t)count);
+    if (n < 0)
+        return -LERR_INVAL;
+    f->of->pos += (uint64_t)n;
+    return n;
+}
+static long p9_fd_write(struct lfd *f, const void *buf, unsigned long len)
+{
+    if (!f->is9w)
+        return -LERR_BADF;              /* a read-only bundle file */
+    unsigned long done = 0;
+    while (done < len) {
+        long n = p9_write(f->p9fid, f->of->pos + done,
+                          (const char *)buf + done, (uint32_t)(len - done));
+        if (n <= 0)
+            break;
+        done += (unsigned long)n;
+    }
+    if (done == 0 && len > 0)
+        return -LERR_ROFS;
+    f->of->pos += done;
+    return (long)done;
+}
+static void p9_ref(struct lfd *f)
+{
+    if (f->p9fid) gfidref[f->p9fid - LINUX_FID_BASE]++;
+    if (f->of) f->of->nref++;
+}
+static void p9_close(struct lfd *f)
+{
+    if (f->p9fid) {
+        uint32_t slot = f->p9fid - LINUX_FID_BASE;
+        if (gfidref[slot] && --gfidref[slot] == 0)
+            p9_clunk(f->p9fid);
+    }
+    ofile_unref(f->of);
+}
+
+/* Synthetic /dev character device. */
+static long dev_fd_read(struct lfd *f, void *buf, unsigned long n)
+{ return dev_read(f->devno, buf, n); }
+static long dev_fd_write(struct lfd *f, const void *buf, unsigned long n)
+{ return dev_write(f->devno, (const char *)buf, n); }
+
+/* epoll instance. */
+static void epoll_ref(struct lfd *f) { epolls[f->epidx].nref++; }
+static void epoll_close(struct lfd *f)
+{
+    struct epoll *ep = &epolls[f->epidx];
+    if (ep->nref > 0 && --ep->nref == 0)
+        ep->used = 0;
+}
+
+/* eventfd counter. */
+static short eventfd_poll(struct lfd *f, short ev)
+{
+    struct leventfd *e = &eventfds[f->efdidx];
+    short r = 0;
+    if (e->count > 0) r |= (short)(ev & POLLIN);
+    if (e->count < EVENTFD_MAXVAL) r |= (short)(ev & POLLOUT);
+    return r;
+}
+static void eventfd_ref(struct lfd *f) { eventfds[f->efdidx].nref++; }
+static void eventfd_close(struct lfd *f)
+{
+    struct leventfd *e = &eventfds[f->efdidx];
+    if (e->nref > 0 && --e->nref == 0)
+        e->used = 0;
+}
+
+/* AF_UNIX socket. A connected endpoint reads from its own receive ring and
+ * writes into the peer's; a listener holds an accept queue. */
+static long
+sock_read(struct lfd *f, void *buf, unsigned long count)
+{
+    struct usock *s = &usocks[f->sidx];
+    if (s->listening)
+        return -LERR_INVAL;
+    int nb = (f->oflags & O_NONBLOCK) != 0;
+    while (s->count == 0) {
+        if (s->peer < 0 || s->peer_closed || s->shut_rd)
+            return 0;                   /* EOF */
+        if (nb)
+            return -LERR_AGAIN;
+        lx_yield();
+        signal_killpoint();
+        if (signal_deliverable())
+            return -LERR_RESTARTSYS;
+    }
+    uint8_t *out = buf;
+    unsigned long n = 0;
+    while (n < count && s->count > 0) {
+        out[n++] = s->buf[s->head];
+        s->head = (s->head + 1) % USOCK_BUF;
+        s->count--;
+    }
+    return (long)n;
+}
+static long
+sock_write(struct lfd *f, const void *buf, unsigned long count)
+{
+    struct usock *s = &usocks[f->sidx];
+    if (s->listening)
+        return -LERR_INVAL;
+    int nb = (f->oflags & O_NONBLOCK) != 0;
+    const uint8_t *in = buf;
+    unsigned long done = 0;
+    while (done < count) {
+        if (s->peer < 0 || s->peer_closed || s->shut_wr) {
+            if (done)
+                return (long)done;
+            if (lproc_cur->sh->sigact[SIGPIPE - 1].handler == SIG_DFL) {
+                lproc_cur->sh->exit_sig = SIGPIPE;
+                do_exit(0, 1);
+            }
+            return -LERR_PIPE;
+        }
+        struct usock *peer = &usocks[s->peer];
+        while (done < count && peer->count < USOCK_BUF) {
+            uint32_t tail = (peer->head + peer->count) % USOCK_BUF;
+            peer->buf[tail] = in[done++];
+            peer->count++;
+        }
+        if (done < count) {             /* peer buffer full */
+            if (nb)
+                return done ? (long)done : -LERR_AGAIN;
+            lx_yield();
+            signal_killpoint();
+            if (signal_deliverable())
+                return done ? (long)done : -LERR_RESTARTSYS;
+        }
+    }
+    return (long)done;
+}
+static short
+sock_poll(struct lfd *f, short ev)
+{
+    struct usock *s = &usocks[f->sidx];
+    short r = 0;
+    if (s->listening) {
+        if (s->acceptq_n > 0)
+            r |= (short)(ev & POLLIN);
+        return r;
+    }
+    if (s->count > 0)
+        r |= (short)(ev & POLLIN);
+    if (s->peer < 0 || s->peer_closed) {
+        r |= POLLHUP;                   /* readable: a read returns EOF */
+        r |= (short)(ev & POLLIN);
+    } else if (usocks[s->peer].count < USOCK_BUF) {
+        r |= (short)(ev & POLLOUT);
+    }
+    return r;
+}
+static void sock_ref(struct lfd *f) { usocks[f->sidx].nref++; }
+static void
+sock_close(struct lfd *f)
+{
+    struct usock *s = &usocks[f->sidx];
+    if (s->nref > 0)
+        s->nref--;
+    if (s->nref > 0)
+        return;                         /* other descriptors still hold it */
+    if (s->listening) {                 /* drop connections queued but unaccepted */
+        for (int k = 0; k < s->acceptq_n; k++) {
+            int qi = s->acceptq[(s->acceptq_head + k) % USOCK_BACKLOG];
+            struct usock *q = &usocks[qi];
+            if (q->peer >= 0) {
+                usocks[q->peer].peer_closed = 1;
+                usocks[q->peer].peer = -1;
+            }
+            q->used = 0;
+        }
+    }
+    if (s->peer >= 0) {                 /* tell the peer we are gone (its read EOFs) */
+        usocks[s->peer].peer_closed = 1;
+        usocks[s->peer].peer = -1;
+    }
+    s->used = 0;
+}
+
+static const struct fd_ops con_ops = {
+    "con", con_read, con_write, dflt_poll, NULL, NULL,
+};
+static const struct fd_ops pipe_ops = {
+    "pipe", pipe_fd_read, pipe_fd_write, pipe_poll, pipe_ref, pipe_close,
+};
+static const struct fd_ops ram_ops = {
+    "ram", ram_read, ram_write, dflt_poll, ram_ref, ram_close,
+};
+static const struct fd_ops p9_ops = {
+    "9p", p9_fd_read, p9_fd_write, dflt_poll, p9_ref, p9_close,
+};
+static const struct fd_ops dir_ops = {
+    "dir", rd_einval, wr_ebadf, dflt_poll, p9_ref, p9_close,
+};
+static const struct fd_ops dev_ops = {
+    "dev", dev_fd_read, dev_fd_write, dflt_poll, NULL, NULL,
+};
+static const struct fd_ops epoll_ops = {
+    "epoll", rd_einval, wr_ebadf, dflt_poll, epoll_ref, epoll_close,
+};
+static const struct fd_ops eventfd_ops = {
+    "eventfd", eventfd_read, eventfd_write, eventfd_poll, eventfd_ref, eventfd_close,
+};
+static const struct fd_ops sock_ops = {
+    "sock", sock_read, sock_write, sock_poll, sock_ref, sock_close,
+};
+
+static void
+fd_set_kind(struct lfd *f, enum fd_kind k)
+{
+    f->kind = k;
+    switch (k) {
+    case FD_CON:     f->ops = &con_ops;     break;
+    case FD_PIPE:    f->ops = &pipe_ops;    break;
+    case FD_RAM:     f->ops = &ram_ops;     break;
+    case FD_9P:      f->ops = &p9_ops;      break;
+    case FD_DIR:     f->ops = &dir_ops;     break;
+    case FD_DEV:     f->ops = &dev_ops;     break;
+    case FD_EPOLL:   f->ops = &epoll_ops;   break;
+    case FD_EVENTFD: f->ops = &eventfd_ops; break;
+    case FD_SOCK:    f->ops = &sock_ops;    break;
+    default:         f->ops = NULL;         break;
+    }
+}
+
+/* ---- AF_UNIX socket syscalls ---- */
+
+static int
+usock_alloc(void)
+{
+    for (int i = 0; i < USOCK_MAX; i++)
+        if (!usocks[i].used)
+            return i;
+    return -1;
+}
+
+/* Parse a user sockaddr_un into a path key (its sun_path, NUL-terminated). */
+static long
+read_sun(uint64_t uaddr, uint64_t addrlen, char *out, size_t outsz)
+{
+    if (!uaddr || addrlen < 2)
+        return -LERR_INVAL;
+    uint8_t tmp[2 + USOCK_PATHMAX];
+    uint64_t n = addrlen > sizeof tmp ? sizeof tmp : addrlen;
+    if (copy_from_user(tmp, uaddr, n) < 0)
+        return -LERR_FAULT;
+    uint16_t fam = (uint16_t)(tmp[0] | (tmp[1] << 8));
+    if (fam != AF_UNIX)
+        return -LERR_INVAL;
+    size_t pl = (size_t)n - 2;
+    size_t i = 0;
+    for (; i < pl && i < outsz - 1 && tmp[2 + i]; i++)
+        out[i] = (char)tmp[2 + i];
+    out[i] = '\0';
+    return 0;
+}
+
+/* Fill a user sockaddr_un from a path and update its socklen_t in/out length. */
+static long
+write_sun(uint64_t uaddr, uint64_t ulenptr, const char *path)
+{
+    if (!uaddr || !ulenptr)
+        return 0;                       /* the caller does not want the address */
+    uint8_t tmp[2 + USOCK_PATHMAX];
+    memset(tmp, 0, sizeof tmp);
+    tmp[0] = AF_UNIX & 0xff;
+    tmp[1] = (AF_UNIX >> 8) & 0xff;
+    uint32_t pl = 0;
+    if (path)
+        while (path[pl] && pl < USOCK_PATHMAX - 1) {
+            tmp[2 + pl] = (uint8_t)path[pl];
+            pl++;
+        }
+    uint32_t full = 2 + pl + (pl ? 1 : 0);      /* include the NUL for a name */
+    uint32_t want;
+    if (copy_from_user(&want, ulenptr, sizeof want) < 0)
+        return -LERR_FAULT;
+    uint32_t n = want < full ? want : full;
+    if (n && copy_to_user(uaddr, tmp, n) < 0)
+        return -LERR_FAULT;
+    if (copy_to_user(ulenptr, &full, sizeof full) < 0)
+        return -LERR_FAULT;
+    return 0;
+}
+
+static long
+do_socket(int domain, int type, int protocol)
+{
+    if (domain != AF_UNIX)
+        return -LERR_NOSYS;             /* only AF_UNIX; caller falls back */
+    if ((type & SOCK_TYPE_MASK) != SOCK_STREAM)
+        return -LERR_NOSYS;
+    (void)protocol;
+    int si = usock_alloc();
+    if (si < 0)
+        return -LERR_NOMEM;
+    int fd = fd_alloc();
+    if (fd < 0)
+        return -LERR_NOMEM;
+    struct usock *s = &usocks[si];
+    memset(s, 0, sizeof *s);
+    s->used = 1;
+    s->nref = 1;
+    s->peer = -1;
+    struct lfd *f = &fds[fd];
+    memset(f, 0, sizeof *f);
+    f->used = 1;
+    fd_set_kind(f, FD_SOCK);
+    f->sidx = si;
+    f->oflags = O_RDWR;
+    if (type & SOCK_NONBLOCK) f->oflags |= O_NONBLOCK;
+    if (type & SOCK_CLOEXEC)  f->cloexec = 1;
+    return fd;
+}
+
+static long
+do_bind(long fd, uint64_t uaddr, uint64_t addrlen)
+{
+    struct lfd *f = fd_get(fd);
+    if (!f)
+        return -LERR_BADF;
+    if (f->kind != FD_SOCK)
+        return -LERR_NOTSOCK;
+    struct usock *s = &usocks[f->sidx];
+    if (s->bound)
+        return -LERR_INVAL;
+    char path[USOCK_PATHMAX];
+    long e = read_sun(uaddr, addrlen, path, sizeof path);
+    if (e < 0)
+        return e;
+    for (int i = 0; i < USOCK_MAX; i++)
+        if (usocks[i].used && usocks[i].bound && strcmp(usocks[i].path, path) == 0)
+            return -LERR_ADDRINUSE;
+    size_t n = 0;
+    while (path[n] && n < USOCK_PATHMAX - 1) { s->path[n] = path[n]; n++; }
+    s->path[n] = '\0';
+    s->bound = 1;
+    return 0;
+}
+
+static long
+do_listen(long fd, int backlog)
+{
+    struct lfd *f = fd_get(fd);
+    if (!f)
+        return -LERR_BADF;
+    if (f->kind != FD_SOCK)
+        return -LERR_NOTSOCK;
+    struct usock *s = &usocks[f->sidx];
+    if (!s->bound)
+        return -LERR_INVAL;
+    s->listening = 1;
+    s->backlog = backlog < 1 ? 1
+               : (backlog > USOCK_BACKLOG ? USOCK_BACKLOG : backlog);
+    return 0;
+}
+
+static long
+do_connect(long fd, uint64_t uaddr, uint64_t addrlen)
+{
+    struct lfd *f = fd_get(fd);
+    if (!f)
+        return -LERR_BADF;
+    if (f->kind != FD_SOCK)
+        return -LERR_NOTSOCK;
+    struct usock *s = &usocks[f->sidx];
+    if (s->listening)
+        return -LERR_INVAL;
+    if (s->peer >= 0)
+        return -LERR_ISCONN;
+    char path[USOCK_PATHMAX];
+    long e = read_sun(uaddr, addrlen, path, sizeof path);
+    if (e < 0)
+        return e;
+    int li = -1;
+    for (int i = 0; i < USOCK_MAX; i++)
+        if (usocks[i].used && usocks[i].listening && usocks[i].bound &&
+            strcmp(usocks[i].path, path) == 0) {
+            li = i;
+            break;
+        }
+    if (li < 0)
+        return -LERR_CONNREFUSED;
+    struct usock *L = &usocks[li];
+    if (L->acceptq_n >= L->backlog)
+        return -LERR_CONNREFUSED;
+    int sv = usock_alloc();
+    if (sv < 0)
+        return -LERR_CONNREFUSED;
+    struct usock *S = &usocks[sv];
+    memset(S, 0, sizeof *S);
+    S->used = 1;
+    S->nref = 0;                        /* held by the accept queue until accept */
+    S->peer = f->sidx;
+    size_t n = 0;                       /* the accepted side's local name */
+    while (L->path[n] && n < USOCK_PATHMAX - 1) { S->path[n] = L->path[n]; n++; }
+    S->path[n] = '\0';
+    s->peer = sv;
+    L->acceptq[(L->acceptq_head + L->acceptq_n) % USOCK_BACKLOG] = sv;
+    L->acceptq_n++;
+    return 0;
+}
+
+static long
+do_accept(long fd, uint64_t uaddr, uint64_t uaddrlen, int flags)
+{
+    struct lfd *f = fd_get(fd);
+    if (!f)
+        return -LERR_BADF;
+    if (f->kind != FD_SOCK)
+        return -LERR_NOTSOCK;
+    struct usock *s = &usocks[f->sidx];
+    if (!s->listening)
+        return -LERR_INVAL;
+    int nb = (f->oflags & O_NONBLOCK) || (flags & SOCK_NONBLOCK);
+    while (s->acceptq_n == 0) {
+        if (nb)
+            return -LERR_AGAIN;
+        lx_yield();
+        signal_killpoint();
+        if (signal_deliverable())
+            return -LERR_RESTARTSYS;
+    }
+    int sv = s->acceptq[s->acceptq_head];
+    s->acceptq_head = (s->acceptq_head + 1) % USOCK_BACKLOG;
+    s->acceptq_n--;
+    int nfd = fd_alloc();
+    if (nfd < 0) {                      /* no fd: drop the connection */
+        struct usock *S = &usocks[sv];
+        if (S->peer >= 0) {
+            usocks[S->peer].peer_closed = 1;
+            usocks[S->peer].peer = -1;
+        }
+        S->used = 0;
+        return -LERR_NOMEM;
+    }
+    usocks[sv].nref = 1;
+    struct lfd *nf = &fds[nfd];
+    memset(nf, 0, sizeof *nf);
+    nf->used = 1;
+    fd_set_kind(nf, FD_SOCK);
+    nf->sidx = sv;
+    nf->oflags = O_RDWR;
+    if (flags & SOCK_NONBLOCK) nf->oflags |= O_NONBLOCK;
+    if (flags & SOCK_CLOEXEC)  nf->cloexec = 1;
+    write_sun(uaddr, uaddrlen, "");     /* the connecting peer is unnamed */
+    return nfd;
+}
+
+static long
+do_getsockname(long fd, uint64_t uaddr, uint64_t ulen)
+{
+    struct lfd *f = fd_get(fd);
+    if (!f)
+        return -LERR_BADF;
+    if (f->kind != FD_SOCK)
+        return -LERR_NOTSOCK;
+    return write_sun(uaddr, ulen, usocks[f->sidx].path);
+}
+
+static long
+do_getpeername(long fd, uint64_t uaddr, uint64_t ulen)
+{
+    struct lfd *f = fd_get(fd);
+    if (!f)
+        return -LERR_BADF;
+    if (f->kind != FD_SOCK)
+        return -LERR_NOTSOCK;
+    struct usock *s = &usocks[f->sidx];
+    if (s->peer < 0)
+        return -LERR_NOTCONN;
+    return write_sun(uaddr, ulen, usocks[s->peer].path);
+}
+
+static long
+do_shutdown(long fd, int how)
+{
+    struct lfd *f = fd_get(fd);
+    if (!f)
+        return -LERR_BADF;
+    if (f->kind != FD_SOCK)
+        return -LERR_NOTSOCK;
+    struct usock *s = &usocks[f->sidx];
+    if (how == SHUT_RD || how == SHUT_RDWR)
+        s->shut_rd = 1;
+    if (how == SHUT_WR || how == SHUT_RDWR) {
+        s->shut_wr = 1;
+        if (s->peer >= 0)
+            usocks[s->peer].peer_closed = 1;
+    }
+    return 0;
+}
+
+static long
+do_setsockopt(long fd, uint64_t optval, uint64_t optlen)
+{
+    struct lfd *f = fd_get(fd);
+    (void)optval; (void)optlen;
+    if (!f)
+        return -LERR_BADF;
+    if (f->kind != FD_SOCK)
+        return -LERR_NOTSOCK;
+    return 0;                           /* accept and ignore every option */
+}
+
+static long
+do_getsockopt(long fd, uint64_t optval, uint64_t optlenptr)
+{
+    struct lfd *f = fd_get(fd);
+    if (!f)
+        return -LERR_BADF;
+    if (f->kind != FD_SOCK)
+        return -LERR_NOTSOCK;
+    int val = 0;                        /* SO_ERROR and all others report 0 */
+    uint32_t olen = 0;
+    if (optlenptr && copy_from_user(&olen, optlenptr, sizeof olen) < 0)
+        return -LERR_FAULT;
+    uint32_t n = olen < sizeof val ? olen : sizeof val;
+    if (optval && n && copy_to_user(optval, &val, n) < 0)
+        return -LERR_FAULT;
+    uint32_t full = sizeof val;
+    if (optlenptr && copy_to_user(optlenptr, &full, sizeof full) < 0)
+        return -LERR_FAULT;
+    return 0;
+}
+
 static long
 do_read(long fd, void *buf, unsigned long count)
 {
@@ -2647,42 +3290,7 @@ do_read(long fd, void *buf, unsigned long count)
         return -LERR_BADF;
     if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
         return -LERR_FAULT;
-    if (f->isdev)
-        return dev_read(f->devno, buf, count);
-    if (f->iseventfd)
-        return eventfd_read(f, buf, count);
-    if (f->iscon)
-        return 0;                       /* console stdin: EOF */
-    if (f->ispipe) {
-        if (f->wr)
-            return -LERR_BADF;
-        struct lpipe *p = &pipes[f->pidx];
-        /* Block until data arrives or every writer has closed (then EOF = 0). */
-        while (p->count == 0 && p->writers > 0) {
-            lx_yield();          /* empty pipe: let a writer fill it */
-            signal_killpoint();  /* a fatal signal unblocks and terminates */
-            if (signal_deliverable())   /* a caught signal: run its handler */
-                return -LERR_RESTARTSYS;
-        }
-        return pipe_read(p, buf, count);
-    }
-    if (f->isram) {
-        struct ramfile *rf = &ramfs[f->ridx];
-        if (f->of->pos >= rf->len)
-            return 0;
-        uint32_t avail = rf->len - (uint32_t)f->of->pos;
-        uint32_t n = count < avail ? (uint32_t)count : avail;
-        memcpy(buf, rf->data + f->of->pos, n);
-        f->of->pos += n;
-        return n;
-    }
-    if (f->isdir)
-        return -LERR_INVAL;
-    long n = p9_read(f->p9fid, f->of->pos, buf, (uint32_t)count);
-    if (n < 0)
-        return -LERR_INVAL;
-    f->of->pos += (uint64_t)n;
-    return n;
+    return f->ops->read(f, buf, count);
 }
 
 /* pread: read at an explicit offset without moving the fd cursor. The dynamic
@@ -2693,13 +3301,13 @@ do_pread(long fd, void *buf, unsigned long count, uint64_t off)
 {
     struct lfd *f = fd_get(fd);
 
-    if (!f || f->iscon || f->ispipe || f->isdir)
+    if (!f || f->kind == FD_CON || f->kind == FD_PIPE || f->kind == FD_DIR)
         return -LERR_BADF;
     if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
         return -LERR_FAULT;
-    if (f->isdev)
+    if (f->kind == FD_DEV)
         return dev_read(f->devno, buf, count);  /* char device: offset ignored */
-    if (f->isram) {
+    if (f->kind == FD_RAM) {
         struct ramfile *rf = &ramfs[f->ridx];
         if (off >= rf->len)
             return 0;
@@ -2721,13 +3329,13 @@ do_pwrite(long fd, const void *buf, unsigned long count, uint64_t off)
 {
     struct lfd *f = fd_get(fd);
 
-    if (!f || f->iscon || f->ispipe || f->isdir)
+    if (!f || f->kind == FD_CON || f->kind == FD_PIPE || f->kind == FD_DIR)
         return -LERR_BADF;
     if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
         return -LERR_FAULT;
-    if (f->isdev)
+    if (f->kind == FD_DEV)
         return dev_write(f->devno, buf, count);  /* char device: offset ignored */
-    if (f->isram) {
+    if (f->kind == FD_RAM) {
         struct ramfile *rf = &ramfs[f->ridx];
         uint64_t end = off + count;
         if (end > RAMFS_FILE_MAX || ramfs_grow(rf, (uint32_t)end) < 0)
@@ -2761,48 +3369,9 @@ do_close(long fd)
 
     if (!f)
         return -LERR_BADF;
-    if (f->iscon || f->isdev) {
-        f->used = 0;                    /* drop the fd; the device is stateless */
-        return 0;
-    }
-    if (f->isepoll) {
-        struct epoll *ep = &epolls[f->epidx];
-        if (ep->nref > 0 && --ep->nref == 0)
-            ep->used = 0;               /* last reference: free the instance */
-        f->used = 0;
-        return 0;
-    }
-    if (f->iseventfd) {
-        struct leventfd *e = &eventfds[f->efdidx];
-        if (e->nref > 0 && --e->nref == 0)
-            e->used = 0;                /* last reference: free the counter */
-        f->used = 0;
-        return 0;
-    }
-    if (f->isram) {
-        ramfs_unref(f->ridx);           /* frees the slot if unlinked and last */
-        ofile_unref(f->of);
-        f->used = 0;
-        return 0;
-    }
-    if (f->ispipe) {                    /* a pipe fd has no offset (of is NULL) */
-        struct lpipe *p = &pipes[f->pidx];
-        if (f->wr && p->writers > 0)
-            p->writers--;
-        else if (!f->wr && p->readers > 0)
-            p->readers--;
-        if (p->readers == 0 && p->writers == 0)
-            p->used = 0;
-        f->used = 0;
-        return 0;
-    }
-    if (f->p9fid) {                     /* an overlay-only directory has none */
-        uint32_t slot = f->p9fid - LINUX_FID_BASE;
-        if (gfidref[slot] && --gfidref[slot] == 0)
-            p9_clunk(f->p9fid);         /* last reference: release the fid */
-    }
-    ofile_unref(f->of);                 /* 9P file/dir, or an overlay-only dir */
-    f->used = 0;
+    if (f->ops && f->ops->close)
+        f->ops->close(f);               /* drop one backend reference */
+    f->used = 0;                        /* release the descriptor slot */
     return 0;
 }
 
@@ -2815,16 +3384,16 @@ do_lseek(long fd, long off, long whence)
         return -LERR_BADF;
     /* A /dev character device has no meaningful position; a seek on it is a
      * no-op that reports offset 0, as /dev/null and friends do on Linux. */
-    if (f->isdev)
+    if (f->kind == FD_DEV)
         return 0;
     /* A pipe or the console is not seekable, whatever fd number it sits on.
      * A file-backed fd is seekable even when it has been moved onto 0, 1 or 2
      * by a redirect, which is exactly what grep does: lseek(0, 0, SEEK_CUR). */
-    if (f->iscon || f->ispipe)
+    if (f->kind == FD_CON || f->kind == FD_PIPE)
         return -LERR_SPIPE;
     if (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END)
         return -LERR_INVAL;
-    uint64_t end = f->isram ? ramfs[f->ridx].len : f->size;
+    uint64_t end = f->kind == FD_RAM ? ramfs[f->ridx].len : f->size;
     uint64_t base = (whence == SEEK_CUR) ? f->of->pos :
                     (whence == SEEK_END) ? end : 0;
     f->of->pos = base + (uint64_t)off;
@@ -3175,14 +3744,14 @@ do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
         struct lfd *f = fd_get(dirfd);
         if (!f)
             return -LERR_BADF;
-        if (f->isdev) {
+        if (f->kind == FD_DEV) {
             ischar = 1;
             ino = f->ino;
-        } else if (f->isram) {
+        } else if (f->kind == FD_RAM) {
             size = ramfs[f->ridx].len;
             ino = (uint64_t)(0x10000 + f->ridx);
         } else {
-            isdir = f->isdir;
+            isdir = f->kind == FD_DIR;
             size = f->size;
             ino = f->p9fid;
         }
@@ -3206,7 +3775,7 @@ do_fstat(long fd, struct linux_stat *out)
         return -LERR_BADF;
     if (!user_ok((uint64_t)(uintptr_t)out, sizeof *out))
         return -LERR_FAULT;
-    if (f->ispipe) {
+    if (f->kind == FD_PIPE) {
         /* Report a FIFO so a tool copies with a read/write loop, not mmap. */
         memset(out, 0, sizeof *out);
         out->st_mode = S_IFIFO | 0644;
@@ -3215,20 +3784,20 @@ do_fstat(long fd, struct linux_stat *out)
         out->st_ino = (uint64_t)(0x20000 + f->pidx);
         return 0;
     }
-    if (f->isdev) {
+    if (f->kind == FD_DEV) {
         fill_stat(out, 0, 0, f->ino);
         out->st_mode = S_IFCHR | 0666;              /* a /dev character device */
         return 0;
     }
-    if (f->iscon) {
+    if (f->kind == FD_CON) {
         fill_stat(out, 0, 0, (uint64_t)fd);         /* console: a plain reg */
         return 0;
     }
-    if (f->isram) {
+    if (f->kind == FD_RAM) {
         fill_stat(out, 0, ramfs[f->ridx].len, (uint64_t)(0x10000 + f->ridx));
         return 0;
     }
-    fill_stat(out, f->isdir, f->size, f->ino);
+    fill_stat(out, f->kind == FD_DIR, f->size, f->ino);
     return 0;
 }
 
@@ -3265,7 +3834,7 @@ do_getdents64(long fd, void *buf, unsigned long count)
 
     if (!f || fd < 3)
         return -LERR_BADF;
-    if (!f->isdir)
+    if (f->kind != FD_DIR)
         return -LERR_NOTDIR;
     if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
         return -LERR_FAULT;
@@ -3463,10 +4032,10 @@ release_fds(struct lshared *sh)
 {
     for (int i = 0; i < LINUX_NFD; i++) {
         struct lfd *f = &sh->fdtab[i];
-        if (!f->used || f->iscon)
+        if (!f->used || f->kind == FD_CON)
             continue;
         ofile_unref(f->of);             /* drop this fd's share of the offset */
-        if (f->ispipe) {
+        if (f->kind == FD_PIPE) {
             struct lpipe *pp = &pipes[f->pidx];
             if (f->wr && pp->writers > 0)
                 pp->writers--;
@@ -3474,8 +4043,17 @@ release_fds(struct lshared *sh)
                 pp->readers--;
             if (pp->readers == 0 && pp->writers == 0)
                 pp->used = 0;
-        } else if (f->isram) {
+        } else if (f->kind == FD_RAM) {
             ramfs_unref(f->ridx);       /* drop this process's ramfile reference */
+        } else if (f->kind == FD_SOCK || f->kind == FD_EVENTFD ||
+                   f->kind == FD_EPOLL) {
+            /* These share a global backend pool across fork and hold no ofile.
+             * Their close op drops the reference, and for a socket it marks the
+             * peer closed so a client blocked in read/recv gets EOF when the
+             * server process exits. Missing this leaks the slot and hangs the
+             * peer. */
+            if (f->ops && f->ops->close)
+                f->ops->close(f);
         } else if (f->p9fid) {
             uint32_t slot = f->p9fid - LINUX_FID_BASE;
             if (gfidref[slot] && --gfidref[slot] == 0)
@@ -3599,26 +4177,14 @@ do_fork(void)
     memcpy(csh->mmap_holes, parent->sh->mmap_holes,
            (size_t)csh->mmap_nhole * sizeof csh->mmap_holes[0]);
 
-    /* Account for the inherited descriptors (the child shares them). */
+    /* Account for the inherited descriptors (the child shares them): one backend
+     * reference each, through the same ops->ref a dup takes. */
     for (int i = 0; i < LINUX_NFD; i++) {
         struct lfd *f = &csh->fdtab[i];
-        if (!f->used || f->iscon)
+        if (!f->used)
             continue;
-        if (f->of)
-            f->of->nref++;              /* child shares the offset */
-        if (f->ispipe) {
-            if (f->wr)
-                pipes[f->pidx].writers++;
-            else
-                pipes[f->pidx].readers++;
-        } else if (f->isram)
-            ramfs[f->ridx].nref++;
-        else if (f->isepoll)
-            epolls[f->epidx].nref++;
-        else if (f->iseventfd)
-            eventfds[f->efdidx].nref++;
-        else if (f->p9fid)
-            gfidref[f->p9fid - LINUX_FID_BASE]++;
+        if (f->ops && f->ops->ref)
+            f->ops->ref(f);
     }
 
     /* The main thread resumes at the fork() site on the cloned stack, rax = 0. */
@@ -3701,20 +4267,20 @@ inherit_fds(struct lshared *csh)
 {
     for (int i = 0; i < LINUX_NFD; i++) {
         struct lfd *f = &csh->fdtab[i];
-        if (!f->used || f->iscon)
+        if (!f->used || f->kind == FD_CON)
             continue;
         if (f->of)
             f->of->nref++;              /* child shares the offset */
-        if (f->ispipe) {
+        if (f->kind == FD_PIPE) {
             if (f->wr)
                 pipes[f->pidx].writers++;
             else
                 pipes[f->pidx].readers++;
-        } else if (f->isram)
+        } else if (f->kind == FD_RAM)
             ramfs[f->ridx].nref++;
-        else if (f->isepoll)
+        else if (f->kind == FD_EPOLL)
             epolls[f->epidx].nref++;
-        else if (f->iseventfd)
+        else if (f->kind == FD_EVENTFD)
             eventfds[f->efdidx].nref++;
         else if (f->p9fid)
             gfidref[f->p9fid - LINUX_FID_BASE]++;
@@ -4634,11 +5200,49 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return 0;
     }
     case SYS_socket:
+        /* Only AF_UNIX is backed; do_socket returns ENOSYS for anything else,
+         * which is the "not a socket" answer gcc's getpeername probe expects. */
+        return do_socket((int)a1, (int)a2, (int)a3);
+    case SYS_bind:
+        return do_bind(a1, (uint64_t)a2, (uint64_t)a3);
+    case SYS_listen:
+        return do_listen(a1, (int)a2);
+    case SYS_connect:
+        return do_connect(a1, (uint64_t)a2, (uint64_t)a3);
+    case SYS_accept:
+        return do_accept(a1, (uint64_t)a2, (uint64_t)a3, 0);
+    case SYS_accept4:
+        return do_accept(a1, (uint64_t)a2, (uint64_t)a3, (int)a4);
     case SYS_getsockname:
+        return do_getsockname(a1, (uint64_t)a2, (uint64_t)a3);
     case SYS_getpeername:
-        /* No sockets in this guest. gcc calls getpeername on its output to see
-         * whether it is a socket; a quiet ENOSYS is the "no" it expects. */
-        return -LERR_NOSYS;
+        return do_getpeername(a1, (uint64_t)a2, (uint64_t)a3);
+    case SYS_shutdown:
+        return do_shutdown(a1, (int)a2);
+    case SYS_setsockopt:
+        return do_setsockopt(a1, (uint64_t)a4, (uint64_t)a5);
+    case SYS_getsockopt:
+        return do_getsockopt(a1, (uint64_t)a4, (uint64_t)a5);
+    case SYS_sendto: {
+        struct lfd *f = fd_get(a1);
+        if (!f)
+            return -LERR_BADF;
+        if (f->kind != FD_SOCK)
+            return -LERR_NOTSOCK;
+        if (a3 && !user_ok((uint64_t)a2, (unsigned long)a3))
+            return -LERR_FAULT;
+        return sock_write(f, (const void *)a2, (unsigned long)a3);
+    }
+    case SYS_recvfrom: {
+        struct lfd *f = fd_get(a1);
+        if (!f)
+            return -LERR_BADF;
+        if (f->kind != FD_SOCK)
+            return -LERR_NOTSOCK;
+        if (a3 && !user_ok((uint64_t)a2, (unsigned long)a3))
+            return -LERR_FAULT;
+        return sock_read(f, (void *)a2, (unsigned long)a3);
+    }
     case SYS_getrandom: {
         uint8_t *buf = (uint8_t *)a1;
         unsigned long len = (unsigned long)a2;
@@ -4977,7 +5581,7 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         struct lfd *f = fd_get(a1);
         if (!f)
             return -LERR_BADF;
-        if (!f->isdir || !f->of)
+        if (f->kind != FD_DIR || !f->of)
             return -LERR_NOTDIR;
         size_t i = 0;
         while (f->of->dpath[i] && i < sizeof cwd_key - 1) {
@@ -5197,6 +5801,14 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
                                          * EINVAL, so a write temp file could not
                                          * be opened (sort, among others). */
             return src->oflags | O_LARGEFILE;
+        if (a2 == 4) {                  /* F_SETFL: update the changeable flags,
+                                         * keeping the access mode. O_NONBLOCK
+                                         * here is what a socket event loop sets
+                                         * so accept/recv return EAGAIN. */
+            src->oflags = (src->oflags & O_ACCMODE) |
+                          (int)(a3 & (O_NONBLOCK | O_APPEND));
+            return 0;
+        }
         return 0;
     }
     case SYS_execve: {
@@ -5737,7 +6349,8 @@ linux_tables_init(void)
     ofiles  = kmalloc(sizeof *ofiles * LINUX_NOFILE);
     shareds = kmalloc(sizeof *shareds * LINUX_NPROC);
     procs   = kmalloc(sizeof *procs * LINUX_NPROC);
-    if (!ramfs || !ofiles || !shareds || !procs) {
+    usocks  = kmalloc(sizeof *usocks * USOCK_MAX);
+    if (!ramfs || !ofiles || !shareds || !procs || !usocks) {
         con_puts("[bin] kernel heap too small for the process tables\n");
         arch_halt();
     }
@@ -5745,6 +6358,7 @@ linux_tables_init(void)
     memset(ofiles, 0, sizeof *ofiles * LINUX_NOFILE);
     memset(shareds, 0, sizeof *shareds * LINUX_NPROC);
     memset(procs, 0, sizeof *procs * LINUX_NPROC);
+    memset(usocks, 0, sizeof *usocks * USOCK_MAX);
     linux_rwmount_init();
 }
 
