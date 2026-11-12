@@ -247,6 +247,16 @@ gr_removef(void *ctx, const struct p9_node *node)
     return be->removef(bctx, node);
 }
 
+static int
+gr_openh(void *ctx, const struct p9_node *file, int for_write)
+{
+    void *bctx;
+    const struct p9_backend *be = owner(ctx, file, &bctx);
+    if (!be->openh)
+        return -1;
+    return be->openh(bctx, file, for_write);
+}
+
 static const struct p9_backend graft_backend = {
     .root = gr_root,
     .walk = gr_walk,
@@ -256,6 +266,7 @@ static const struct p9_backend graft_backend = {
     .create = gr_create,
     .truncate = gr_truncate,
     .removef = gr_removef,
+    .openh = gr_openh,
 };
 
 struct p9graft *

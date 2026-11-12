@@ -7,6 +7,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "jotun_9p.h"
 
@@ -27,6 +28,17 @@ find_fid(struct p9srv *s, uint32_t fid)
     return -1;
 }
 
+/* Release a fid: close a held host descriptor and free the slot. */
+static void
+release_fid(struct p9srv *s, int fi)
+{
+    if (s->fids[fi].hostfd >= 0) {
+        close(s->fids[fi].hostfd);
+        s->fids[fi].hostfd = -1;
+    }
+    s->fids[fi].used = 0;
+}
+
 static int
 alloc_fid(struct p9srv *s, uint32_t fid)
 {
@@ -37,11 +49,23 @@ alloc_fid(struct p9srv *s, uint32_t fid)
         if (!s->fids[i].used) {
             s->fids[i].used = 1;
             s->fids[i].open = 0;
+            s->fids[i].hostfd = -1;
             s->fids[i].fid = fid;
             return i;
         }
     }
     return -1;
+}
+
+/* Open a host descriptor for a just-opened or just-created regular-file fid, if
+ * the backend serves one. Held for the fid's lifetime; reads and writes then go
+ * through it (so the file survives being unlinked while open). */
+static void
+hold_fid_fd(struct p9srv *s, int fi, int for_write)
+{
+    s->fids[fi].hostfd = -1;
+    if (!s->fids[fi].node.is_dir && s->be->openh)
+        s->fids[fi].hostfd = s->be->openh(s->ctx, &s->fids[fi].node, for_write);
 }
 
 static void
@@ -152,9 +176,10 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
         p9i_str(&in, ver, sizeof ver);
         if (msize > JOTUN_P9_MSIZE)
             msize = JOTUN_P9_MSIZE;
-        /* A new session: drop any existing fids. */
+        /* A new session: drop any existing fids, closing held descriptors. */
         for (int i = 0; i < P9_MAXFID; i++)
-            s->fids[i].used = 0;
+            if (s->fids[i].used)
+                release_fid(s, i);
         reply_hdr(&o, rsp, rspcap, P9_RVERSION, tag);
         p9o_u32(&o, msize);
         p9o_str(&o, "9P2000");
@@ -243,6 +268,7 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
             s->fids[fi].node.length = 0;
         }
         s->fids[fi].open = 1;
+        hold_fid_fd(s, fi, wants_write);
         reply_hdr(&o, rsp, rspcap, P9_ROPEN, tag);
         put_qid(&o, &s->fids[fi].node);
         p9o_u32(&o, 0);             /* iounit */
@@ -288,7 +314,13 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
             uint8_t tmp[JOTUN_P9_MSIZE];
             if (count > sizeof tmp)
                 count = sizeof tmp;
-            long got = s->be->readf(s->ctx, n, offset, tmp, count);
+            long got;
+            if (s->fids[fi].hostfd >= 0) {
+                ssize_t r = pread(s->fids[fi].hostfd, tmp, count, (off_t)offset);
+                got = r < 0 ? -1 : r;
+            } else {
+                got = s->be->readf(s->ctx, n, offset, tmp, count);
+            }
             if (got < 0)
                 return reply_error(rsp, rspcap, tag, "read failed");
             p9o_u32(&o, (uint32_t)got);
@@ -300,7 +332,7 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
         uint32_t fid = p9i_u32(&in);
         int fi = find_fid(s, fid);
         if (fi >= 0)
-            s->fids[fi].used = 0;
+            release_fid(s, fi);
         if (s->dir_valid && s->dir_fid == fid)
             s->dir_valid = 0;           /* its cached listing is now stale */
         reply_hdr(&o, rsp, rspcap, P9_RCLUNK, tag);
@@ -341,6 +373,7 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
             return reply_error(rsp, rspcap, tag, "create failed");
         s->fids[fi].node = nn;
         s->fids[fi].open = 1;
+        hold_fid_fd(s, fi, 1);      /* read-write: a create-write-read fid reuses it */
         reply_hdr(&o, rsp, rspcap, P9_RCREATE, tag);
         put_qid(&o, &s->fids[fi].node);
         p9o_u32(&o, 0);             /* iounit */
@@ -358,7 +391,13 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
             return reply_error(rsp, rspcap, tag, "bad fid");
         if (!s->be->writef)
             return reply_error(rsp, rspcap, tag, "read-only");
-        long wrote = s->be->writef(s->ctx, &s->fids[fi].node, offset, data, count);
+        long wrote;
+        if (s->fids[fi].hostfd >= 0) {
+            ssize_t w = pwrite(s->fids[fi].hostfd, data, count, (off_t)offset);
+            wrote = w < 0 ? -1 : w;
+        } else {
+            wrote = s->be->writef(s->ctx, &s->fids[fi].node, offset, data, count);
+        }
         if (wrote < 0)
             return reply_error(rsp, rspcap, tag, "write failed");
         if (offset + (uint64_t)wrote > s->fids[fi].node.length)
@@ -375,7 +414,7 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
         if (fi < 0)
             return reply_error(rsp, rspcap, tag, "bad fid");
         int rc = s->be->removef ? s->be->removef(s->ctx, &s->fids[fi].node) : -1;
-        s->fids[fi].used = 0;
+        release_fid(s, fi);
         if (s->dir_valid && s->dir_fid == fid)
             s->dir_valid = 0;
         if (rc != 0)

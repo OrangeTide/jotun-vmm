@@ -280,6 +280,15 @@ ov_removef(void *ctx, const struct p9_node *node)
     return ov->under->removef(ov->under_ctx, node);
 }
 
+static int
+ov_openh(void *ctx, const struct p9_node *file, int for_write)
+{
+    struct p9overlay *ov = ctx;
+    if (is_synth(file) || !ov->under->openh)
+        return -1;              /* synthetic /net files are served via readf */
+    return ov->under->openh(ov->under_ctx, file, for_write);
+}
+
 static const struct p9_backend overlay_backend = {
     .root = ov_root,
     .walk = ov_walk,
@@ -289,6 +298,7 @@ static const struct p9_backend overlay_backend = {
     .create = ov_create,
     .truncate = ov_truncate,
     .removef = ov_removef,
+    .openh = ov_openh,
 };
 
 struct p9overlay *

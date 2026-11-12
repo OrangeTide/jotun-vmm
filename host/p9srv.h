@@ -61,6 +61,16 @@ struct p9_backend {
                    uint32_t perm, struct p9_node *out);
     int  (*truncate)(void *ctx, const struct p9_node *file, uint64_t len);
     int  (*removef)(void *ctx, const struct p9_node *node);
+    /* Optional. Open a regular file and return a host file descriptor the server
+     * holds for the fid's lifetime, reading and writing it with pread/pwrite and
+     * closing it on clunk. A held descriptor keeps the file's inode alive after
+     * its name is removed, so a program that unlinks a file it still has open
+     * (a shell's self-cleaning here-document temp, and much of autoconf) keeps
+     * reading and writing it. A backend with no host file (the CAS bundle) leaves
+     * this NULL and the server falls back to readf/writef by path. Returns an fd
+     * >= 0, or -1 to decline (the server then uses readf/writef). for_write opens
+     * read-write so one descriptor serves a create-write-read sequence. */
+    int  (*openh)(void *ctx, const struct p9_node *file, int for_write);
 };
 
 /* Must cover the guest's 9P fid pool (GFID_MAX in guest/libos/linuxelf.c) plus
@@ -73,6 +83,7 @@ struct p9srv {
     struct {
         int            used;
         int            open;
+        int            hostfd;      /* backend's held host fd, or -1 (use readf/writef) */
         uint32_t       fid;
         struct p9_node node;
     } fids[P9_MAXFID];

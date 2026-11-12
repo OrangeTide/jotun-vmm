@@ -284,6 +284,23 @@ hd_truncate(void *vctx, const struct p9_node *file, uint64_t len)
     return truncate(full, (off_t)len) == 0 ? 0 : -1;
 }
 
+/* Open a real host descriptor for a file, which the server holds for the fid's
+ * lifetime (reads/writes go through it with pread/pwrite). Holding the fd is
+ * what gives open-unlink semantics: once it is open, removing the name leaves
+ * the inode reachable through this descriptor until it is closed. The handle was
+ * confined to the root at walk time, so it needs no further realpath here. */
+static int
+hd_openh(void *vctx, const struct p9_node *file, int for_write)
+{
+    struct p9hostdir *c = vctx;
+    if (file->is_dir || (for_write && !c->writable))
+        return -1;
+    char full[PATH_MAX];
+    if (host_path(c, file->handle, full, sizeof full) != 0)
+        return -1;
+    return open(full, for_write ? O_RDWR : O_RDONLY);
+}
+
 static int
 hd_removef(void *vctx, const struct p9_node *node)
 {
@@ -308,6 +325,7 @@ static const struct p9_backend hostdir_backend = {
     .create = hd_create,
     .truncate = hd_truncate,
     .removef = hd_removef,
+    .openh = hd_openh,
 };
 
 const struct p9_backend *
