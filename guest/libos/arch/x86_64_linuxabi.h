@@ -32,6 +32,9 @@
 #define SYS_ioctl           16
 #define SYS_pread64         17
 #define SYS_pwrite64        18
+#define SYS_pkey_mprotect   329
+#define SYS_pkey_alloc      330
+#define SYS_pkey_free       331
 #define SYS_writev          20
 #define SYS_access          21
 #define SYS_pipe            22

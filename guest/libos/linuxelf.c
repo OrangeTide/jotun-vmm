@@ -217,6 +217,24 @@ put_dec(long v)
         con_putc(b[--n]);
 }
 
+/* Print an unsigned value in hex with a 0x prefix, for fault diagnostics. */
+static void
+put_hex(uint64_t u)
+{
+    char b[16];
+    int n = 0;
+
+    con_putc('0');
+    con_putc('x');
+    do {
+        int d = (int)(u & 0xf);
+        b[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+        u >>= 4;
+    } while (u);
+    while (n)
+        con_putc(b[--n]);
+}
+
 /****************************************************************
  * File descriptors over the read-only 9P bundle.
  ****************************************************************/
@@ -3266,8 +3284,10 @@ release_fds(struct lshared *sh)
 
 /* Futex: a small wait queue keyed by (process, user address). Enough for the
  * pthread primitives (mutex, cond, join), which use private futexes. */
-#define FUTEX_WAIT 0
-#define FUTEX_WAKE 1
+#define FUTEX_WAIT        0
+#define FUTEX_WAKE        1
+#define FUTEX_WAIT_BITSET 9
+#define FUTEX_WAKE_BITSET 10
 
 struct fwaiter {
     int             used;
@@ -3300,7 +3320,15 @@ do_futex(uint64_t uaddr, int op, int val)
 
     if (!user_ok(uaddr, sizeof(int)))
         return -LERR_FAULT;
-    if (cmd == FUTEX_WAIT) {
+    /* FUTEX_WAIT_BITSET/WAKE_BITSET carry a bit mask (and the WAIT form an
+     * absolute rather than relative timeout). Callers that use them, including
+     * abseil's thread pool that V8's concurrent builtin generation runs on, pass
+     * FUTEX_BITSET_MATCH_ANY, so the mask selects every waiter and they reduce to
+     * plain WAIT/WAKE. This layer already ignores the timeout and the mask (not
+     * forwarded from the dispatch), so route them through the same paths; a
+     * mismatch here is fatal to the caller (abseil RAW-logs and aborts on an
+     * ENOSYS from a futex). */
+    if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) {
         /* The compare and the enlisting both run under the giant lock, and so
          * does futex_wake, so a concurrent wake cannot slip between them: either
          * the waker's value store lands first and the compare fails here (no
@@ -3334,7 +3362,7 @@ do_futex(uint64_t uaddr, int op, int val)
             return -LERR_RESTARTSYS;
         return 0;
     }
-    if (cmd == FUTEX_WAKE)
+    if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET)
         return futex_wake(uaddr, val);
     return -LERR_NOSYS;
 }
@@ -3724,7 +3752,13 @@ linux_fault_entry(long vec, uint64_t addr)
     put_dec(t->sh->pid);
     con_puts(" killed by signal ");
     put_dec(sig);
-    con_putc('\n');
+    con_puts(" (trap ");
+    put_dec(vec);
+    con_puts(" rip ");
+    put_hex(t->tf.rcx);
+    con_puts(" addr ");
+    put_hex(addr);
+    con_puts(")\n");
     t->sh->exit_sig = sig;
     do_exit(0, 1);                      /* noreturn: releases the lock, tears down */
 }
@@ -4204,7 +4238,12 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return 0;                       /* accept and ignore */
     case SYS_mprotect:
     case SYS_madvise:
+    case SYS_pkey_mprotect:             /* no protection keys: ignore the key */
         return 0;                       /* flat RW map, nothing to enforce */
+    case SYS_pkey_alloc:
+        return -LERR_NOSYS;             /* no PKU; callers fall back to mprotect */
+    case SYS_pkey_free:
+        return 0;
     case SYS_fadvise64:
         return 0;                       /* advisory only; accept and ignore */
     case SYS_copy_file_range:

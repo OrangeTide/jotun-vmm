@@ -50,6 +50,9 @@
 #define SYS_read            63
 #define SYS_pread64         67
 #define SYS_pwrite64        68
+#define SYS_pkey_mprotect   288
+#define SYS_pkey_alloc      289
+#define SYS_pkey_free       290
 #define SYS_write           64
 #define SYS_writev          66
 #define SYS_readlinkat      78

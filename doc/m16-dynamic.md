@@ -1088,7 +1088,7 @@ its `wait4` reports the signal, which is the containment the split buys.
 
 ## Compiling Node (Stage C)
 
-With the guest scaled up (2 GiB RAM and user window, a 128 MiB overlay file
+With the guest scaled up (3.5 GiB RAM and user window, a 128 MiB overlay file
 cap, 256 processes and 320 tasks, a writable host mount), the native host
 toolchain compiles the real Node v26.13.0 checkout inside the sandbox. The
 build runs from a manifest that grafts the host toolchain and the Node tree:
@@ -1155,9 +1155,45 @@ commit:
   after folding it into the `.d`, and those files live on the host mount, out of
   the overlay's reach. The same fix clears the ICU cleanup `unlinkat`.
 
-One syscall is still unimplemented but tolerated: `epoll_create1` (291) returns
-`ENOSYS`, which Python's selector and the build step that touches it fall back
-from cleanly. It stays on the list for the network poller (M16.6).
+## Pushing the Node build through V8
+
+Running `make -j1` on the real tree walks much further than the first `-j2`
+smoke, and each stall was a concrete gap. In order:
+
+- **epoll.** The build and Python's selector reach for `epoll`; it was
+  `ENOSYS`. Implemented over the existing poll readiness model (level-triggered,
+  a refcounted instance pool shared across dup/fork), so it is no longer a gap.
+- **9P deep paths.** A gyp dependency file mirrors the absolute object path
+  under `.deps`, reaching 17+ path components (an OpenSSL curve448 object is
+  one). A `Twalk` carries at most 16 elements, so `ns_walk` stopped at the 16th,
+  an interior directory, and a create under it reported `EISDIR`. `ns_walk` now
+  walks deep paths in chunks, each continuing from the fid the previous one
+  established. This cleared OpenSSL: the build went from 415 to 1343 objects.
+- **`pwrite64`.** The `js2c` step writes the generated `node_javascript.cc`
+  with `pwrite64` (unimplemented, syscall 18 on x86-64). Added as the positional
+  mirror of `pread64`. The build then reached 2722 objects, through V8's base.
+- **The 2 GiB window ceiling.** V8's `pipeline.cc` drives `cc1plus` to a
+  ~2.36 GiB peak (measured on the host), more than the 2 GiB user window could
+  hold, so the in-guest compile died with an out-of-window `SIGSEGV` (no guest
+  mmap diagnostic: `cc1plus` faulted on a bad access, the signature of malloc
+  returning null against the window ceiling). Guest RAM and the window were
+  raised to 3.5 GiB, the largest contiguous RAM that keeps the device MMIO band
+  below the x86 IOAPIC/local-APIC MMIO at `0xfec00000` without splitting around
+  that hole. See the "3.5 GiB window" note in the per-arch vmspace headers.
+- **Running V8, not just compiling it.** With the window raised, the compile
+  reached `mksnapshot`, which V8 links and then *runs* to generate the builtins
+  snapshot. This is the first time V8's own generated code executes in the
+  guest, and it crashed: `--concurrent-builtin-generation` runs on abseil's
+  thread pool, whose `futex_waiter.cc` calls `FUTEX_WAIT_BITSET`, a futex command
+  the guest did not handle, so it got `ENOSYS` and abseil RAW-logged a fatal
+  error (followed by a `#GP`). The `BITSET` wait/wake forms carry a bit mask and,
+  for the wait, an absolute timeout; callers pass `FUTEX_BITSET_MATCH_ANY`, so
+  with the mask and timeout already ignored at this layer they reduce to plain
+  `FUTEX_WAIT`/`FUTEX_WAKE` and now route through the same paths. `pkey_alloc`
+  (seen just before, syscall 330) is answered with an explicit `ENOSYS` so V8
+  falls back from protection keys cleanly, and `pkey_mprotect` aliases
+  `mprotect`. `mksnapshot` then runs to completion in-guest and writes the
+  5.75 MB `embedded.S` and the 947 KB `snapshot.cc`.
 
 ## Planned work: real privilege separation
 
