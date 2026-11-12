@@ -35,6 +35,10 @@
 #define SYS_pkey_mprotect   329
 #define SYS_pkey_alloc      330
 #define SYS_pkey_free       331
+#define SYS_eventfd         284
+#define SYS_eventfd2        290
+#define SYS_capget          125
+#define SYS_clock_getres    229
 #define SYS_writev          20
 #define SYS_access          21
 #define SYS_pipe            22

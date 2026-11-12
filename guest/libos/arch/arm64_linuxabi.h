@@ -53,6 +53,9 @@
 #define SYS_pkey_mprotect   288
 #define SYS_pkey_alloc      289
 #define SYS_pkey_free       290
+#define SYS_eventfd2        19
+#define SYS_capget          90
+#define SYS_clock_getres    114
 #define SYS_write           64
 #define SYS_writev          66
 #define SYS_readlinkat      78
@@ -140,6 +143,7 @@
 #define SYS_pause      (-21)       /* AArch64 has ppoll, not pause */
 #define SYS_epoll_create (-22)     /* AArch64 has epoll_create1 (20), not this */
 #define SYS_epoll_wait (-23)       /* AArch64 has epoll_pwait (22), not this */
+#define SYS_eventfd    (-24)       /* AArch64 has eventfd2 (19), not legacy eventfd */
 #define SYS_ppoll           73     /* musl's poll() and pause() both use this */
 #define SYS_epoll_create1   20
 #define SYS_epoll_ctl       21

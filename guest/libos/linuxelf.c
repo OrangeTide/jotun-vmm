@@ -86,6 +86,7 @@
 #define O_EXCL      0x0080
 #define O_TRUNC     0x0200
 #define O_APPEND    0x0400
+#define O_NONBLOCK  0x0800      /* non-blocking: reads/writes return EAGAIN not block */
 #define O_DIRECTORY 0x10000
 #define O_NOFOLLOW  0x20000     /* do not follow a symlink at the final component */
 #define O_LARGEFILE 0x8000      /* the kernel sets this on every 64-bit open */
@@ -332,6 +333,8 @@ struct lfd {
     int      devno;             /* which device (a DEV_* kind) when isdev */
     int      isepoll;           /* this fd is an epoll instance */
     int      epidx;             /* epoll pool index when isepoll */
+    int      iseventfd;         /* this fd is an eventfd counter */
+    int      efdidx;            /* eventfd pool index when iseventfd */
     int      pidx;              /* pipe pool index when ispipe */
     int      ridx;              /* ramfs index when isram */
     int      wr;                /* pipe write end when set, else read end */
@@ -476,6 +479,26 @@ struct epoll {
     struct epitem items[EPOLL_NINT];
 };
 static struct epoll epolls[EPOLL_MAX];
+
+/* The eventfd pool. An eventfd is a 64-bit counter behind a descriptor: a write
+ * adds to it, a read returns it (and clears it, or in semaphore mode returns 1
+ * and decrements), and it polls readable while non-zero. libuv builds its async
+ * wakeup handle on one (EFD_NONBLOCK|EFD_CLOEXEC), and uv_loop_init fails without
+ * it, so node's snapshot builder could not start. The pool is global and
+ * refcounted so dup and fork share one counter, as they must: one thread writes
+ * to wake the loop that another reads. */
+#define EVENTFD_MAX  16
+#define EFD_SEMAPHORE 1
+#define EFD_CLOEXEC   0x80000
+#define EFD_NONBLOCK  0x800
+#define EVENTFD_MAXVAL 0xfffffffffffffffeULL    /* ULLONG_MAX - 1, the Linux cap */
+struct leventfd {
+    int      used;
+    int      nref;                  /* open fds referencing this counter */
+    int      semaphore;             /* EFD_SEMAPHORE: read returns 1 and decrements */
+    uint64_t count;
+};
+static struct leventfd eventfds[EVENTFD_MAX];
 
 /* A shared open-file description: the offset state that several descriptors can
  * share. One is made per open(); dup and fork copy the pointer, not the offset,
@@ -1113,6 +1136,8 @@ clone_fd(int dst, struct lfd *src)
         ramfs[src->ridx].nref++;        /* another fd references the ramfile */
     } else if (src->isepoll) {
         epolls[src->epidx].nref++;      /* another fd references the epoll */
+    } else if (src->iseventfd) {
+        eventfds[src->efdidx].nref++;   /* another fd references the counter */
     } else if (src->p9fid) {
         gfidref[src->p9fid - LINUX_FID_BASE]++;
     }
@@ -1644,6 +1669,9 @@ bundle_path(const char *p)
     return p;
 }
 
+static long eventfd_read(struct lfd *f, void *buf, unsigned long count);
+static long eventfd_write(struct lfd *f, const void *buf, unsigned long count);
+
 static long
 do_write(long fd, const char *buf, unsigned long len)
 {
@@ -1655,6 +1683,8 @@ do_write(long fd, const char *buf, unsigned long len)
         return -LERR_FAULT;
     if (f->isdev)
         return dev_write(f->devno, buf, len);
+    if (f->iseventfd)
+        return eventfd_write(f, buf, len);
     if (f->iscon) {                     /* console stdout/stderr */
         for (unsigned long i = 0; i < len; i++)
             con_putc(buf[i]);
@@ -2123,6 +2153,14 @@ poll_ready(struct lfd *f, short events)
     if (!f)
         return POLLNVAL;
     short r = 0;
+    if (f->iseventfd) {
+        struct leventfd *e = &eventfds[f->efdidx];
+        if (e->count > 0)
+            r |= (short)(events & POLLIN);
+        if (e->count < EVENTFD_MAXVAL)
+            r |= (short)(events & POLLOUT);
+        return r;
+    }
     if (f->ispipe) {
         struct lpipe *p = &pipes[f->pidx];
         if (f->wr) {
@@ -2444,6 +2482,116 @@ do_epoll_wait(long epfd, uint64_t uevents, long maxevents, long timeout_ms)
     return rc;
 }
 
+/* Allocate an eventfd with an initial counter value. flags take EFD_SEMAPHORE,
+ * EFD_NONBLOCK and EFD_CLOEXEC. */
+static long
+do_eventfd(unsigned initval, int flags)
+{
+    int ei = -1;
+    for (int i = 0; i < EVENTFD_MAX; i++)
+        if (!eventfds[i].used) {
+            ei = i;
+            break;
+        }
+    if (ei < 0)
+        return -LERR_NOMEM;
+    int fd = fd_alloc();
+    if (fd < 0)
+        return -LERR_NOMEM;
+    memset(&eventfds[ei], 0, sizeof eventfds[ei]);
+    eventfds[ei].used = 1;
+    eventfds[ei].nref = 1;
+    eventfds[ei].semaphore = (flags & EFD_SEMAPHORE) ? 1 : 0;
+    eventfds[ei].count = initval;
+    memset(&fds[fd], 0, sizeof fds[fd]);
+    fds[fd].used = 1;
+    fds[fd].iseventfd = 1;
+    fds[fd].efdidx = ei;
+    fds[fd].oflags = O_RDWR;
+    if (flags & EFD_NONBLOCK)
+        fds[fd].oflags |= O_NONBLOCK;
+    if (flags & EFD_CLOEXEC)
+        fds[fd].cloexec = 1;
+    return fd;
+}
+
+/* capget: no capability model, so report an empty set, which is the honest
+ * answer for an unprivileged process and what node/libuv expect when they probe
+ * during init. The data is two __user_cap_data_struct words addressed by a v3
+ * header (effective/permitted/inheritable); zero them. A helper, not an inline
+ * case, so its buffer stays off the one -O0 syscall-dispatch stack frame. */
+static long
+do_capget(uint64_t udata)
+{
+    uint32_t zero[6] = {0};
+
+    if (udata && copy_to_user(udata, zero, sizeof zero) < 0)
+        return -LERR_FAULT;
+    return 0;
+}
+
+/* clock_getres: report a 1 ns resolution for every clock. Callers use it only to
+ * size sleeps and timers; the guest clock is coarser but nothing needs the true
+ * grain. A helper for the same stack reason as do_capget. */
+static long
+do_clock_getres(uint64_t ures)
+{
+    struct { int64_t sec; int64_t nsec; } ts = { 0, 1 };
+
+    if (ures && copy_to_user(ures, &ts, sizeof ts) < 0)
+        return -LERR_FAULT;
+    return 0;
+}
+
+/* eventfd read: deliver the counter (the whole value, or 1 in semaphore mode)
+ * into an 8-byte buffer, blocking while it is zero unless the fd is non-blocking. */
+static long
+eventfd_read(struct lfd *f, void *buf, unsigned long count)
+{
+    struct leventfd *e = &eventfds[f->efdidx];
+
+    if (count < sizeof(uint64_t))
+        return -LERR_INVAL;
+    while (e->count == 0) {
+        if (f->oflags & O_NONBLOCK)
+            return -LERR_AGAIN;
+        lx_yield();                     /* empty: let a writer post to it */
+        signal_killpoint();
+        if (signal_deliverable())
+            return -LERR_RESTARTSYS;
+    }
+    uint64_t v = e->semaphore ? 1 : e->count;
+    e->count = e->semaphore ? e->count - 1 : 0;
+    memcpy(buf, &v, sizeof v);
+    return (long)sizeof v;
+}
+
+/* eventfd write: add an 8-byte value to the counter, blocking (or EAGAIN when
+ * non-blocking) if it would exceed the Linux cap. A write of ULLONG_MAX is the
+ * documented error. */
+static long
+eventfd_write(struct lfd *f, const void *buf, unsigned long count)
+{
+    struct leventfd *e = &eventfds[f->efdidx];
+    uint64_t add;
+
+    if (count < sizeof(uint64_t))
+        return -LERR_INVAL;
+    memcpy(&add, buf, sizeof add);
+    if (add == 0xffffffffffffffffULL)
+        return -LERR_INVAL;
+    while (e->count + add > EVENTFD_MAXVAL) {
+        if (f->oflags & O_NONBLOCK)
+            return -LERR_AGAIN;
+        lx_yield();                     /* full: let a reader drain it */
+        signal_killpoint();
+        if (signal_deliverable())
+            return -LERR_RESTARTSYS;
+    }
+    e->count += add;
+    return (long)sizeof add;
+}
+
 static long
 do_read(long fd, void *buf, unsigned long count)
 {
@@ -2455,6 +2603,8 @@ do_read(long fd, void *buf, unsigned long count)
         return -LERR_FAULT;
     if (f->isdev)
         return dev_read(f->devno, buf, count);
+    if (f->iseventfd)
+        return eventfd_read(f, buf, count);
     if (f->iscon)
         return 0;                       /* console stdin: EOF */
     if (f->ispipe) {
@@ -2573,6 +2723,13 @@ do_close(long fd)
         struct epoll *ep = &epolls[f->epidx];
         if (ep->nref > 0 && --ep->nref == 0)
             ep->used = 0;               /* last reference: free the instance */
+        f->used = 0;
+        return 0;
+    }
+    if (f->iseventfd) {
+        struct leventfd *e = &eventfds[f->efdidx];
+        if (e->nref > 0 && --e->nref == 0)
+            e->used = 0;                /* last reference: free the counter */
         f->used = 0;
         return 0;
     }
@@ -3410,6 +3567,10 @@ do_fork(void)
                 pipes[f->pidx].readers++;
         } else if (f->isram)
             ramfs[f->ridx].nref++;
+        else if (f->isepoll)
+            epolls[f->epidx].nref++;
+        else if (f->iseventfd)
+            eventfds[f->efdidx].nref++;
         else if (f->p9fid)
             gfidref[f->p9fid - LINUX_FID_BASE]++;
     }
@@ -3505,6 +3666,10 @@ inherit_fds(struct lshared *csh)
                 pipes[f->pidx].readers++;
         } else if (f->isram)
             ramfs[f->ridx].nref++;
+        else if (f->isepoll)
+            epolls[f->epidx].nref++;
+        else if (f->iseventfd)
+            eventfds[f->efdidx].nref++;
         else if (f->p9fid)
             gfidref[f->p9fid - LINUX_FID_BASE]++;
     }
@@ -4244,6 +4409,14 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return -LERR_NOSYS;             /* no PKU; callers fall back to mprotect */
     case SYS_pkey_free:
         return 0;
+    case SYS_eventfd:
+        return do_eventfd((unsigned)a1, 0);
+    case SYS_eventfd2:
+        return do_eventfd((unsigned)a1, (int)a2);
+    case SYS_capget:
+        return do_capget((uint64_t)a2);
+    case SYS_clock_getres:
+        return do_clock_getres((uint64_t)a2);
     case SYS_fadvise64:
         return 0;                       /* advisory only; accept and ignore */
     case SYS_copy_file_range:

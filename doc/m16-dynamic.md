@@ -1194,6 +1194,20 @@ smoke, and each stall was a concrete gap. In order:
   falls back from protection keys cleanly, and `pkey_mprotect` aliases
   `mprotect`. `mksnapshot` then runs to completion in-guest and writes the
   5.75 MB `embedded.S` and the 947 KB `snapshot.cc`.
+- **node's own snapshot.** After V8's `mksnapshot` comes node's `node_mksnapshot`,
+  which runs the full node binary in-guest to build the startup snapshot. It
+  aborted in `uv_loop_init`: libuv's async wakeup handle is an `eventfd`, and
+  `eventfd2` (syscall 290/19) was unimplemented, so the loop failed to
+  initialise. eventfd is now a counter behind a descriptor (a write adds, a read
+  returns and clears it, or returns 1 and decrements in semaphore mode; it polls
+  readable while non-zero), refcounted across dup and fork like a pipe, so the
+  thread that posts a wakeup and the loop that reads it share one counter. With
+  `capget` and `clock_getres` also answered, `node_mksnapshot` runs to completion
+  and writes the 21 MB `node_snapshot.cc`. The `capget`/`clock_getres` bodies
+  live in helpers, not inline switch cases: their few bytes of locals, added to
+  the one `-O0` syscall-dispatch frame, re-tripped the kstack overflow that
+  corrupts the preemption save area (the sleep and time tests failed), the same
+  trap the utimensat work first hit.
 
 ## Planned work: real privilege separation
 
