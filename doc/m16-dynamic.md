@@ -1218,6 +1218,44 @@ milestone is a working node, not just a clean build. 3745 objects, from a V8
 translation unit that needs 2.36 GiB through to node's own snapshot, all
 compiled by an unmodified host gcc running as an ordinary guest process.
 
+## A second project: Redis
+
+Node is one data point, and a large one, but it leans on gyp and a bundled
+Python. To show the build path is not Node-shaped, the next target was Redis
+7.4.1, a plain recursive Makefile with a bundled autotools sub-build (jemalloc,
+lua, hdr_histogram, fpconv). It builds from the same manifest shape: the host
+toolchain grafted read-only (`/usr`, `/lib`, `/bin`), the source tree mounted
+read-write, and a driver that sets `PATH`/`COMPILER_PATH`/`TMPDIR`. `make
+MALLOC=libc` runs to completion in-guest, status 0, 103 objects, producing a
+11.6 MB `redis-server` and a `redis-cli` that match a native control build.
+The in-guest binaries also run under the hypervisor: both report their version,
+and `redis-server --test-memory 1` runs its full memory test and passes.
+
+Two gaps surfaced, each a real capability rather than a Redis quirk:
+
+- **"#!" scripts.** `do_execve` only loaded ELF, so a script executed by name
+  returned `ENOENT`. Redis's `mkreleasehdr.sh` is run as `sh -c
+  ./mkreleasehdr.sh` at make-parse time to generate `release.h`; without it the
+  `src` build cannot compile `release.c`. The kernel now peeks the first bytes
+  and, on `#!`, execs the named interpreter with the script path and any one
+  interpreter argument spliced into argv ahead of the script's own, resolving
+  nested interpreters up to four deep. This is what lets configure, libtool, and
+  ordinary build scripts run when invoked directly.
+
+- **`setitimer`/`getitimer` (ITIMER_REAL).** These were `ENOSYS`. `redis-server`
+  disarms the software-watchdog interval timer during config even when the
+  watchdog is off, and exited at startup when the call failed. ITIMER_REAL is
+  now backed by the host tick, raising SIGALRM through the existing per-tick
+  hook. ITIMER_VIRTUAL and ITIMER_PROF are rejected with `EINVAL`, and alarm and
+  timerfd remain unbuilt.
+
+The cut line is the network. With those two fixes `redis-server` reaches
+"Running mode=standalone" and stops only at `socket(): Function not
+implemented`: the guest has a Plan 9 network, not the POSIX BSD socket surface
+(`socket`/`bind`/`listen`/`accept`). A serving Redis in the sandbox is the next
+milestone, and it is about sockets, not about building the project, which is
+done.
+
 ## Planned work: real privilege separation
 
 Today the guest kernel and the Linux process share ring 0. User code runs with
