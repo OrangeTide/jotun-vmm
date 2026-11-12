@@ -1352,6 +1352,18 @@ build logs a few `unhandled syscall 196` lines (`flistxattr`), which is harmless
 a filesystem with no extended attributes returns the same ENOSYS, and the
 toolchain ignores it.
 
+Then the whole of Redis builds against it. The earlier Redis build used
+`MALLOC=libc` to sidestep jemalloc; a plain `make` reuses that stored setting, so
+the allocator is chosen with `make -C src clean` then `make MALLOC=jemalloc`. That
+recompiles the roughly 130 Redis objects with `-DUSE_JEMALLOC` and links the
+in-guest-built `libjemalloc.a`. The result is a 17 MB `redis-server` that reports
+`malloc=jemalloc-5.3.0` and carries 719 `je_` symbols. Run in-guest, it serves a
+client over a unix socket: PING returns PONG, SET and GET round-trip a value,
+INCR counts, APPEND extends, DBSIZE reports the keyspace, and `shutdown` exits the
+server cleanly. So a real third-party autotools dependency is built from its own
+`configure` and linked into a real program that then runs and serves, all
+in-guest over host-mounted toolchain and sources.
+
 ## Planned work: real privilege separation
 
 Today the guest kernel and the Linux process share ring 0. User code runs with
