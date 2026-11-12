@@ -625,6 +625,7 @@ struct lproc {
     uint64_t ss_sp, ss_size;
     int      ss_flags;
     uint64_t sleep_deadline;/* nonzero: this thread sleeps until this timer tick */
+    long cur_nr;            /* syscall this thread is currently in (spin watchdog) */
 };
 
 _Static_assert(__builtin_offsetof(struct lproc, tf) == 0, "trapframe first");
@@ -722,9 +723,46 @@ lx_block(void)
     giant_lock();
 }
 
+/* Yields since any syscall last completed. A syscall that finishes resets it
+ * (lx_progress, called from the dispatch wrapper). If it climbs without bound
+ * the cooperative set is livelocked: every runnable thread is yielding and none
+ * is completing work, so a thread is waiting on a condition nothing will make
+ * true. The watchdog dumps the task table and each stuck thread's syscall once,
+ * to turn a silent 100%-CPU hang into a diagnosable one. */
+static long g_yields_since_progress;
+
+static void
+lx_progress(void)
+{
+    g_yields_since_progress = 0;
+}
+
 static void
 lx_yield(void)
 {
+    if (++g_yields_since_progress == 8000000) {
+        con_puts("[bin] SPIN watchdog: tid ");
+        put_dec(lproc_cur->tid);
+        con_puts(" in syscall ");
+        put_dec(lproc_cur->cur_nr);
+        con_putc('\n');
+        task_dump();
+        /* Each live Linux thread and the syscall it is parked in. */
+        for (int i = 0; i < LINUX_NPROC; i++) {
+            struct lproc *p = &procs[i];
+            if (!p->used)
+                continue;
+            con_puts("  lproc pid ");
+            put_dec(p->sh ? p->sh->pid : -1);
+            con_puts(" tid ");
+            put_dec(p->tid);
+            con_puts(p->ismain ? " main" : " thr ");
+            con_puts(" syscall ");
+            put_dec(p->cur_nr);
+            con_puts(p->exited ? " exited" : "");
+            con_putc('\n');
+        }
+    }
     giant_unlock();
     task_yield();
     giant_lock();
@@ -3833,6 +3871,17 @@ do_exit(long code, int group)
     if (group) {
         sh->exited = 1;
         sh->exit_status = code;
+        /* exit_group terminates the whole thread group, not just this thread.
+         * Mark the process exited (above) and rouse every other live thread so
+         * it runs, reaches a killpoint (every blocking loop calls
+         * signal_killpoint after a wake), sees sh->exited, and tears itself
+         * down. Without this a worker parked in futex_wait never exits, the
+         * process never reaches refs 0, and a waiting parent spins in wait4. */
+        for (int i = 0; i < LINUX_NPROC; i++) {
+            struct lproc *p = &procs[i];
+            if (p->used && !p->exited && p->sh == sh && p != t)
+                task_wake(p->task_id);
+        }
     }
 
     /* A posix_spawn child that exits before exec (its exec failed) still has to
@@ -3920,7 +3969,7 @@ linux_fault_entry(long vec, uint64_t addr)
     con_puts(" (trap ");
     put_dec(vec);
     con_puts(" rip ");
-    put_hex(t->tf.rcx);
+    put_hex(tf_pc(&t->tf));
     con_puts(" addr ");
     put_hex(addr);
     con_puts(")\n");
@@ -3995,9 +4044,16 @@ take_fatal_signal(void)
 static void
 signal_killpoint(void)
 {
+    struct lproc *t = lproc_cur;
+
+    /* A group exit started by another thread (exit_group) tears this one down
+     * too. The process status is already recorded, so exit this thread alone. */
+    if (t->sh->exited && !t->exited)
+        do_exit(0, 0);                  /* noreturn: releases the lock, tears down */
+
     int s = take_fatal_signal();
     if (s) {
-        lproc_cur->sh->exit_sig = s;
+        t->sh->exit_sig = s;
         do_exit(0, 1);                  /* noreturn: releases the lock, tears down */
     }
 }
@@ -5153,7 +5209,9 @@ long
 linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
 {
     giant_lock();
+    lproc_cur->cur_nr = nr;                  /* for the lx_yield spin watchdog */
     long r = linux_sys_dispatch_inner(nr, a1, a2, a3, a4, a5);
+    lx_progress();          /* a completed syscall clears the spin watchdog */
     signal_killpoint();     /* a default-fatal signal terminates here */
     r = maybe_deliver_signal(r);    /* a caught signal runs its handler on return */
     giant_unlock();

@@ -186,6 +186,13 @@ tf_user_sp(const struct trapframe *tf)
     return tf->sp;
 }
 
+/* The interrupted user instruction pointer (for fault diagnostics): ELR_EL1. */
+static inline uint64_t
+tf_pc(const struct trapframe *tf)
+{
+    return tf->pc;
+}
+
 /* The syscall/return value register (x0), preserved when a fault is caught. */
 static inline uint64_t
 tf_retval(const struct trapframe *tf)

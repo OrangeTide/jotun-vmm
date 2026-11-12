@@ -192,6 +192,14 @@ tf_user_sp(const struct trapframe *tf)
     return tf->rsp;
 }
 
+/* The interrupted user instruction pointer (for fault diagnostics). On x86 a
+ * fault stub saves the faulting rip into the rcx slot. */
+static inline uint64_t
+tf_pc(const struct trapframe *tf)
+{
+    return tf->rcx;
+}
+
 /* The syscall/return value register (rax), preserved when a fault is caught. */
 static inline uint64_t
 tf_retval(const struct trapframe *tf)
