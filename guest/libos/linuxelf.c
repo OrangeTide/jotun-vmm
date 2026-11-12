@@ -748,6 +748,8 @@ static void signal_killpoint(void);
 static int signal_deliverable(void);
 static void deliver_signal(int sig, long result, int restart, int si_code,
                            uint64_t si_addr);
+static struct lshared *proc_by_pid(int pid);
+static void wake_process_threads(const struct lshared *sh);
 /* linux_jump is declared by the arch backend (linux_arch.h); linux_resume takes
  * struct lproc, which is defined here, so it is declared here. */
 extern void linux_resume(struct lproc *p) __attribute__((noreturn));
@@ -4377,9 +4379,13 @@ do_clone3(uint64_t uargs, uint64_t size)
 }
 
 /* wait4: reap a child process. Returns its pid and writes an exit-encoded
- * status. Yields while children still run so they can finish. */
+ * status. Yields while children still run so they can finish, unless WNOHANG is
+ * set: then a run with no reapable child returns 0 at once instead of blocking.
+ * A shell polling a background job (dash does this after a foreground command
+ * completes) passes WNOHANG and must not be parked on the still-running job. */
+#define LINUX_WNOHANG 1
 static long
-do_wait4(long pid, int *status)
+do_wait4(long pid, int *status, int options)
 {
     struct lshared *mysh = lproc_cur->sh;
 
@@ -4418,6 +4424,8 @@ do_wait4(long pid, int *status)
         }
         if (!haskid)
             return -LERR_CHILD;
+        if (options & LINUX_WNOHANG)
+            return 0;                   /* children live but none reapable yet */
         lx_yield();                     /* a child is still running: let it run */
         signal_killpoint();             /* a fatal signal unblocks and terminates */
         if (signal_deliverable())       /* a caught signal (e.g. SIGCHLD handler) */
@@ -4480,6 +4488,18 @@ do_exit(long code, int group)
          * points at these page tables). The parent's wait4, running under its
          * own CR3, destroys it; with no parent it is left until shutdown. The
          * slot lingers (used, exited) carrying the status for wait4. */
+
+        /* Notify the parent that a child died. A shell reaping a background job
+         * (dash does this from a SIGCHLD handler woken by sigsuspend) relies on
+         * the signal, not just the zombie: it polls with WNOHANG, then blocks
+         * for SIGCHLD. Post it process-directed and rouse the parent's threads
+         * so a blocked wait or sigsuspend re-checks and the handler runs at the
+         * next syscall boundary. */
+        struct lshared *par = proc_by_pid(sh->parent);
+        if (par) {
+            par->sig_pending |= SIGBIT(SIGCHLD);
+            wake_process_threads(par);
+        }
     }
 
     /* This thread cannot free its own kstack (it runs on it); hand it to the
@@ -5104,6 +5124,32 @@ do_sigaltstack(uint64_t ss, uint64_t old)
         t->ss_size = n.size;
     }
     return 0;
+}
+
+/* rt_sigsuspend(mask, sigsetsize): install mask as the blocked set, block until
+ * a caught signal is deliverable, then return EINTR with the handler poised to
+ * run at the syscall-return boundary (maybe_deliver_signal sees it under this
+ * mask). A shell waiting for a background child suspends here with SIGCHLD
+ * unblocked, so the SIGCHLD posted when the child exits wakes it and runs the
+ * handler. The suspend mask is left in effect (rt_sigreturn keeps it across the
+ * handler); callers that care, like dash, reset their mask explicitly on return,
+ * which matches how they bracket the call. */
+static long
+do_rt_sigsuspend(uint64_t umask, uint64_t sigsetsize)
+{
+    if (sigsetsize != sizeof(uint64_t))
+        return -LERR_INVAL;
+    struct lproc *t = lproc_cur;
+    uint64_t newmask;
+    if (copy_from_user(&newmask, umask, sizeof newmask) < 0)
+        return -LERR_FAULT;
+
+    t->sig_blocked = newmask & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+    while (!signal_deliverable()) {
+        lx_block();
+        signal_killpoint();             /* a fatal signal terminates here */
+    }
+    return -LERR_INTR;
 }
 
 /* The body of the SYSCALL handler, run with the giant lock held (see
@@ -5841,7 +5887,7 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_clone3:
         return do_clone3((uint64_t)a1, (uint64_t)a2);
     case SYS_wait4:
-        return do_wait4(a1, (int *)a2);
+        return do_wait4(a1, (int *)a2, (int)a3);
     case SYS_futex:
         return do_futex((uint64_t)a1, (int)a2, (int)a3);
     case SYS_sched_yield:
@@ -5892,6 +5938,8 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_rt_sigreturn:
         /* Return from a handler: restore the frame maybe_deliver_signal built. */
         return do_rt_sigreturn();
+    case SYS_rt_sigsuspend:
+        return do_rt_sigsuspend((uint64_t)a1, (uint64_t)a2);
     case SYS_pause:
         return do_pause();
     case SYS_uname: {

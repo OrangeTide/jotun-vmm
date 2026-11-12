@@ -80,6 +80,7 @@
 #define SYS_tgkill          131
 #define SYS_rt_sigaction    134
 #define SYS_rt_sigprocmask  135
+#define SYS_rt_sigsuspend   133
 #define SYS_rt_sigreturn    139
 #define SYS_uname           160
 #define SYS_getrusage       165
