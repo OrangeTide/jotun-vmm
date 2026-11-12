@@ -236,7 +236,7 @@ parse_stat(struct p9_in *in, struct p9_stat *out)
     p9i_qid(in, &out->qid);
     out->mode = p9i_u32(in);
     (void)p9i_u32(in);              /* atime */
-    (void)p9i_u32(in);              /* mtime */
+    out->mtime = p9i_u32(in);       /* mtime, Unix seconds */
     out->length = p9i_u64(in);
     p9i_str(in, out->name, sizeof out->name);
     p9i_str(in, NULL, 0);           /* uid */

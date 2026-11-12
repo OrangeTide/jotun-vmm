@@ -104,3 +104,9 @@ boot_timer_ticks(void)
      * does not hoist or cache a stale value. An aligned 8-byte load is atomic. */
     return *(const volatile uint64_t *)&info->timer_ticks;
 }
+
+uint64_t
+boot_unix_time(void)
+{
+    return info ? info->boot_unix_time : 0;
+}

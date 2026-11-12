@@ -22,6 +22,7 @@ struct p9_node {
     uint32_t mode;                  /* permission bits, low 9 */
     uint64_t length;                /* file size, 0 for directories */
     uint64_t qid_path;              /* stable unique id for the qid */
+    uint32_t mtime;                 /* modification time, Unix seconds (0 if none) */
     char     handle[P9_HANDLE_MAX]; /* backend handle (hash or relative path) */
     char     name[256];             /* leaf name, for stat */
 };
@@ -33,6 +34,7 @@ struct p9_dirent {
     uint32_t mode;
     uint64_t length;
     uint64_t qid_path;
+    uint32_t mtime;                 /* modification time, Unix seconds (0 if none) */
 };
 
 /* A directory listing streams its entries to this callback, one at a time, so

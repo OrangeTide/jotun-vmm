@@ -82,7 +82,7 @@ put_qid(struct p9_out *o, const struct p9_node *n)
 /* Serialize one stat structure (its own size[2] prefix included). */
 static void
 put_stat(struct p9_out *o, const char *name, int is_dir, uint32_t mode,
-         uint64_t length, uint64_t qid_path)
+         uint64_t length, uint64_t qid_path, uint32_t mtime)
 {
     uint16_t namelen = (uint16_t)strlen(name);
     uint16_t sz = (uint16_t)(47 + namelen);     /* bytes after this size field */
@@ -97,8 +97,8 @@ put_stat(struct p9_out *o, const char *name, int is_dir, uint32_t mode,
     p9o_u32(o, 0);                  /* dev */
     p9o_qid(o, &q);
     p9o_u32(o, (mode & 0777u) | (is_dir ? P9_DMDIR : 0u));
-    p9o_u32(o, 0);                  /* atime */
-    p9o_u32(o, 0);                  /* mtime */
+    p9o_u32(o, mtime);              /* atime (report mtime for both) */
+    p9o_u32(o, mtime);              /* mtime */
     p9o_u64(o, length);
     p9o_str(o, name);
     p9o_str(o, "");                 /* uid */
@@ -117,7 +117,7 @@ dir_ser_emit(void *vctx, const struct p9_dirent *de)
     struct p9_out o;
 
     p9o_init(&o, tmp, sizeof tmp);
-    put_stat(&o, de->name, de->is_dir, de->mode, de->length, de->qid_path);
+    put_stat(&o, de->name, de->is_dir, de->mode, de->length, de->qid_path, de->mtime);
     if (!o.ok)
         return 0;                       /* skip an entry that will not fit */
 
@@ -349,7 +349,7 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
         /* Rstat carries a 2-byte count before the stat structure. */
         uint16_t namelen = (uint16_t)strlen(name);
         p9o_u16(&o, (uint16_t)(49 + namelen));
-        put_stat(&o, name, n->is_dir, n->mode, n->length, n->qid_path);
+        put_stat(&o, name, n->is_dir, n->mode, n->length, n->qid_path, n->mtime);
         return p9o_finish(&o);
     }
     case P9_TCREATE: {

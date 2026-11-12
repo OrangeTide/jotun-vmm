@@ -56,6 +56,13 @@ struct jotun_bootinfo {
      * default a pre-v4 or line-model host leaves. */
     uint32_t irq_model;
     uint32_t _pad_irq;
+    /* The host's real wall-clock time at boot, in Unix seconds, or 0 when the
+     * host does not supply one. The guest bases its realtime clock on this plus
+     * the elapsed tick count, so a file it creates is stamped near real time and
+     * is newer than host-mounted sources (which carry their real host mtimes).
+     * Without it the guest would use a fixed epoch and autotools' "newly created
+     * file is older than distributed files" sanity check fails on host mounts. */
+    uint64_t boot_unix_time;
     uint8_t  blob[JOTUN_BOOT_BLOB_MAX];
 };
 

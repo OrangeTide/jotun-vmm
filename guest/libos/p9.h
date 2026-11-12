@@ -16,6 +16,7 @@
 struct p9_stat {
     struct p9_qid qid;
     uint32_t      mode;
+    uint32_t      mtime;            /* modification time, Unix seconds (0 if none) */
     uint64_t      length;
     char          name[64];
 };

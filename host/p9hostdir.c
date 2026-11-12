@@ -65,6 +65,7 @@ fill_node(struct p9_node *out, const char *rel, const char *name,
     out->mode = st->st_mode & 0777;
     out->length = out->is_dir ? 0 : (uint64_t)st->st_size;
     out->qid_path = (uint64_t)st->st_ino;       /* host inode: stable, unique */
+    out->mtime = (uint32_t)st->st_mtime;        /* real host mtime, Unix seconds */
     strncpy(out->handle, rel, sizeof out->handle - 1);
     out->handle[sizeof out->handle - 1] = '\0';
     strncpy(out->name, name, sizeof out->name - 1);
@@ -144,6 +145,7 @@ hd_list(void *vctx, const struct p9_node *dir, p9_emit_fn emit, void *ectx)
         e.mode = st.st_mode & 0777;
         e.length = e.is_dir ? 0 : (uint64_t)st.st_size;
         e.qid_path = (uint64_t)st.st_ino;
+        e.mtime = (uint32_t)st.st_mtime;
         if (emit(ectx, &e) != 0)
             break;
     }

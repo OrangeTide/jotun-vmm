@@ -208,6 +208,12 @@ setup_bootinfo(struct guest *gp, int gargc, char **gargv)
     b->ram_size = gp->gm.size;
     b->timer_hz = g_timer_hz;       /* 0 when no preemption timer is running */
 
+    /* The host's real wall-clock time, so the guest's realtime clock starts near
+     * now rather than a fixed epoch. A file the guest creates then post-dates
+     * host-mounted sources, which autotools' sanity check requires. */
+    time_t now = time(NULL);
+    b->boot_unix_time = now > 0 ? (uint64_t)now : 0;
+
     /* Tell an arm64 guest how the preemption tick reaches it, which the backend
      * decides: an in-kernel GIC (v3 or v2) the guest drives on Linux/KVM, or the
      * bare line model on Hypervisor.framework (x86 guests ignore it). */

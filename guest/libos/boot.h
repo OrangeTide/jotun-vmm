@@ -44,4 +44,8 @@ uint64_t boot_timer_ticks(void);
  * reads it to pick its acknowledge mechanism. */
 uint32_t boot_irq_model(void);
 
+/* The host's real wall-clock time at boot, in Unix seconds, or 0 when the host
+ * supplied none. The realtime clock bases itself on this. */
+uint64_t boot_unix_time(void);
+
 #endif /* LIBOS_BOOT_H */

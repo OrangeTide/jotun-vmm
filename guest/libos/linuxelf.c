@@ -410,11 +410,21 @@ struct ramfile {
     uint64_t mtime;             /* seconds; stamped on create and write */
 };
 
-/* The guest has no battery clock. The epoch is a recent date so timestamps look
- * plausible and, crucially, a file written during a run is newer than the
- * read-only bundle files (reported at the epoch): autotools' sanity check
- * rejects a build tree whose freshly created file is older than its sources. */
-#define GUEST_EPOCH 1735689600ULL       /* 2025-01-01 UTC, in seconds */
+/* The guest has no battery clock. The host passes its real wall-clock time at
+ * boot (boot_unix_time); the realtime clock is that plus the elapsed monotonic
+ * time. A file written during a run is then stamped near real time, so it beats
+ * both the read-only bundle files (reported at the epoch) and host-mounted
+ * sources that carry their real host mtimes: autotools' sanity check rejects a
+ * build tree whose freshly created file is older than its sources. A host that
+ * supplies no time (0) falls back to the fixed date below. */
+#define GUEST_EPOCH 1735689600ULL       /* 2025-01-01 UTC: fallback only */
+
+static uint64_t
+guest_epoch(void)
+{
+    uint64_t t = boot_unix_time();
+    return t ? t : GUEST_EPOCH;
+}
 
 /* Nanoseconds since boot, monotonic. With the host preemption timer running,
  * this comes from the tick counter the host advances in wall time (accurate and
@@ -434,7 +444,7 @@ guest_mono_ns(void)
 static uint64_t
 guest_now_sec(void)
 {
-    return GUEST_EPOCH + guest_mono_ns() / 1000000000ULL;
+    return guest_epoch() + guest_mono_ns() / 1000000000ULL;
 }
 
 /* Overlay files are timestamped from the same wall clock the time syscalls
@@ -451,8 +461,9 @@ static uint64_t
 fs_stamp(void)
 {
     uint64_t t = guest_now_sec();
-    if (t <= GUEST_EPOCH)
-        t = GUEST_EPOCH + 1;
+    uint64_t ep = guest_epoch();
+    if (t <= ep)
+        t = ep + 1;
     if (t < fs_last_stamp)
         t = fs_last_stamp;
     fs_last_stamp = t;
@@ -3409,13 +3420,14 @@ mtime_of_ino(uint64_t ino)
 {
     if (ino >= 0x10000 && ino < 0x10000 + (uint64_t)RAMFS_MAX)
         return ramfs[ino - 0x10000].mtime;
-    return GUEST_EPOCH;
+    return guest_epoch();
 }
 
 static void
-fill_stat(struct linux_stat *s, int isdir, uint64_t size, uint64_t ino)
+fill_stat(struct linux_stat *s, int isdir, uint64_t size, uint64_t ino,
+          uint64_t mtime)
 {
-    uint64_t mt = mtime_of_ino(ino);
+    uint64_t mt = mtime ? mtime : mtime_of_ino(ino);
     memset(s, 0, sizeof *s);
     s->st_mode = isdir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
     s->st_nlink = 1;
@@ -3430,8 +3442,11 @@ fill_stat(struct linux_stat *s, int isdir, uint64_t size, uint64_t ino)
  * 9P). Returns 0 and fills the out-params, or a negative errno. Callers that
  * hold a raw userspace path use meta_path, which applies the cwd first. */
 static long
-meta_key(const char *key, int *isdir, uint64_t *size, uint64_t *ino)
+meta_key(const char *key, int *isdir, uint64_t *size, uint64_t *ino,
+         uint64_t *mtime)
 {
+    if (mtime)
+        *mtime = 0;                     /* 0 means: fall back to mtime_of_ino */
     int dk = dev_lookup(key);           /* a /dev node, or the /dev directory */
     if (dk) {
         *isdir = 0;
@@ -3468,6 +3483,8 @@ meta_key(const char *key, int *isdir, uint64_t *size, uint64_t *ino)
         *isdir = (st.qid.type & P9_QTDIR) != 0;
         *size = st.length;
         *ino = st.qid.path;
+        if (mtime)
+            *mtime = st.mtime;          /* real host mtime, Unix seconds */
     }
     p9_clunk(fid);
     return ok ? 0 : -LERR_NOENT;
@@ -3475,11 +3492,12 @@ meta_key(const char *key, int *isdir, uint64_t *size, uint64_t *ino)
 
 /* Metadata for a raw userspace path: resolve the cwd, then meta_key. */
 static long
-meta_path(const char *path, int *isdir, uint64_t *size, uint64_t *ino)
+meta_path(const char *path, int *isdir, uint64_t *size, uint64_t *ino,
+          uint64_t *mtime)
 {
     char key[RAMFS_NAME];
     resolve_path(path, key, sizeof key);
-    return meta_key(key, isdir, size, ino);
+    return meta_key(key, isdir, size, ino, mtime);
 }
 
 /* stat a path. follow=1 (stat) resolves a final-component symlink to its
@@ -3494,11 +3512,11 @@ do_stat_path(const char *path, struct linux_stat *out, int follow)
     if (follow)
         follow_link_key(key, sizeof key);
     int isdir = 0;
-    uint64_t size = 0, ino = 1;
-    long rc = meta_key(key, &isdir, &size, &ino);
+    uint64_t size = 0, ino = 1, mtime = 0;
+    long rc = meta_key(key, &isdir, &size, &ino, &mtime);
 
     if (rc == 0) {
-        fill_stat(out, isdir, size, ino);
+        fill_stat(out, isdir, size, ino, mtime);
         if (dev_lookup(key))
             out->st_mode = S_IFCHR | 0666;      /* a /dev character device */
         else if (!follow) {
@@ -3523,7 +3541,7 @@ do_symlink(const char *target, const char *linkpath)
         return -LERR_EXIST;             /* the root always exists */
     int isdir;
     uint64_t sz, ino;
-    if (meta_key(key, &isdir, &sz, &ino) == 0)
+    if (meta_key(key, &isdir, &sz, &ino, NULL) == 0)
         return -LERR_EXIST;             /* overlay entry or bundle name taken */
     int ri = ramfs_create(key, 0);
     if (ri < 0)
@@ -3574,7 +3592,7 @@ do_mkdir(const char *path)
         return -LERR_EXIST;             /* the root always exists */
     int isdir;
     uint64_t sz, ino;
-    if (meta_key(key, &isdir, &sz, &ino) == 0)
+    if (meta_key(key, &isdir, &sz, &ino, NULL) == 0)
         return -LERR_EXIST;
     if (under_rw_mount(key))            /* land the directory on the host */
         return create_9p_dir(key);
@@ -3601,7 +3619,7 @@ do_rmdir(const char *path)
     }
     int isdir;
     uint64_t sz, ino;
-    if (meta_key(key, &isdir, &sz, &ino) != 0)
+    if (meta_key(key, &isdir, &sz, &ino, NULL) != 0)
         return -LERR_NOENT;
     if (!isdir)
         return -LERR_NOTDIR;
@@ -3638,7 +3656,7 @@ do_rename(const char *oldp, const char *newp)
     if (ri < 0) {
         int isdir;
         uint64_t sz, ino;
-        if (meta_key(ok, &isdir, &sz, &ino) == 0)
+        if (meta_key(ok, &isdir, &sz, &ino, NULL) == 0)
             return -LERR_XDEV;          /* read-only source: cannot rename */
         return -LERR_NOENT;
     }
@@ -3704,9 +3722,10 @@ struct linux_statx {
 #define AT_SYMLINK_NOFOLLOW 0x100
 
 static void
-fill_statx(struct linux_statx *s, int isdir, uint64_t size, uint64_t ino)
+fill_statx(struct linux_statx *s, int isdir, uint64_t size, uint64_t ino,
+           uint64_t mtime)
 {
-    uint64_t mt = mtime_of_ino(ino);
+    uint64_t mt = mtime ? mtime : mtime_of_ino(ino);
     memset(s, 0, sizeof *s);
     s->stx_mask = STATX_BASIC_STATS;
     s->stx_blksize = 4096;
@@ -3725,7 +3744,7 @@ static long
 do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
 {
     int isdir = 0, islink = 0, ischar = 0;
-    uint64_t size = 0, ino = 1;
+    uint64_t size = 0, ino = 1, mtime = 0;
 
     if (!user_ok((uint64_t)(uintptr_t)out, sizeof *out))
         return -LERR_FAULT;
@@ -3734,7 +3753,7 @@ do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
         resolve_path(path, key, sizeof key);
         if (!(flags & AT_SYMLINK_NOFOLLOW))
             follow_link_key(key, sizeof key);
-        long rc = meta_key(key, &isdir, &size, &ino);
+        long rc = meta_key(key, &isdir, &size, &ino, &mtime);
         if (rc != 0)
             return rc;
         ischar = dev_lookup(key) != 0;
@@ -3760,7 +3779,7 @@ do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
     } else {
         return -LERR_NOENT;
     }
-    fill_statx(out, isdir, size, ino);
+    fill_statx(out, isdir, size, ino, mtime);
     if (ischar)
         out->stx_mode = S_IFCHR | 0666;
     else if (islink)
@@ -3787,19 +3806,19 @@ do_fstat(long fd, struct linux_stat *out)
         return 0;
     }
     if (f->kind == FD_DEV) {
-        fill_stat(out, 0, 0, f->ino);
+        fill_stat(out, 0, 0, f->ino, 0);
         out->st_mode = S_IFCHR | 0666;              /* a /dev character device */
         return 0;
     }
     if (f->kind == FD_CON) {
-        fill_stat(out, 0, 0, (uint64_t)fd);         /* console: a plain reg */
+        fill_stat(out, 0, 0, (uint64_t)fd, 0);      /* console: a plain reg */
         return 0;
     }
     if (f->kind == FD_RAM) {
-        fill_stat(out, 0, ramfs[f->ridx].len, (uint64_t)(0x10000 + f->ridx));
+        fill_stat(out, 0, ramfs[f->ridx].len, (uint64_t)(0x10000 + f->ridx), 0);
         return 0;
     }
-    fill_stat(out, f->kind == FD_DIR, f->size, f->ino);
+    fill_stat(out, f->kind == FD_DIR, f->size, f->ino, 0);
     return 0;
 }
 
@@ -4976,7 +4995,7 @@ do_nanosleep(int clockid, int flags, uint64_t req_ptr)
         /* Absolute: req is on the named clock. Convert a realtime deadline into
          * the monotonic base the tick counter uses. */
         int realtime = (clockid == 0);          /* CLOCK_REALTIME */
-        uint64_t epoch_ns = GUEST_EPOCH * 1000000000ULL;
+        uint64_t epoch_ns = guest_epoch() * 1000000000ULL;
         target_ns = (realtime && req_ns > epoch_ns) ? req_ns - epoch_ns : req_ns;
     } else {
         target_ns = guest_mono_ns() + req_ns;
@@ -5217,12 +5236,12 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_clock_gettime: {
         /* The host preemption timer drives a real wall clock; without it this is
          * the cycle counter read as nanoseconds (approximate). It shares the
-         * epoch with file mtimes (both GUEST_EPOCH + elapsed), so a fresh build
-         * file is never in the future. A MONOTONIC request gets uptime from the
-         * same source without the epoch offset. */
+         * epoch with file mtimes (both the boot epoch + elapsed), so a fresh
+         * build file is never in the future. A MONOTONIC request gets uptime from
+         * the same source without the epoch offset. */
         uint64_t ns = guest_mono_ns();
         int monotonic = (a1 == 1 || a1 == 4);   /* MONOTONIC, MONOTONIC_RAW */
-        uint64_t base = monotonic ? 0 : GUEST_EPOCH;
+        uint64_t base = monotonic ? 0 : guest_epoch();
         if (a2) {                         /* struct timespec { sec; nsec; } */
             uint64_t ts[2];
             ts[0] = base + ns / 1000000000ULL;
@@ -5237,7 +5256,7 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         uint64_t ns = guest_mono_ns();
         if (a1) {                         /* struct timeval { sec; usec; } */
             uint64_t tv[2];
-            tv[0] = GUEST_EPOCH + ns / 1000000000ULL;
+            tv[0] = guest_epoch() + ns / 1000000000ULL;
             tv[1] = (ns / 1000ULL) % 1000000ULL;
             long e = copy_to_user((uint64_t)a1, tv, sizeof tv);
             if (e < 0)
@@ -5606,7 +5625,7 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         }
         int isdir;
         uint64_t size, ino;
-        if (meta_key(key, &isdir, &size, &ino) < 0)
+        if (meta_key(key, &isdir, &size, &ino, NULL) < 0)
             return -LERR_NOENT;
         if (!isdir)
             return -LERR_NOTDIR;
@@ -5718,11 +5737,11 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         int isdir;
         uint64_t size, ino;
         if (under_rw_mount(ukey)) {     /* land the removal on the host mount */
-            if (meta_key(ukey, &isdir, &size, &ino) != 0)
+            if (meta_key(ukey, &isdir, &size, &ino, NULL) != 0)
                 return -LERR_NOENT;
             return isdir ? -LERR_ISDIR : remove_9p(ukey);
         }
-        if (meta_path(upath, &isdir, &size, &ino) == 0)
+        if (meta_path(upath, &isdir, &size, &ino, NULL) == 0)
             return isdir ? -LERR_ISDIR : -LERR_ROFS;
         return -LERR_NOENT;
     }
@@ -5792,7 +5811,7 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
             return e;
         int isdir;
         uint64_t size, ino;
-        long r = meta_path(up, &isdir, &size, &ino);
+        long r = meta_path(up, &isdir, &size, &ino, NULL);
         return r < 0 ? r : 0;
     }
     case SYS_faccessat:
@@ -5808,7 +5827,7 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
             return e;
         int isdir;
         uint64_t size, ino;
-        long r = meta_path(up, &isdir, &size, &ino);
+        long r = meta_path(up, &isdir, &size, &ino, NULL);
         return r < 0 ? r : 0;
     }
     case SYS_fcntl: {
