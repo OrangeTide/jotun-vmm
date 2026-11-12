@@ -1295,6 +1295,33 @@ over a connected socket. What is not: AF_INET, datagram sockets, and
 cross-process sockets between separate guests (the inter-guest path is the Plan 9
 network, see m14-net).
 
+## Autotools on a host mount
+
+The earlier autotools attempt (see "The autotools attempt" above) stopped at a
+reproducible `cc1` `#UD` and was walked back. The root cause was not the
+compiler. With the source tree on a host-directory mount, `./configure` wrote a
+0-byte `conftest.c`: the shell created the file, the heredoc body went in, and
+the shell then unlinked the name while still holding the file open. The host
+backend was path-based, so once the name was gone the writes and the compiler's
+read resolved nothing. `cc1` faulted on an empty input. Per-fid host descriptors
+(see the open-unlink commit) fixed it: the file stays reachable through the held
+descriptor after its name is removed.
+
+That exposed the next wall. `configure`'s `AM_SANITY_CHECK` compares the mtime of
+a file it just created against the mtimes of the distributed sources and aborts
+with "newly created file is older than distributed files" when the new file looks
+older. Two gaps made it look older: the guest wall clock was pinned to a fixed
+2025-01-01 epoch, and the host mount reported every file's mtime as 0. The boot
+clock now starts from the host's Unix time, and the 9p stat path carries each
+host file's real mtime, so a file created now is newer than sources checked out
+earlier, as it should be.
+
+With those three fixes, a minimal automake project (`amhello`) configures and
+builds end-to-end from a host mount: `./configure CC=/usr/bin/gcc` exits 0, `make`
+exits 0, and the built `hello` prints its line and exits 0. The build uses the
+unmodified host autoconf-generated `configure`, the host `bash`, `make` and `gcc`
+from live host mounts, and a writable host mount for the build tree.
+
 ## Planned work: real privilege separation
 
 Today the guest kernel and the Linux process share ring 0. User code runs with
