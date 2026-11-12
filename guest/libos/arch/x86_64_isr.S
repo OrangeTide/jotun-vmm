@@ -43,6 +43,20 @@ isr_event:
 
     cmpb $0, fpu_use_xsave(%rip)
     je 1f
+    /* Zero the 64-byte XSAVE header (at offset 512) before saving. The
+     * non-compacted XSAVE writes only XSTATE_BV; it leaves XCOMP_BV and the
+     * reserved header bytes untouched, and XRSTOR raises #GP if either is
+     * nonzero. The area is carved fresh from the stack each time, so without
+     * this it restores over stale stack bytes and faults. */
+    xorq %rax, %rax
+    movq %rax, 512(%r12)
+    movq %rax, 520(%r12)
+    movq %rax, 528(%r12)
+    movq %rax, 536(%r12)
+    movq %rax, 544(%r12)
+    movq %rax, 552(%r12)
+    movq %rax, 560(%r12)
+    movq %rax, 568(%r12)
     mov $0xffffffff, %eax      /* XSAVE/XRSTOR component mask: all enabled state */
     mov $0xffffffff, %edx
     xsave (%r12)
