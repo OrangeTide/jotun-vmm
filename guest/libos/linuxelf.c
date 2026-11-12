@@ -166,6 +166,8 @@
 #define LERR_NOSPC  28          /* ENOSPC: a write to /dev/full */
 #define LERR_SRCH   3           /* ESRCH: kill of a pid that does not exist */
 #define LERR_INTR   4           /* EINTR: a blocking call interrupted by a signal */
+#define LERR_NOEXEC 8           /* ENOEXEC: not an executable (bad "#!" line) */
+#define LERR_LOOP   40          /* ELOOP: too many nested "#!" interpreters */
 
 /* An internal marker (never returned to user): a blocking syscall was cut short
  * by a deliverable caught signal. The signal-delivery boundary turns it into a
@@ -5410,38 +5412,143 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     follow_link_key(relbuf, sizeof relbuf);
     const char *rel = relbuf;
 
-    /* A program built in the writable overlay (configure's ./conftest, a linked
-     * a.out) execs from its in-memory image; a bundle or host-mount file execs
-     * over a 9P fid. Capture the overlay buffer here, before the vmspace switch,
-     * and open the 9P fid only in the bundle case. */
-    int ri = ramfs_find(rel);
-    const unsigned char *exemem = NULL;
-    uint64_t exelen = 0;
-    if (ri >= 0 && !ramfs[ri].is_dir) {
-        exemem = ramfs[ri].data;
-        exelen = ramfs[ri].len;
-    } else {
-        if (ns_walk(rel, LINUX_FID) != 0)
-            return -LERR_NOENT;
-        if (p9_open(LINUX_FID) != 0) {
-            p9_clunk(LINUX_FID);
-            return -LERR_ACCES;
-        }
-    }
-
+    /* Snapshot argv/envp into kernel memory first: they may point into the image
+     * about to be overwritten, and a "#!" script rewrites argv below. */
     static const char *na[LINUX_MAX_ARGS];
     static const char *ne[LINUX_MAX_ARGS];
     char *sbuf = kmalloc(EXEC_STR_MAX);
-    if (!sbuf) {
-        if (!exemem)
-            p9_clunk(LINUX_FID);
+    if (!sbuf)
         return -LERR_NOMEM;
-    }
     int argc = copy_uvec(argv, na, sbuf, EXEC_STR_MAX / 2);
     int envc = copy_uvec(envp, ne, sbuf + EXEC_STR_MAX / 2, EXEC_STR_MAX / 2);
     if (argc == 0) {                    /* execve needs at least argv[0] */
         na[0] = rel;
         argc = 1;
+    }
+
+    /* Open the program to run, resolving "#!" interpreters. A program built in
+     * the writable overlay (configure's ./conftest, a linked a.out) execs from
+     * its in-memory image; a bundle or host-mount file execs over a 9P fid. A
+     * script whose first two bytes are "#!" is not loadable as an ELF: the named
+     * interpreter runs instead, with the script path (and any one "#!" argument)
+     * spliced into argv ahead of the script's own arguments, exactly as Linux
+     * does. shbuf holds the interpreter/argument/script strings so they survive
+     * relbuf being rewritten across nested levels. */
+    const unsigned char *exemem = NULL;
+    uint64_t exelen = 0;
+    char *shbuf = kmalloc(2048);
+    if (!shbuf) {
+        kfree(sbuf);
+        return -LERR_NOMEM;
+    }
+    size_t shoff = 0;
+    int shdepth = 0;
+    for (;;) {
+        int ri = ramfs_find(rel);
+        exemem = NULL;
+        exelen = 0;
+        if (ri >= 0 && !ramfs[ri].is_dir) {
+            exemem = ramfs[ri].data;
+            exelen = ramfs[ri].len;
+        } else {
+            if (ns_walk(rel, LINUX_FID) != 0) {
+                kfree(shbuf);
+                kfree(sbuf);
+                return -LERR_NOENT;
+            }
+            if (p9_open(LINUX_FID) != 0) {
+                p9_clunk(LINUX_FID);
+                kfree(shbuf);
+                kfree(sbuf);
+                return -LERR_ACCES;
+            }
+        }
+
+        /* Peek the first bytes to spot a "#!" interpreter line. 9P reads are
+         * offset-based, so the loader re-reads from 0 afterwards. */
+        unsigned char hdr[160];
+        int hn = 0;
+        if (exemem) {
+            hn = exelen < sizeof hdr ? (int)exelen : (int)sizeof hdr;
+            if (hn > 0)
+                memcpy(hdr, exemem, (size_t)hn);
+        } else {
+            long r = p9_read(LINUX_FID, 0, hdr, sizeof hdr);
+            hn = r > 0 ? (int)r : 0;
+        }
+        if (hn < 2 || hdr[0] != '#' || hdr[1] != '!')
+            break;                      /* an ELF (or the loader rejects it) */
+
+        if (!exemem)
+            p9_clunk(LINUX_FID);
+        if (++shdepth > 4) {            /* bounded against a script cycle */
+            kfree(shbuf);
+            kfree(sbuf);
+            return -LERR_LOOP;
+        }
+
+        /* Parse "#!": skip blanks, take the interpreter path, then at most one
+         * argument (the rest of the line, trimmed), stopping at a newline. */
+        int i = 2;
+        while (i < hn && (hdr[i] == ' ' || hdr[i] == '\t'))
+            i++;
+        int is = i;
+        while (i < hn && hdr[i] != ' ' && hdr[i] != '\t' && hdr[i] != '\n')
+            i++;
+        int ie = i;
+        while (i < hn && (hdr[i] == ' ' || hdr[i] == '\t'))
+            i++;
+        int as = i;
+        while (i < hn && hdr[i] != '\n')
+            i++;
+        int ae = i;
+        while (ae > as && (hdr[ae - 1] == ' ' || hdr[ae - 1] == '\t'))
+            ae--;
+        int ilen = ie - is, alen = ae - as, slen = (int)strlen(rel);
+        if (ilen <= 0) {                /* "#!" with no interpreter */
+            kfree(shbuf);
+            kfree(sbuf);
+            return -LERR_NOEXEC;
+        }
+        if (shoff + (size_t)ilen + (size_t)alen + (size_t)slen + 3 > 2048) {
+            kfree(shbuf);
+            kfree(sbuf);
+            return -LERR_NOMEM;
+        }
+
+        char *interp = shbuf + shoff;
+        memcpy(interp, hdr + is, (size_t)ilen);
+        interp[ilen] = '\0';
+        shoff += (size_t)ilen + 1;
+        char *iarg = NULL;
+        if (alen > 0) {
+            iarg = shbuf + shoff;
+            memcpy(iarg, hdr + as, (size_t)alen);
+            iarg[alen] = '\0';
+            shoff += (size_t)alen + 1;
+        }
+        char *script = shbuf + shoff;   /* copy before relbuf is rewritten */
+        memcpy(script, rel, (size_t)slen);
+        script[slen] = '\0';
+        shoff += (size_t)slen + 1;
+
+        /* Rewrite argv to: interp [iarg] script  then the script's own argv[1..].
+         * The script's argv[0] is dropped; the script path takes its place. */
+        static const char *na2[LINUX_MAX_ARGS];
+        int k = 0;
+        na2[k++] = interp;
+        if (iarg)
+            na2[k++] = iarg;
+        na2[k++] = script;
+        for (int j = 1; j < argc && k < LINUX_MAX_ARGS - 1; j++)
+            na2[k++] = na[j];
+        for (int j = 0; j < k; j++)
+            na[j] = na2[j];
+        argc = k;
+
+        resolve_path(interp, relbuf, sizeof relbuf);
+        follow_link_key(relbuf, sizeof relbuf);
+        rel = relbuf;
     }
 
     /* A fresh address space for the new image, replacing the old one. A
@@ -5453,6 +5560,7 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     if (!as) {
         if (!exemem)
             p9_clunk(LINUX_FID);
+        kfree(shbuf);
         kfree(sbuf);
         return -LERR_NOMEM;
     }
@@ -5466,6 +5574,7 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     if (lr != 0) {
         vmspace_switch(old);            /* keep the old image on failure */
         vmspace_destroy(as);
+        kfree(shbuf);
         kfree(sbuf);
         return -LERR_NOENT;
     }
@@ -5489,6 +5598,7 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
 
     arena_init(image_top(&exe, &interp));   /* fresh heap above the new image */
     uint64_t rsp = build_stack_vec(na, argc, ne, envc, &exe, &interp);
+    kfree(shbuf);
     kfree(sbuf);
 
     /* The child now has its own space, so the vfork parent can safely resume. */
