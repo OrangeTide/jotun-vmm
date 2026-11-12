@@ -3306,18 +3306,12 @@ do_read(long fd, void *buf, unsigned long count)
     return f->ops->read(f, buf, count);
 }
 
-/* pread: read at an explicit offset without moving the fd cursor. The dynamic
- * linker reads library program headers this way. Pipes and the console have no
- * position, so they are rejected. */
+/* Positioned read into a kernel-accessible buffer, on an already validated
+ * non-pipe/non-console fd. do_pread wraps it with the fd and user-buffer checks;
+ * splice reuses it for a seekable end with an explicit offset. */
 static long
-do_pread(long fd, void *buf, unsigned long count, uint64_t off)
+pread_core(struct lfd *f, void *buf, unsigned long count, uint64_t off)
 {
-    struct lfd *f = fd_get(fd);
-
-    if (!f || f->kind == FD_CON || f->kind == FD_PIPE || f->kind == FD_DIR)
-        return -LERR_BADF;
-    if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
-        return -LERR_FAULT;
     if (f->kind == FD_DEV)
         return dev_read(f->devno, buf, count);  /* char device: offset ignored */
     if (f->kind == FD_RAM) {
@@ -3333,19 +3327,10 @@ do_pread(long fd, void *buf, unsigned long count, uint64_t off)
     return n < 0 ? -LERR_INVAL : n;
 }
 
-/* pwrite: write at an explicit offset without disturbing the fd's own
- * position, the mirror of do_pread. A ram file grows to fit; a writable 9P
- * file writes through to the host at off. Pipes, the console and directories
- * have no position, so they are rejected, as on Linux. */
+/* Positioned write from a kernel-accessible buffer, the mirror of pread_core. */
 static long
-do_pwrite(long fd, const void *buf, unsigned long count, uint64_t off)
+pwrite_core(struct lfd *f, const void *buf, unsigned long count, uint64_t off)
 {
-    struct lfd *f = fd_get(fd);
-
-    if (!f || f->kind == FD_CON || f->kind == FD_PIPE || f->kind == FD_DIR)
-        return -LERR_BADF;
-    if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
-        return -LERR_FAULT;
     if (f->kind == FD_DEV)
         return dev_write(f->devno, buf, count);  /* char device: offset ignored */
     if (f->kind == FD_RAM) {
@@ -3373,6 +3358,97 @@ do_pwrite(long fd, const void *buf, unsigned long count, uint64_t off)
         return (long)done;
     }
     return -LERR_BADF;                  /* read-only bundle file */
+}
+
+/* pread: read at an explicit offset without moving the fd cursor. The dynamic
+ * linker reads library program headers this way. Pipes and the console have no
+ * position, so they are rejected. */
+static long
+do_pread(long fd, void *buf, unsigned long count, uint64_t off)
+{
+    struct lfd *f = fd_get(fd);
+
+    if (!f || f->kind == FD_CON || f->kind == FD_PIPE || f->kind == FD_DIR)
+        return -LERR_BADF;
+    if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
+        return -LERR_FAULT;
+    return pread_core(f, buf, count, off);
+}
+
+/* pwrite: write at an explicit offset without disturbing the fd's own
+ * position, the mirror of do_pread. A ram file grows to fit; a writable 9P
+ * file writes through to the host at off. Pipes, the console and directories
+ * have no position, so they are rejected, as on Linux. */
+static long
+do_pwrite(long fd, const void *buf, unsigned long count, uint64_t off)
+{
+    struct lfd *f = fd_get(fd);
+
+    if (!f || f->kind == FD_CON || f->kind == FD_PIPE || f->kind == FD_DIR)
+        return -LERR_BADF;
+    if (count && !user_ok((uint64_t)(uintptr_t)buf, count))
+        return -LERR_FAULT;
+    return pwrite_core(f, buf, count, off);
+}
+
+/* splice(fd_in, off_in, fd_out, off_out, len, flags): move up to len bytes
+ * between two descriptors, one of which must be a pipe, without passing the
+ * data through userspace. We bounce it through a kernel buffer: the stream end
+ * (a NULL offset) reads or writes through its backend ops (so a pipe blocks and
+ * reports EOF as a normal read does), and a non-NULL offset drives the seekable
+ * end through pread_core/pwrite_core and is advanced in place. One chunk per
+ * call, like Linux, which may return a short count; callers loop until 0. GNU
+ * grep uses this to drain its input to /dev/null, and a real kernel always has
+ * splice, so returning ENOSYS made grep treat it as a fatal input error. */
+#define SPLICE_CHUNK 65536
+static long
+do_splice(long fd_in, uint64_t uoff_in, long fd_out, uint64_t uoff_out,
+          unsigned long len, unsigned int flags)
+{
+    (void)flags;
+    struct lfd *fin = fd_get(fd_in);
+    struct lfd *fout = fd_get(fd_out);
+    if (!fin || !fout)
+        return -LERR_BADF;
+    if (fin->kind != FD_PIPE && fout->kind != FD_PIPE)
+        return -LERR_INVAL;             /* splice needs one pipe end */
+    if ((fin->kind == FD_PIPE && uoff_in) || (fout->kind == FD_PIPE && uoff_out))
+        return -LERR_SPIPE;             /* an offset on the pipe end is ESPIPE */
+    if (len == 0)
+        return 0;
+    if (len > SPLICE_CHUNK)
+        len = SPLICE_CHUNK;
+
+    int64_t in_off = -1, out_off = -1;
+    if (uoff_in && copy_from_user(&in_off, uoff_in, sizeof in_off) != 0)
+        return -LERR_FAULT;
+    if (uoff_out && copy_from_user(&out_off, uoff_out, sizeof out_off) != 0)
+        return -LERR_FAULT;
+
+    char *buf = kmalloc(len);
+    if (!buf)
+        return -LERR_NOMEM;
+
+    long got = uoff_in ? pread_core(fin, buf, len, (uint64_t)in_off)
+                       : fin->ops->read(fin, buf, len);
+    if (got <= 0) {
+        kfree(buf);
+        return got;                     /* 0 at EOF, or a negative errno */
+    }
+    long put = uoff_out ? pwrite_core(fout, buf, (unsigned long)got, (uint64_t)out_off)
+                        : fout->ops->write(fout, buf, (unsigned long)got);
+    kfree(buf);
+    if (put < 0)
+        return put;
+    if (uoff_in && put > 0) {
+        in_off += put;
+        copy_to_user(uoff_in, &in_off, sizeof in_off);
+    }
+    if (uoff_out && put > 0) {
+        out_off += put;
+        copy_to_user(uoff_out, &out_off, sizeof out_off);
+    }
+    return put;
 }
 
 static long
@@ -5377,6 +5453,9 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_pread(a1, (void *)a2, (unsigned long)a3, (uint64_t)a4);
     case SYS_pwrite64:
         return do_pwrite(a1, (const void *)a2, (unsigned long)a3, (uint64_t)a4);
+    case SYS_splice:
+        return do_splice(a1, (uint64_t)a2, a3, (uint64_t)a4,
+                         (unsigned long)a5, (unsigned int)tf_arg6(&lproc_cur->tf));
     case SYS_write:
         return do_write(a1, (const char *)a2, (unsigned long)a3);
     case SYS_writev:
