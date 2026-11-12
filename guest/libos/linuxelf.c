@@ -123,6 +123,7 @@
 #define SIGKILL      9          /* cannot be caught, blocked, or ignored */
 #define SIGSTOP      19         /* likewise; we have no stop state, so a no-op */
 #define SIGPIPE      13
+#define SIGALRM      14
 #define SIGCHLD      17
 #define SIGCONT      18
 #define SIGURG       23
@@ -577,6 +578,11 @@ struct lshared {
         uint64_t mask;
     } sigact[NSIG];
     uint64_t sig_pending;       /* process-directed signals awaiting action */
+    /* ITIMER_REAL: a per-process interval timer that raises SIGALRM. The deadline
+     * is a timer tick (0 disarmed); the interval, in ticks, re-arms it on expiry
+     * (0 for a one-shot). The tick hook raises SIGALRM when the deadline passes. */
+    uint64_t itimer_real_deadline;
+    uint64_t itimer_real_interval;
     /* A posix_spawn child (clone with CLONE_VM|CLONE_VFORK) borrows its parent's
      * address space until it execs its own, so execve and wait4 must not destroy
      * it. While vforking, the parent is blocked on vfork_waiter and the child
@@ -4226,8 +4232,90 @@ ns_to_deadline_tick(uint64_t target_ns)
     return (target_ns + per_tick_ns - 1) / per_tick_ns;
 }
 
-/* Wake any thread whose sleep deadline has passed. Runs from the event ISR and
- * at scheduler idle. */
+/* ITIMER_REAL, the only interval timer supported. The value and interval are
+ * carried as timer ticks in the process's lshared; getitimer/setitimer convert
+ * to and from the itimerval {it_interval, it_value} the user passes, each a
+ * struct timeval {tv_sec, tv_usec} (two 64-bit words), so the whole structure is
+ * four words. */
+#define LINUX_ITIMER_REAL 0
+
+static uint64_t
+tv_to_ticks(uint64_t sec, uint64_t usec)
+{
+    uint32_t hz = boot_timer_hz();
+    if (hz == 0)
+        return 0;                       /* no clock: nothing to arm against */
+    return sec * hz + (usec * hz) / 1000000ULL;
+}
+
+static void
+ticks_to_tv(uint64_t ticks, uint64_t *sec, uint64_t *usec)
+{
+    uint32_t hz = boot_timer_hz();
+    if (hz == 0) {
+        *sec = 0;
+        *usec = 0;
+        return;
+    }
+    *sec = ticks / hz;
+    *usec = ((ticks % hz) * 1000000ULL) / hz;
+}
+
+static long
+do_getitimer(int which, uint64_t ucur)
+{
+    if (which != LINUX_ITIMER_REAL)
+        return -LERR_INVAL;             /* VIRTUAL/PROF are not supported */
+    struct lshared *sh = lproc_cur->sh;
+    uint64_t now = boot_timer_ticks();
+    uint64_t rem = sh->itimer_real_deadline > now
+                 ? sh->itimer_real_deadline - now : 0;
+    uint64_t tv[4];
+    ticks_to_tv(sh->itimer_real_interval, &tv[0], &tv[1]);
+    ticks_to_tv(rem, &tv[2], &tv[3]);
+    if (ucur && copy_to_user(ucur, tv, sizeof tv) < 0)
+        return -LERR_FAULT;
+    return 0;
+}
+
+static long
+do_setitimer(int which, uint64_t unew, uint64_t uold)
+{
+    if (which != LINUX_ITIMER_REAL)
+        return -LERR_INVAL;
+    struct lshared *sh = lproc_cur->sh;
+    uint64_t now = boot_timer_ticks();
+
+    /* Report the previous setting first: a caller may pass the same buffer for
+     * old and new, so the old value is read before the new one overwrites it. */
+    if (uold) {
+        uint64_t rem = sh->itimer_real_deadline > now
+                     ? sh->itimer_real_deadline - now : 0;
+        uint64_t tv[4];
+        ticks_to_tv(sh->itimer_real_interval, &tv[0], &tv[1]);
+        ticks_to_tv(rem, &tv[2], &tv[3]);
+        if (copy_to_user(uold, tv, sizeof tv) < 0)
+            return -LERR_FAULT;
+    }
+    if (unew) {
+        uint64_t tv[4];
+        if (copy_from_user(tv, unew, sizeof tv) < 0)
+            return -LERR_FAULT;
+        if (tv[1] >= 1000000ULL || tv[3] >= 1000000ULL)
+            return -LERR_INVAL;         /* tv_usec out of range */
+        sh->itimer_real_interval = tv_to_ticks(tv[0], tv[1]);
+        if ((tv[2] | tv[3]) == 0) {
+            sh->itimer_real_deadline = 0;   /* it_value zero disarms the timer */
+        } else {
+            uint64_t v = tv_to_ticks(tv[2], tv[3]);
+            sh->itimer_real_deadline = now + (v ? v : 1);  /* at least one tick */
+        }
+    }
+    return 0;
+}
+
+/* Wake any thread whose sleep deadline has passed, and fire ITIMER_REAL. Runs
+ * from the event ISR and at scheduler idle. */
 static void
 sleep_wake_hook(void)
 {
@@ -4236,6 +4324,21 @@ sleep_wake_hook(void)
         struct lproc *t = &procs[i];
         if (t->used && t->sleep_deadline && now >= t->sleep_deadline)
             task_wake(t->task_id);
+    }
+    /* Raise SIGALRM on a process whose interval timer has elapsed, then re-arm
+     * by its interval (or disarm a one-shot). Waking the main thread lets a
+     * blocking syscall return so the signal is delivered at the boundary. */
+    for (int i = 0; i < LINUX_NPROC; i++) {
+        struct lshared *sh = &shareds[i];
+        if (sh->used && sh->itimer_real_deadline &&
+            now >= sh->itimer_real_deadline) {
+            sh->sig_pending |= SIGBIT(SIGALRM);
+            if (sh->itimer_real_interval)
+                sh->itimer_real_deadline += sh->itimer_real_interval;
+            else
+                sh->itimer_real_deadline = 0;
+            task_wake(sh->main_task);
+        }
     }
 }
 
@@ -5144,6 +5247,12 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
             return e;
         return (long)sizeof mask;
     }
+    case SYS_setitimer:
+        /* setitimer(which, new, old): arm/disarm ITIMER_REAL (SIGALRM). */
+        return do_setitimer((int)a1, (uint64_t)a2, (uint64_t)a3);
+    case SYS_getitimer:
+        /* getitimer(which, cur): report the remaining ITIMER_REAL value. */
+        return do_getitimer((int)a1, (uint64_t)a2);
     case SYS_nanosleep:
         /* nanosleep(req, rem): a relative sleep on the monotonic clock. */
         return do_nanosleep(1, 0, (uint64_t)a1);
