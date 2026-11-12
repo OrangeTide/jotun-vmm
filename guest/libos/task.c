@@ -23,6 +23,7 @@
  * status is collected.
  */
 #include "task.h"
+#include "boot.h"
 
 #include <stdint.h>
 
@@ -289,6 +290,21 @@ sched_start(void)
     struct percpu *pc = this_cpu();
 
     for (;;) {
+        /* Run the event hooks once per timer tick even while tasks are runnable,
+         * not only when the queue drains to idle. A task that busy-waits by
+         * yielding (poll, epoll_wait, wait4) keeps the queue non-empty and stays
+         * in ring 0, where timer interrupts do not fire, so without this a hook
+         * that readies a parked task (a timed sleep reaching its deadline, an
+         * interval timer) would never run and the sleeper would starve behind
+         * the spinner. Gated on the tick so it costs one scan per tick, not one
+         * per context switch. */
+        static uint64_t last_hook_tick;
+        uint64_t tick = boot_timer_ticks();
+        if (tick != last_hook_tick) {
+            last_hook_tick = tick;
+            run_event_hooks();
+        }
+
         unsigned long f = lock_irq();
         if (shutdown) {
             unlock_irq(f);
