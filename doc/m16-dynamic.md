@@ -560,8 +560,9 @@ Three small calls surfaced and were added, all additive:
 
 - `gettimeofday` (96): bash reads the wall clock at startup. Split from the
   cycle counter the same way as `clock_gettime`.
-- `socket` (41): bash probes for a socket during init. There are no sockets in
-  this guest, so it returns a quiet ENOSYS and bash falls back cleanly.
+- `socket` (41): an AF_UNIX stream socket is backed in-guest (see "A serving
+  Redis" below). A request for any other family returns a quiet ENOSYS and a
+  caller such as bash falls back cleanly.
 - `fadvise64` (221): coreutils calls `posix_fadvise` on its input. It is
   advisory, so the stub returns 0.
 
@@ -1249,12 +1250,50 @@ Two gaps surfaced, each a real capability rather than a Redis quirk:
   hook. ITIMER_VIRTUAL and ITIMER_PROF are rejected with `EINVAL`, and alarm and
   timerfd remain unbuilt.
 
-The cut line is the network. With those two fixes `redis-server` reaches
-"Running mode=standalone" and stops only at `socket(): Function not
-implemented`: the guest has a Plan 9 network, not the POSIX BSD socket surface
-(`socket`/`bind`/`listen`/`accept`). A serving Redis in the sandbox is the next
-milestone, and it is about sockets, not about building the project, which is
-done.
+The cut line was the network. With those two fixes `redis-server` reached
+"Running mode=standalone" and stopped only at `socket(): Function not
+implemented`: the guest had a Plan 9 network, not the POSIX BSD socket surface
+(`socket`/`bind`/`listen`/`accept`).
+
+## A serving Redis: AF_UNIX sockets
+
+That cut line is now crossed. The guest has AF_UNIX stream sockets, in-guest
+only, and a real Redis 7.4.1 built in the sandbox serves a client over a unix
+socket. The driver backgrounds `redis-server --unixsocket /tmp/r.sock`, then
+runs `redis-cli -s /tmp/r.sock` for PING, SET, GET, INCR and APPEND. The replies
+are correct (PONG, OK, the stored value, 1/2, the new length), the server shuts
+down cleanly on `redis-cli shutdown`, and the guest halts.
+
+The socket layer is a typed-fd backend. Each descriptor names its backend with
+an `enum fd_kind` and binds to a `struct fd_ops` vtable
+(read/write/poll/ref/close), which replaced the old pile of boolean type flags
+and makes a new backend a table entry. A socket is a pair of in-guest endpoints,
+each with a receive ring: a write appends to the peer's ring, a read drains its
+own, and a listener holds an accept queue that the poll path reports readable so
+the server's `epoll_wait` wakes. `linuxusock` covers a connect/accept round trip.
+
+Making the server actually serve took three fixes beyond the sockets themselves,
+each a general gap the demo exposed:
+
+- A busy-waiting task (the server spinning in `epoll_wait`) kept the scheduler in
+  ring 0, where timer interrupts do not fire, so a foreground `sleep` in the same
+  guest starved. The scheduler now runs its event hooks once per timer tick even
+  while tasks are runnable. `linuxsleepspin` covers it.
+- A shell reaps a background job by polling `waitpid` with `WNOHANG` and then
+  suspending for `SIGCHLD`. `wait4` ignored `WNOHANG` (so it blocked), no
+  `SIGCHLD` was posted on child exit, and `rt_sigsuspend` was unimplemented. All
+  three are now in place. `linuxsigchld` covers the sequence.
+- A process that exits must close its socket descriptors so the peer gets EOF.
+  `release_fds` now closes socket, eventfd and epoll descriptors through their
+  close op; for a socket this marks the peer closed. Without it, `redis-cli`
+  blocked in `recvfrom` forever after the server exited. `linuxusockeof` covers
+  a peer that exits without `close` delivering EOF.
+
+What is in: AF_UNIX `SOCK_STREAM` within one guest, the full
+socket/bind/listen/connect/accept/shutdown call set, and `sendto`/`recvfrom`
+over a connected socket. What is not: AF_INET, datagram sockets, and
+cross-process sockets between separate guests (the inter-guest path is the Plan 9
+network, see m14-net).
 
 ## Planned work: real privilege separation
 
