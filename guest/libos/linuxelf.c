@@ -104,6 +104,7 @@
 #define S_IFLNK  0120000
 #define S_IFIFO  0010000
 #define S_IFCHR  0020000
+#define S_IFSOCK 0140000
 #define DT_DIR  4
 #define DT_REG  8
 #define DT_CHR  2
@@ -1351,6 +1352,10 @@ enum {
 /* Synthetic inode numbers for /dev, in a range clear of the ramfs (0x10000),
  * pipe (0x20000) ranges so identities never collide. */
 #define DEV_INO_BASE 0x30000ULL
+
+/* Synthetic inode base for bound AF_UNIX socket paths, clear of the ranges
+ * above. A bound socket has a filesystem name but no file behind it. */
+#define SOCK_INO_BASE 0x40000ULL
 
 static const struct devnode {
     const char *name;           /* leaf name under /dev */
@@ -3108,6 +3113,23 @@ do_bind(long fd, uint64_t uaddr, uint64_t addrlen)
     return 0;
 }
 
+/* Index of the bound AF_UNIX socket whose path normalizes to `key`, or -1.
+ * bind records a path but creates no file, so this lets stat report S_IFSOCK at
+ * that name (what `test -S` and a readiness poll look for) instead of ENOENT. */
+static int
+usock_bound_key(const char *key)
+{
+    for (int i = 0; i < USOCK_MAX; i++) {
+        if (!usocks[i].used || !usocks[i].bound)
+            continue;
+        char k[RAMFS_NAME];
+        norm_key(usocks[i].path, k, sizeof k);
+        if (strcmp(k, key) == 0)
+            return i;
+    }
+    return -1;
+}
+
 static long
 do_listen(long fd, int backlog)
 {
@@ -3550,6 +3572,13 @@ meta_key(const char *key, int *isdir, uint64_t *size, uint64_t *ino,
         *ino = 1;
         return 0;
     }
+    int su = usock_bound_key(key);      /* a bound AF_UNIX socket name */
+    if (su >= 0) {
+        *isdir = 0;
+        *size = 0;
+        *ino = SOCK_INO_BASE + (uint64_t)su;
+        return 0;
+    }
     uint32_t fid = LINUX_FID_BASE + GFID_MAX;       /* scratch, above the pool */
     if (ns_walk(key, fid) != 0)
         return -LERR_NOENT;
@@ -3595,6 +3624,8 @@ do_stat_path(const char *path, struct linux_stat *out, int follow)
         fill_stat(out, isdir, size, ino, mtime);
         if (dev_lookup(key))
             out->st_mode = S_IFCHR | 0666;      /* a /dev character device */
+        else if (usock_bound_key(key) >= 0)
+            out->st_mode = S_IFSOCK | 0755;     /* a bound AF_UNIX socket name */
         else if (!follow) {
             int ri = ramfs_find(key);
             if (ri >= 0 && ramfs[ri].is_link)
@@ -3819,7 +3850,7 @@ fill_statx(struct linux_statx *s, int isdir, uint64_t size, uint64_t ino,
 static long
 do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
 {
-    int isdir = 0, islink = 0, ischar = 0;
+    int isdir = 0, islink = 0, ischar = 0, issock = 0;
     uint64_t size = 0, ino = 1, mtime = 0;
 
     if (!user_ok((uint64_t)(uintptr_t)out, sizeof *out))
@@ -3833,6 +3864,7 @@ do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
         if (rc != 0)
             return rc;
         ischar = dev_lookup(key) != 0;
+        issock = usock_bound_key(key) >= 0;
         if (!ischar && (flags & AT_SYMLINK_NOFOLLOW)) {
             int ri = ramfs_find(key);       /* lstat-style: see the link itself */
             islink = ri >= 0 && ramfs[ri].is_link;
@@ -3847,6 +3879,9 @@ do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
         } else if (f->kind == FD_RAM) {
             size = ramfs[f->ridx].len;
             ino = (uint64_t)(0x10000 + f->ridx);
+        } else if (f->kind == FD_SOCK) {
+            issock = 1;
+            ino = SOCK_INO_BASE + (uint64_t)f->sidx;
         } else {
             isdir = f->kind == FD_DIR;
             size = f->size;
@@ -3858,6 +3893,8 @@ do_statx(long dirfd, const char *path, long flags, struct linux_statx *out)
     fill_statx(out, isdir, size, ino, mtime);
     if (ischar)
         out->stx_mode = S_IFCHR | 0666;
+    else if (issock)
+        out->stx_mode = S_IFSOCK | 0755;
     else if (islink)
         out->stx_mode = S_IFLNK | 0777;
     return 0;
@@ -3892,6 +3929,11 @@ do_fstat(long fd, struct linux_stat *out)
     }
     if (f->kind == FD_RAM) {
         fill_stat(out, 0, ramfs[f->ridx].len, (uint64_t)(0x10000 + f->ridx), 0);
+        return 0;
+    }
+    if (f->kind == FD_SOCK) {
+        fill_stat(out, 0, 0, SOCK_INO_BASE + (uint64_t)f->sidx, 0);
+        out->st_mode = S_IFSOCK | 0755;             /* an AF_UNIX socket fd */
         return 0;
     }
     fill_stat(out, f->kind == FD_DIR, f->size, f->ino, 0);
