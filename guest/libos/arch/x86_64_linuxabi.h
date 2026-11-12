@@ -39,6 +39,7 @@
 #define SYS_eventfd2        290
 #define SYS_capget          125
 #define SYS_clock_getres    229
+#define SYS_io_uring_setup  425
 #define SYS_writev          20
 #define SYS_access          21
 #define SYS_pipe            22

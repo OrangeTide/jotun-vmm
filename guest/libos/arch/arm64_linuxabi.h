@@ -56,6 +56,7 @@
 #define SYS_eventfd2        19
 #define SYS_capget          90
 #define SYS_clock_getres    114
+#define SYS_io_uring_setup  425
 #define SYS_write           64
 #define SYS_writev          66
 #define SYS_readlinkat      78

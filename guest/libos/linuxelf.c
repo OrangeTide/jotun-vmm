@@ -4463,6 +4463,8 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return 0;                       /* flat RW map, nothing to enforce */
     case SYS_pkey_alloc:
         return -LERR_NOSYS;             /* no PKU; callers fall back to mprotect */
+    case SYS_io_uring_setup:
+        return -LERR_NOSYS;             /* no io_uring; libuv falls back to epoll */
     case SYS_pkey_free:
         return 0;
     case SYS_eventfd:
