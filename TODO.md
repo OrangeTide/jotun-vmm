@@ -131,15 +131,20 @@ about a dozen startup syscalls, and a static musl hello world exiting cleanly.
 ## Dynamic Linux + Node build: open gaps and bugs
 
 The milestone drifted well past the static-only scope above: the guest now runs
-unmodified dynamic glibc binaries, and the live goal (2026-11-08) is building a
-complex project, a NodeJS v26.13.0 checkout at `REF/node`. Staged A (run
-python3), B (run `./configure`), C (compile a target). Stages B and C both work:
-`./configure --with-intl=none` runs end to end and generates `out/Makefile`, and
-`make -j2` then compiles real translation units in-guest with the host toolchain
-(a V8 third-party C++ unit, then libuv, then OpenSSL; 127 objects and climbing in
-one bounded run, no toolchain errors). The working manifest, build environment,
-and the gcc/python gotchas are written up in doc/m16-dynamic.md ("Compiling Node
-(Stage C)"). The items below are the gaps and bugs that surfaced getting there.
+unmodified dynamic glibc binaries, and the live goal (2026-11-08) was building a
+complex project, a NodeJS v26.13.0 checkout at `REF/node`. That is DONE
+(2026-11-11): the full Node.js builds end to end in-guest on the host toolchain,
+`make` exits 0, and the 103 MB `out/Release/node` runs (reports v26.13.0 and
+executes JavaScript). 3745 objects, from a V8 translation unit that needs
+2.36 GiB through to node running itself to build its startup snapshot. Getting
+from Stage C (127 objects) to a finished binary took: 9p deep-path Twalk chunking
+(f8bdc46), `pwrite64` (681563f), raising RAM and the user window 2->3.5 GiB for
+V8's `pipeline.cc` (2d55f82), `FUTEX_WAIT_BITSET` + `pkey` so V8's `mksnapshot`
+runs in-guest (833b522), and `eventfd2` + `capget`/`clock_getres` so node's
+`node_mksnapshot` runs in-guest (f2bad85). The manifest, build environment, the
+gcc/python gotchas, and this whole push are written up in doc/m16-dynamic.md
+("Compiling Node (Stage C)" and "Pushing the Node build through V8"). The items
+below are the gaps and bugs that surfaced getting there.
 
 Fixed on the way to Stage B (for the record):
 
@@ -219,13 +224,15 @@ inside it. A real target like V8 is the goal, not a thing to declare out of
 scope. The guest is just undersized today; these are the expansions that make a
 large build work. Roughly in dependency order:
 
-- [ ] Raise guest RAM into the multi-GiB range, and scale the frame pool and the
-      user address-space window with it. A single `cc1plus` translation unit of
-      V8 can want 1 to 2 GiB, and the link step more; 256 MiB is the hard wall.
-      RAM is host-allocated at boot, so this is mostly picking a larger size and
-      widening the window/physmap layout (the window has already moved 32 ->
-      128 MiB and 108 MiB for gcc; this is the same lever, pushed much further).
-      Demand paging already covers the large sparse reservations compilers make.
+- [x] Raise guest RAM into the multi-GiB range, and scale the frame pool and the
+      user address-space window with it. Done: RAM and the window went 256 MiB ->
+      2 GiB -> 3.5 GiB (commits 759f51b, 2d55f82). V8's heaviest `cc1plus`
+      translation unit (`pipeline.cc`) needs a measured 2.36 GiB and now compiles;
+      the full node binary (103 MB) links. 3.5 GiB is the largest contiguous RAM
+      that keeps the device MMIO band below the x86 IOAPIC/APIC hole at
+      0xfec00000 without splitting it; going past ~3.9 GiB needs that split (a
+      later step). The per-process page tables now span four top-level slots on
+      both arches; see the per-arch vmspace headers and doc/m16-dynamic.md.
 - [x] A WRITABLE host-backed mount. A build's output tree (`out/`, object files,
       archives, the linked binary) now lands on the host filesystem instead of
       guest RAM. This was the key architectural piece: it removes the in-RAM

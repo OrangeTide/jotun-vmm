@@ -1209,6 +1209,15 @@ smoke, and each stall was a concrete gap. In order:
   corrupts the preemption save area (the sleep and time tests failed), the same
   trap the utimensat work first hit.
 
+With both snapshots built in-guest, the compile of `node_snapshot.cc` and the
+final link follow, and `make` finishes with status 0: a 103 MB
+`out/Release/node`, a complete Node.js v26.13.0 built end to end inside the
+sandbox on the host toolchain over 9P. The binary is a valid x86-64 PIE that
+runs (`node --version` reports v26.13.0 and it executes JavaScript), so the
+milestone is a working node, not just a clean build. 3745 objects, from a V8
+translation unit that needs 2.36 GiB through to node's own snapshot, all
+compiled by an unmodified host gcc running as an ordinary guest process.
+
 ## Planned work: real privilege separation
 
 Today the guest kernel and the Linux process share ring 0. User code runs with
