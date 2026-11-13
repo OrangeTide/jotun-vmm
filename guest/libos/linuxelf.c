@@ -6989,12 +6989,18 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
     const char *rel = relbuf;
 
     /* Snapshot argv/envp into kernel memory first: they may point into the image
-     * about to be overwritten, and a "#!" script rewrites argv below. */
-    static const char *na[LINUX_MAX_ARGS];
-    static const char *ne[LINUX_MAX_ARGS];
-    char *sbuf = kmalloc(EXEC_STR_MAX);
+     * about to be overwritten, and a "#!" script rewrites argv below. The string
+     * bytes and the argv/envp pointer arrays (na, ne, and the "#!" scratch na2)
+     * all live in one per-call allocation, never static: execve yields the giant
+     * lock to load the ELF over 9P, so a static array would be clobbered by a
+     * concurrent execve in that window, dropping an argument (seen under a
+     * parallel make as a shell invoked with its command lost). */
+    char *sbuf = kmalloc(EXEC_STR_MAX + 3 * LINUX_MAX_ARGS * sizeof(char *));
     if (!sbuf)
         return -LERR_NOMEM;
+    const char **na  = (const char **)(sbuf + EXEC_STR_MAX);
+    const char **ne  = na + LINUX_MAX_ARGS;
+    const char **na2 = ne + LINUX_MAX_ARGS;
     int argc = copy_uvec(argv, na, sbuf, EXEC_STR_MAX / 2);
     int envc = copy_uvec(envp, ne, sbuf + EXEC_STR_MAX / 2, EXEC_STR_MAX / 2);
     if (argc == 0) {                    /* execve needs at least argv[0] */
@@ -7114,8 +7120,8 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
         shoff += (size_t)slen + 2;
 
         /* Rewrite argv to: interp [iarg] script  then the script's own argv[1..].
-         * The script's argv[0] is dropped; the script path takes its place. */
-        static const char *na2[LINUX_MAX_ARGS];
+         * The script's argv[0] is dropped; the script path takes its place. na2
+         * is the per-call scratch carved from sbuf above (never static). */
         int k = 0;
         na2[k++] = interp;
         if (iarg)
