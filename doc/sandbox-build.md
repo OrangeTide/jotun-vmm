@@ -179,8 +179,10 @@ make install PREFIX=/opt     # system-wide (may need sudo)
 - `PREFIX` defaults to `$HOME/.local`; pass `PREFIX=/opt` or `PREFIX=/usr/local`
   for a system install, and `DESTDIR` to stage into a package root.
 - `jotun` lands in `$PREFIX/bin`, the `libos.elf` kernel in
-  `$PREFIX/libexec/jotun` (pass that path as the kernel-image argument when
-  running), and `jotun.1` in `$PREFIX/share/man/man1`.
+  `$PREFIX/libexec/jotun`, and `jotun.1` in `$PREFIX/share/man/man1`. An
+  installed `jotun` finds that kernel automatically (it looks next to the binary
+  and in `../libexec/jotun`), so you run it with just a manifest and no
+  kernel-image argument. `JOTUN_KERNEL` overrides the search.
 - `make uninstall` removes the same files. See `man jotun` (or
   `man ./man/jotun.1` before installing) for the full command and manifest
   reference.

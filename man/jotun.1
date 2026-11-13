@@ -41,11 +41,24 @@ as the init program and its arguments.
 .PP
 If no
 .I kernel-image
-is given on the command line, the kernel is lifted from a bundle (the object
-.BR boot/kernel ),
-and failing that the file
+is given on the command line,
+.B jotun
+resolves one in order: the file named by
+.BR JOTUN_KERNEL ;
+a kernel lifted from a bundle (the object
+.BR boot/kernel );
+.B libos.elf
+next to the
+.B jotun
+binary (a build tree) or in
+.B ../libexec/jotun
+relative to it (an install tree); and
+.B libos.elf
+in the current directory. Failing all of these, the file
 .B test_guest.elf
-in the current directory is used.
+in the current directory is used. An installed
+.B jotun
+therefore boots from just a manifest, with no kernel path on the command line.
 .SH OPTIONS
 .TP
 .BI -m " manifest"
@@ -131,6 +144,10 @@ before boot, verifying it against the trusted
 .IR key .
 The guest refuses to boot if the pull cannot be verified.
 .SH ENVIRONMENT
+.TP
+.B JOTUN_KERNEL
+Path to the kernel image to load when none is given on the command line. Takes
+precedence over the automatic search.
 .TP
 .B JOTUN_MANIFEST
 Manifest for the single guest when no

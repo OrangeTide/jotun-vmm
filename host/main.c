@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -25,6 +26,10 @@
 #include "manifest.h"
 #include "bundlepull.h"
 #include "net.h"
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 /* This host runs native-arch guests (KVM and HVF both run the host CPU), so the
  * build arch is the guest arch, and this token selects the matching variant in
@@ -648,12 +653,60 @@ guest_vm_create(struct guest *gp)
  * historical test_guest.elf default so a bare run still boots. svctx is the
  * smolvfs context from p9smolvfs_open, or NULL for the in-memory backend.
  * Fills gp->img. Returns 0, or -1 on failure. */
+/* Resolve the directory holding the running executable, so an installed jotun
+ * can find its libos.elf next to it (a build tree) or in ../libexec/jotun (an
+ * install tree) with no kernel path on the command line. Fills dir (holding at
+ * least PATH_MAX bytes) and returns 0, or -1 if the path cannot be resolved. */
+static int
+self_dir(char *dir, size_t dirsz)
+{
+    char path[PATH_MAX];
+#if defined(__APPLE__)
+    uint32_t n = sizeof path;
+    if (_NSGetExecutablePath(path, &n) != 0)
+        return -1;
+#else
+    ssize_t n = readlink("/proc/self/exe", path, sizeof path - 1);
+    if (n < 0)
+        return -1;
+    path[n] = '\0';
+#endif
+    /* Collapse symlinks and ".." so ../libexec is computed from the real
+     * location; fall back to the raw path if realpath fails. */
+    char real[PATH_MAX];
+    const char *resolved = realpath(path, real) ? real : path;
+    char *slash = strrchr(resolved, '/');
+    if (!slash || slash == resolved)
+        return -1;
+    size_t len = (size_t)(slash - resolved);
+    if (len + 1 > dirsz)
+        return -1;
+    memcpy(dir, resolved, len);
+    dir[len] = '\0';
+    return 0;
+}
+
+/* Load an ELF kernel from path if it is readable. Returns 0 on success, or -1
+ * if the file is absent or does not load. */
+static int
+try_kernel_file(struct guest *gp, const char *path)
+{
+    if (access(path, R_OK) != 0)
+        return -1;
+    return elf_load_file(path, gp->gm.base, GUEST_RAM_SIZE, &gp->img);
+}
+
 static int
 guest_load_kernel(struct guest *gp, int gid, const char *cli_kernel,
                   void *svctx)
 {
     if (cli_kernel)
         return elf_load_file(cli_kernel, gp->gm.base, GUEST_RAM_SIZE, &gp->img);
+
+    /* An explicit override wins over every search below. */
+    const char *env_kernel = getenv("JOTUN_KERNEL");
+    if (env_kernel)
+        return elf_load_file(env_kernel, gp->gm.base, GUEST_RAM_SIZE, &gp->img);
 
     if (svctx) {
         void *img = NULL;
@@ -667,6 +720,29 @@ guest_load_kernel(struct guest *gp, int gid, const char *cli_kernel,
                         " (%s)\n", gid, JOTUN_KERNEL_PATH);
             return rc;
         }
+    }
+
+    /* No kernel named and none in a bundle: find libos.elf automatically, so an
+     * installed jotun boots with just a manifest. Try next to the binary (build
+     * tree), then ../libexec/jotun relative to it (install tree), then the
+     * current directory. */
+    char dir[PATH_MAX];
+    char cand[PATH_MAX];
+    if (self_dir(dir, sizeof dir) == 0) {
+        int r = snprintf(cand, sizeof cand, "%s/libos.elf", dir);
+        if (r > 0 && r < (int)sizeof cand && try_kernel_file(gp, cand) == 0) {
+            fprintf(stderr, "[boot] guest %d: kernel %s\n", gid, cand);
+            return 0;
+        }
+        r = snprintf(cand, sizeof cand, "%s/../libexec/jotun/libos.elf", dir);
+        if (r > 0 && r < (int)sizeof cand && try_kernel_file(gp, cand) == 0) {
+            fprintf(stderr, "[boot] guest %d: kernel %s\n", gid, cand);
+            return 0;
+        }
+    }
+    if (try_kernel_file(gp, "libos.elf") == 0) {
+        fprintf(stderr, "[boot] guest %d: kernel libos.elf\n", gid);
+        return 0;
     }
 
     return elf_load_file("test_guest.elf", gp->gm.base, GUEST_RAM_SIZE,
