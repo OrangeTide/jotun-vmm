@@ -281,6 +281,16 @@ ov_removef(void *ctx, const struct p9_node *node)
 }
 
 static int
+ov_renamef(void *ctx, const struct p9_node *olddir, const char *oldname,
+           const struct p9_node *newdir, const char *newname)
+{
+    struct p9overlay *ov = ctx;
+    if (is_synth(olddir) || is_synth(newdir) || !ov->under->renamef)
+        return -1;
+    return ov->under->renamef(ov->under_ctx, olddir, oldname, newdir, newname);
+}
+
+static int
 ov_openh(void *ctx, const struct p9_node *file, int for_write)
 {
     struct p9overlay *ov = ctx;
@@ -298,6 +308,7 @@ static const struct p9_backend overlay_backend = {
     .create = ov_create,
     .truncate = ov_truncate,
     .removef = ov_removef,
+    .renamef = ov_renamef,
     .openh = ov_openh,
 };
 

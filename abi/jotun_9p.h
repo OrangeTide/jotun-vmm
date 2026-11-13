@@ -44,6 +44,11 @@ enum {
     P9_TREMOVE  = 122, P9_RREMOVE  = 123,
     P9_TSTAT    = 124, P9_RSTAT    = 125,
     P9_TWSTAT   = 126, P9_RWSTAT   = 127,
+    /* Rename, modeled on 9P2000.L Trenameat: move oldname under olddirfid to
+     * newname under newdirfid. Both fids must name directories in one backend.
+     * Carried here as a jotun extension so a writable host mount can rename a
+     * file (temp-then-rename is how most tools write a file atomically). */
+    P9_TRENAME  = 128, P9_RRENAME  = 129,
 };
 
 /* qid.type and stat.mode high bits. */

@@ -248,6 +248,20 @@ gr_removef(void *ctx, const struct p9_node *node)
 }
 
 static int
+gr_renamef(void *ctx, const struct p9_node *olddir, const char *oldname,
+           const struct p9_node *newdir, const char *newname)
+{
+    void *obctx, *nbctx;
+    const struct p9_backend *obe = owner(ctx, olddir, &obctx);
+    const struct p9_backend *nbe = owner(ctx, newdir, &nbctx);
+    if (obe != nbe || obctx != nbctx)   /* no rename across grafted trees */
+        return -1;
+    if (!obe->renamef)
+        return -1;
+    return obe->renamef(obctx, olddir, oldname, newdir, newname);
+}
+
+static int
 gr_openh(void *ctx, const struct p9_node *file, int for_write)
 {
     void *bctx;
@@ -266,6 +280,7 @@ static const struct p9_backend graft_backend = {
     .create = gr_create,
     .truncate = gr_truncate,
     .removef = gr_removef,
+    .renamef = gr_renamef,
     .openh = gr_openh,
 };
 

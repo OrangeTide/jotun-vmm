@@ -45,10 +45,10 @@ typedef int (*p9_emit_fn)(void *emit_ctx, const struct p9_dirent *de);
 /* The backend interface. root and walk return 0 or -1; list emits each entry
  * and returns 0 or -1; readf returns a byte count or -1.
  *
- * The write ops (writef, create, truncate, removef) are NULL for a read-only
- * backend; the server reports a read-only error when a T-message needs one that
- * is absent. create makes a child of dir: a directory when perm has P9_DMDIR,
- * else a regular file, and fills out with the new node. */
+ * The write ops (writef, create, truncate, removef, renamef) are NULL for a
+ * read-only backend; the server reports a read-only error when a T-message needs
+ * one that is absent. create makes a child of dir: a directory when perm has
+ * P9_DMDIR, else a regular file, and fills out with the new node. */
 struct p9_backend {
     int  (*root)(void *ctx, struct p9_node *out);
     int  (*walk)(void *ctx, const struct p9_node *dir, const char *name,
@@ -63,6 +63,11 @@ struct p9_backend {
                    uint32_t perm, struct p9_node *out);
     int  (*truncate)(void *ctx, const struct p9_node *file, uint64_t len);
     int  (*removef)(void *ctx, const struct p9_node *node);
+    /* Move oldname under olddir to newname under newdir, replacing an existing
+     * destination. Both directories belong to this backend (the server and the
+     * graft wrapper enforce that). NULL on a read-only backend. Returns 0 or -1. */
+    int  (*renamef)(void *ctx, const struct p9_node *olddir, const char *oldname,
+                    const struct p9_node *newdir, const char *newname);
     /* Optional. Open a regular file and return a host file descriptor the server
      * holds for the fid's lifetime, reading and writing it with pread/pwrite and
      * closing it on clunk. A held descriptor keeps the file's inode alive after

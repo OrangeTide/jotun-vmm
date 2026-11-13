@@ -226,6 +226,23 @@ p9_remove(uint32_t fid)
     return 0;
 }
 
+int
+p9_rename(uint32_t olddirfid, uint32_t newdirfid,
+          const char *oldname, const char *newname)
+{
+    struct p9_out o;
+    struct p9_in in;
+
+    begin(&o, P9_TRENAME);
+    p9o_u32(&o, olddirfid);
+    p9o_u32(&o, newdirfid);
+    p9o_str(&o, oldname);
+    p9o_str(&o, newname);
+    if (txn(&o, &in) != P9_RRENAME)
+        return -1;
+    return 0;
+}
+
 /* Parse one stat structure, cursor positioned at its leading size[2] field. */
 static int
 parse_stat(struct p9_in *in, struct p9_stat *out)

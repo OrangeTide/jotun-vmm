@@ -2088,6 +2088,57 @@ remove_9p(const char *key)
     return 0;
 }
 
+/* Split a normalized key into its parent directory and leaf name. parent is
+ * written to buf (the root maps to ""); the returned pointer is the leaf within
+ * key. */
+static const char *
+split_parent(const char *key, char *buf, size_t cap)
+{
+    size_t kl = strlen(key), cut = kl;
+    while (cut > 0 && key[cut - 1] != '/')
+        cut--;
+    size_t plen = cut > 0 ? cut - 1 : 0;
+    if (plen >= cap)
+        plen = cap - 1;
+    memcpy(buf, key, plen);
+    buf[plen] = '\0';
+    return key + cut;
+}
+
+/* Rename a file on a writable host mount over 9P: walk both parent directories
+ * and issue Trename. Both keys are normalized and known to be under a writable
+ * mount. A build writes most files as a temp then renames it into place (conf
+ * writes .config this way), and those live on the host mount, not the overlay,
+ * so the overlay rename path cannot reach them. */
+static long
+rename_9p(const char *oldkey, const char *newkey)
+{
+    char oparent[RAMFS_NAME], nparent[RAMFS_NAME];
+    const char *oleaf = split_parent(oldkey, oparent, sizeof oparent);
+    const char *nleaf = split_parent(newkey, nparent, sizeof nparent);
+    if (oleaf[0] == '\0' || nleaf[0] == '\0')
+        return -LERR_INVAL;
+
+    uint32_t of = fid_alloc();
+    if (of == 0)
+        return -LERR_NOMEM;
+    if (ns_walk(oparent, of) != 0)      /* ns_walk releases the fid on failure */
+        return -LERR_NOENT;
+    uint32_t nf = fid_alloc();
+    if (nf == 0) {
+        p9_clunk(of);
+        return -LERR_NOMEM;
+    }
+    if (ns_walk(nparent, nf) != 0) {
+        p9_clunk(of);
+        return -LERR_NOENT;
+    }
+    long rc = p9_rename(of, nf, oleaf, nleaf) == 0 ? 0 : -LERR_XDEV;
+    p9_clunk(of);
+    p9_clunk(nf);
+    return rc;
+}
+
 static long
 do_open(const char *path, long flags, long mode)
 {
@@ -3014,11 +3065,22 @@ static void ram_close(struct lfd *f)
  * open-file description). */
 static long p9_fd_read(struct lfd *f, void *buf, unsigned long count)
 {
-    long n = p9_read(f->p9fid, f->of->pos, buf, (uint32_t)count);
-    if (n < 0)
-        return -LERR_INVAL;
-    f->of->pos += (uint64_t)n;
-    return n;
+    /* Fill the whole request from successive 9P chunks (each capped by the
+     * transport msize), stopping at EOF. A regular file on Linux returns the
+     * full count in one read(), and tools such as the kernel's fixdep assume
+     * that, so a single short chunk would break them. */
+    unsigned long done = 0;
+    while (done < count) {
+        long n = p9_read(f->p9fid, f->of->pos, (char *)buf + done,
+                         (uint32_t)(count - done));
+        if (n < 0)
+            return done ? (long)done : -LERR_INVAL;
+        if (n == 0)
+            break;                      /* EOF */
+        f->of->pos += (uint64_t)n;
+        done += (unsigned long)n;
+    }
+    return (long)done;
 }
 static long p9_fd_write(struct lfd *f, const void *buf, unsigned long len)
 {
@@ -3588,8 +3650,20 @@ pread_core(struct lfd *f, void *buf, unsigned long count, uint64_t off)
         memcpy(buf, rf->data + off, n);
         return n;
     }
-    long n = p9_read(f->p9fid, off, buf, (uint32_t)count);
-    return n < 0 ? -LERR_INVAL : n;
+    /* Fill the whole request from successive 9P chunks, stopping at EOF, so a
+     * positioned read of a regular file returns the full count as on Linux (see
+     * p9_fd_read). */
+    unsigned long done = 0;
+    while (done < count) {
+        long n = p9_read(f->p9fid, off + done, (char *)buf + done,
+                         (uint32_t)(count - done));
+        if (n < 0)
+            return done ? (long)done : -LERR_INVAL;
+        if (n == 0)
+            break;                      /* EOF */
+        done += (unsigned long)n;
+    }
+    return (long)done;
 }
 
 /* Positioned write from a kernel-accessible buffer, the mirror of pread_core. */
@@ -4058,8 +4132,14 @@ do_rename(const char *oldp, const char *newp)
     if (ri < 0) {
         int isdir;
         uint64_t sz, ino;
-        if (meta_key(ok, &isdir, &sz, &ino, NULL) == 0)
-            return -LERR_XDEV;          /* read-only source: cannot rename */
+        if (meta_key(ok, &isdir, &sz, &ino, NULL) == 0) {
+            /* The source is on a backend, not the overlay. If both paths are on a
+             * writable host mount, rename there over 9P; otherwise it is a move
+             * off a read-only mount, which cannot be done. */
+            if (under_rw_mount(ok) && under_rw_mount(nk))
+                return rename_9p(ok, nk);
+            return -LERR_XDEV;
+        }
         return -LERR_NOENT;
     }
 
@@ -5975,8 +6055,11 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_utimensat(a1, (uint64_t)a2);
     case SYS_dup: {
         struct lfd *f = fd_get(a1);
-        if (!f || a1 < 3)
-            return -LERR_BADF;          /* console dup not needed here */
+        if (!f)
+            return -LERR_BADF;
+        /* dup of a std fd is legitimate: flex dup()s stdout to save it before
+         * redirecting to its output file, then restores it. clone_fd handles a
+         * console fd as the dup2/dup3 paths below already rely on. */
         int nfd = fd_alloc();
         if (nfd < 0)
             return -LERR_NOMEM;
@@ -6461,9 +6544,26 @@ build_stack_vec(const char *const *argv, int argc,
                 const char *const *envp, int envc,
                 const struct elf_info *exe, const struct elf_info *interp)
 {
-    uint8_t *sp = (uint8_t *)(uintptr_t)LINUX_USTACK_TOP;
+    /* Leave one page of headroom above the initial data. Linux keeps mapped
+     * stack VMA above the argv/env block, so glibc's vectorized string routines
+     * and the odd one-byte peek past a terminator never fault. VM_USER_HI itself
+     * is the one user address pf_handle refuses to back (the kernel band starts
+     * there), so data flush against it makes those benign over-reads fatal. The
+     * headroom page instead faults in zeroed on the first over-read, which also
+     * stops any scan that runs past AT_RANDOM. */
+    uint8_t *sp = (uint8_t *)(uintptr_t)(LINUX_USTACK_TOP - PAGE_SIZE);
     char *argp[LINUX_MAX_ARGS];
     char *envpp[LINUX_MAX_ARGS];
+
+    /* 16 bytes for AT_RANDOM at the top of the block, seeded from the cycle
+     * counter, as Linux places it, above the argv and env strings. */
+    sp -= 16;
+    uint8_t *rnd = sp;
+    uint64_t seed = arch_cycles();
+    for (int k = 0; k < 16; k++) {
+        rnd[k] = (uint8_t)seed;
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    }
 
     for (int i = envc - 1; i >= 0; i--) {
         size_t len = strlen(envp[i]) + 1;
@@ -6476,15 +6576,6 @@ build_stack_vec(const char *const *argv, int argc,
         sp -= len;
         memcpy(sp, argv[i], len);
         argp[i] = (char *)sp;
-    }
-
-    /* 16 bytes for AT_RANDOM, seeded from the cycle counter, below the strings. */
-    sp -= 16;
-    uint8_t *rnd = sp;
-    uint64_t seed = arch_cycles();
-    for (int k = 0; k < 16; k++) {
-        rnd[k] = (uint8_t)seed;
-        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
     }
 
     /* The control block below that, 16-byte aligned as the entry contract wants

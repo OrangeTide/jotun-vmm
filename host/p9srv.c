@@ -422,6 +422,28 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
         reply_hdr(&o, rsp, rspcap, P9_RREMOVE, tag);
         return p9o_finish(&o);
     }
+    case P9_TRENAME: {
+        /* Move oldname under olddirfid to newname under newdirfid. */
+        uint32_t olddirfid = p9i_u32(&in);
+        uint32_t newdirfid = p9i_u32(&in);
+        char oldname[256], newname[256];
+        p9i_str(&in, oldname, sizeof oldname);
+        p9i_str(&in, newname, sizeof newname);
+        if (!in.ok)
+            return reply_error(rsp, rspcap, tag, "bad Trename");
+        int oi = find_fid(s, olddirfid);
+        int ni = find_fid(s, newdirfid);
+        if (oi < 0 || ni < 0)
+            return reply_error(rsp, rspcap, tag, "bad fid");
+        if (!s->be->renamef)
+            return reply_error(rsp, rspcap, tag, "read-only");
+        if (s->be->renamef(s->ctx, &s->fids[oi].node, oldname,
+                           &s->fids[ni].node, newname) != 0)
+            return reply_error(rsp, rspcap, tag, "rename failed");
+        s->dir_valid = 0;           /* a listing may have changed */
+        reply_hdr(&o, rsp, rspcap, P9_RRENAME, tag);
+        return p9o_finish(&o);
+    }
     default:
         return reply_error(rsp, rspcap, tag, "unsupported message");
     }

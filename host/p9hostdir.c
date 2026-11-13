@@ -401,6 +401,35 @@ hd_removef(void *vctx, const struct p9_node *node)
     return unlink(full) == 0 ? 0 : -1;
 }
 
+static int
+hd_renamef(void *vctx, const struct p9_node *olddir, const char *oldname,
+           const struct p9_node *newdir, const char *newname)
+{
+    struct p9hostdir *c = vctx;
+    if (!c->writable || !valid_name(oldname) || !valid_name(newname))
+        return -1;
+
+    /* Each leaf joins onto an already-confined directory handle, so the two
+     * paths stay within the root (valid_name rejects "/", "." and ".."). */
+    char orel[P9_HANDLE_MAX], nrel[P9_HANDLE_MAX];
+    int ol = olddir->handle[0]
+        ? snprintf(orel, sizeof orel, "%s/%s", olddir->handle, oldname)
+        : snprintf(orel, sizeof orel, "%s", oldname);
+    int nl = newdir->handle[0]
+        ? snprintf(nrel, sizeof nrel, "%s/%s", newdir->handle, newname)
+        : snprintf(nrel, sizeof nrel, "%s", newname);
+    if (ol < 0 || ol >= (int)sizeof orel || nl < 0 || nl >= (int)sizeof nrel)
+        return -1;
+
+    char ofull[PATH_MAX], nfull[PATH_MAX];
+    if (host_path(c, orel, ofull, sizeof ofull) != 0 ||
+        host_path(c, nrel, nfull, sizeof nfull) != 0)
+        return -1;
+    invalidate(c, orel);
+    invalidate(c, nrel);
+    return rename(ofull, nfull) == 0 ? 0 : -1;
+}
+
 static const struct p9_backend hostdir_backend = {
     .root = hd_root,
     .walk = hd_walk,
@@ -410,6 +439,7 @@ static const struct p9_backend hostdir_backend = {
     .create = hd_create,
     .truncate = hd_truncate,
     .removef = hd_removef,
+    .renamef = hd_renamef,
     .openh = hd_openh,
 };
 
