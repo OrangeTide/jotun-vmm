@@ -30,6 +30,13 @@
 
 #include <stdint.h>
 
+/* The uname machine string, the name Linux reports for this architecture. */
+#if defined(__aarch64__)
+#define UNAME_MACHINE "aarch64"
+#else
+#define UNAME_MACHINE "x86_64"
+#endif
+
 /* The 9P fid used to load the program ELF, distinct from the native loader's
  * (prog.c uses 10), and the pool of fids backing open file descriptors. */
 #define LINUX_FID      12u
@@ -6141,7 +6148,7 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         if (!a1)
             return -LERR_INVAL;
         static const char *const f[6] = {
-            "Linux", "jotun", "6.0.0-jotun", "#1 jotun", "x86_64", "(none)",
+            "Linux", "jotun", "6.0.0-jotun", "#1 jotun", UNAME_MACHINE, "(none)",
         };
         char u[6 * 65];
         memset(u, 0, sizeof u);
