@@ -324,6 +324,25 @@ abort_entry:
     stp     x28, x29, [sp, #224]
     str     x30,      [sp, #240]
 
+    /* A wild kernel branch: an instruction-fetch abort (EC 0x21, same EL) taken
+     * from EL1h is the kernel executing in unmapped memory. pf_handle would mask
+     * it by mapping the page, so catch it here and report the saved frame, which
+     * names the bad target register and the call site (x30). */
+    mrs     x2, esr_el1
+    lsr     x3, x2, #26
+    cmp     x3, #0x21
+    b.ne    .Labort_pf
+    mrs     x3, spsr_el1
+    and     x3, x3, #0xf
+    cmp     x3, #0x5                /* EL1h: kernel, not an EL1t app fetch */
+    b.ne    .Labort_pf
+    mov     x0, sp                  /* saved x0..x30 */
+    mrs     x1, far_el1
+    mrs     x2, elr_el1
+    add     x3, sp, #256            /* live SP_EL1 at the faulting fetch */
+    bl      arm64_wild_branch_report
+    b       .
+.Labort_pf:
     mrs     x0, far_el1
     mrs     x1, esr_el1
     bl      pf_handle
@@ -426,17 +445,25 @@ abort_entry:
     b       .
 
 8:
-    /* Unrecoverable: report and halt. arm64_fault_report does not return. */
+    /* Unrecoverable: report and halt. arm64_fault_report does not return. x29/x30
+     * still hold the fault-time frame pointer and link register (this is the
+     * first bl since the exception), so pass them to dump the kernel call chain. */
+    mov     x4, x29
+    mov     x5, x30
     mrs     x0, far_el1
     mrs     x1, esr_el1
     mrs     x2, elr_el1
+    mrs     x3, spsr_el1
     bl      arm64_fault_report
     b       .
 
 serror_entry:
+    mov     x4, x29
+    mov     x5, x30
     mrs     x0, far_el1
     mrs     x1, esr_el1
     mrs     x2, elr_el1
+    mrs     x3, spsr_el1
     bl      arm64_fault_report
     b       .
 

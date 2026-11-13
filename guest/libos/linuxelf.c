@@ -749,6 +749,37 @@ struct lproc *lproc_cur;
 #define nhole     (lproc_cur->sh->mmap_nhole)
 #define cwd_key   (lproc_cur->sh->cwd)
 
+/* Identify the faulting process for the arm64 fatal-fault report: its pid and
+ * thread, the syscall it last entered, and where its heap and mmap arena sit, so
+ * a faulting PC can be placed (program image below heap_base, the heap, or the
+ * mmap region). Called from arm64_fault_report. */
+void
+linux_fault_ident(void)
+{
+    struct lproc *p = lproc_cur;
+    if (!p || !p->sh)
+        return;
+    con_puts("\n  pid=");
+    put_dec(p->sh->pid);
+    con_puts(" tid=");
+    put_dec(p->tid);
+    con_puts(" cur_nr=");
+    put_dec(p->cur_nr);
+    con_puts(" heap=[");
+    put_hex(heap_base);         /* macros over lproc_cur->sh, which is p */
+    con_putc(',');
+    put_hex(brk_cur);
+    con_puts(") mmap=[");
+    put_hex(mmap_cur);
+    con_putc(',');
+    put_hex(mmap_top);
+    con_puts(") kstack=[");
+    put_hex((uint64_t)(uintptr_t)p->kstack);
+    con_putc(',');
+    put_hex(p->kstack_top);
+    con_putc(')');
+}
+
 static long do_execve(const char *path, const char *const *argv,
                       const char *const *envp);
 static struct lfd *fd_get(long fd);

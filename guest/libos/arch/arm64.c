@@ -75,8 +75,42 @@ extern char arm64_vectors[];
  * fault that is not a demand-mappable page or on an SError; a healthy guest
  * never gets here. It exists so a foreign Linux binary that faults leaves a
  * readable trail instead of vanishing. */
+/* Implemented in linuxelf.c: print the faulting process's identity and arena. */
+void linux_fault_ident(void);
+
+/* An instruction-fetch abort taken from EL1h means the kernel tried to execute
+ * in unmapped memory: a wild branch through a corrupted pointer or return
+ * address. Called from abort_entry with the saved register frame (x0..x30 at
+ * regs[0..30]) before pf_handle can mask it by mapping the page. Dumping every
+ * register shows which one held the bad target, x30 shows the call site, and the
+ * live SP_EL1 pins which stack it faulted on. */
 void
-arm64_fault_report(uint64_t far, uint64_t esr, uint64_t elr)
+arm64_wild_branch_report(const uint64_t *regs, uint64_t far, uint64_t elr,
+                         uint64_t sp)
+{
+    con_puts("\n*** wild kernel branch ***\n  far=");
+    con_puthex(far);
+    con_puts(" elr=");
+    con_puthex(elr);
+    con_puts("\n  x0..x30:");
+    for (int i = 0; i <= 30; i++) {
+        con_puts(i % 4 == 0 ? "\n   " : " ");
+        con_puthex(regs[i]);
+    }
+    con_puts("\n  fp(x29)=");
+    con_puthex(regs[29]);
+    con_puts(" sp_el1=");
+    con_puthex(sp);
+    linux_fault_ident();
+    con_puts("\nhalted\n");
+    arch_halt();
+    for (;;)
+        ;
+}
+
+void
+arm64_fault_report(uint64_t far, uint64_t esr, uint64_t elr, uint64_t spsr,
+                   uint64_t fp, uint64_t lr)
 {
     con_puts("\n*** EL1 fault ***\n  esr=");
     con_puthex(esr);
@@ -86,6 +120,31 @@ arm64_fault_report(uint64_t far, uint64_t esr, uint64_t elr)
     con_puthex(far);
     con_puts("\n  elr=");
     con_puthex(elr);
+    con_puts(" spsr=");
+    con_puthex(spsr);
+    con_puts(" from=");
+    con_puts((spsr & 0xf) == 0x4 ? "EL1t(user)" : "EL1h(kernel)");
+    /* Dump the words around the faulting PC: zeros mean an unfilled page
+     * executed as code, non-zero garbage means a stale/wrong page. The fetch
+     * that faulted proves the page is mapped, so this read is safe. */
+    con_puts("\n  code@elr-4..+8=");
+    for (int i = -1; i <= 2; i++) {
+        con_puthex(*(const volatile uint32_t *)(uintptr_t)(elr + (int64_t)i * 4));
+        con_putc(' ');
+    }
+    linux_fault_ident();
+    /* The fault-time link register and a walk of the saved frame chain name the
+     * kernel call path that branched to the bad PC. Each frame is {saved fp,
+     * saved lr}; stop when fp leaves the kernel's identity region or is zero. */
+    con_puts("\n  lr=");
+    con_puthex(lr);
+    con_puts("\n  frames:");
+    for (int i = 0; i < 8 && fp >= 0x400000 && fp < 0x300000000ULL && (fp & 7) == 0; i++) {
+        uint64_t slr = *(const volatile uint64_t *)(uintptr_t)(fp + 8);
+        con_putc(' ');
+        con_puthex(slr);
+        fp = *(const volatile uint64_t *)(uintptr_t)fp;
+    }
     con_puts("\nhalted\n");
 
     arch_halt();

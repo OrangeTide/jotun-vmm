@@ -128,11 +128,15 @@ phys_to_virt(uint64_t p)
     return (void *)(uintptr_t)p;
 }
 
+static uint64_t g_pool_lo, g_pool_hi;   /* frame-allocator bounds, for the guard */
+
 void
 phys_init(uint64_t lo, uint64_t hi)
 {
     lo = (lo + VM_PAGE - 1) & ~(VM_PAGE - 1);
     hi &= ~(VM_PAGE - 1);
+    g_pool_lo = lo;
+    g_pool_hi = hi;
     free_head = 0;
     for (uint64_t f = hi; f >= lo + VM_PAGE; ) {
         f -= VM_PAGE;
@@ -147,7 +151,26 @@ phys_alloc(void)
     uint64_t f = free_head;
     if (f == 0)
         return 0;
-    free_head = *(uint64_t *)phys_to_virt(f);
+    uint64_t next = *(uint64_t *)phys_to_virt(f);
+    /* The free list is a chain through the frames themselves, so a stray write to
+     * a free frame (or a wrong free) can splice in an address outside the pool.
+     * Handing that out would let a copy clobber whatever lives there (a kernel
+     * stack in the heap band, say), so catch it here where the chain is still
+     * intact rather than downstream. A healthy list never trips this. */
+    if (f < g_pool_lo || f >= g_pool_hi || (f & (VM_PAGE - 1)) != 0) {
+        con_puts("\n*** phys_alloc: out-of-pool frame ***\n  f=");
+        con_puthex(f);
+        con_puts(" next=");
+        con_puthex(next);
+        con_puts(" pool=[");
+        con_puthex(g_pool_lo);
+        con_putc(',');
+        con_puthex(g_pool_hi);
+        con_puts(")\nhalted\n");
+        for (;;)
+            __asm__ volatile ("wfi");
+    }
+    free_head = next;
     memset(phys_to_virt(f), 0, VM_PAGE);
     return f;
 }
