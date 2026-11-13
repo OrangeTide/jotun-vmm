@@ -48,4 +48,14 @@ uint32_t boot_irq_model(void);
  * supplied none. The realtime clock bases itself on this. */
 uint64_t boot_unix_time(void);
 
+/* Number of environment strings the host passed (after the arguments), and the
+ * i-th one ("NAME=value"), or NULL if out of range. The host supplies these
+ * only for an interactive guest; otherwise the count is 0. */
+int boot_envc(void);
+const char *boot_envp(int i);
+
+/* Nonzero when the host wired this guest's console to a live terminal: stdin
+ * delivers keystrokes and the init program should run a tty line discipline. */
+int boot_console_interactive(void);
+
 #endif /* LIBOS_BOOT_H */

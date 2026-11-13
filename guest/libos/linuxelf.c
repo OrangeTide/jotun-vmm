@@ -2658,9 +2658,245 @@ static short dflt_poll(struct lfd *f, short ev)
     return r;
 }
 
+/* ------------------------------------------------------------------------- *
+ * Console tty discipline. On an interactive guest the host puts its terminal
+ * in raw mode and feeds keystrokes into the UART; this gives the init program a
+ * line discipline over that byte stream: canonical-mode line editing with echo
+ * by default, raw mode when a program (a shell's line editor) clears ICANON. A
+ * non-interactive console still reads as EOF, exactly as before.
+ *
+ * There is no terminal translation: bytes pass through untouched, so the guest
+ * emits escape sequences for the host's own terminal (its TERM is passed in).
+ * A host terminal that is not xterm-compatible may therefore mis-render some
+ * sequences; a translating line discipline is future work.
+ * ------------------------------------------------------------------------- */
+
+/* The kernel termios ABI, as TCGETS/TCSETS exchange it. */
+struct linux_termios {
+    uint32_t c_iflag;
+    uint32_t c_oflag;
+    uint32_t c_cflag;
+    uint32_t c_lflag;
+    uint8_t  c_line;
+    uint8_t  c_cc[19];
+};
+
+struct linux_winsize {
+    uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel;
+};
+
+/* c_iflag */
+#define T_ICRNL     0x0100
+#define T_IXON      0x0400
+/* c_oflag */
+#define T_OPOST     0x0001
+#define T_ONLCR     0x0004
+/* c_cflag */
+#define T_B38400    0x000f
+#define T_CS8       0x0030
+#define T_CREAD     0x0080
+/* c_lflag */
+#define T_ISIG      0x0001
+#define T_ICANON    0x0002
+#define T_ECHO      0x0008
+#define T_ECHOE     0x0010
+#define T_ECHOK     0x0020
+#define T_IEXTEN    0x8000
+/* c_cc indices */
+#define T_VINTR     0
+#define T_VQUIT     1
+#define T_VERASE    2
+#define T_VKILL     3
+#define T_VEOF      4
+#define T_VMIN      6
+
+/* ioctl requests (same values on the architectures this guest targets). */
+#define T_TCGETS        0x5401
+#define T_TCSETS        0x5402
+#define T_TCSETSW       0x5403
+#define T_TCSETSF       0x5404
+#define T_TIOCGPGRP     0x540F
+#define T_TIOCSPGRP     0x5410
+#define T_TIOCGWINSZ    0x5413
+
+static int con_interactive;             /* mirror of the boot block flag */
+static struct linux_termios con_tio;    /* current console line settings */
+static struct linux_winsize con_ws = { 24, 80, 0, 0 };
+
+/* Parked console readers, mirroring net.c's waiter model: the event hook wakes
+ * them on any device event and each rechecks the UART, reblocking if still dry.
+ * No lost wakeup: a reader sets its flag before testing the UART, so input that
+ * races in is caught by the next hook, which task_wake records as pending. */
+static volatile int con_waiting[TASK_MAX];
+
+static void
+con_wake_waiters(void)
+{
+    for (int i = 0; i < TASK_MAX; i++)
+        if (con_waiting[i])
+            task_wake(i);
+}
+
+/* Default the console to a cooked tty: CR to NL on input, output post-processed
+ * to CR+LF, canonical line editing with echo. Registers the wake hook once. */
+static void
+con_tty_init(void)
+{
+    con_interactive = boot_console_interactive();
+    con_tio.c_iflag = T_ICRNL | T_IXON;
+    con_tio.c_oflag = T_OPOST | T_ONLCR;
+    con_tio.c_cflag = T_B38400 | T_CS8 | T_CREAD;
+    con_tio.c_lflag = T_ISIG | T_ICANON | T_ECHO | T_ECHOE | T_ECHOK | T_IEXTEN;
+    con_tio.c_cc[T_VINTR] = 3;          /* ^C */
+    con_tio.c_cc[T_VQUIT] = 28;         /* ^\ */
+    con_tio.c_cc[T_VERASE] = 127;       /* DEL */
+    con_tio.c_cc[T_VKILL] = 21;         /* ^U */
+    con_tio.c_cc[T_VEOF] = 4;           /* ^D */
+    con_tio.c_cc[T_VMIN] = 1;
+    if (con_interactive)
+        task_add_event_hook(con_wake_waiters);
+}
+
+/* Block until the UART has a byte and return it (0-255), or -1 when a signal
+ * becomes deliverable while parked so the caller can report EINTR. */
+static int
+con_getc_blocking(void)
+{
+    int me = task_self();
+
+    __atomic_store_n(&con_waiting[me], 1, __ATOMIC_SEQ_CST);
+    for (;;) {
+        int c = con_raw_getc();
+        if (c >= 0) {
+            __atomic_store_n(&con_waiting[me], 0, __ATOMIC_SEQ_CST);
+            return c;
+        }
+        if (signal_deliverable()) {
+            __atomic_store_n(&con_waiting[me], 0, __ATOMIC_SEQ_CST);
+            return -1;
+        }
+        task_block();
+    }
+}
+
+static void
+con_echo(char c)
+{
+    if (con_tio.c_lflag & T_ECHO)
+        con_putc(c);
+}
+
+/* Raw-mode read: return as soon as one byte is available (the VMIN=1 case),
+ * draining whatever else is already buffered, up to n. */
+static long
+con_read_raw(char *buf, unsigned long n)
+{
+    unsigned long got = 0;
+    int c;
+
+    if (n == 0)
+        return 0;
+    c = con_getc_blocking();
+    if (c < 0)
+        return -LERR_RESTARTSYS;
+    buf[got++] = (char)c;
+    con_echo((char)c);
+    while (got < n) {
+        c = con_raw_getc();
+        if (c < 0)
+            break;
+        buf[got++] = (char)c;
+        con_echo((char)c);
+    }
+    return (long)got;
+}
+
+/* Canonical read: gather one line, echoing and honouring erase, kill, and EOF,
+ * and return it (newline included) once Return is pressed. ^D returns the
+ * partial line, or 0 (EOF) at the start of a line. */
+static long
+con_read_canon(char *buf, unsigned long n)
+{
+    unsigned long got = 0;
+
+    for (;;) {
+        int ci = con_getc_blocking();
+        char c;
+        if (ci < 0)
+            return got ? (long)got : -LERR_RESTARTSYS;
+        c = (char)ci;
+
+        if (c == '\r' && (con_tio.c_iflag & T_ICRNL))
+            c = '\n';
+        if (c == '\n') {
+            con_putc('\n');
+            if (got < n)
+                buf[got++] = '\n';
+            return (long)got;
+        }
+        if ((unsigned char)c == con_tio.c_cc[T_VERASE] || c == 8) {
+            if (got > 0) {
+                got--;
+                if (con_tio.c_lflag & T_ECHOE)
+                    con_puts("\b \b");
+            }
+            continue;
+        }
+        if ((unsigned char)c == con_tio.c_cc[T_VKILL]) {
+            while (got > 0) {
+                got--;
+                if (con_tio.c_lflag & T_ECHOK)
+                    con_puts("\b \b");
+            }
+            continue;
+        }
+        if ((unsigned char)c == con_tio.c_cc[T_VEOF])
+            return (long)got;
+        if (got < n) {
+            buf[got++] = c;
+            con_echo(c);
+        }
+    }
+}
+
+/* Service an ioctl on the console. Returns 0 (or a negative error) when the
+ * request is a tty request, or -LERR_NOTTY when it is not, so a non-interactive
+ * console and unknown requests behave as a non-tty. */
+static long
+con_ioctl(unsigned long req, uint64_t arg)
+{
+    if (!con_interactive)
+        return -LERR_NOTTY;
+    switch (req) {
+    case T_TCGETS:
+        return copy_to_user(arg, &con_tio, sizeof con_tio) < 0
+            ? -LERR_FAULT : 0;
+    case T_TCSETS:
+    case T_TCSETSW:
+    case T_TCSETSF:
+        return copy_from_user(&con_tio, arg, sizeof con_tio) < 0
+            ? -LERR_FAULT : 0;
+    case T_TIOCGWINSZ:
+        return copy_to_user(arg, &con_ws, sizeof con_ws) < 0
+            ? -LERR_FAULT : 0;
+    case T_TIOCGPGRP:
+    case T_TIOCSPGRP:
+        return 0;                   /* no job control: accept and ignore */
+    default:
+        return -LERR_NOTTY;
+    }
+}
+
 /* Console. */
 static long con_read(struct lfd *f, void *buf, unsigned long n)
-{ (void)f; (void)buf; (void)n; return 0; }   /* stdin: EOF */
+{
+    (void)f;
+    if (!con_interactive)
+        return 0;                   /* no terminal attached: EOF, as before */
+    if (con_tio.c_lflag & T_ICANON)
+        return con_read_canon(buf, n);
+    return con_read_raw(buf, n);
+}
 static long con_write(struct lfd *f, const void *buf, unsigned long n)
 {
     (void)f;
@@ -5517,8 +5753,14 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         }
         return 0;
     }
-    case SYS_ioctl:
-        return -LERR_NOTTY;             /* no tty: musl falls back */
+    case SYS_ioctl: {
+        /* A console descriptor gets the tty requests (so isatty and a shell's
+         * line-editor setup work); everything else is still "not a tty". */
+        struct lfd *f = fd_get(a1);
+        if (f && f->kind == FD_CON)
+            return con_ioctl((unsigned long)a2, (uint64_t)a3);
+        return -LERR_NOTTY;
+    }
     case SYS_poll:
         return do_poll((uint64_t)a1, (uint64_t)a2, (long)a3);
     case SYS_ppoll:
@@ -6279,12 +6521,23 @@ build_stack(const char *argv0, const struct elf_info *exe,
             const struct elf_info *interp)
 {
     const char *args[LINUX_MAX_ARGS];
+    /* The boot environment is a handful of strings (the host caps it well below
+     * this); keep the array small so this frame plus build_stack_vec's stays
+     * within the init task's kernel stack. */
+    const char *env[32];
     int argc = 0;
+    int envc = 0;
+    int envmax = (int)(sizeof env / sizeof env[0]);
 
     args[argc++] = argv0;
     for (int i = 2; i < boot_argc() && argc < LINUX_MAX_ARGS; i++)
         args[argc++] = boot_argv(i);
-    return build_stack_vec(args, argc, NULL, 0, exe, interp);
+    /* The host supplies an environment only for an interactive guest (a PATH,
+     * HOME, PS1, and a TERM for the host terminal); otherwise envc is 0 and the
+     * program starts with an empty environment, exactly as before. */
+    for (int i = 0; i < boot_envc() && envc < envmax; i++)
+        env[envc++] = boot_envp(i);
+    return build_stack_vec(args, argc, envc ? env : NULL, envc, exe, interp);
 }
 
 /* Copy a NULL-terminated user vector of string pointers into out[] with the
@@ -6624,6 +6877,7 @@ linux_phys_init(void)
         linux_tables_init();
         kheap_init();           /* heap now grows past the bootstrap band */
         task_add_event_hook(sleep_wake_hook);   /* wake timed sleepers on a tick */
+        con_tty_init();         /* console line discipline + input wake hook */
         phys_ready = 1;
     }
 }

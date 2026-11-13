@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #define COM1        0x3f8
+#define LSR_DR      0x01        /* data ready: a received byte is waiting */
 #define LSR_THRE    0x20        /* transmit holding register empty */
 
 static inline void
@@ -30,6 +31,14 @@ con_raw_putc(char c)
     while (!(inb(COM1 + 5) & LSR_THRE))
         ;
     outb(COM1, (unsigned char)c);
+}
+
+int
+con_raw_getc(void)
+{
+    if (!(inb(COM1 + 5) & LSR_DR))
+        return -1;
+    return (int)inb(COM1 + 0);      /* RBR */
 }
 
 void

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 #include "vmm.h"
@@ -172,6 +173,79 @@ rouse_vcpus(void *ctx)
     }
 }
 
+/* Interactive console: the host terminal is put in raw mode so every keystroke
+ * reaches the guest byte for byte, and an input thread feeds those bytes into
+ * the UART receive ring, rousing the console-owning guest so a parked reader
+ * wakes. The guest runs the tty line discipline (echo, line editing, raw mode);
+ * the host only clears its own cooked input so nothing is swallowed on the way.
+ * ISIG is left on, so Ctrl-C still stops the sandbox; signals are not yet
+ * forwarded to the guest. */
+static struct termios saved_tio;
+static int raw_active;
+
+static void
+console_restore(void)
+{
+    if (raw_active) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved_tio);
+        raw_active = 0;
+    }
+}
+
+static void
+console_sig_restore(int sig)
+{
+    console_restore();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* Put stdin in raw mode, keeping ISIG so Ctrl-C reaches the host. Returns 0 on
+ * success, -1 if stdin is not a terminal. */
+static int
+console_raw_enable(void)
+{
+    struct termios t;
+
+    if (tcgetattr(STDIN_FILENO, &saved_tio) != 0)
+        return -1;
+    t = saved_tio;
+    /* Clear cooked input so CR, flow control, and parity never swallow a byte;
+     * the guest's line discipline maps CR and echoes. Keep OPOST on the output
+     * side so the host still turns the guest's '\n' into CR+LF. */
+    t.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    t.c_lflag &= ~(ICANON | ECHO | IEXTEN);
+    t.c_cflag |= CS8;
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &t) != 0)
+        return -1;
+    raw_active = 1;
+    atexit(console_restore);
+    signal(SIGINT, console_sig_restore);
+    signal(SIGTERM, console_sig_restore);
+    return 0;
+}
+
+/* Input thread: block on the terminal, push each burst of keystrokes into the
+ * UART receive ring, and rouse the console guest so a task parked on a console
+ * read wakes and drains them. Exits when the terminal reaches end of input. */
+static void *
+console_input_thread(void *arg)
+{
+    struct guest *gp = arg;
+    unsigned char buf[256];
+
+    for (;;) {
+        ssize_t n = read(STDIN_FILENO, buf, sizeof buf);
+        if (n <= 0)
+            break;
+        uart_rx_push(buf, (unsigned long)n);
+        rouse_vcpus(gp);
+    }
+    return NULL;
+}
+
 /* Translate a guest-physical range to a host pointer, or NULL if it does not
  * fit entirely within guest RAM. Every guest-supplied address is checked here
  * before the host dereferences it. */
@@ -230,6 +304,35 @@ setup_bootinfo(struct guest *gp, int gargc, char **gargv)
         n++;
     }
     b->argc = (uint32_t)n;
+
+    /* An interactive guest gets its console wired to the host terminal and a
+     * small default environment so its shell has a PATH, a home, a prompt, and
+     * a TERM that matches the host terminal (raw byte passthrough, so the guest
+     * must emit escapes for the real terminal rather than assume TERM=linux). */
+    int interactive = gp->manifest.interactive && isatty(STDIN_FILENO);
+    b->console_flags = interactive ? JOTUN_CONSOLE_INTERACTIVE : 0;
+    uint32_t envc = 0;
+    if (interactive) {
+        const char *term = getenv("TERM");
+        char termvar[64];
+        snprintf(termvar, sizeof termvar, "TERM=%s",
+                 term && term[0] ? term : "xterm-256color");
+        const char *envv[] = {
+            termvar,
+            "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+            "HOME=/root",
+            "PS1=\\w \\$ ",
+        };
+        for (size_t i = 0; i < sizeof envv / sizeof envv[0]; i++) {
+            size_t len = strlen(envv[i]) + 1;
+            if (off + len > JOTUN_BOOT_BLOB_MAX)
+                break;
+            memcpy(&b->blob[off], envv[i], len);
+            off += (uint32_t)len;
+            envc++;
+        }
+    }
+    b->envc = envc;
     b->blob_len = off;
 
     /* List each writable host mount's guest prefix ("/<name>") so the guest
@@ -938,6 +1041,21 @@ main(int argc, char **argv)
         }
     }
 
+    /* If a guest asked for an interactive console and stdin is a terminal, put
+     * the terminal in raw mode and start the input thread bound to the first
+     * such guest. One terminal backs one console, so later interactive guests
+     * share the host log but not the keyboard. */
+    pthread_t input_thread = 0;
+    struct guest *console_guest = NULL;
+    for (int gi = 0; gi < nguests; gi++) {
+        if (guests[gi].manifest.interactive && isatty(STDIN_FILENO)) {
+            console_guest = &guests[gi];
+            break;
+        }
+    }
+    if (console_guest && console_raw_enable() == 0)
+        pthread_create(&input_thread, NULL, console_input_thread, console_guest);
+
     pthread_t timer_thread = 0;
     /* Preempt running Linux user loops by default; the mechanism (in-kernel
      * APIC event vector, per-thread TSS.rsp0, ring-3-only yield) is proven.
@@ -961,6 +1079,15 @@ main(int argc, char **argv)
         __atomic_store_n(&tctx.stop, 1, __ATOMIC_SEQ_CST);
         pthread_join(timer_thread, NULL);
     }
+
+    /* The guests have exited. The input thread is blocked on the terminal, so
+     * cancel it rather than wait for a keystroke, and return the terminal to
+     * its cooked settings. */
+    if (input_thread) {
+        pthread_cancel(input_thread);
+        pthread_join(input_thread, NULL);
+    }
+    console_restore();
 
     /* Stop the front end first, so its server thread delivers no more events
      * to a sink before draw_shutdown frees it. */

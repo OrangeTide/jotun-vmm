@@ -20,13 +20,19 @@
 #define MMIO_POWEROFF  0xE0010000ull
 
 /* Device state. Only the handful of latched registers a polling driver reads
- * back are kept; transmit goes straight to stdout and there is no receive
- * path. */
+ * back are kept; transmit goes straight to stdout. The receive path is a shared
+ * ring (uart_rx_*) the host input thread fills from the terminal. */
 typedef struct uart_16550 {
     uint8_t ier, lcr, mcr, fcr, scr, dll, dlm;
 } uart_16550;
 
 void uart_init(uart_16550 *u);
+
+/* Push bytes from the host terminal into the receive ring, for the guest to
+ * read back as console input. Called by the input thread. Bytes that overflow
+ * the ring are dropped, as a real UART FIFO would overrun. Safe to call
+ * concurrently with the vcpu threads draining the ring. */
+void uart_rx_push(const unsigned char *p, unsigned long n);
 
 /* Service an I/O-port exit. If the port belongs to this UART, handle it (for a
  * write, emit the byte; for a read, fill exit->io.data) and return true.

@@ -12,9 +12,13 @@
 
 #define MAX_ARGV    32
 
+#define MAX_ENVV    32
+
 static const struct jotun_bootinfo *info;
 static const char *argv[MAX_ARGV];
 static int argc;
+static const char *envv[MAX_ENVV];
+static int envc;
 
 int
 boot_init(void)
@@ -42,6 +46,18 @@ boot_init(void)
         while (off < b->blob_len && b->blob[off] != '\0')
             off++;
         off++;      /* step past the terminator */
+    }
+
+    /* The environment strings follow the argument strings in the same blob. */
+    uint32_t ne = b->envc;
+    if (ne > MAX_ENVV)
+        ne = MAX_ENVV;
+    for (uint32_t i = 0; i < ne && off < b->blob_len; i++) {
+        envv[i] = (const char *)&b->blob[off];
+        envc++;
+        while (off < b->blob_len && b->blob[off] != '\0')
+            off++;
+        off++;
     }
     return 0;
 }
@@ -109,4 +125,24 @@ uint64_t
 boot_unix_time(void)
 {
     return info ? info->boot_unix_time : 0;
+}
+
+int
+boot_envc(void)
+{
+    return envc;
+}
+
+const char *
+boot_envp(int i)
+{
+    if (i < 0 || i >= envc)
+        return NULL;
+    return envv[i];
+}
+
+int
+boot_console_interactive(void)
+{
+    return info && (info->console_flags & JOTUN_CONSOLE_INTERACTIVE) ? 1 : 0;
 }

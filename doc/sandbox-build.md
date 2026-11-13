@@ -183,8 +183,8 @@ curl -fsSLO https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-m
 mkdir -p alpine/rootfs && tar -xzf alpine-minirootfs-$ver-x86_64.tar.gz -C alpine/rootfs
 ```
 
-A manifest that serves it and drops into a shell (an interactive run needs a
-console; this one runs a command and exits):
+A manifest that serves it and runs a command, then exits (for an interactive
+shell instead, see the next section):
 
 ```
 rootfs host:/abs/path/to/alpine/rootfs
@@ -210,6 +210,50 @@ rootfs host:/abs/path/to/rootfs
 mount out host:/abs/path/to/outdir rw
 init bin /bin/busybox sh /out/build.sh
 ```
+
+## An interactive shell
+
+Add `console interactive` to the manifest to wire the guest console to your
+terminal, so the init program gets a real tty: keystrokes reach the guest and
+the shell shows a prompt and edits lines.
+
+```
+rootfs host:/abs/path/to/alpine/rootfs
+console interactive
+init bin /bin/busybox sh
+```
+
+```sh
+./jotun -m alpine.manifest libos.elf
+```
+
+Type `exit` (or run `poweroff`) to leave the shell, which stops the sandbox.
+
+What happens under the hood: the host puts your terminal in raw mode and feeds
+every keystroke into the guest's console UART; the guest runs a small tty line
+discipline (canonical line editing with echo, or raw mode when a program such as
+a shell's line editor asks for it) and answers `TCGETS`/`TCSETS` so programs see
+a tty. The guest also receives a default environment (`PATH`, `HOME`, `PS1`, and
+`TERM` copied from your terminal).
+
+Limitations in this first version:
+
+- There is no terminal translation. Bytes pass through untouched and the guest's
+  `TERM` is copied from the host, so a shell and curses programs behave on an
+  xterm-family terminal (most Linux terminals, Terminal.app, iTerm). A terminal
+  that is not xterm-compatible may mis-render some escape sequences.
+- Ctrl-C stops the sandbox rather than interrupting the guest command. Terminal
+  signals are not yet forwarded to the guest.
+- There is no job control (`busybox` prints "can't access tty; job control
+  turned off"). Pipelines and background jobs still work; `fg`/`bg` do not.
+- `console interactive` applies to one guest. With several guests, the first
+  interactive one owns the keyboard; the rest share the output log only.
+- On macOS (Hypervisor.framework), an interactive shell is reliable for shell
+  builtins but can fault after running an external command and returning to the
+  prompt. This looks like a pre-existing Apple-Silicon task-switch coherency
+  hazard that a long-lived interactive shell is the first to expose; it does not
+  affect non-interactive runs. Interactive shells are solid on Linux/KVM (both
+  x86-64 and arm64). This is being tracked for a fix.
 
 ## KVM permissions (Linux)
 

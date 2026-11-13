@@ -18,7 +18,12 @@
 /* Sentinel and version, so the guest can tell a block was placed and that the
  * two sides agree on the layout. */
 #define JOTUN_BOOT_MAGIC    0x4a4f5442u     /* a fixed sentinel, "JOTB" */
-#define JOTUN_BOOT_VERSION  4u
+#define JOTUN_BOOT_VERSION  5u
+
+/* console_flags bits. INTERACTIVE marks a guest whose console is wired to a
+ * live host terminal: stdin delivers keystrokes and the guest runs a tty line
+ * discipline. Without it the console is output-only and a read returns EOF. */
+#define JOTUN_CONSOLE_INTERACTIVE  0x1u
 
 /* Byte budget for the packed string blob. The whole block is one page. */
 #define JOTUN_BOOT_BLOB_MAX 3440u
@@ -63,6 +68,10 @@ struct jotun_bootinfo {
      * Without it the guest would use a fixed epoch and autotools' "newly created
      * file is older than distributed files" sanity check fails on host mounts. */
     uint64_t boot_unix_time;
+    /* Console wiring for the init program. See JOTUN_CONSOLE_* above. 0 (the
+     * default a pre-v5 host leaves) means an output-only console. */
+    uint32_t console_flags;
+    uint32_t _pad_console;
     uint8_t  blob[JOTUN_BOOT_BLOB_MAX];
 };
 

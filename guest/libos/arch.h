@@ -14,6 +14,12 @@
  * it and also feeds any sink registered with con_set_sink. */
 void con_raw_putc(char c);
 
+/* Read one byte from the console device without blocking: returns the byte
+ * (0-255) when the UART has one, or -1 when none is waiting. The host fills the
+ * UART receive path from the terminal only for an interactive guest; otherwise
+ * this always returns -1. */
+int con_raw_getc(void);
+
 /* Stop the vcpu for good. Does not return. On x86-64 this is HLT; on arm64 it
  * is a store to the poweroff register. */
 void arch_halt(void);

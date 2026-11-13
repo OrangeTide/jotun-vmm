@@ -95,9 +95,10 @@ On Linux this needs `/dev/kvm` access (see KVM permissions below); macOS needs n
 
 To try a real userland rather than the test binaries, point the guest root at an
 extracted distro rootfs (a minimal Alpine or Debian image, or an exported
-container) and run its shell. The `doc/sandbox-build.md` "Running a distro rootfs"
-section walks through it. That doc is also the full per-platform guide, including
-running your own binaries.
+container) and run its shell. Add `console interactive` to the manifest for a
+live shell prompt you can type at. The `doc/sandbox-build.md` "Running a distro
+rootfs" and "An interactive shell" sections walk through it. That doc is also the
+full per-platform guide, including running your own binaries.
 
 ```sh
 make clean

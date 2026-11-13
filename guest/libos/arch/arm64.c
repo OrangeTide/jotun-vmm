@@ -15,6 +15,7 @@
 #define UART_BASE   0xE0000000ull
 #define UART_DR     (UART_BASE + 0x00)      /* data register */
 #define UART_FR     (UART_BASE + 0x18)      /* flag register */
+#define FR_RXFE     (1u << 4)               /* receive FIFO empty */
 #define FR_TXFF     (1u << 5)               /* transmit FIFO full */
 #define POWEROFF    0xE0010000ull
 
@@ -27,6 +28,17 @@ con_raw_putc(char c)
     while (*fr & FR_TXFF)
         ;
     *dr = (unsigned int)(unsigned char)c;
+}
+
+int
+con_raw_getc(void)
+{
+    volatile unsigned int *fr = (volatile unsigned int *)UART_FR;
+    volatile unsigned int *dr = (volatile unsigned int *)UART_DR;
+
+    if (*fr & FR_RXFE)
+        return -1;
+    return (int)(*dr & 0xff);
 }
 
 void

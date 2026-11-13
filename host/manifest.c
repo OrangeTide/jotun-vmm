@@ -140,6 +140,11 @@ manifest_load(const char *path, struct manifest *m)
              * kernel then comes from the command-line image. */
             if (strncmp(val, "host:", 5) == 0)
                 copy_field(m->rootfs, sizeof m->rootfs, val + 5);
+        } else if (strcmp(key, "console") == 0) {
+            /* "console interactive": wire the guest console to the host
+             * terminal so the init program gets an interactive tty. */
+            if (strcmp(val, "interactive") == 0)
+                m->interactive = 1;
         } else if (strcmp(key, "init") == 0) {
             /* Tokenize the rest into the argument vector. */
             char *p = val;

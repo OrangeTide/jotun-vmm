@@ -2,6 +2,7 @@
 
 #include "uart.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -16,8 +17,56 @@
 #define UART_SCR     7      /* scratch */
 
 #define LCR_DLAB 0x80
+#define LSR_DR   0x01       /* data ready: a received byte is waiting */
 #define LSR_THRE 0x20       /* transmit holding register empty */
 #define LSR_TEMT 0x40       /* transmitter empty */
+
+/* The receive ring, shared by the input thread (producer) and the vcpu threads
+ * that drain it through uart_io/uart_mmio (consumers). A plain mutex-guarded
+ * ring: input is a trickle of keystrokes, so there is no contention to tune
+ * for. head is the write index, tail the read index; empty when they meet. */
+#define RX_RING 4096
+static unsigned char rx_buf[RX_RING];
+static unsigned rx_head, rx_tail;
+static pthread_mutex_t rx_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void
+uart_rx_push(const unsigned char *p, unsigned long n)
+{
+    pthread_mutex_lock(&rx_lock);
+    for (unsigned long i = 0; i < n; i++) {
+        unsigned next = (rx_head + 1) % RX_RING;
+        if (next == rx_tail)
+            break;              /* ring full: drop the rest */
+        rx_buf[rx_head] = p[i];
+        rx_head = next;
+    }
+    pthread_mutex_unlock(&rx_lock);
+}
+
+/* Pop one received byte, or -1 when the ring is empty. */
+static int
+rx_pop(void)
+{
+    int v = -1;
+    pthread_mutex_lock(&rx_lock);
+    if (rx_tail != rx_head) {
+        v = rx_buf[rx_tail];
+        rx_tail = (rx_tail + 1) % RX_RING;
+    }
+    pthread_mutex_unlock(&rx_lock);
+    return v;
+}
+
+static bool
+rx_ready(void)
+{
+    bool r;
+    pthread_mutex_lock(&rx_lock);
+    r = rx_tail != rx_head;
+    pthread_mutex_unlock(&rx_lock);
+    return r;
+}
 
 void
 uart_init(uart_16550 *u)
@@ -66,12 +115,21 @@ uart_io(uart_16550 *u, vmm_exit_info_t *exit)
     } else {
         uint8_t v = 0;
         switch (off) {
-        case UART_THR_RBR: v = (u->lcr & LCR_DLAB) ? u->dll : 0; break;
+        case UART_THR_RBR:
+            if (u->lcr & LCR_DLAB) {
+                v = u->dll;
+            } else {
+                int b = rx_pop();               /* RBR: next received byte */
+                v = b < 0 ? 0 : (uint8_t)b;
+            }
+            break;
         case UART_IER_DLM: v = (u->lcr & LCR_DLAB) ? u->dlm : u->ier; break;
         case UART_IIR_FCR: v = 0x01; break;             /* no interrupt pending */
         case UART_LCR:     v = u->lcr; break;
         case UART_MCR:     v = u->mcr; break;
-        case UART_LSR:     v = LSR_THRE | LSR_TEMT; break; /* always ready */
+        case UART_LSR:                                  /* transmit always ready */
+            v = LSR_THRE | LSR_TEMT | (rx_ready() ? LSR_DR : 0);
+            break;
         case UART_MSR:     v = 0xb0; break;             /* DCD|DSR|CTS */
         case UART_SCR:     v = u->scr; break;
         default: break;
@@ -81,9 +139,10 @@ uart_io(uart_16550 *u, vmm_exit_info_t *exit)
     return true;
 }
 
-/* PL011 register offsets (the subset a polling transmit driver touches). */
+/* PL011 register offsets (the subset a polling driver touches). */
 #define PL011_DR 0x00       /* data register */
 #define PL011_FR 0x18       /* flag register */
+#define FR_RXFE  (1u << 4)  /* receive FIFO empty */
 #define FR_TXFF  (1u << 5)  /* transmit FIFO full */
 
 bool
@@ -107,10 +166,16 @@ uart_mmio(vmm_exit_info_t *exit)
             fflush(stdout);
         }
     } else {
-        /* FR with TXFF clear means the transmitter is always ready; every
-         * other register reads back as zero. */
+        /* DR pops a received byte; FR reports the transmitter always ready
+         * (TXFF clear) and the receive FIFO empty (RXFE) when the ring has
+         * drained; every other register reads back as zero. */
         uint32_t v = 0;
-        (void)off;
+        if (off == PL011_DR) {
+            int b = rx_pop();
+            v = b < 0 ? 0 : (uint32_t)b;
+        } else if (off == PL011_FR) {
+            v = rx_ready() ? 0 : FR_RXFE;
+        }
         memset(d, 0, exit->mmio.size);
         memcpy(d, &v, n);
     }
