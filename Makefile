@@ -454,105 +454,6 @@ macsyntax:
 	    -DSO_NOSIGPIPE=0x1022 -I$(MACSHIM) -Iabi -I$(SMOLVFS_DIR) host/net.c
 	@echo "macsyntax: macOS net path OK"
 
-## Run the web terminal guest with the draw server open on port 9230. Front it
-## with Caddy for TLS (see example/web/Caddyfile and doc/web-hosting.md) and open
-## https://localhost:8443/. Needs a bundle first: make bundle BUNDLE_ARCHS=$(GUEST_ARCH)
-web: $(TARGET) libos.elf
-	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root JOTUN_DRAW_PORT=9230 \
-	    ./$(TARGET) libos.elf webterm
-
-## Smoke-test the web path end to end. The test binary spawns the webterm guest
-## with the draw server, drives it over a WebSocket, and checks the shell
-## round-trip. Needs a bundle: make bundle BUNDLE_ARCHS=$(GUEST_ARCH)
-build/websmoke: tools/websmoke.c | build
-	$(CC) $(CFLAGS) -o $@ $<
-web-smoke: $(TARGET) libos.elf build/websmoke
-	./build/websmoke ./$(TARGET) $(BUNDLE_DEPOT)
-
-## brokerd: the process-per-session web hosting supervisor (M15.2 host
-## mechanism). It forks one jotun child per browser session and proxies to it.
-brokerd: host/brokerd.c
-	$(CC) $(CFLAGS) -o $@ $<
-
-## Multi-user web hosting: run the supervisor, front it with Caddy for TLS the
-## same way as make web. Needs a bundle: make bundle BUNDLE_ARCHS=$(GUEST_ARCH)
-web-multi: brokerd $(TARGET) libos.elf
-	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./brokerd
-
-## authd: the bearer-token validator Caddy delegates to (forward_auth), and
-## jmint: the tool that mints a token into the store authd reads (M15.3).
-authd: host/authd.c
-	$(CC) $(CFLAGS) -o $@ $<
-jmint: host/jmint.c
-	$(CC) $(CFLAGS) -o $@ $<
-
-## Authenticated multi-user hosting: brokerd + authd behind Caddy, with a shared
-## secret so brokerd trusts only the identity authd vouches for. Mint tokens with
-## ./jmint <user> [cap]; front with example/web/Caddyfile-auth. Needs a bundle.
-web-auth: brokerd authd $(TARGET) libos.elf
-	@test -n "$(JOTUN_BROKER_AUTH_SECRET)" || \
-	    { echo "set JOTUN_BROKER_AUTH_SECRET (shared with authd)"; exit 1; }
-	JOTUN_BROKER_AUTH_SECRET=$(JOTUN_BROKER_AUTH_SECRET) \
-	    JOTUN_AUTH_TOKENS=$(JOTUN_AUTH_TOKENS) ./authd & \
-	JOTUN_BROKER_AUTH_SECRET=$(JOTUN_BROKER_AUTH_SECRET) \
-	    JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./brokerd; kill %1 2>/dev/null
-
-## One-command authenticated demo: brokerd + authd + Caddy together, so the whole
-## chain is a single foreground command for local testing. Generates an ephemeral
-## shared secret if none is set, mints a `demo` token into build/demo.tokens on
-## first run and prints the login URL, keeps Caddy's CA under build/, and tears
-## all three down on exit (Ctrl-C). Needs caddy on PATH and a bundle.
-web-auth-demo: brokerd authd jmint $(TARGET) libos.elf
-	@mkdir -p build/caddy; \
-	secret=$${JOTUN_BROKER_AUTH_SECRET:-$$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')}; \
-	store=build/demo.tokens; \
-	if [ ! -s $$store ]; then \
-	    tok=$$(JOTUN_AUTH_TOKENS=$$store ./jmint demo 5); \
-	    echo "minted demo token: $$tok"; \
-	else tok=$$(awk 'NR==1{print $$1}' $$store); fi; \
-	echo "open in a browser: https://localhost:8443/login?token=$$tok"; \
-	echo "(accept the local CA once; Ctrl-C stops authd, brokerd, and Caddy)"; \
-	JOTUN_AUTH_TOKENS=$$store JOTUN_BROKER_AUTH_SECRET=$$secret ./authd & a=$$!; \
-	JOTUN_BROKER_AUTH_SECRET=$$secret JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
-	    ./brokerd & b=$$!; \
-	trap 'kill $$a $$b 2>/dev/null' INT TERM EXIT; \
-	XDG_DATA_HOME=build/caddy XDG_CONFIG_HOME=build/caddy \
-	    caddy run --config example/web/Caddyfile-auth
-
-## Multi-session smoke test: brokerd opens two independent sessions and checks
-## they get separate guests and tear down. Needs a bundle.
-build/brokersmoke: tools/brokersmoke.c | build
-	$(CC) $(CFLAGS) -o $@ $<
-broker-smoke: brokerd $(TARGET) libos.elf build/brokersmoke
-	./build/brokersmoke ./brokerd ./$(TARGET) $(BUNDLE_DEPOT)
-
-## TLS front-end smoke test: run brokerd behind Caddy (the make web-multi recipe)
-## and reach it over TLS with openssl s_client, checking two sessions get routed
-## through the proxy. Needs caddy on PATH and a bundle: make bundle BUNDLE_ARCHS=$(GUEST_ARCH)
-build/caddysmoke: tools/caddysmoke.c | build
-	$(CC) $(CFLAGS) -o $@ $<
-caddy-smoke: brokerd $(TARGET) libos.elf build/caddysmoke
-	./build/caddysmoke ./$(TARGET) $(BUNDLE_DEPOT) example/web/Caddyfile
-
-## Admission + auth smoke test: mints two users, starts authd and brokerd with a
-## shared secret, checks authd's token validation and brokerd's per-user session
-## caps and identity gate. Needs a bundle: make bundle BUNDLE_ARCHS=$(GUEST_ARCH)
-build/authsmoke: tools/authsmoke.c | build
-	$(CC) $(CFLAGS) -o $@ $<
-auth-smoke: brokerd authd jmint $(TARGET) libos.elf build/authsmoke
-	./build/authsmoke ./brokerd ./authd ./jmint ./$(TARGET) $(BUNDLE_DEPOT)
-
-## End-to-end auth check through Caddy: runs brokerd + authd + Caddy with
-## example/web/Caddyfile-auth and drives the real forward_auth chain with curl
-## (no token 401, bearer 302, /login sets the cookie, cookie 302, bad token 401),
-## so it guards the Caddyfile wiring that auth-smoke only simulates. Needs caddy
-## and curl on the PATH and a bundle.
-build/cauthsmoke: tools/cauthsmoke.c | build
-	$(CC) $(CFLAGS) -o $@ $<
-caddy-auth-smoke: brokerd authd jmint $(TARGET) libos.elf build/cauthsmoke
-	./build/cauthsmoke ./brokerd ./authd ./jmint ./$(TARGET) $(BUNDLE_DEPOT) \
-	    example/web/Caddyfile-auth
-
 ## Host check of the guest format engine against literal expectations. The
 ## formatter is portable C, so it is built for the host with snprintf renamed to
 ## jsnprintf (so it sits beside the host libc) and checked byte for byte.
@@ -567,20 +468,8 @@ build/fmttest: tools/fmttest.c build/host_fmt.o build/host_fmtfloat.o | build
 fmt-test: build/fmttest
 	./build/fmttest
 
-## Broker control-channel ABI check (M15.2 step two, defined ahead of wiring).
-## Drives the host-side mock (host/brokerctl.c) over the shared struct the way a
-## broker guest would: spawn/bind/destroy and lifecycle-event draining, with the
-## quota and error paths. A pure host unit test, no VM.
-build/brokerctl.o: host/brokerctl.c host/brokerctl.h abi/jotun_broker.h | build
-	$(CC) $(CFLAGS) -Ihost -c -o $@ $<
-build/brokerctltest: tools/brokerctltest.c build/brokerctl.o host/brokerctl.h abi/jotun_broker.h | build
-	$(CC) $(CFLAGS) -Ihost -o $@ tools/brokerctltest.c build/brokerctl.o
-brokerctl-test: build/brokerctltest
-	./build/brokerctltest
-
 clean:
-	rm -f $(TARGET) libos.elf $(PROGS) castool jbundle \
-	    brokerd authd jmint
+	rm -f $(TARGET) libos.elf $(PROGS) castool jbundle
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test linux-progs linux-spike linux-smoke linux-tmp-mount linux-run
+.PHONY: all clean bundle macsyntax fmt-test linux-progs linux-spike linux-smoke linux-tmp-mount linux-run
