@@ -1105,15 +1105,23 @@ mmap_fill(long fd, uint64_t va, uint64_t off, uint64_t len)
         struct ramfile *rf = &ramfs[f->ridx];
         for (uint64_t i = 0; i < len && off + i < rf->len; i++)
             dst[i] = rf->data[off + i];
-        return 0;
+    } else {
+        uint64_t done = 0;              /* 9P bundle file */
+        while (done < len) {
+            long n = p9_read(f->p9fid, off + done, dst + done,
+                             (uint32_t)(len - done));
+            if (n <= 0)
+                break;                  /* short read: the rest stays zero */
+            done += (uint64_t)n;
+        }
     }
-    uint64_t done = 0;                  /* 9P bundle file */
-    while (done < len) {
-        long n = p9_read(f->p9fid, off + done, dst + done, (uint32_t)(len - done));
-        if (n <= 0)
-            break;                      /* short read: the rest stays zero */
-        done += (uint64_t)n;
-    }
+    /* These bytes are often the text of a shared library the dynamic linker just
+     * mapped file-backed. On a non-coherent-icache arch (HVF/Apple Silicon) the
+     * icache must be invalidated for the written range or the CPU fetches stale
+     * lines, from this frame's previous life as other code, and executes them as
+     * undefined instructions. A heavy fork/exec load (a build) recycles frames
+     * fast enough to hit this deterministically. No-op on x86. */
+    arch_sync_icache(dst, len);
     return 0;
 }
 
