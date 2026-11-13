@@ -316,7 +316,17 @@ struct linux_dirent64 {
 };
 
 #define LINUX_NFD   128                 /* per-process descriptors (0..NFD-1) */
-#define LINUX_NPIPE 4
+/* Pipes are a global pool shared across processes (a pipe inherited across fork
+ * is the same buffer in parent and child). A parallel build (`make -j`) holds
+ * many live at once: every $(shell) and command substitution a recursive make
+ * or a config script runs is a pipe, nested pipelines use several, and the -j
+ * jobserver holds one more. Four was enough for a serial run but a parallel one
+ * exhausts it (the shell reports "Pipe call failed" when pipe() returns
+ * -ENOMEM). The pool holds only metadata (a slot is a few dozen bytes), so 256
+ * slots are cheap; each live pipe's PIPE_CAP ring is kmalloc'd on creation and
+ * freed on last close, so ring memory tracks the pipes actually open, not the
+ * pool size. */
+#define LINUX_NPIPE 256
 #define PIPE_CAP    4096
 
 /* The writable in-memory overlay: files and directories created or written by
@@ -493,7 +503,7 @@ struct lpipe {
     int      writers;
     uint32_t head;              /* next byte to read */
     uint32_t count;             /* bytes buffered */
-    uint8_t  buf[PIPE_CAP];
+    uint8_t  *buf;              /* PIPE_CAP ring, kmalloc'd while the pipe lives */
 };
 
 /* The pipe pool is shared across processes: a pipe inherited across fork is the
@@ -519,7 +529,7 @@ struct lpipe {
  * of processes are live at once. */
 #define LINUX_KSTACK (64u * 1024)
 #define CLONE_VM     0x00000100u        /* clone shares the address space (thread) */
-static struct lpipe pipes[LINUX_NPIPE];
+static struct lpipe *pipes;             /* [LINUX_NPIPE], heap, see linux_tables_init */
 
 /* The epoll pool. An epoll fd owns an interest list of (fd, events, data)
  * entries that epoll_wait scans for readiness the same way poll does. The pool
@@ -1788,10 +1798,17 @@ do_pipe2(int *pfd, int flags)
         return -LERR_NOMEM;
     }
 
+    uint8_t *ring = kmalloc(PIPE_CAP);   /* the ring lives only while the pipe does */
+    if (!ring) {
+        fds[rfd].used = 0;
+        return -LERR_NOMEM;
+    }
+
     memset(&pipes[pidx], 0, sizeof pipes[pidx]);
     pipes[pidx].used = 1;
     pipes[pidx].readers = 1;
     pipes[pidx].writers = 1;
+    pipes[pidx].buf = ring;
 
     memset(&fds[rfd], 0, sizeof fds[rfd]);
     memset(&fds[wfd], 0, sizeof fds[wfd]);
@@ -3242,7 +3259,11 @@ static void pipe_close(struct lfd *f)
     struct lpipe *p = &pipes[f->pidx];
     if (f->wr && p->writers > 0) p->writers--;
     else if (!f->wr && p->readers > 0) p->readers--;
-    if (p->readers == 0 && p->writers == 0) p->used = 0;
+    if (p->readers == 0 && p->writers == 0) {
+        kfree(p->buf);
+        p->buf = NULL;
+        p->used = 0;
+    }
 }
 
 /* Overlay (ramfs) file. */
@@ -4775,8 +4796,11 @@ release_fds(struct lshared *sh)
                 pp->writers--;
             else if (!f->wr && pp->readers > 0)
                 pp->readers--;
-            if (pp->readers == 0 && pp->writers == 0)
+            if (pp->readers == 0 && pp->writers == 0) {
+                kfree(pp->buf);
+                pp->buf = NULL;
                 pp->used = 0;
+            }
         } else if (f->kind == FD_RAM) {
             ramfs_unref(f->ridx);       /* drop this process's ramfile reference */
         } else if (f->kind == FD_SOCK || f->kind == FD_EVENTFD ||
@@ -7182,7 +7206,8 @@ linux_tables_init(void)
     shareds = kmalloc(sizeof *shareds * LINUX_NPROC);
     procs   = kmalloc(sizeof *procs * LINUX_NPROC);
     usocks  = kmalloc(sizeof *usocks * USOCK_MAX);
-    if (!ramfs || !ofiles || !shareds || !procs || !usocks) {
+    pipes   = kmalloc(sizeof *pipes * LINUX_NPIPE);
+    if (!ramfs || !ofiles || !shareds || !procs || !usocks || !pipes) {
         con_puts("[bin] kernel heap too small for the process tables\n");
         arch_halt();
     }
@@ -7191,6 +7216,7 @@ linux_tables_init(void)
     memset(shareds, 0, sizeof *shareds * LINUX_NPROC);
     memset(procs, 0, sizeof *procs * LINUX_NPROC);
     memset(usocks, 0, sizeof *usocks * USOCK_MAX);
+    memset(pipes, 0, sizeof *pipes * LINUX_NPIPE);
     linux_rwmount_init();
 }
 
