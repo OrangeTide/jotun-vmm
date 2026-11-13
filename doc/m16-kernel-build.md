@@ -186,9 +186,30 @@ and `rename()` on a writable host mount (a new 9P rename op). linux-smoke stays
 36/36 on x86-64/KVM and aarch64/KVM.
 
 macOS/HVF note: `rootfs host:/` cannot be used there, because the Mac's
-binaries are Mach-O, not Linux ELF. The headline aarch64-on-macOS run needs a
-Linux aarch64 distro rootfs (with gcc, flex, bison, bc, pahole) mounted in, per
-the toolchain-sourcing section. That is the next step for the Mac.
+binaries are Mach-O, not Linux ELF. The headline aarch64-on-macOS run uses a
+Linux aarch64 distro rootfs (Debian bookworm, built with debootstrap: gcc,
+binutils, make, flex, bison, bc, dwarves/pahole, libelf-dev, libssl-dev) served
+with `rootfs host:<debroot>`, the kernel tree on a writable `mount ksrc
+host:<tree> rw`, and a shell wrapper that sets PATH and runs make.
+
+S0 headline (aarch64 guest on macOS/HVF, 16 KiB granule) is done:
+`make ARCH=arm64 defconfig` ran end to end, exit 0, a real 300 KB / 11164-line
+`.config`. Bringing it up root-caused and fixed a deterministic fault that was
+not a build gap: the per-process kernel stack (`LINUX_KSTACK`) was 16 KiB and
+the `execve` chain overflowed it into the adjacent process kstack, so a victim
+resumed on a clobbered return address. Fixed by raising `LINUX_KSTACK` to
+64 KiB (a separate bug from the nondeterministic HVF async-IRQ preempt
+corruption). linux-smoke stays 36/36 on all three configs.
+
+S1 host tools is done on the headline (Mac). `make ARCH=arm64 prepare` (after
+`olddefconfig`) ran end to end, exit 0: `fixdep` and `modpost` compiled with
+HOSTCC and ran from the output mount, `include/generated/autoconf.h` and
+`asm-offsets.h` (132 lines) were generated, and the arm64 VDSO was compiled,
+linked, and `objcopy`'d in-guest. This proves the host-tool round trip (compile
+an ELF to the mount, execute it mid-build) plus real arm64 codegen and binutils
+`ld`/`objcopy`. The early `status=1`/`status=127` child exits are Kbuild's own
+`cc-option`/`try-run` probes, expected to fail. No `flock` or `select` gap was
+hit at this stage. Next: S2 (`make Image`) with the minimal config.
 
 ## Open risks
 
