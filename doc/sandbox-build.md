@@ -166,6 +166,51 @@ make bundle BUNDLE_ARCHS=<arch> EXTRA_BUNDLE_FILES="build/prog1 build/prog2"
 non-native arch. Set it to this host's arch to build a single-arch bundle with no
 cross toolchain.
 
+## Running a distro rootfs
+
+Instead of a bundle of individually built programs, the guest root can be served
+straight from an extracted distro rootfs on the host, so its own `/bin`, `/lib`
+and `/usr` are the guest's. The manifest directive is `rootfs host:<path>`, and
+the kernel comes from the command-line `libos.elf`. This runs the distro's
+userland binaries under the libOS; it does not boot the distro's kernel or init.
+
+A minimal Alpine rootfs, for an x86-64 host (use the `aarch64` download on an arm
+host):
+
+```sh
+ver=3.21.10
+curl -fsSLO https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-$ver-x86_64.tar.gz
+mkdir -p alpine/rootfs && tar -xzf alpine-minirootfs-$ver-x86_64.tar.gz -C alpine/rootfs
+```
+
+A manifest that serves it and drops into a shell (an interactive run needs a
+console; this one runs a command and exits):
+
+```
+rootfs host:/abs/path/to/alpine/rootfs
+init bin /bin/busybox sh -c "uname -a; echo hi | grep hi; ls /bin | head"
+```
+
+```sh
+JOTUN_HZ=100 ./jotun -m alpine.manifest libos.elf
+```
+
+busybox's applets are all absolute symlinks to `/bin/busybox`. They resolve
+because the host mount treats the rootfs root as `/` (a chroot-style resolver),
+not the host's real root. The same works for a Debian `debootstrap` tree or the
+filesystem of an exported container (`docker export` or `podman export` of a
+started container, extracted into a directory).
+
+The rootfs is read-only. A guest write lands in the in-RAM overlay, so `/tmp` is
+writable within the run but is not persisted. To write build output back to the
+host, add a normal writable mount beside the rootfs:
+
+```
+rootfs host:/abs/path/to/rootfs
+mount out host:/abs/path/to/outdir rw
+init bin /bin/busybox sh /out/build.sh
+```
+
 ## KVM permissions (Linux)
 
 Running needs read and write on `/dev/kvm`. Add yourself to the `kvm` group once:

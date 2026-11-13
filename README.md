@@ -19,7 +19,9 @@ Working today:
   Around 100 syscalls: a VFS, per-process paging, `fork`/threads/`futex`,
   signals, pipes, `epoll`/`eventfd`, `splice`, and in-guest AF_UNIX sockets.
 - Host filesystem mounts over 9P (read-only and writable), so a guest process
-  reads the host toolchain and writes build output to the host.
+  reads the host toolchain and writes build output to the host. The guest root
+  can also be served from a host directory, so a minimal distro rootfs (Alpine,
+  Debian, or an exported container) runs its userland in the sandbox.
 - Real builds in-guest from a host-mounted toolchain: Node.js v26.13.0 compiles
   and runs; Redis 7.4.1 builds (including jemalloc through its autotools
   `./configure`) and serves clients; autotools `./configure` works on
@@ -89,9 +91,13 @@ make linux-smoke SPIKE_BIN_DIR=a64bins    # macos/arm64 (uses pre-built arm64 bi
 ```
 
 On Linux this needs `/dev/kvm` access (see KVM permissions below); macOS needs no
-`sudo`. That is the only step that differs between platforms. The full
-per-platform guide, including running your own binaries, is in
-`doc/sandbox-build.md`.
+`sudo`. That is the only step that differs between platforms.
+
+To try a real userland rather than the test binaries, point the guest root at an
+extracted distro rootfs (a minimal Alpine or Debian image, or an exported
+container) and run its shell. The `doc/sandbox-build.md` "Running a distro rootfs"
+section walks through it. That doc is also the full per-platform guide, including
+running your own binaries.
 
 ```sh
 make clean
