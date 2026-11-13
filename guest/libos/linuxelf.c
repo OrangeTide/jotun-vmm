@@ -6925,10 +6925,15 @@ copy_uvec(const char *const *uvec, const char **out, char *buf, size_t buflen)
     return n;
 }
 
-/* Scratch for one execve's argv and envp strings, split half and half. A
- * compiler's linker command line plus gcc's inherited COLLECT and COMPILER_PATH
- * environment runs to several kilobytes, so this is sized well above that. */
-#define EXEC_STR_MAX 32768
+/* Scratch for one execve's argv and envp strings, split half and half (so a
+ * single argv or envp string can be up to EXEC_STR_MAX/2). A kernel build runs
+ * commands far larger than a compiler invocation: a directory's built-in.a
+ * recipe is one `sh -c` string that printfs every member object path (hundreds
+ * for a driver like nouveau), tens of kilobytes in a single argument. If a
+ * string does not fit, copy_uvec drops it, so the shell is handed `-c` with no
+ * command. Size the half well above the largest such command. The block is
+ * kmalloc'd per execve from the growable kernel heap, not reserved. */
+#define EXEC_STR_MAX (512u * 1024u)
 
 /* Load a program already open on LINUX_FID into the active address space, and
  * its PT_INTERP dynamic linker if it has one. The executable loads at
