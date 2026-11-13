@@ -133,6 +133,13 @@ manifest_load(const char *path, struct manifest *m)
             copy_field(m->ref, sizeof m->ref, val);
         } else if (strcmp(key, "subtree") == 0) {
             copy_field(m->subtree, sizeof m->subtree, val);
+        } else if (strcmp(key, "rootfs") == 0) {
+            /* "rootfs host:<path>": serve the guest root from a live host
+             * directory (read-only) instead of a bundle, so a distro rootfs
+             * sits at "/" and its absolute symlinks resolve correctly. The
+             * kernel then comes from the command-line image. */
+            if (strncmp(val, "host:", 5) == 0)
+                copy_field(m->rootfs, sizeof m->rootfs, val + 5);
         } else if (strcmp(key, "init") == 0) {
             /* Tokenize the rest into the argument vector. */
             char *p = val;
@@ -153,5 +160,5 @@ manifest_load(const char *path, struct manifest *m)
     }
 
     fclose(f);
-    return (m->bundle[0] || m->origin[0]) ? 0 : -1;
+    return (m->bundle[0] || m->origin[0] || m->rootfs[0]) ? 0 : -1;
 }

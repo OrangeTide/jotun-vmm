@@ -708,13 +708,31 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
     const struct p9_backend *be = NULL;
     void *p9ctx = NULL;
     void *svctx = NULL;
-    if (bundle && bundle[0])
+    const char *rootfs = have_manifest ? gp->manifest.rootfs : NULL;
+    if (rootfs && rootfs[0]) {
+        /* Serve the guest root from a host directory (read-only): a distro
+         * rootfs then sits at "/", so its absolute symlinks (every busybox
+         * applet is one) resolve within it. The kernel comes from the
+         * command-line image, not a bundle. */
+        be = p9hostdir_open(rootfs, 0, &p9ctx);
+        if (be)
+            fprintf(stderr, "[9p] guest %d: serving root from host dir %s\n",
+                    gid, rootfs);
+        else
+            fprintf(stderr, "[9p] guest %d: could not open rootfs %s\n",
+                    gid, rootfs);
+    }
+    if (be && rootfs && rootfs[0]) {
+        /* Root served from a host dir: no bundle context, so the kernel is not
+         * lifted from here (svctx stays NULL and comes from the command line). */
+    } else if (!be && bundle && bundle[0]) {
         be = p9smolvfs_open(bundle, ref, subtree, JOTUN_ARCH, &p9ctx);
-    if (be) {
+    }
+    if (be && !(rootfs && rootfs[0])) {
         svctx = p9ctx;
         fprintf(stderr, "[9p] guest %d: serving bundle %s (ref %s, subtree %s)\n",
                 gid, bundle, ref, subtree[0] ? subtree : "/");
-    } else {
+    } else if (!be) {
         if (bundle && bundle[0])
             fprintf(stderr, "[9p] guest %d: could not open bundle %s,"
                     " using in-memory tree\n", gid, bundle);

@@ -6,6 +6,8 @@
 #ifndef MANIFEST_H
 #define MANIFEST_H
 
+#include <limits.h>
+
 #define MANIFEST_MAXARG 16
 #define MANIFEST_MAXNET 16
 #define MANIFEST_MAXMOUNT 8
@@ -25,23 +27,25 @@ struct manifest_net {
  * (then is_host is 1, bundle holds the path, and ref and subtree are unused). */
 struct manifest_mount {
     char name[64];                      /* top-level name in the guest root */
-    char bundle[256];                   /* depot path, or host dir when is_host */
+    char bundle[PATH_MAX];              /* depot path, or host dir when is_host */
     char ref[64];                       /* ref name, default "root" */
-    char subtree[256];                  /* subtree within that bundle, or "" */
+    char subtree[PATH_MAX];             /* subtree within that bundle, or "" */
     int  is_host;                       /* source is a live host directory */
     int  writable;                      /* host mount serves writes (rw) */
 };
 
 struct manifest {
-    char bundle[256];                   /* depot path */
+    char bundle[PATH_MAX];              /* depot path */
     char origin[256];                   /* http origin to pull from, or "" */
     char key[128];                      /* trusted publisher key (hex), or "" */
     char label[64];                     /* topic label, or "" for the bare topic */
     char ref[64];                       /* ref name, default "root" */
-    char subtree[256];                  /* guest root within the bundle */
+    char subtree[PATH_MAX];             /* guest root within the bundle */
+    char rootfs[PATH_MAX];              /* host dir to serve as the guest root
+                                         * (read-only), or "" to use the bundle */
     char name[64];                      /* this guest's network name, or "" */
     int  argc;
-    char argv[MANIFEST_MAXARG][64];     /* init program and arguments */
+    char argv[MANIFEST_MAXARG][PATH_MAX];   /* init program and arguments */
     int  nnet;
     struct manifest_net net[MANIFEST_MAXNET];   /* network-allow rules */
 

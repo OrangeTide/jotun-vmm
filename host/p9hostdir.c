@@ -55,6 +55,92 @@ within(const char *root, const char *real)
     return real[rl] == '\0' || real[rl] == '/';
 }
 
+/* Resolve `rel` (a path relative to the mount root) to a real host path, with
+ * the mount root treated as "/": an absolute symlink target resolves against
+ * the root, not the host's real root, and ".." never climbs above it. This is
+ * what a chroot or a container runtime does, and it is what lets a mounted
+ * distro rootfs work, where every busybox applet is an absolute symlink to
+ * /bin/busybox. The host's own realpath cannot do this (it resolves an absolute
+ * target against the host root, which then fails the confinement check). The
+ * resolved path is returned in `out` and is always within root. Returns 0, or
+ * -1 if a component is missing, a symlink chain is too deep, or a buffer is too
+ * small. */
+static int
+resolve_chroot(const char *root, const char *rel, char *out, size_t cap)
+{
+    char cur[PATH_MAX];                 /* resolved real path so far */
+    char rest[PATH_MAX];                /* unresolved remainder */
+    char comp[PATH_MAX];
+    int links = 0;
+
+    if (strlen(root) >= sizeof cur || strlen(rel) >= sizeof rest)
+        return -1;
+    strcpy(cur, root);
+    strcpy(rest, rel);
+
+    while (rest[0]) {
+        char *slash = strchr(rest, '/');
+        size_t clen = slash ? (size_t)(slash - rest) : strlen(rest);
+        if (clen >= sizeof comp)
+            return -1;
+        memcpy(comp, rest, clen);
+        comp[clen] = '\0';
+        if (slash)
+            memmove(rest, slash + 1, strlen(slash + 1) + 1);
+        else
+            rest[0] = '\0';
+
+        if (comp[0] == '\0' || strcmp(comp, ".") == 0)
+            continue;
+        if (strcmp(comp, "..") == 0) {          /* up, but never above root */
+            if (strcmp(cur, root) != 0) {
+                char *s = strrchr(cur, '/');
+                if (s && s > cur)
+                    *s = '\0';
+                if (strlen(cur) < strlen(root))
+                    strcpy(cur, root);
+            }
+            continue;
+        }
+
+        char cand[PATH_MAX];
+        if ((size_t)snprintf(cand, sizeof cand, "%s/%s", cur, comp) >= sizeof cand)
+            return -1;
+        struct stat st;
+        if (lstat(cand, &st) != 0)
+            return -1;
+        if (S_ISLNK(st.st_mode)) {
+            if (++links > 40)
+                return -1;                      /* symlink loop guard */
+            char tgt[PATH_MAX], nrest[PATH_MAX];
+            ssize_t tl = readlink(cand, tgt, sizeof tgt - 1);
+            if (tl < 0)
+                return -1;
+            tgt[tl] = '\0';
+            if (tgt[0] == '/') {                 /* absolute: restart at root */
+                strcpy(cur, root);
+                if ((size_t)snprintf(nrest, sizeof nrest, "%s%s%s", tgt + 1,
+                                     rest[0] ? "/" : "", rest) >= sizeof nrest)
+                    return -1;
+            } else {                             /* relative: against cur */
+                if ((size_t)snprintf(nrest, sizeof nrest, "%s%s%s", tgt,
+                                     rest[0] ? "/" : "", rest) >= sizeof nrest)
+                    return -1;
+            }
+            strcpy(rest, nrest);
+            continue;
+        }
+        if (strlen(cand) >= sizeof cur)
+            return -1;
+        strcpy(cur, cand);                      /* descend into the component */
+    }
+
+    if (!within(root, cur) || strlen(cur) >= cap)
+        return -1;
+    strcpy(out, cur);
+    return 0;
+}
+
 /* The host handle (a path relative to the root; "" is the root itself) is the
  * node's handle. Fill a node from a stat of it. */
 static void
@@ -98,13 +184,10 @@ hd_walk(void *vctx, const struct p9_node *dir, const char *name,
     if (rl < 0 || rl >= (int)sizeof rel || (size_t)rl >= sizeof out->handle)
         return -1;                      /* must fit the node handle */
 
-    char full[PATH_MAX];
-    if (snprintf(full, sizeof full, "%s/%s", c->root, rel) >= (int)sizeof full)
-        return -1;
-
-    /* Resolve symlinks and refuse anything that leaves the root. */
+    /* Resolve symlinks with the mount root as "/", refusing any escape. The
+     * node keeps the logical handle (rel); hd_openh resolves it the same way. */
     char real[PATH_MAX];
-    if (!realpath(full, real) || !within(c->root, real))
+    if (resolve_chroot(c->root, rel, real, sizeof real) != 0)
         return -1;
 
     struct stat st;
@@ -164,11 +247,10 @@ hd_readf(void *vctx, const struct p9_node *file, uint64_t off, void *buf,
             close(c->cur_fd);
         c->cur_fd = -1;
         c->cur_handle[0] = '\0';
-        char full[PATH_MAX];
-        if (snprintf(full, sizeof full, "%s/%s", c->root, file->handle)
-            >= (int)sizeof full)
+        char real[PATH_MAX];
+        if (resolve_chroot(c->root, file->handle, real, sizeof real) != 0)
             return -1;
-        c->cur_fd = open(full, O_RDONLY);
+        c->cur_fd = open(real, O_RDONLY);
         if (c->cur_fd < 0)
             return -1;
         strncpy(c->cur_handle, file->handle, sizeof c->cur_handle - 1);
@@ -290,17 +372,18 @@ hd_truncate(void *vctx, const struct p9_node *file, uint64_t len)
  * lifetime (reads/writes go through it with pread/pwrite). Holding the fd is
  * what gives open-unlink semantics: once it is open, removing the name leaves
  * the inode reachable through this descriptor until it is closed. The handle was
- * confined to the root at walk time, so it needs no further realpath here. */
+ * confined to the root at walk time; resolve_chroot here keeps an absolute
+ * symlink target bound to the mount root rather than the host's real root. */
 static int
 hd_openh(void *vctx, const struct p9_node *file, int for_write)
 {
     struct p9hostdir *c = vctx;
     if (file->is_dir || (for_write && !c->writable))
         return -1;
-    char full[PATH_MAX];
-    if (host_path(c, file->handle, full, sizeof full) != 0)
+    char real[PATH_MAX];
+    if (resolve_chroot(c->root, file->handle, real, sizeof real) != 0)
         return -1;
-    return open(full, for_write ? O_RDWR : O_RDONLY);
+    return open(real, for_write ? O_RDWR : O_RDONLY);
 }
 
 static int
