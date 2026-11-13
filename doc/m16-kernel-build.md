@@ -167,6 +167,29 @@ Each step is independently provable and gates the next.
 - `-j` must be explicit and matched to the libOS process budget, not left to
   make's auto-detection.
 
+## Status
+
+S0 (defconfig) is done on x86-64/KVM and aarch64/KVM. `make defconfig` for a
+Linux 6.12 source tree runs end to end in the guest: fixdep, flex, bison, and
+conf all build with the host toolchain and run, and conf writes a real `.config`
+to the writable host mount (Linux/x86_64 and Linux/arm64 headers, the expected
+symbol counts). The setup is the host root served read-only as the guest root
+(`rootfs host:/`) plus the kernel tree on a writable mount, with a shell wrapper
+that sets PATH and runs make. On aarch64 the host also needs `pahole` (the
+`dwarves` package); without it `init/Kconfig`'s `PAHOLE_VERSION` line fails to
+parse. This is the "complete distro toolchain" point above, not a guest bug.
+
+Bringing S0 up fixed four guest/host gaps (commit, "fixes to run the kernel
+build's config stage in-guest"): short reads on host-mount files, the initial
+stack packed flush against the unmapped ceiling, `dup()` of a std fd refused,
+and `rename()` on a writable host mount (a new 9P rename op). linux-smoke stays
+36/36 on x86-64/KVM and aarch64/KVM.
+
+macOS/HVF note: `rootfs host:/` cannot be used there, because the Mac's
+binaries are Mach-O, not Linux ELF. The headline aarch64-on-macOS run needs a
+Linux aarch64 distro rootfs (with gcc, flex, bison, bc, pahole) mounted in, per
+the toolchain-sourcing section. That is the next step for the Mac.
+
 ## Open risks
 
 - `flock` and `select` gaps may each need a small syscall addition.
