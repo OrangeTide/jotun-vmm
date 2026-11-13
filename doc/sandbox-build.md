@@ -166,6 +166,25 @@ make bundle BUNDLE_ARCHS=<arch> EXTRA_BUNDLE_FILES="build/prog1 build/prog2"
 non-native arch. Set it to this host's arch to build a single-arch bundle with no
 cross toolchain.
 
+## Installing
+
+`make install` copies the host binary, the guest kernel, and the man page into a
+prefix:
+
+```sh
+make install                 # into $HOME/.local (no privilege needed)
+make install PREFIX=/opt     # system-wide (may need sudo)
+```
+
+- `PREFIX` defaults to `$HOME/.local`; pass `PREFIX=/opt` or `PREFIX=/usr/local`
+  for a system install, and `DESTDIR` to stage into a package root.
+- `jotun` lands in `$PREFIX/bin`, the `libos.elf` kernel in
+  `$PREFIX/libexec/jotun` (pass that path as the kernel-image argument when
+  running), and `jotun.1` in `$PREFIX/share/man/man1`.
+- `make uninstall` removes the same files. See `man jotun` (or
+  `man ./man/jotun.1` before installing) for the full command and manifest
+  reference.
+
 ## Running a distro rootfs
 
 Instead of a bundle of individually built programs, the guest root can be served

@@ -487,8 +487,34 @@ build/fmttest: tools/fmttest.c build/host_fmt.o build/host_fmtfloat.o | build
 fmt-test: build/fmttest
 	./build/fmttest
 
+## Installation. PREFIX is the install root; it defaults to a user-local
+## $HOME/.local so "make install" needs no privilege. Pass PREFIX=/opt (or
+## PREFIX=/usr/local) for a system install, and DESTDIR to stage into a package
+## root. The host binary goes in bin, the guest kernel in libexec/jotun (pass
+## its path as the kernel-image argument when running), and the man page in
+## share/man/man1.
+PREFIX ?= $(HOME)/.local
+DESTDIR ?=
+bindir = $(PREFIX)/bin
+libexecdir = $(PREFIX)/libexec/jotun
+mandir = $(PREFIX)/share/man/man1
+INSTALL = install
+
+install: $(TARGET) $(GUEST) man/jotun.1
+	$(INSTALL) -d $(DESTDIR)$(bindir) $(DESTDIR)$(libexecdir) $(DESTDIR)$(mandir)
+	$(INSTALL) -m 755 $(TARGET) $(DESTDIR)$(bindir)/$(TARGET)
+	$(INSTALL) -m 644 $(GUEST) $(DESTDIR)$(libexecdir)/$(GUEST)
+	$(INSTALL) -m 644 man/jotun.1 $(DESTDIR)$(mandir)/jotun.1
+	@echo "installed to $(DESTDIR)$(PREFIX)"
+
+uninstall:
+	rm -f $(DESTDIR)$(bindir)/$(TARGET)
+	rm -f $(DESTDIR)$(libexecdir)/$(GUEST)
+	rm -f $(DESTDIR)$(mandir)/jotun.1
+	-rmdir $(DESTDIR)$(libexecdir) 2>/dev/null
+
 clean:
 	rm -f $(TARGET) libos.elf $(PROGS) castool jbundle
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax fmt-test linux-progs linux-spike linux-smoke linux-tmp-mount linux-cmdline linux-run
+.PHONY: all clean install uninstall bundle macsyntax fmt-test linux-progs linux-spike linux-smoke linux-tmp-mount linux-cmdline linux-run

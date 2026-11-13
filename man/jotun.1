@@ -1,0 +1,209 @@
+.TH JOTUN 1 "2026-11-13" "jotun" "User Commands"
+.SH NAME
+jotun \- hypervisor-hosted sandbox for unmodified Linux binaries
+.SH SYNOPSIS
+.B jotun
+.RI [ -m " manifest" ]...
+.RI [ kernel-image ]
+.RI [ init-arg ...]
+.SH DESCRIPTION
+.B jotun
+is a small hypervisor that runs unmodified native Linux binaries inside a
+freestanding guest kernel (a library OS) with real privilege separation. It
+runs over Linux KVM (x86-64 and arm64) and macOS Hypervisor.framework (arm64),
+with the guest architecture equal to the host. The intended use is to build and
+cross-compile real projects inside the sandbox, using a host toolchain mounted
+into the guest over 9P.
+.PP
+Each guest runs one
+.I kernel-image
+(the library OS, normally the file
+.B libos.elf
+produced by the build) and an init program. A guest's configuration comes
+from a manifest named with
+.BR -m ,
+or, when no manifest is given, from the environment and the trailing
+command-line arguments.
+.PP
+With one or more
+.B -m
+options, each names the manifest of one guest; all guests share the single
+.I kernel-image
+given as the first bare argument. With no
+.BR -m ,
+a single guest runs, taking its manifest from
+.B JOTUN_MANIFEST
+if set, and otherwise running
+.I kernel-image
+with the trailing
+.IR init-arg s
+as the init program and its arguments.
+.PP
+If no
+.I kernel-image
+is given on the command line, the kernel is lifted from a bundle (the object
+.BR boot/kernel ),
+and failing that the file
+.B test_guest.elf
+in the current directory is used.
+.SH OPTIONS
+.TP
+.BI -m " manifest"
+Bring up a guest configured by
+.IR manifest .
+May be repeated, once per guest, up to the compiled-in guest limit. All guests
+named this way share the one
+.I kernel-image
+argument.
+.SH MANIFEST
+A manifest is a text file, one directive per line. Blank lines and lines
+beginning with
+.B #
+are ignored. The recognized directives are:
+.TP
+.BI rootfs " host:path"
+Serve the guest root from the live host directory
+.I path
+(read-only), so a distro root filesystem sits at
+.BR / .
+The kernel then comes from the command-line image.
+.TP
+.BI bundle " path"
+Serve the guest root from a bundle depot at
+.IR path .
+.TP
+.BI ref " name"
+Name the root tree within the bundle (default
+.BR root ).
+.TP
+.BI subtree " path"
+Serve only the given subtree of the bundle root.
+.TP
+.BI mount " name source [ref] [subtree]"
+Graft a shared tree at the top-level
+.I name
+in the guest root. A
+.I source
+of
+.BI host: path
+serves a live host directory; appending the token
+.B rw
+makes that host mount writable, so guest writes land on the host. Any other
+.I source
+is a bundle depot, with an optional
+.I ref
+and
+.IR subtree .
+.TP
+.BI init " program [arg ...]"
+The init program run inside the guest and its arguments.
+.TP
+.BI name " string"
+The guest's name on the inter-guest network.
+.TP
+.BI cmdline " string"
+The kernel command line the guest exposes as
+.BR /proc/cmdline .
+The whole value is kept verbatim, spaces included.
+.TP
+.B console interactive
+Wire the guest console to the host terminal, giving init an interactive tty.
+.TP
+.BI net " allow cidr ports [proto]"
+Permit outbound traffic to
+.I cidr
+on
+.I ports
+(optionally restricted to
+.IR proto ).
+Without any
+.B net
+directive the default policy denies outbound traffic.
+.TP
+.BI origin " url"
+.TQ
+.BI key " keyspec"
+.TQ
+.BI label " string"
+Pull a signed bundle from
+.I origin
+before boot, verifying it against the trusted
+.IR key .
+The guest refuses to boot if the pull cannot be verified.
+.SH ENVIRONMENT
+.TP
+.B JOTUN_MANIFEST
+Manifest for the single guest when no
+.B -m
+is given.
+.TP
+.B JOTUN_VCPUS
+Number of vcpus per guest (default 1, capped at the compiled-in maximum).
+.TP
+.B JOTUN_HZ
+Preemption timer rate in ticks per second. Preemption of guest user code is
+opt-in: with
+.B JOTUN_HZ
+unset or 0 no timer runs and the scheduler is cooperative.
+.TP
+.B JOTUN_NO_PREEMPT
+When set, disable the in-kernel preemption that is otherwise on by default.
+.TP
+.B JOTUN_MAX_EXITS
+Stop a guest after this many VM exits (0, the default, means no limit). A
+debugging aid.
+.TP
+.B JOTUN_DEBUG
+Enable verbose host-side debug logging.
+.TP
+.B JOTUN_ORIGIN ", " JOTUN_KEY ", " JOTUN_LABEL ", " JOTUN_CACHE ", " JOTUN_BUNDLE ", " JOTUN_REF ", " JOTUN_NAME
+Environment fallbacks for the single no-manifest guest, matching the manifest
+directives of the same name.
+.B JOTUN_CACHE
+names the local directory a pulled bundle is cached in.
+.SH FILES
+.TP
+.B libos.elf
+The guest library OS kernel, built alongside
+.BR jotun .
+Normally passed as the
+.I kernel-image
+argument.
+.TP
+.B test_guest.elf
+Fallback kernel image loaded from the current directory when no image is given
+and none is present in a bundle.
+.SH EXAMPLES
+Run an interactive shell from a Debian root filesystem on the host, with the
+kernel source tree mounted writable:
+.PP
+.RS
+.nf
+jotun -m build.manifest libos.elf
+.fi
+.RE
+.PP
+where
+.B build.manifest
+contains:
+.PP
+.RS
+.nf
+rootfs host:/home/user/debroot
+mount ksrc host:/home/user/src rw
+console interactive
+init bin /bin/sh
+.fi
+.RE
+.SH EXIT STATUS
+.B jotun
+exits 0 on a clean shutdown, and non-zero if a guest fails to come up or a
+signed pull cannot be verified.
+.SH SEE ALSO
+The project README and the documents under
+.BR doc/ ,
+in particular
+.B doc/sandbox-build.md
+(building and running) and
+.B doc/unikernel-design.md
+(design).
