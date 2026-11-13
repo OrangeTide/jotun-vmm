@@ -508,7 +508,16 @@ struct lpipe {
  * task); see task.h. */
 #define LINUX_NPROC  256
 #define LINUX_MMAP_HOLES 256            /* freed mmap spans tracked per address space */
-#define LINUX_KSTACK (16u * 1024)       /* per-process syscall handler stack */
+/* Per-process syscall/fault handler stack (SP_EL1 on arm64). It must hold the
+ * deepest kernel chain a syscall can reach. The execve path is the worst case:
+ * do_execve builds the new image and user stack with multi-kilobyte local
+ * buffers (argv/envp arrays, a path buffer), elf_load writes the segments, and
+ * each write demand-faults through abort_entry (a 256-byte register frame) into
+ * pf_handle. At 16 KiB that chain overflowed and silently corrupted the adjacent
+ * process's kstack in the kheap, surfacing as a wild kernel branch during a
+ * build. 64 KiB gives ample headroom; the cost is trivial since only a handful
+ * of processes are live at once. */
+#define LINUX_KSTACK (64u * 1024)
 #define CLONE_VM     0x00000100u        /* clone shares the address space (thread) */
 static struct lpipe pipes[LINUX_NPIPE];
 
