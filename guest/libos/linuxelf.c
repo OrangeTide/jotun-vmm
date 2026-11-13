@@ -6262,6 +6262,10 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return 0;                       /* no supplementary groups */
     case SYS_getpgrp:
         return 1;                       /* a single process group */
+    case SYS_getpgid:
+        return 1;                       /* the one process group (see getpgrp) */
+    case SYS_getsid:
+        return lproc_cur->sh->pid;      /* session id is our pid (see setsid) */
     case SYS_getrusage: {
         /* usage is the second argument; who (a1) is ignored. Zeroed counters:
          * no CPU-time accounting, which gcc and as query but tolerate. */

@@ -110,6 +110,8 @@
 #define SYS_getpgrp         111
 #define SYS_setsid          112
 #define SYS_setreuid        113
+#define SYS_getpgid         121
+#define SYS_getsid          124
 #define SYS_setregid        114
 #define SYS_getgroups       115
 #define SYS_setgroups       116
