@@ -158,6 +158,8 @@
 #define SYS_epoll_create (-22)     /* AArch64 has epoll_create1 (20), not this */
 #define SYS_epoll_wait (-23)       /* AArch64 has epoll_pwait (22), not this */
 #define SYS_eventfd    (-24)       /* AArch64 has eventfd2 (19), not legacy eventfd */
+#define SYS_select     (-25)       /* AArch64 has pselect6 (72), not legacy select */
+#define SYS_pselect6        72     /* GNU make's -j jobserver waits with this */
 #define SYS_ppoll           73     /* musl's poll() and pause() both use this */
 #define SYS_splice          76
 #define SYS_sendfile        71

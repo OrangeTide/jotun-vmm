@@ -2432,6 +2432,178 @@ do_ppoll(uint64_t ufds, uint64_t nfds, uint64_t tmo_ptr, uint64_t sigmask_ptr)
     return r;
 }
 
+/* select/pselect6 over the poll readiness machinery. nfds is the highest file
+ * descriptor to examine plus one; readfds, writefds, and exceptfds are bitmaps
+ * by pointer, each NULL to ignore that set. The three sets are rewritten in
+ * place to the descriptors that are ready and the count of ready (descriptor,
+ * set) pairs is returned. timeout_ms is <0 to wait indefinitely, 0 to test once
+ * and return, or a positive bound. The cooperative wait mirrors do_poll. */
+#define SELECT_MAXFD 1024
+
+static long
+do_select(int nfds, uint64_t rp, uint64_t wp, uint64_t ep, long timeout_ms)
+{
+    if (nfds < 0 || nfds > SELECT_MAXFD)
+        return -LERR_INVAL;
+    size_t words = ((size_t)nfds + 63) / 64;
+    size_t bytes = words * sizeof(uint64_t);
+    uint64_t rfds[SELECT_MAXFD / 64];
+    uint64_t wfds[SELECT_MAXFD / 64];
+    uint64_t efds[SELECT_MAXFD / 64];
+    memset(rfds, 0, sizeof rfds);
+    memset(wfds, 0, sizeof wfds);
+    memset(efds, 0, sizeof efds);
+    if (rp && copy_from_user(rfds, rp, bytes) < 0)
+        return -LERR_FAULT;
+    if (wp && copy_from_user(wfds, wp, bytes) < 0)
+        return -LERR_FAULT;
+    if (ep && copy_from_user(efds, ep, bytes) < 0)
+        return -LERR_FAULT;
+
+    /* One pollfd per descriptor requested in any set. */
+    struct pollfd *pf = kmalloc((size_t)nfds * sizeof *pf + 1);
+    if (!pf)
+        return -LERR_NOMEM;
+    int npf = 0;
+    for (int fd = 0; fd < nfds; fd++) {
+        short ev = 0;
+        if (rp && ((rfds[fd / 64] >> (fd & 63)) & 1))
+            ev |= POLLIN;
+        if (wp && ((wfds[fd / 64] >> (fd & 63)) & 1))
+            ev |= POLLOUT;
+        if (ep && ((efds[fd / 64] >> (fd & 63)) & 1))
+            ev |= POLLPRI;
+        if (!ev)
+            continue;
+        pf[npf].fd = fd;
+        pf[npf].events = ev;
+        pf[npf].revents = 0;
+        npf++;
+    }
+
+    uint64_t deadline = 0;
+    if (timeout_ms > 0)
+        deadline = arch_cycles() + (uint64_t)timeout_ms * 1000000ULL;
+    long ready;
+    int interrupted = 0;
+    for (;;) {
+        ready = 0;
+        for (int i = 0; i < npf; i++) {
+            pf[i].revents = poll_ready(fd_get(pf[i].fd), pf[i].events);
+            if (pf[i].revents)
+                ready++;
+        }
+        if (ready > 0 || timeout_ms == 0)
+            break;
+        if (timeout_ms > 0 && arch_cycles() >= deadline)
+            break;
+        lx_yield();                     /* let a peer make a descriptor ready */
+        signal_killpoint();
+        if (signal_deliverable()) {     /* a caught signal interrupts the wait */
+            interrupted = 1;
+            break;
+        }
+    }
+    if (interrupted) {
+        kfree(pf);
+        return -LERR_RESTARTSYS;
+    }
+
+    /* Rewrite the sets to the ready descriptors. A descriptor ready for both
+     * reading and writing counts in each set, as select specifies. The
+     * readable condition includes a hangup or error, the writable condition an
+     * error, matching how select reports a half-closed or failed descriptor. */
+    memset(rfds, 0, sizeof rfds);
+    memset(wfds, 0, sizeof wfds);
+    memset(efds, 0, sizeof efds);
+    long count = 0;
+    for (int i = 0; i < npf; i++) {
+        int fd = pf[i].fd;
+        short re = pf[i].revents;
+        if (rp && (re & (POLLIN | POLLHUP | POLLERR))) {
+            rfds[fd / 64] |= 1ULL << (fd & 63);
+            count++;
+        }
+        if (wp && (re & (POLLOUT | POLLERR))) {
+            wfds[fd / 64] |= 1ULL << (fd & 63);
+            count++;
+        }
+        if (ep && (re & POLLPRI)) {
+            efds[fd / 64] |= 1ULL << (fd & 63);
+            count++;
+        }
+    }
+    kfree(pf);
+    if (rp)
+        copy_to_user(rp, rfds, bytes);
+    if (wp)
+        copy_to_user(wp, wfds, bytes);
+    if (ep)
+        copy_to_user(ep, efds, bytes);
+    return count;
+}
+
+/* pselect6(nfds, r, w, e, timeout_ts, sigmask6). The timeout is a timespec by
+ * pointer (NULL to wait forever) and is not updated on return, as Linux
+ * specifies. sigmask6, when non-NULL, points at { const sigset_t *ss; size_t }:
+ * ss is applied for the wait so a signal it unblocks interrupts the call, the
+ * same temporary-mask handling as do_ppoll (the atomic guarantee is not
+ * modelled). GNU make's -j jobserver waits on its pipe here, unblocking SIGCHLD
+ * through ss so a child's exit breaks the wait. */
+static long
+do_pselect6(int nfds, uint64_t rp, uint64_t wp, uint64_t ep,
+            uint64_t tsp, uint64_t sigmask6)
+{
+    long timeout_ms = -1;
+    if (tsp) {
+        uint64_t ts[2];                 /* tv_sec, tv_nsec */
+        long e = copy_from_user(ts, tsp, sizeof ts);
+        if (e < 0)
+            return e;
+        if (ts[1] >= 1000000000ULL)
+            return -LERR_INVAL;
+        timeout_ms = (long)(ts[0] * 1000ULL + (ts[1] + 999999ULL) / 1000000ULL);
+    }
+
+    uint64_t saved = lproc_cur->sig_blocked;
+    int swapped = 0;
+    if (sigmask6) {
+        uint64_t head[2];               /* { ss pointer, ss length } */
+        if (copy_from_user(head, sigmask6, sizeof head) < 0)
+            return -LERR_FAULT;
+        if (head[0]) {
+            uint64_t m;
+            if (copy_from_user(&m, head[0], sizeof m) < 0)
+                return -LERR_FAULT;
+            lproc_cur->sig_blocked = m;
+            swapped = 1;
+        }
+    }
+
+    long r = do_select(nfds, rp, wp, ep, timeout_ms);
+
+    if (swapped)
+        lproc_cur->sig_blocked = saved;
+    return r;
+}
+
+/* select(nfds, r, w, e, timeout_tv): the legacy x86-64 call, timeout by a
+ * timeval pointer (NULL to wait forever). Linux rewrites the timeval with the
+ * time left; that update is not modelled, since the common callers pass NULL or
+ * do not read it back. */
+static long
+do_select_tv(int nfds, uint64_t rp, uint64_t wp, uint64_t ep, uint64_t tvp)
+{
+    long timeout_ms = -1;
+    if (tvp) {
+        uint64_t tv[2];                 /* tv_sec, tv_usec */
+        if (copy_from_user(tv, tvp, sizeof tv) < 0)
+            return -LERR_FAULT;
+        timeout_ms = (long)(tv[0] * 1000ULL + (tv[1] + 999ULL) / 1000ULL);
+    }
+    return do_select(nfds, rp, wp, ep, timeout_ms);
+}
+
 /* epoll. The event bits below the output-only ones match the poll bits exactly
  * (EPOLLIN==POLLIN, EPOLLOUT==POLLOUT, ...), so epoll readiness reuses
  * poll_ready. EPOLLET (edge-triggered) is accepted but treated as level, which
@@ -5901,6 +6073,12 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
         return do_poll((uint64_t)a1, (uint64_t)a2, (long)a3);
     case SYS_ppoll:
         return do_ppoll((uint64_t)a1, (uint64_t)a2, (uint64_t)a3, (uint64_t)a4);
+    case SYS_pselect6:
+        return do_pselect6((int)a1, (uint64_t)a2, (uint64_t)a3, (uint64_t)a4,
+                           (uint64_t)a5, tf_arg6(&lproc_cur->tf));
+    case SYS_select:
+        return do_select_tv((int)a1, (uint64_t)a2, (uint64_t)a3, (uint64_t)a4,
+                            (uint64_t)a5);
     case SYS_epoll_create:
         return do_epoll_create1(0);     /* legacy; the size hint is ignored */
     case SYS_epoll_create1:

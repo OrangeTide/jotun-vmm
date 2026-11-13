@@ -18,6 +18,8 @@
 #define SYS_fstat           5
 #define SYS_lstat           6
 #define SYS_poll            7
+#define SYS_select          23
+#define SYS_pselect6        270
 #define SYS_ppoll           271
 #define SYS_splice          275
 #define SYS_sendfile        40
