@@ -321,6 +321,21 @@ setup_bootinfo(struct guest *gp, int gargc, char **gargv)
         }
     }
     b->envc = envc;
+
+    /* The kernel command line follows the argv and envp strings in the blob.
+     * The guest serves it as /proc/cmdline. It is stored without a terminator;
+     * cmdline_len bounds it. */
+    uint32_t cmdlen = 0;
+    const char *cmdline = gp->manifest.cmdline;
+    if (cmdline && cmdline[0]) {
+        size_t len = strlen(cmdline);
+        if (off + len <= JOTUN_BOOT_BLOB_MAX) {
+            memcpy(&b->blob[off], cmdline, len);
+            off += (uint32_t)len;
+            cmdlen = (uint32_t)len;
+        }
+    }
+    b->cmdline_len = cmdlen;
     b->blob_len = off;
 
     /* List each writable host mount's guest prefix ("/<name>") so the guest

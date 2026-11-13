@@ -18,7 +18,7 @@
 /* Sentinel and version, so the guest can tell a block was placed and that the
  * two sides agree on the layout. */
 #define JOTUN_BOOT_MAGIC    0x4a4f5442u     /* a fixed sentinel, "JOTB" */
-#define JOTUN_BOOT_VERSION  5u
+#define JOTUN_BOOT_VERSION  6u
 
 /* console_flags bits. INTERACTIVE marks a guest whose console is wired to a
  * live host terminal: stdin delivers keystrokes and the guest runs a tty line
@@ -36,8 +36,9 @@
 #define JOTUN_BOOT_RWMOUNT_LEN  64
 
 /* The parameter block. argc argument strings followed by envc environment
- * strings live in blob[], each NUL-terminated and concatenated in order;
- * blob_len is the number of bytes used. The init program is argv[0]. */
+ * strings live in blob[], each NUL-terminated and concatenated in order; the
+ * kernel command line follows them (cmdline_len bytes, no terminator counted).
+ * blob_len is the total bytes used. The init program is argv[0]. */
 struct jotun_bootinfo {
     uint32_t magic;
     uint32_t version;
@@ -71,7 +72,9 @@ struct jotun_bootinfo {
     /* Console wiring for the init program. See JOTUN_CONSOLE_* above. 0 (the
      * default a pre-v5 host leaves) means an output-only console. */
     uint32_t console_flags;
-    uint32_t _pad_console;
+    /* Length of the kernel command line in blob[], placed right after the argv
+     * and envp strings. The guest exposes it as /proc/cmdline. 0 when none. */
+    uint32_t cmdline_len;
     uint8_t  blob[JOTUN_BOOT_BLOB_MAX];
 };
 

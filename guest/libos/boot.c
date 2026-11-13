@@ -19,6 +19,8 @@ static const char *argv[MAX_ARGV];
 static int argc;
 static const char *envv[MAX_ENVV];
 static int envc;
+static const char *cmdline;     /* kernel command line in the blob, or NULL */
+static uint32_t cmdline_len;
 
 int
 boot_init(void)
@@ -58,6 +60,14 @@ boot_init(void)
         while (off < b->blob_len && b->blob[off] != '\0')
             off++;
         off++;
+    }
+
+    /* The kernel command line follows the argv and envp strings, stored without
+     * a terminator; cmdline_len bounds it, clamped to what remains in the blob. */
+    if (b->cmdline_len && off < b->blob_len) {
+        uint32_t avail = b->blob_len - off;
+        cmdline_len = b->cmdline_len < avail ? b->cmdline_len : avail;
+        cmdline = (const char *)&b->blob[off];
     }
     return 0;
 }
@@ -145,4 +155,12 @@ int
 boot_console_interactive(void)
 {
     return info && (info->console_flags & JOTUN_CONSOLE_INTERACTIVE) ? 1 : 0;
+}
+
+const char *
+boot_cmdline(uint32_t *len)
+{
+    if (len)
+        *len = cmdline_len;
+    return cmdline;
 }

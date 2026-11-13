@@ -383,6 +383,25 @@ linux-spike: $(TARGET) libos.elf $(LINUX_SPIKE_BINS)
 	$(SPIKE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
 	    ./$(TARGET) libos.elf bin $(SPIKE_PROG)
 
+## Kernel-command-line test. A manifest sets "cmdline <string>"; linuxcmdline
+## reads /proc/cmdline in the guest and prints it. The test passes only when the
+## printed value matches the string the manifest supplied, which proves the host
+## passes a command line through the boot block and the guest serves it. Separate
+## from linux-smoke because it needs a manifest.
+linux-cmdline: $(TARGET) libos.elf build/linuxcmdline
+	@set -e; \
+	cl='root=/dev/vda ro quiet jotun.test=1'; \
+	mf=build/cmdline.manifest; \
+	printf 'bundle %s\nref root\nsubtree /\ninit bin linuxcmdline\ncmdline %s\n' \
+	    "$(BUNDLE_DEPOT)" "$$cl" > $$mf; \
+	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="build/linuxcmdline"; \
+	out=`$(SPIKE_ENV) $(if $(TIMEOUT),$(TIMEOUT) $(SPIKE_SECS)) \
+	    ./$(TARGET) -m $$mf libos.elf 2>&1`; \
+	echo "$$out"; \
+	rm -f $$mf; \
+	if echo "$$out" | grep -qF "cmdline: [$$cl]"; then echo "linux-cmdline: ok"; \
+	else echo "linux-cmdline: FAILED"; exit 1; fi
+
 ## Writable-host-mount test. A manifest maps the guest's /tmp to a fresh host
 ## directory ("mount tmp host:<dir> rw"); linuxtmp then stats /tmp, creates a
 ## file under it, and reads the bytes back. The test passes only when the guest
@@ -472,4 +491,4 @@ clean:
 	rm -f $(TARGET) libos.elf $(PROGS) castool jbundle
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax fmt-test linux-progs linux-spike linux-smoke linux-tmp-mount linux-run
+.PHONY: all clean bundle macsyntax fmt-test linux-progs linux-spike linux-smoke linux-tmp-mount linux-cmdline linux-run

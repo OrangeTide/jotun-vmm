@@ -262,6 +262,29 @@ Limitations in this first version:
   arm64) is solid in every case. This needs a fix in the arm64 interrupt
   save/restore path and is tracked separately.
 
+## Kernel command line
+
+The init program runs as pid 1. To pass it boot parameters the usual Linux way,
+add a `cmdline` directive; the guest serves its value as `/proc/cmdline`.
+
+```
+rootfs host:/abs/path/to/rootfs
+cmdline root=/dev/vda ro quiet mykey=value
+init bin /sbin/init
+```
+
+The whole rest of the `cmdline` line is kept verbatim, including spaces, so a
+multi-word command line needs no quoting. Inside the guest:
+
+```sh
+cat /proc/cmdline
+# root=/dev/vda ro quiet mykey=value
+```
+
+The file is newline-terminated, as Linux writes it. When no `cmdline` directive
+is given, `/proc/cmdline` is present but empty. Any process whose parent exits is
+reparented to pid 1, matching Linux, so an orphan's `getppid()` reads 1.
+
 ## KVM permissions (Linux)
 
 Running needs read and write on `/dev/kvm`. Add yourself to the `kvm` group once:

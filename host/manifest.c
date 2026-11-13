@@ -1,8 +1,9 @@
 /* manifest.c : parse the per-guest manifest.
  *
  * One directive per line: "key value". Blank lines and lines beginning with
- * '#' are ignored. Keys: bundle, ref, subtree, and init (whose value is the
- * whole argument vector). Unknown keys are ignored so the format can grow. */
+ * '#' are ignored. Keys include bundle, origin, key, ref, subtree, rootfs,
+ * mount, net, name, label, console, cmdline, and init (whose value is the whole
+ * argument vector). Unknown keys are ignored so the format can grow. */
 #include "manifest.h"
 
 #include <stdio.h>
@@ -140,6 +141,11 @@ manifest_load(const char *path, struct manifest *m)
              * kernel then comes from the command-line image. */
             if (strncmp(val, "host:", 5) == 0)
                 copy_field(m->rootfs, sizeof m->rootfs, val + 5);
+        } else if (strcmp(key, "cmdline") == 0) {
+            /* "cmdline <string>": the kernel command line the guest exposes as
+             * /proc/cmdline. The whole value (which may contain spaces) is kept
+             * verbatim. */
+            copy_field(m->cmdline, sizeof m->cmdline, val);
         } else if (strcmp(key, "console") == 0) {
             /* "console interactive": wire the guest console to the host
              * terminal so the init program gets an interactive tty. */

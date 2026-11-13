@@ -58,4 +58,8 @@ const char *boot_envp(int i);
  * delivers keystrokes and the init program should run a tty line discipline. */
 int boot_console_interactive(void);
 
+/* The kernel command line the host supplied (served as /proc/cmdline), or NULL
+ * when none. It is not NUL-terminated; *len receives its length in bytes. */
+const char *boot_cmdline(uint32_t *len);
+
 #endif /* LIBOS_BOOT_H */

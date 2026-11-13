@@ -4932,6 +4932,14 @@ do_exit(long code, int group)
             par->sig_pending |= SIGBIT(SIGCHLD);
             wake_process_threads(par);
         }
+
+        /* Reparent any surviving children to init (pid 1), as Linux does when a
+         * parent dies: an orphan's parent becomes init, so its getppid reads 1
+         * and its eventual exit belongs to init rather than a dead process. */
+        for (int i = 0; i < LINUX_NPROC; i++)
+            if (shareds[i].used && shareds[i].parent == sh->pid
+                && shareds[i].pid != sh->pid)
+                shareds[i].parent = 1;
     }
 
     /* This thread cannot free its own kstack (it runs on it); hand it to the
@@ -6869,6 +6877,33 @@ linux_tables_init(void)
     linux_rwmount_init();
 }
 
+/* Create a minimal synthetic /proc in the writable overlay. /proc/cmdline holds
+ * the host-supplied kernel command line, newline-terminated as Linux writes it,
+ * so the init program can read boot parameters the usual way. More /proc entries
+ * can join this as they are needed. */
+static void
+linux_proc_init(void)
+{
+    uint32_t clen = 0;
+    const char *cl = boot_cmdline(&clen);
+    int ri;
+
+    if (ramfs_find("proc") < 0)
+        ramfs_create("proc", 1);        /* so getdents and `ls /proc` see it */
+
+    ri = ramfs_create("proc/cmdline", 0);
+    if (ri < 0)
+        return;
+    if (ramfs_grow(&ramfs[ri], clen + 1) < 0) {
+        ramfs_free_slot(ri);
+        return;
+    }
+    if (clen)
+        memcpy(ramfs[ri].data, cl, clen);
+    ramfs[ri].data[clen] = '\n';
+    ramfs[ri].len = clen + 1;
+}
+
 static void
 linux_phys_init(void)
 {
@@ -6878,6 +6913,7 @@ linux_phys_init(void)
         kheap_init();           /* heap now grows past the bootstrap band */
         task_add_event_hook(sleep_wake_hook);   /* wake timed sleepers on a tick */
         con_tty_init();         /* console line discipline + input wake hook */
+        linux_proc_init();      /* synthetic /proc/cmdline */
         phys_ready = 1;
     }
 }

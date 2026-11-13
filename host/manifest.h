@@ -44,6 +44,8 @@ struct manifest {
     char rootfs[PATH_MAX];              /* host dir to serve as the guest root
                                          * (read-only), or "" to use the bundle */
     char name[64];                      /* this guest's network name, or "" */
+    char cmdline[512];                  /* kernel command line, exposed to the
+                                         * guest as /proc/cmdline, or "" */
     int  interactive;                   /* wire the console to the host terminal */
     int  argc;
     char argv[MANIFEST_MAXARG][PATH_MAX];   /* init program and arguments */
