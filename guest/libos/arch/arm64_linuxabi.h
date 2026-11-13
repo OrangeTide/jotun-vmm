@@ -160,6 +160,7 @@
 #define SYS_eventfd    (-24)       /* AArch64 has eventfd2 (19), not legacy eventfd */
 #define SYS_ppoll           73     /* musl's poll() and pause() both use this */
 #define SYS_splice          76
+#define SYS_sendfile        71
 #define SYS_epoll_create1   20
 #define SYS_epoll_ctl       21
 #define SYS_epoll_pwait     22

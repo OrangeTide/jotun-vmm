@@ -20,6 +20,7 @@
 #define SYS_poll            7
 #define SYS_ppoll           271
 #define SYS_splice          275
+#define SYS_sendfile        40
 #define SYS_lseek           8
 #define SYS_mmap            9
 #define SYS_mprotect        10

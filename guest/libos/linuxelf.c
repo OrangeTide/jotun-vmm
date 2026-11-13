@@ -3473,6 +3473,58 @@ do_splice(long fd_in, uint64_t uoff_in, long fd_out, uint64_t uoff_out,
     return put;
 }
 
+/* sendfile(out_fd, in_fd, offset, count): copy up to count bytes from a
+ * seekable in_fd to out_fd, like splice but with no pipe requirement. When
+ * offset is non-NULL the copy starts there and advances it in place without
+ * moving the file position; when NULL it reads from and advances in_fd's own
+ * position. One chunk per call, as on Linux; callers loop. busybox cat and cp
+ * use it, and it returned ENOSYS before. */
+static long
+do_sendfile(long out_fd, long in_fd, uint64_t uoff, unsigned long count)
+{
+    struct lfd *fin = fd_get(in_fd);
+    struct lfd *fout = fd_get(out_fd);
+    if (!fin || !fout)
+        return -LERR_BADF;
+    if (fin->kind == FD_PIPE || fin->kind == FD_CON || fin->kind == FD_DIR)
+        return -LERR_INVAL;             /* the source must be seekable */
+    if (count == 0)
+        return 0;
+    if (count > SPLICE_CHUNK)
+        count = SPLICE_CHUNK;
+
+    int64_t off = 0;
+    uint64_t pos;
+    if (uoff) {
+        if (copy_from_user(&off, uoff, sizeof off) != 0)
+            return -LERR_FAULT;
+        pos = (uint64_t)off;
+    } else {
+        pos = fin->of ? fin->of->pos : 0;
+    }
+
+    char *buf = kmalloc(count);
+    if (!buf)
+        return -LERR_NOMEM;
+
+    long got = pread_core(fin, buf, count, pos);
+    if (got <= 0) {
+        kfree(buf);
+        return got;
+    }
+    long put = fout->ops->write(fout, buf, (unsigned long)got);
+    kfree(buf);
+    if (put < 0)
+        return put;
+    if (uoff) {
+        off += put;
+        copy_to_user(uoff, &off, sizeof off);
+    } else if (fin->of) {
+        fin->of->pos += (uint64_t)put;
+    }
+    return put;
+}
+
 static long
 do_close(long fd)
 {
@@ -5498,6 +5550,8 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     case SYS_splice:
         return do_splice(a1, (uint64_t)a2, a3, (uint64_t)a4,
                          (unsigned long)a5, (unsigned int)tf_arg6(&lproc_cur->tf));
+    case SYS_sendfile:
+        return do_sendfile(a1, a2, (uint64_t)a3, (unsigned long)a4);
     case SYS_write:
         return do_write(a1, (const char *)a2, (unsigned long)a3);
     case SYS_writev:
