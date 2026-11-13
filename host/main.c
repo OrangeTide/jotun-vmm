@@ -16,7 +16,6 @@
 #include "jotun_boot.h"
 #include "jotun_9p.h"
 #include "jotun_net.h"
-#include "jotun_draw.h"
 #include "p9srv.h"
 #include "p9mem.h"
 #include "p9smolvfs.h"
@@ -26,7 +25,6 @@
 #include "manifest.h"
 #include "bundlepull.h"
 #include "net.h"
-#include "draw.h"
 
 /* This host runs native-arch guests (KVM and HVF both run the host CPU), so the
  * build arch is the guest arch, and this token selects the matching variant in
@@ -112,7 +110,7 @@ struct guest_mem {
  * threads a struct guest * through the call graph so each guest is addressed by
  * pointer rather than by this global. */
 struct guest {
-    int gid;                    /* 0..nguests-1; guest 0 owns the front end */
+    int gid;                    /* 0..nguests-1 */
     vmm_vm_t *vm;
     struct guest_mem gm;
     elf_image img;
@@ -122,7 +120,6 @@ struct guest {
     int nvcpus;
 
     struct netdev *netdev;      /* net provider sharing this guest's channel */
-    struct drawdev *drawdev;    /* draw sink sharing this guest's channel */
     struct p9srv p9;            /* 9P server, guarded by dev_lock */
     struct net_policy policy;   /* net rules for this guest */
     struct manifest manifest;   /* this guest's domain config, if from -m */
@@ -158,7 +155,7 @@ vcpu_idle_wait(struct vcpu_ctx *c)
  * into its running vcpus (breaking their run so the guest ISR fires) and wake
  * any that are idle (so they leave the idle rendezvous and recheck). The net
  * poll thread calls this (with the owning guest as ctx) when a socket a guest
- * task waits on becomes ready, and the draw sink when an input event is queued.
+ * task waits on becomes ready.
  * Only this guest's vcpus are touched, so one guest's device traffic never
  * disturbs another. */
 static void
@@ -257,15 +254,6 @@ gpa_to_host(struct guest *gp, uint64_t gpa, uint64_t len)
     return gp->gm.base + gpa;
 }
 
-/* The draw sink's address translator: same bounds check, with the callback
- * signature the sink expects. The context is the owning guest, passed to
- * draw_init. */
-static void *
-draw_gpa(void *ctx, uint64_t gpa, uint64_t len)
-{
-    return gpa_to_host((struct guest *)ctx, gpa, len);
-}
-
 /* Write the boot parameter block into guest RAM before the vcpu starts. The
  * guest argv is whatever follows the kernel image on the command line, with
  * argv[0] the init program. */
@@ -356,33 +344,6 @@ setup_bootinfo(struct guest *gp, int gargc, char **gargv)
     b->nrwmount = nrw;
 }
 
-/* Doorbell handler: drain the request ring, echo each message into the
- * response ring, and raise the response event. Called with dev_lock held. */
-static void
-ring_service(struct guest *gp)
-{
-    struct jotun_ring *r = gpa_to_host(gp, JOTUN_RING_BASE, sizeof(*r));
-    if (!r)
-        return;
-
-    while (r->req_tail != r->req_head) {
-        struct jotun_msg *q = &r->req[r->req_tail % JOTUN_RING_SLOTS];
-        uint16_t len = q->len;
-        if (len > JOTUN_MSG_MAX)
-            len = JOTUN_MSG_MAX;
-
-        struct jotun_msg *s = &r->rsp[r->rsp_head % JOTUN_RING_SLOTS];
-        s->len = len;
-        memcpy(s->data, q->data, len);
-        r->rsp_head++;
-        r->req_tail++;
-
-        fprintf(stderr, "[ring] echoed %u bytes: %.*s\n",
-                (unsigned)len, (int)len, q->data);
-    }
-    r->evt_pending |= JOTUN_EVT_RSP;
-}
-
 /* 9P doorbell handler: process the T-message in the shared channel and write
  * the reply back into it. Called with dev_lock held. */
 static void
@@ -405,18 +366,6 @@ net_service(struct guest *gp)
     if (!c || !gp->netdev)
         return;
     net_handle(gp->netdev, c);
-}
-
-/* Draw doorbell handler: process the request in the draw channel and write the
- * result back. Called without dev_lock, like the net doorbell, since the sink
- * has no shared console state. */
-static void
-draw_service(struct guest *gp)
-{
-    struct jotun_draw *c = gpa_to_host(gp, JOTUN_DRAW_BASE, sizeof(*c));
-    if (!c || !gp->drawdev)
-        return;
-    draw_handle(gp->drawdev, c);
 }
 
 /* Turn one manifest rule (strings) into a numeric net_rule. Returns 0, or -1
@@ -557,10 +506,6 @@ run_vcpu(void *arg)
             net_service(gp);
             continue;
         } else if (e.reason == VMM_EXIT_REASON_MMIO
-                   && e.mmio.write && e.mmio.address == JOTUN_DRAW_DOORBELL) {
-            draw_service(gp);
-            continue;
-        } else if (e.reason == VMM_EXIT_REASON_MMIO
                    && e.mmio.write && e.mmio.address == JOTUN_EVENT_EOI) {
             /* The arm64 guest acknowledges a preemption IRQ here so the backend
              * lowers the line it holds asserted. */
@@ -571,8 +516,6 @@ run_vcpu(void *arg)
             pthread_mutex_lock(&dev_lock);
             if (uart_mmio(&e)) {
                 /* serviced by the console */
-            } else if (e.mmio.write && e.mmio.address == JOTUN_DOORBELL) {
-                ring_service(gp);
             } else if (e.mmio.write && e.mmio.address == JOTUN_P9_DOORBELL) {
                 p9_service(gp);
             } else if (e.mmio.write && e.mmio.address == MMIO_POWEROFF) {
@@ -732,14 +675,13 @@ guest_vm_free(struct guest *gp)
 /* Bring one guest fully up and start its vcpus: resolve its domain config (from
  * a -m manifest, or from the environment and the trailing CLI args when none is
  * given), create its VM and RAM, write its boot block, install its net policy
- * and provider, attach the browser front end for guest 0 only, pull a signed
+ * and provider, pull a signed
  * bundle if an origin is named, open its 9P server, and spawn its vcpu threads.
  * Returns 0, or -1 on failure (a pull that cannot be verified refuses the
  * boot). The env/argv fallback applies only to a lone guest with no manifest. */
 static int
 guest_bringup(struct guest *gp, int gid, const char *kernel,
-              const char *manifest_path, int nvcpus, int draw_test,
-              struct drawfe *fe, int targc, char **targv)
+              const char *manifest_path, int nvcpus, int targc, char **targv)
 {
     gp->gid = gid;
 
@@ -875,15 +817,6 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
         ? net_init(netchan, rouse_vcpus, gp, &gp->policy, g_vswitch, netname)
         : NULL;
 
-    /* Every guest gets a draw sink attached to the one shared front end, which
-     * composites their scenes into a single browser session. With no front end
-     * (JOTUN_DRAW_PORT=0, fe NULL) the sink still exists but draws nowhere. */
-    struct jotun_draw *drawchan =
-        gpa_to_host(gp, JOTUN_DRAW_BASE, sizeof(*drawchan));
-    gp->drawdev = drawchan
-        ? draw_init(drawchan, gid, fe, rouse_vcpus, gp, draw_test, draw_gpa, gp)
-        : NULL;
-
     /* Graft mounts make shared read-only trees appear at top-level names in
      * this guest's root, alongside its own tree. Each graft wraps the backend
      * built so far, so several chain, each adding one name. They wrap the base
@@ -997,14 +930,6 @@ main(int argc, char **argv)
     const char *cap_env = getenv("JOTUN_MAX_EXITS");
     max_exits = cap_env ? strtoul(cap_env, NULL, 0) : 0;
 
-    int draw_test = getenv("JOTUN_DRAW_TEST") != NULL;
-
-    /* One browser front end backs the whole session; guest 0 attaches its sink.
-     * Opt out with JOTUN_DRAW_PORT=0; the default port is localhost-only. */
-    const char *pe = getenv("JOTUN_DRAW_PORT");
-    int draw_port = pe ? (int)strtol(pe, NULL, 0) : 9230;
-    struct drawfe *fe = drawfe_start(draw_port);
-
     /* A preemption timer is opt-in: JOTUN_HZ ticks per second, across all. */
     unsigned hz = 0;
     const char *hz_env = getenv("JOTUN_HZ");
@@ -1034,8 +959,8 @@ main(int argc, char **argv)
     for (int gi = 0; gi < nguests; gi++) {
         const char *mpath = nmanifests > 0 ? manifests[gi]
                                            : getenv("JOTUN_MANIFEST");
-        if (guest_bringup(&guests[gi], gi, kernel, mpath, nvcpus, draw_test,
-                          fe, targc, targv) != 0) {
+        if (guest_bringup(&guests[gi], gi, kernel, mpath, nvcpus,
+                          targc, targv) != 0) {
             fprintf(stderr, "guest %d: bring-up failed\n", gi);
             return 1;
         }
@@ -1089,12 +1014,8 @@ main(int argc, char **argv)
     }
     console_restore();
 
-    /* Stop the front end first, so its server thread delivers no more events
-     * to a sink before draw_shutdown frees it. */
-    drawfe_stop(fe);
     for (int gi = 0; gi < nguests; gi++) {
         net_shutdown(guests[gi].netdev);
-        draw_shutdown(guests[gi].drawdev);
         guest_vm_free(&guests[gi]);
     }
     return rc;

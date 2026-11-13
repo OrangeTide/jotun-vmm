@@ -66,9 +66,9 @@ ifeq ($(OS), Darwin)
     CFLAGS += -D__APPLE__
     LDFLAGS += -framework Hypervisor
     SRC = host/vmm_hvf.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c \
-        host/p9smolvfs.c host/p9overlay.c host/p9graft.c host/p9hostdir.c host/manifest.c host/jimage.c host/net.c host/draw.c host/drawws.c host/png.c host/http.c host/bundlepull.c host/main.c $(SMOLVFS_SRC)
+        host/p9smolvfs.c host/p9overlay.c host/p9graft.c host/p9hostdir.c host/manifest.c host/jimage.c host/net.c host/http.c host/bundlepull.c host/main.c $(SMOLVFS_SRC)
     CC = clang
-    GUEST = test_guest.elf echo.elf libos.elf
+    GUEST = libos.elf
     GUEST_SRC = guest/test_guest_arm64.c
     LIBOS_ARCH = guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
         guest/libos/arch/arm64_boot.S guest/libos/arch/arm64_linuxsys.S \
@@ -84,12 +84,12 @@ ifeq ($(OS), Darwin)
 else
     CFLAGS += -D__linux__
     SRC = host/vmm_kvm.c host/elf.c host/uart.c host/p9srv.c host/p9mem.c \
-        host/p9smolvfs.c host/p9overlay.c host/p9graft.c host/p9hostdir.c host/manifest.c host/jimage.c host/net.c host/draw.c host/drawws.c host/png.c host/http.c host/bundlepull.c host/main.c $(SMOLVFS_SRC)
+        host/p9smolvfs.c host/p9overlay.c host/p9graft.c host/p9hostdir.c host/manifest.c host/jimage.c host/net.c host/http.c host/bundlepull.c host/main.c $(SMOLVFS_SRC)
     CC = gcc
     GUEST_CFLAGS += -no-pie
     ifeq ($(ARCH), x86_64)
         # linux/x86-64: KVM, 64-bit long-mode x86 guest at 1 MiB.
-        GUEST = test_guest.elf echo.elf libos.elf
+        GUEST = libos.elf
         GUEST_SRC = guest/test_guest_x86.c
         LIBOS_ARCH = guest/libos/arch/x86_64.c guest/libos/arch/x86_64_ctx.S \
             guest/libos/arch/x86_64_isr.S guest/libos/arch/x86_64_boot.S \
@@ -100,7 +100,7 @@ else
     endif
     ifeq ($(ARCH), aarch64)
         # linux/arm64: KVM, arm64 guest.
-        GUEST = test_guest.elf echo.elf libos.elf
+        GUEST = libos.elf
         GUEST_SRC = guest/test_guest_arm64.c
         LIBOS_ARCH = guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
             guest/libos/arch/arm64_boot.S guest/libos/arch/arm64_linuxsys.S \
@@ -140,42 +140,31 @@ ifeq ($(OS), Darwin)
 	codesign --force --entitlements entitlements.plist --sign - $@
 endif
 
-# Freestanding guests share one link line; only the source differs.
-GUEST_LINK = $(GUEST_CC) $(GUEST_CFLAGS) -Wl,-Ttext=$(GUEST_TEXT) -o $@ $<
-
-test_guest.elf: $(GUEST_SRC)
-	$(GUEST_LINK)
-
-echo.elf: guest/echo.c
-	$(GUEST_LINK)
-
 # The library OS is multiple translation units: the portable core plus the
-# selected arch file. It needs its own include path and links all objects.
+# selected arch file. It needs its own include path and links all objects. The
+# guest is the Linux binary-compatibility emulation; networking (net.c, ns.c)
+# backs its sockets and 9P (p9.c) its filesystem.
 LIBOS_SRC_COMMON = guest/libos/main.c guest/libos/mem.c guest/libos/task.c \
     guest/libos/boot.c guest/libos/p9.c guest/libos/elfload.c \
-    guest/libos/prog.c guest/libos/jsh.c guest/libos/ns.c guest/libos/net.c \
-    guest/libos/draw.c guest/libos/string.c guest/libos/fmt.c \
-    guest/libos/print.c guest/libos/webterm.c guest/libos/threads.c \
+    guest/libos/ns.c guest/libos/net.c \
+    guest/libos/string.c guest/libos/fmt.c \
+    guest/libos/print.c \
     guest/libos/linuxelf.c
 LIBOS_SRC = $(LIBOS_SRC_COMMON) $(LIBOS_ARCH)
 
-# triton.c is the only guest translation unit built with the FPU enabled: it is
-# the software rasterizer and uses floating point. The rest of the guest stays
-# integer-only (-mgeneral-regs-only). Compile it to an object on its own with
-# that flag dropped, then link it with the integer-only sources. The guest
-# enables the FPU at boot and preserves FP state across task switches, so this
-# object's floating point is safe to run.
+# The guest is integer-only (-mgeneral-regs-only) except fmtfloat.c, the format
+# engine's floating-point unit, which needs the FPU for printf's f/e/g. Compile
+# it on its own with that flag dropped, then link it with the integer-only
+# sources. The guest enables the FPU at boot and preserves FP state across task
+# switches, so this object's floating point is safe to run.
 GUEST_FP_CFLAGS = $(filter-out -mgeneral-regs-only -Wl%,$(GUEST_CFLAGS))
-LIBOS_FP_OBJ = build/triton.o build/fmtfloat.o
+LIBOS_FP_OBJ = build/fmtfloat.o
 
 build:
 	mkdir -p build
 
-build/triton.o: guest/libos/triton.c guest/libos/triton.h | build
-	$(GUEST_CC) $(GUEST_FP_CFLAGS) -Iguest/libos -c -o $@ $<
-
 # fmtfloat.c is the format engine's floating-point unit, built with the FPU on
-# for the same reason as triton.o and linked into the integer-only formatter.
+# and linked into the integer-only formatter.
 build/fmtfloat.o: guest/libos/fmtfloat.c guest/libos/fmtfloat.h | build
 	$(GUEST_CC) $(GUEST_FP_CFLAGS) -Iguest/libos -c -o $@ $<
 
@@ -276,13 +265,11 @@ ASRC_aarch64 := guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
 define IMG_ARCH_template
 build/img/$(1):
 	mkdir -p build/img/$(1)
-build/img/$(1)/triton.o: guest/libos/triton.c guest/libos/triton.h | build/img/$(1)
-	$(2) $$(GUEST_BASE_FP) $(4) -Iguest/libos -c -o $$@ $$<
 build/img/$(1)/fmtfloat.o: guest/libos/fmtfloat.c guest/libos/fmtfloat.h | build/img/$(1)
 	$(2) $$(GUEST_BASE_FP) $(4) -Iguest/libos -c -o $$@ $$<
-build/img/$(1)/kernel: $$(LIBOS_SRC_COMMON) $(5) build/img/$(1)/triton.o build/img/$(1)/fmtfloat.o | build/img/$(1)
+build/img/$(1)/kernel: $$(LIBOS_SRC_COMMON) $(5) build/img/$(1)/fmtfloat.o | build/img/$(1)
 	$(2) $$(GUEST_BASE) $(4) -Iguest/libos -Wl,-Ttext=$(3) -o $$@ \
-	    $$(LIBOS_SRC_COMMON) $(5) build/img/$(1)/triton.o build/img/$(1)/fmtfloat.o
+	    $$(LIBOS_SRC_COMMON) $(5) build/img/$(1)/fmtfloat.o
 build/img/$(1)/libc_fmt.o: guest/libos/fmt.c | build/img/$(1)
 	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
 build/img/$(1)/libc_fmtfloat.o: guest/libos/fmtfloat.c | build/img/$(1)
@@ -340,14 +327,6 @@ bundle: castool jbundle $(BUNDLE_DEPS)
 	done; \
 	./jbundle -d $(BUNDLE_DEPOT) --ref root --name jotun-demo $$args
 	./castool -d $(BUNDLE_DEPOT) pack
-
-## Run the native malloc test program. Builds the test program, stages it plus a
-## one-line launcher script into the bundle, and runs it through jsh. Exercises
-## the bundle program allocator (guest/prog/libc/jmalloc.c + jsbrk.c).
-malloc-test: $(TARGET) libos.elf build/malloctest
-	printf 'malloctest\n' > build/mtrun
-	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="build/malloctest build/mtrun"
-	JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root ./$(TARGET) libos.elf mtrun
 
 ## --- Linux binary-compat test programs (example/linux*.c) ------------------
 ## These run unmodified static Linux binaries in the `bin` guest, exercising the
@@ -600,8 +579,8 @@ brokerctl-test: build/brokerctltest
 	./build/brokerctltest
 
 clean:
-	rm -f $(TARGET) test_guest.elf echo.elf libos.elf $(PROGS) castool jbundle \
+	rm -f $(TARGET) libos.elf $(PROGS) castool jbundle \
 	    brokerd authd jmint
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test linux-progs linux-spike linux-smoke linux-tmp-mount linux-run malloc-test
+.PHONY: all clean bundle macsyntax web web-smoke web-multi broker-smoke caddy-smoke fmt-test web-auth web-auth-demo auth-smoke caddy-auth-smoke brokerctl-test linux-progs linux-spike linux-smoke linux-tmp-mount linux-run
