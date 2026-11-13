@@ -248,12 +248,19 @@ Limitations in this first version:
   turned off"). Pipelines and background jobs still work; `fg`/`bg` do not.
 - `console interactive` applies to one guest. With several guests, the first
   interactive one owns the keyboard; the rest share the output log only.
-- On macOS (Hypervisor.framework), an interactive shell is reliable for shell
-  builtins but can fault after running an external command and returning to the
-  prompt. This looks like a pre-existing Apple-Silicon task-switch coherency
-  hazard that a long-lived interactive shell is the first to expose; it does not
-  affect non-interactive runs. Interactive shells are solid on Linux/KVM (both
-  x86-64 and arm64). This is being tracked for a fix.
+- On macOS (Hypervisor.framework), a shell that spawns external commands can
+  fault intermittently. This is a pre-existing bug, not specific to the
+  interactive console: an asynchronous interrupt taken while a process forks,
+  execs, and reaps corrupts a process on Apple Silicon. A plain `busybox sh`
+  running a few external commands faults about half the time with `JOTUN_HZ` set
+  (the preemption timer is the interrupt) and never with `JOTUN_NO_PREEMPT=1`.
+  The interactive console hits the same bug through a different interrupt, the
+  keystroke wake-up, which `JOTUN_NO_PREEMPT` does not gate, so an interactive
+  shell that runs external commands is currently unreliable on macOS regardless.
+  Shell builtins alone are fine. Non-interactive builds are fine as long as the
+  preemption timer is off (leave `JOTUN_HZ` unset). Linux/KVM (both x86-64 and
+  arm64) is solid in every case. This needs a fix in the arm64 interrupt
+  save/restore path and is tracked separately.
 
 ## KVM permissions (Linux)
 
