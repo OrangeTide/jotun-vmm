@@ -211,6 +211,32 @@ an ELF to the mount, execute it mid-build) plus real arm64 codegen and binutils
 `cc-option`/`try-run` probes, expected to fail. No `flock` or `select` gap was
 hit at this stage. Next: S2 (`make Image`) with the minimal config.
 
+S2 image (headline) is done on the Mac (aarch64 guest on macOS/HVF, 16 KiB
+granule). `make ARCH=arm64 -j4 Image` ran to exit 0 and produced a real aarch64
+Linux 6.12 kernel from source in-guest: `arch/arm64/boot/Image` (about 78 MiB,
+with the valid `ARM\x64` boot magic) and `vmlinux` (about 89 MiB, an aarch64
+ELF). The whole back end ran in-guest: `NM`, `KSYMS`, the kallsyms passes,
+`LD vmlinux`, `System.map`, `SORTTAB`, and `OBJCOPY Image`. The minimal config
+is `defconfig` with `MODULES=n`, no `DEBUG_INFO`/DWARF/BTF, `GDB_SCRIPTS` off,
+and `DRM_MSM` off. `DRM_MSM` is disabled because it builds its register headers
+with `$(PYTHON3)`, and the Debian rootfs has no Python; this is a toolchain
+gap, handled by not building that one driver, not a guest bug.
+
+Bringing S2 up root-caused one real guest bug. The final `vmlinux` link failed
+with undefined nouveau symbols, because `execve` silently truncated `argv` at
+`LINUX_MAX_ARGS` (256). A directory's `built-in.a` recipe runs a single `ar`
+with every member object as its own argument, and nouveau has 724, so `ar`
+bundled only the first ~252 and the rest were dropped from the archive. The
+objects themselves compiled fine (compile command lines stay under the cap).
+The fix raises `LINUX_MAX_ARGS` to 2048 and moves `build_stack_vec`'s two
+`argv`/`envp` pointer arrays off the 64 KiB kernel stack (the caller now passes
+that scratch in), so the larger cap cannot overflow the kstack. linux-smoke is
+37/37 on x86-64/KVM and aarch64/KVM, and 36/37 on the Mac with the timer off
+(only `linuxpreempt`, which structurally needs the timer). A diagnosis note:
+the macOS `ar` and `file` cannot read GNU thin archives (`!<thin>`) and
+misreport a valid archive as corrupt, so thin-archive membership is checked
+with `strings <archive> | grep <member>.o`, not `ar t`.
+
 ## Open risks
 
 - `flock` and `select` gaps may each need a small syscall addition.
