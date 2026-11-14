@@ -4127,6 +4127,75 @@ do_lseek(long fd, long off, long whence)
     return (long)f->of->pos;
 }
 
+/* Set an overlay file's length to len, zero-filling an extension (ftruncate
+ * semantics). The buffer only ever grows; a shrink just lowers len. */
+static long
+ramfs_set_len(struct ramfile *rf, uint64_t len)
+{
+    if (len > RAMFS_FILE_MAX)
+        return -LERR_NOMEM;
+    if ((uint32_t)len > rf->len) {
+        if (ramfs_grow(rf, (uint32_t)len) < 0)
+            return -LERR_NOMEM;
+        memset(rf->data + rf->len, 0, (size_t)((uint32_t)len - rf->len));
+    }
+    rf->len = (uint32_t)len;
+    rf->mtime = fs_stamp();
+    return 0;
+}
+
+/* ftruncate(fd, len): resize an open regular file to len. An overlay file is
+ * resized in memory; a writable host-mount file (FD_9P opened rw) is truncated
+ * on the host over 9P. A linker and libelf (objtool's elf_update) call this to
+ * size their output after writing it, so without it a kernel link fails with
+ * "cannot write data to file". A read-only or non-regular fd cannot be sized. */
+static long
+do_ftruncate(long fd, uint64_t len)
+{
+    struct lfd *f = fd_get(fd);
+
+    if (!f)
+        return -LERR_BADF;
+    if (f->kind == FD_RAM) {
+        long r = ramfs_set_len(&ramfs[f->ridx], len);
+        if (r == 0)
+            f->size = len;
+        return r;
+    }
+    if (f->kind == FD_9P && f->is9w) {
+        if (p9_truncate(f->p9fid, len) != 0)
+            return -LERR_INVAL;
+        f->size = len;
+        return 0;
+    }
+    /* A read-only file, a directory, a pipe, the console, a device or a socket
+     * cannot be truncated; Linux returns EINVAL for a non-regular target. */
+    return -LERR_INVAL;
+}
+
+/* truncate(path, len): the path-named form. Resolve against the overlay first,
+ * then the host mount, mirroring ftruncate's two backends. */
+static long
+do_truncate(const char *path, uint64_t len)
+{
+    char key[RAMFS_NAME];
+    resolve_path(path, key, sizeof key);
+    follow_link_key(key, sizeof key);
+
+    int ri = ramfs_find(key);
+    if (ri >= 0 && !ramfs[ri].is_dir)
+        return ramfs_set_len(&ramfs[ri], len);
+    if (ri >= 0)
+        return -LERR_ISDIR;
+
+    uint32_t fid = LINUX_FID_BASE + GFID_MAX;   /* scratch, above the pool */
+    if (ns_walk(key, fid) != 0)
+        return -LERR_NOENT;
+    long r = p9_truncate(fid, len) == 0 ? 0 : -LERR_INVAL;
+    p9_clunk(fid);
+    return r;
+}
+
 /* An overlay inode is 0x10000+ri, so recover a created file's own mtime from it;
  * bundle files and other objects report the epoch. */
 static uint64_t
@@ -6198,6 +6267,16 @@ linux_sys_dispatch_inner(long nr, long a1, long a2, long a3, long a4, long a5)
     }
     case SYS_lseek:
         return do_lseek(a1, a2, a3);
+    case SYS_ftruncate:
+        return do_ftruncate(a1, (uint64_t)a2);
+    case SYS_truncate: {
+        char pb[UPATH_MAX];
+        long e;
+        const char *up = user_path((uint64_t)a1, pb, &e);
+        if (!up)
+            return e;
+        return do_truncate(up, (uint64_t)a2);
+    }
     case SYS_stat:
     case SYS_lstat: {
         char pb[UPATH_MAX];

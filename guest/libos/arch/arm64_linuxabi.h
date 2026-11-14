@@ -49,6 +49,8 @@
 #define SYS_pipe2           59
 #define SYS_getdents64      61
 #define SYS_lseek           62
+#define SYS_truncate        45
+#define SYS_ftruncate       46
 #define SYS_read            63
 #define SYS_pread64         67
 #define SYS_pwrite64        68

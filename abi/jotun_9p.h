@@ -49,6 +49,11 @@ enum {
      * Carried here as a jotun extension so a writable host mount can rename a
      * file (temp-then-rename is how most tools write a file atomically). */
     P9_TRENAME  = 128, P9_RRENAME  = 129,
+    /* Truncate fid's file to a given length, a jotun extension so a writable
+     * host mount can serve ftruncate/truncate. A linker and libelf size their
+     * output file after writing it; without this a kernel link fails at the
+     * objtool/elf_update step with "cannot write data to file". */
+    P9_TTRUNCATE = 130, P9_RTRUNCATE = 131,
 };
 
 /* qid.type and stat.mode high bits. */

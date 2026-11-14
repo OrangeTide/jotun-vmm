@@ -243,6 +243,21 @@ p9_rename(uint32_t olddirfid, uint32_t newdirfid,
     return 0;
 }
 
+/* Truncate fid's open file to len bytes. */
+int
+p9_truncate(uint32_t fid, uint64_t len)
+{
+    struct p9_out o;
+    struct p9_in in;
+
+    begin(&o, P9_TTRUNCATE);
+    p9o_u32(&o, fid);
+    p9o_u64(&o, len);
+    if (txn(&o, &in) != P9_RTRUNCATE)
+        return -1;
+    return 0;
+}
+
 /* Parse one stat structure, cursor positioned at its leading size[2] field. */
 static int
 parse_stat(struct p9_in *in, struct p9_stat *out)

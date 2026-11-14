@@ -25,6 +25,8 @@
 #define SYS_sendfile        40
 #define SYS_lseek           8
 #define SYS_mmap            9
+#define SYS_truncate        76
+#define SYS_ftruncate       77
 #define SYS_mprotect        10
 #define SYS_munmap          11
 #define SYS_mremap          25

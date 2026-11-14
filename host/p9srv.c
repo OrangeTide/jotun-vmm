@@ -444,6 +444,22 @@ p9srv_handle(struct p9srv *s, const uint8_t *req, uint32_t reqlen,
         reply_hdr(&o, rsp, rspcap, P9_RRENAME, tag);
         return p9o_finish(&o);
     }
+    case P9_TTRUNCATE: {
+        /* Truncate fid's file to len. */
+        uint32_t fid = p9i_u32(&in);
+        uint64_t len = p9i_u64(&in);
+        if (!in.ok)
+            return reply_error(rsp, rspcap, tag, "bad Ttruncate");
+        int fi = find_fid(s, fid);
+        if (fi < 0)
+            return reply_error(rsp, rspcap, tag, "bad fid");
+        if (!s->be->truncate)
+            return reply_error(rsp, rspcap, tag, "read-only");
+        if (s->be->truncate(s->ctx, &s->fids[fi].node, len) != 0)
+            return reply_error(rsp, rspcap, tag, "truncate failed");
+        reply_hdr(&o, rsp, rspcap, P9_RTRUNCATE, tag);
+        return p9o_finish(&o);
+    }
     default:
         return reply_error(rsp, rspcap, tag, "unsupported message");
     }

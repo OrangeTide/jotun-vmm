@@ -53,6 +53,7 @@ long p9_write(uint32_t fid, uint64_t offset, const void *buf, uint32_t count);
 int p9_remove(uint32_t fid);
 int p9_rename(uint32_t olddirfid, uint32_t newdirfid,
               const char *oldname, const char *newname);
+int p9_truncate(uint32_t fid, uint64_t len);
 
 /* Release a fid. Returns 0 or -1. */
 int p9_clunk(uint32_t fid);
