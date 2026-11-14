@@ -237,6 +237,22 @@ the macOS `ar` and `file` cannot read GNU thin archives (`!<thin>`) and
 misreport a valid archive as corrupt, so thin-archive membership is checked
 with `strings <archive> | grep <member>.o`, not `ar t`.
 
+S3 modules and dtbs is done on the Mac headline. With `CONFIG_MODULES`
+re-enabled (and the same debug/BTF/DRM_MSM minimization as S2),
+`make ARCH=arm64 -j4 Image modules dtbs` ran to exit 0 and produced, from
+source in-guest: `arch/arm64/boot/Image` (about 44 MiB, smaller than the S2
+image because the drivers now build as modules rather than into `vmlinux`),
+`vmlinux` (about 53 MiB), 1308 `.ko` modules, and 1191 `.dtb` device trees. A
+sample module (`mac80211.ko`) is a valid aarch64 relocatable ELF, and a sample
+device tree is a valid flattened-device-tree blob. This exercises the module
+back end (`modpost`, genksyms, `.ko` linking with libelf) and the in-tree
+device-tree compiler (`dtc`, built from flex and bison). No new guest gap
+surfaced; the S2 `argv` fix carried the stage through. Enabling `CONFIG_MODULES`
+rewrites `autoconf.h`, so S3 is a near-full recompile; the stale S2 archives and
+`vmlinux` are cleared first for a consistent base. A benign "Clock skew
+detected" warning comes from the mount's synthetic file timestamps against the
+wall clock and does not affect the result.
+
 ## Open risks
 
 - `flock` and `select` gaps may each need a small syscall addition.
