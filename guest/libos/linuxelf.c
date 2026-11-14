@@ -78,8 +78,14 @@
  * passes the crt objects, every -L path, the input objects, the -l libraries,
  * and the end crt objects, which runs well past a few dozen arguments. Too low
  * a cap silently drops the trailing arguments (the end crt objects, or the
- * input object itself), which a linker then reports as undefined symbols. */
-#define LINUX_MAX_ARGS 256
+ * input object itself), which a linker then reports as undefined symbols. A
+ * kernel build goes much further: a directory's built-in.a recipe runs one
+ * `ar` with every member object as a separate argument, and a large driver
+ * (nouveau) has over 700. The cap sits well above that so the archive is built
+ * whole. build_stack_vec no longer sizes any stack array on this value (its
+ * argv/envp scratch is passed in), so raising it costs only the per-execve
+ * snapshot heap buffer, not kernel stack. */
+#define LINUX_MAX_ARGS 2048
 
 #define AT_FDCWD (-100)
 
@@ -6796,8 +6802,13 @@ linux_sys_dispatch(long nr, long a1, long a2, long a3, long a4, long a5)
 static uint64_t
 build_stack_vec(const char *const *argv, int argc,
                 const char *const *envp, int envc,
-                const struct elf_info *exe, const struct elf_info *interp)
+                const struct elf_info *exe, const struct elf_info *interp,
+                char **argp, char **envpp)
 {
+    /* argp holds argc placed-string pointers, envpp holds envc; the caller owns
+     * both (sized for its own argc/envc), so this routine keeps no large array
+     * on the kernel stack and LINUX_MAX_ARGS can grow without threatening it. */
+
     /* Leave one page of headroom above the initial data. Linux keeps mapped
      * stack VMA above the argv/env block, so glibc's vectorized string routines
      * and the odd one-byte peek past a terminator never fault. VM_USER_HI itself
@@ -6806,8 +6817,6 @@ build_stack_vec(const char *const *argv, int argc,
      * headroom page instead faults in zeroed on the first over-read, which also
      * stops any scan that runs past AT_RANDOM. */
     uint8_t *sp = (uint8_t *)(uintptr_t)(LINUX_USTACK_TOP - PAGE_SIZE);
-    char *argp[LINUX_MAX_ARGS];
-    char *envpp[LINUX_MAX_ARGS];
 
     /* 16 bytes for AT_RANDOM at the top of the block, seeded from the cycle
      * counter, as Linux places it, above the argv and env strings. */
@@ -6873,24 +6882,28 @@ static uint64_t
 build_stack(const char *argv0, const struct elf_info *exe,
             const struct elf_info *interp)
 {
-    const char *args[LINUX_MAX_ARGS];
-    /* The boot environment is a handful of strings (the host caps it well below
-     * this); keep the array small so this frame plus build_stack_vec's stays
-     * within the init task's kernel stack. */
-    const char *env[32];
+    /* The boot argv and environment are each a handful of strings (the host
+     * caps both well below these), so small fixed arrays suffice. They also
+     * serve as build_stack_vec's placed-pointer scratch, kept on this frame
+     * since they stay tiny regardless of LINUX_MAX_ARGS. */
+    enum { BOOT_ARGS_MAX = 64, BOOT_ENV_MAX = 32 };
+    const char *args[BOOT_ARGS_MAX];
+    const char *env[BOOT_ENV_MAX];
+    char *argp[BOOT_ARGS_MAX];
+    char *envpp[BOOT_ENV_MAX];
     int argc = 0;
     int envc = 0;
-    int envmax = (int)(sizeof env / sizeof env[0]);
 
     args[argc++] = argv0;
-    for (int i = 2; i < boot_argc() && argc < LINUX_MAX_ARGS; i++)
+    for (int i = 2; i < boot_argc() && argc < BOOT_ARGS_MAX; i++)
         args[argc++] = boot_argv(i);
     /* The host supplies an environment only for an interactive guest (a PATH,
      * HOME, PS1, and a TERM for the host terminal); otherwise envc is 0 and the
      * program starts with an empty environment, exactly as before. */
-    for (int i = 0; i < boot_envc() && envc < envmax; i++)
+    for (int i = 0; i < boot_envc() && envc < BOOT_ENV_MAX; i++)
         env[envc++] = boot_envp(i);
-    return build_stack_vec(args, argc, envc ? env : NULL, envc, exe, interp);
+    return build_stack_vec(args, argc, envc ? env : NULL, envc, exe, interp,
+                           argp, envpp);
 }
 
 /* Copy a NULL-terminated user vector of string pointers into out[] with the
@@ -6999,13 +7012,17 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
      * all live in one per-call allocation, never static: execve yields the giant
      * lock to load the ELF over 9P, so a static array would be clobbered by a
      * concurrent execve in that window, dropping an argument (seen under a
-     * parallel make as a shell invoked with its command lost). */
-    char *sbuf = kmalloc(EXEC_STR_MAX + 3 * LINUX_MAX_ARGS * sizeof(char *));
+     * parallel make as a shell invoked with its command lost). The last two
+     * blocks (bsa, bse) are build_stack_vec's placed-pointer scratch, so that
+     * routine keeps no LINUX_MAX_ARGS-sized array on the kernel stack. */
+    char *sbuf = kmalloc(EXEC_STR_MAX + 5 * LINUX_MAX_ARGS * sizeof(char *));
     if (!sbuf)
         return -LERR_NOMEM;
     const char **na  = (const char **)(sbuf + EXEC_STR_MAX);
     const char **ne  = na + LINUX_MAX_ARGS;
     const char **na2 = ne + LINUX_MAX_ARGS;
+    char **bsa = (char **)(na2 + LINUX_MAX_ARGS);
+    char **bse = bsa + LINUX_MAX_ARGS;
     int argc = copy_uvec(argv, na, sbuf, EXEC_STR_MAX / 2);
     int envc = copy_uvec(envp, ne, sbuf + EXEC_STR_MAX / 2, EXEC_STR_MAX / 2);
     if (argc == 0) {                    /* execve needs at least argv[0] */
@@ -7189,7 +7206,7 @@ do_execve(const char *path, const char *const *argv, const char *const *envp)
             memset(&lproc_cur->sh->sigact[s], 0, sizeof lproc_cur->sh->sigact[s]);
 
     arena_init(image_top(&exe, &interp));   /* fresh heap above the new image */
-    uint64_t rsp = build_stack_vec(na, argc, ne, envc, &exe, &interp);
+    uint64_t rsp = build_stack_vec(na, argc, ne, envc, &exe, &interp, bsa, bse);
     kfree(shbuf);
     kfree(sbuf);
 
