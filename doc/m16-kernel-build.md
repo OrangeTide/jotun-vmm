@@ -267,17 +267,26 @@ aarch64/KVM (pumpkin, 4 KiB granule) `make -j4 Image` produced a valid
 0x38) plus an 89 MiB `vmlinux`. With the Mac's S2+S3 this closes the matrix:
 every host builds a real kernel from source in-guest.
 
-The pumpkin build exposed a preemption bug. With preemption on (the default),
-`cc1` hit a reproducible internal compiler error (`internal compiler error: in
+The pumpkin build exposed a `cc1` corruption bug, not yet root-caused. The first
+run hit a reproducible internal compiler error (`internal compiler error: in
 ggc_set_mark, at ggc-page.cc:1551`) while compiling a trivial file
-(`net/sched/sch_blackhole.o`), and the error repeated across both the parallel
-and the serial retry. The same file compiles cleanly on x86-64/KVM and on the
-Mac, so the input and toolchain are fine; an ICE in the garbage collector's mark
-phase is the signature of an asynchronous interrupt corrupting `cc1` mid-compile.
-Resuming the build with `JOTUN_NO_PREEMPT=1` cleared that exact file and ran to
-`Image`. So arm64/KVM has a latent preemption-corruption path that the short
-smoke suite never reached but a multi-hour `cc1` workload does. It is recorded
-here, not yet root-caused or fixed.
+(`net/sched/sch_blackhole.o`), and the error repeated on the in-process serial
+retry. The same file compiles cleanly on x86-64/KVM and on the Mac, so the input
+and toolchain are fine; an ICE in the garbage collector's mark phase means `cc1`
+found a bad pointer in its own GC heap, a stray write into its data memory. A
+fresh jotun process then compiled that exact file and ran to `Image`. The two
+runs differed only in that the failing one was a long-lived process that had
+already built 7692 objects over many hours (its serial retry inherited the same
+aged state), while the passing one started clean. No preemption was involved:
+`JOTUN_HZ` was unset for both runs, so the host preemption timer never started
+(`main.c`: the timer thread is created only when `hz > 0`), and the manifest
+has no `name` line and ran non-interactively, so there was no device-rouse
+source either. Both builds ran purely cooperatively. The signal is therefore
+guest state that accumulates over heavy fork/exec/exit churn and eventually
+corrupts a `cc1` heap, not an asynchronous interrupt. It is recorded here, not
+yet root-caused or fixed; the candidates are the physical-frame allocator, the
+per-process page-table teardown, and the kernel heap under sustained process
+turnover.
 
 ## Open risks
 
