@@ -253,6 +253,32 @@ rewrites `autoconf.h`, so S3 is a near-full recompile; the stale S2 archives and
 detected" warning comes from the mount's synthetic file timestamps against the
 wall clock and does not affect the result.
 
+S4 is the three-arch matrix: the S2 image build (minimal config, modules off)
+repeated on the two KVM hosts so a kernel is built from source in-guest on every
+supported configuration. On x86-64/KVM (tenn) `make -j4 bzImage` produced a
+valid `arch/x86/boot/bzImage` (about 12.5 MiB, `file` reports a 6.12.0
+bzImage with the `55 aa` boot signature and `HdrS` magic) plus a 47 MiB
+`vmlinux`. This surfaced one real guest gap: x86 `objtool` runs on `vmlinux.o`
+and calls `ftruncate(2)` through libelf's `elf_update`, which the guest did not
+implement. `ftruncate`/`truncate` are now implemented end to end (ramfs and the
+writable 9P mount, the latter over a new `P9_TTRUNCATE` wire op). On
+aarch64/KVM (pumpkin, 4 KiB granule) `make -j4 Image` produced a valid
+`arch/arm64/boot/Image` (about 78 MiB, `ARM\x64` magic `0x644d5241` at offset
+0x38) plus an 89 MiB `vmlinux`. With the Mac's S2+S3 this closes the matrix:
+every host builds a real kernel from source in-guest.
+
+The pumpkin build exposed a preemption bug. With preemption on (the default),
+`cc1` hit a reproducible internal compiler error (`internal compiler error: in
+ggc_set_mark, at ggc-page.cc:1551`) while compiling a trivial file
+(`net/sched/sch_blackhole.o`), and the error repeated across both the parallel
+and the serial retry. The same file compiles cleanly on x86-64/KVM and on the
+Mac, so the input and toolchain are fine; an ICE in the garbage collector's mark
+phase is the signature of an asynchronous interrupt corrupting `cc1` mid-compile.
+Resuming the build with `JOTUN_NO_PREEMPT=1` cleared that exact file and ran to
+`Image`. So arm64/KVM has a latent preemption-corruption path that the short
+smoke suite never reached but a multi-hour `cc1` workload does. It is recorded
+here, not yet root-caused or fixed.
+
 ## Open risks
 
 - `flock` and `select` gaps may each need a small syscall addition.
