@@ -171,7 +171,25 @@ phys_alloc(void)
             __asm__ volatile ("wfi");
     }
     free_head = next;
-    memset(phys_to_virt(f), 0, VM_PAGE);
+    uint8_t *zv = phys_to_virt(f);
+    memset(zv, 0, VM_PAGE);
+    /* The zero above is written through the non-cacheable physmap. The next
+     * owner reads this frame through a cacheable user mapping, so a cacheable
+     * line left over the physical frame would shadow the zeroed RAM and hand
+     * the new owner a previous owner's data. The line survives process churn:
+     * fork reads the parent's pages through their cacheable mapping, so copied
+     * and reused frames carry cacheable lines that the non-cacheable zero
+     * cannot override. Invalidate the frame by address so the cacheable read
+     * misses to the zeroed RAM, and order the non-cacheable zero ahead of it.
+     * The caches are physically tagged, so this reaches the lines whatever VA
+     * loaded them. Invalidate, not clean-and-invalidate: a stale line must be
+     * dropped, never written back over the zero. */
+    if (physmap_on && f >= VM_USER_LO && f < VM_USER_HI) {
+        __asm__ volatile ("dsb ish" ::: "memory");
+        for (uint64_t off = 0; off < VM_PAGE; off += 64)
+            __asm__ volatile ("dc ivac, %0" : : "r"(zv + off) : "memory");
+        __asm__ volatile ("dsb ish" ::: "memory");
+    }
     return f;
 }
 

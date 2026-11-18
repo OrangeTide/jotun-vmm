@@ -344,6 +344,10 @@ bundle: castool jbundle $(BUNDLE_DEPS)
 LINUX_SPIKE_SRCS := $(filter-out example/linuxtmp.c,$(wildcard example/linux*.c))
 LINUX_SPIKE_BINS := $(patsubst example/%.c,build/%,$(LINUX_SPIKE_SRCS))
 LINUX_SPIKE_PROGS := $(patsubst build/%,%,$(LINUX_SPIKE_BINS))
+## linuxchurn is a long-running stress reproducer, not a unit test: it is built
+## and bundled like the others but kept out of the smoke loop, which runs each
+## program with no arguments. Run it explicitly with linux-spike.
+SMOKE_PROGS := $(filter-out linuxchurn,$(LINUX_SPIKE_PROGS))
 SPIKE_CC_x86_64  ?= musl-gcc
 SPIKE_CC_aarch64 ?= aarch64-linux-musl-gcc
 SPIKE_CC ?= $(SPIKE_CC_$(ARCH))
@@ -433,7 +437,7 @@ linux-tmp-mount: $(TARGET) libos.elf build/linuxtmp
 linux-smoke: $(TARGET) libos.elf $(LINUX_SPIKE_BINS)
 	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="$(LINUX_SPIKE_BINS)"
 	@fail=0; \
-	for p in $(LINUX_SPIKE_PROGS); do \
+	for p in $(SMOKE_PROGS); do \
 	    out=`$(SPIKE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
 	        $(if $(TIMEOUT),$(TIMEOUT) $(SPIKE_SECS)) \
 	        ./$(TARGET) libos.elf bin $$p 2>&1`; \
@@ -444,7 +448,7 @@ linux-smoke: $(TARGET) libos.elf $(LINUX_SPIKE_BINS)
 	        echo "  FAIL  $$p"; fail=1; \
 	    fi; \
 	done; \
-	if [ $$fail -eq 0 ]; then echo "linux-smoke: all $(words $(LINUX_SPIKE_PROGS)) passed"; \
+	if [ $$fail -eq 0 ]; then echo "linux-smoke: all $(words $(SMOKE_PROGS)) passed"; \
 	else echo "linux-smoke: FAILURES above"; exit 1; fi
 
 ## Run an arbitrary host-built static Linux binary in the bin guest, for build
