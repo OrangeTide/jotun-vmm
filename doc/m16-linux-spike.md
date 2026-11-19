@@ -243,22 +243,18 @@ Each binary must be a static non-PIE `ET_EXEC` linked at `0x400000` for this
 guest arch (what `aarch64-linux-musl-gcc -static -no-pie -O2` produces). The
 directory name is arbitrary; `a64bins` is only a convention.
 
-Build the directory once on a Linux host that has the musl cross-compiler, then
-copy it to the macos machine (it is untracked, so git does not carry it). From
-the repo root:
+Build the directory with the `linux-prebuilts` target on a Linux host that has
+the musl cross-compiler, then copy it to the macos machine (it is untracked, so
+git does not carry it):
 
 ```
-mkdir -p a64bins
-for c in example/linux*.c; do
-    p=$(basename "$c" .c)
-    [ "$p" = linuxtmp ] && continue
-    aarch64-linux-musl-gcc -static -no-pie -O2 -o "a64bins/$p" "$c"
-done
+make linux-prebuilts PREBUILT_DIR=a64bins SPIKE_CC=aarch64-linux-musl-gcc
 ```
 
-Keep the directory in sync with `example/linux*.c`. When a new `linux*.c` test
-lands, rebuild the missing binary into the prebuilt directory, or the copy step
-fails with `cp: a64bins/<name>: No such file or directory`.
+`PREBUILT_DIR` is the output directory (default `prebuilts`) and `SPIKE_CC` is
+the cross-compiler. The target builds every `example/linux*.c`, so re-run it
+whenever a new test lands to keep the directory in sync. A stale directory makes
+the copy step fail with `cp: <dir>/<name>: No such file or directory`.
 
 `make linux-smoke` needs only the `SMOKE_PROGS` subset, so the prebuilt
 directory does not have to carry `linuxchurn` (the long-running stress

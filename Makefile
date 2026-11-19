@@ -381,6 +381,27 @@ build/linux%: example/linux%.c | build
 ## Build every test program.
 linux-progs: $(LINUX_SPIKE_BINS)
 
+## Populate a directory of prebuilt spike binaries for a toolchain-less host.
+## macos has no static musl AArch64 cross-compiler, so it cannot compile the
+## build/linux* programs; it copies them from SPIKE_BIN_DIR instead. Run this on
+## a Linux host that has SPIKE_CC, then copy PREBUILT_DIR to the target host and
+## pass it back as SPIKE_BIN_DIR:
+##   make linux-prebuilts PREBUILT_DIR=a64bins SPIKE_CC=aarch64-linux-musl-gcc
+##   # copy a64bins/ to the mac, then: make linux-smoke SPIKE_BIN_DIR=a64bins
+## It builds every example/linux*.c (including linuxtmp and linuxchurn) so
+## linux-spike, linux-tmp-mount, and linux-cmdline work from the prebuilts too.
+PREBUILT_DIR ?= prebuilts
+linux-prebuilts:
+	@command -v $(SPIKE_CC) >/dev/null 2>&1 || \
+	    { echo "need a static musl compiler on PATH (SPIKE_CC=, default $(SPIKE_CC))"; exit 1; }
+	@mkdir -p "$(PREBUILT_DIR)"
+	@n=0; for c in $(wildcard example/linux*.c); do \
+	    p=`basename "$$c" .c`; \
+	    $(SPIKE_CC) -static -no-pie -O2 -o "$(PREBUILT_DIR)/$$p" "$$c" || exit 1; \
+	    n=`expr $$n + 1`; \
+	done; \
+	echo "linux-prebuilts: $$n binaries in $(PREBUILT_DIR)"
+
 ## Run one test program in the bin guest (default linuxhello):
 ##   make linux-spike SPIKE_PROG=linuxcat
 ## All programs are bundled, because some (linuxexec) run their peers.
@@ -524,4 +545,4 @@ clean:
 	rm -f $(TARGET) libos.elf $(PROGS) castool jbundle
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean install uninstall bundle macsyntax fmt-test linux-progs linux-spike linux-smoke linux-tmp-mount linux-cmdline linux-run
+.PHONY: all clean install uninstall bundle macsyntax fmt-test linux-progs linux-prebuilts linux-spike linux-smoke linux-tmp-mount linux-cmdline linux-run
