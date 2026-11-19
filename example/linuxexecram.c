@@ -5,7 +5,7 @@
  * program (linuxhello) into an overlay path, then execs it from there. On
  * success this image is replaced and linuxhello's own output follows; the
  * "execve failed" line should never print. Run with
- * `make linux-spike SPIKE_PROG=linuxexecram`. An ordinary Linux binary. */
+ * `make linux-example EXAMPLE_PROG=linuxexecram`. An ordinary Linux binary. */
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>

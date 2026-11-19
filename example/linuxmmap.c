@@ -6,7 +6,7 @@
  * a read-only 9P bundle file: it maps the file MAP_PRIVATE and checks the bytes
  * match a plain read, preads at a nonzero offset, and overlays the file onto a
  * prior anonymous reservation with MAP_FIXED. Run with
- * `make linux-spike SPIKE_PROG=linuxmmap`. An ordinary Linux binary. */
+ * `make linux-example EXAMPLE_PROG=linuxmmap`. An ordinary Linux binary. */
 #include <fcntl.h>
 #include <string.h>
 #include <sys/mman.h>

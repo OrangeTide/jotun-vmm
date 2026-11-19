@@ -1,10 +1,10 @@
-/* linuxls.c : a static Linux test program for the M16.2 getdents64 path.
+/* linuxls.c : a static Linux example for the getdents64 path.
  *
  * Opens the bundle root as a directory and lists it with getdents64, marking
  * directories with a trailing slash. It uses the raw open/getdents64/close
  * syscalls (no opendir, so no heap), exercising directory enumeration over the
- * read-only 9P bundle. Built by `make linux-spike`; run with
- * `make linux-spike SPIKE_PROG=linuxls`. An ordinary Linux binary. */
+ * read-only 9P bundle. Built by `make linux-example`; run with
+ * `make linux-example EXAMPLE_PROG=linuxls`. An ordinary Linux binary. */
 #include <fcntl.h>
 #include <string.h>
 #include <sys/syscall.h>

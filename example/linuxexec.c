@@ -3,7 +3,7 @@
  * Prints a line, then replaces itself with another bundle program (linuxhello)
  * via execve. On success this process's image is gone and linuxhello's output
  * follows; the "execve failed" line should never print. Run with
- * `make linux-spike SPIKE_PROG=linuxexec`. An ordinary Linux binary. */
+ * `make linux-example EXAMPLE_PROG=linuxexec`. An ordinary Linux binary. */
 #include <string.h>
 #include <unistd.h>
 

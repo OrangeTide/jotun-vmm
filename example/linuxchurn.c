@@ -17,7 +17,7 @@
  * random data. The run does not stop at the first hit, so repeated samples
  * accumulate. Args: workers chunk_mib rounds do_fork (defaults 4 8 200 1;
  * do_fork 0 drops the child, leaving only the zero-on-reuse check). Run with
- * `make linux-spike SPIKE_PROG="linuxchurn 4 16 1000"`. An ordinary Linux
+ * `make linux-example EXAMPLE_PROG="linuxchurn 4 16 1000"`. An ordinary Linux
  * binary. */
 #include <stdint.h>
 #include <string.h>

@@ -34,7 +34,7 @@ Two separate toolchains are involved and they are easy to confuse.
    guest. These must be static, non-PIE `ET_EXEC` that load at `0x400000`. The
    test programs under `example/linux*.c` are built with a static musl
    compiler, selected per arch (see each section). A host without a musl
-   cross-compiler can instead point `SPIKE_BIN_DIR` at a directory of pre-built
+   cross-compiler can instead point `EXAMPLE_BIN_DIR` at a directory of pre-built
    binaries for this arch.
 
 ### lld resolution
@@ -63,7 +63,7 @@ and LLVM clang, so the same setting works everywhere. Override it with
 ```sh
 make                           # jotun + native test guest
 make linux-smoke               # build libos.elf, bundle the tests, run all of them
-make linux-spike SPIKE_PROG=linuxcat   # run one test program
+make linux-example EXAMPLE_PROG=linuxcat   # run one test program
 ```
 
 Run an arbitrary static Linux x86-64 binary:
@@ -78,7 +78,7 @@ make linux-run BIN=/path/to/prog ARGS="a b c"
 
 - `make` and `gcc`.
 - `aarch64-linux-musl-gcc` (static musl for arm64) to build the Linux test
-  binaries. Install a musl arm64 cross-toolchain, or override `SPIKE_CC` with the
+  binaries. Install a musl arm64 cross-toolchain, or override `EXAMPLE_CC` with the
   name your toolchain uses.
 - `lld` only if you build a multi-arch bundle that cross-compiles the x86-64
   guest. The native arm64 build does not need it.
@@ -91,7 +91,7 @@ Same targets as x86-64:
 ```sh
 make
 make linux-smoke
-make linux-spike SPIKE_PROG=linuxcat
+make linux-example EXAMPLE_PROG=linuxcat
 make linux-run BIN=/path/to/prog ARGS="a b c"
 ```
 
@@ -120,7 +120,7 @@ native build artifacts (the bundle tools) are rebuilt for this host.
 
 - the Linux test binaries. macOS has no musl cross-compiler by default, so build
   the `example/linux*.c` programs on a Linux arm64 box (static, non-PIE, loading
-  at `0x400000`) and copy them over, then point `SPIKE_BIN_DIR` at that
+  at `0x400000`) and copy them over, then point `EXAMPLE_BIN_DIR` at that
   directory. By convention this project keeps them in an untracked `a64bins/`
   directory.
 
@@ -133,8 +133,8 @@ native build artifacts (the bundle tools) are rebuilt for this host.
 
 ```sh
 make                                       # jotun (auto-signed) + guest
-make linux-smoke SPIKE_BIN_DIR=a64bins     # run the suite from pre-built binaries
-make linux-spike SPIKE_PROG=linuxcat SPIKE_BIN_DIR=a64bins
+make linux-smoke EXAMPLE_BIN_DIR=a64bins     # run the suite from pre-built binaries
+make linux-example EXAMPLE_PROG=linuxcat EXAMPLE_BIN_DIR=a64bins
 ```
 
 HVF does not need `sudo`.
@@ -320,15 +320,15 @@ run `jotun` directly, so prefix the whole command, for example
 
 ## Overridable knobs
 
-- `SPIKE_CC` selects the musl compiler (default `musl-gcc` on x86-64,
+- `EXAMPLE_CC` selects the musl compiler (default `musl-gcc` on x86-64,
   `aarch64-linux-musl-gcc` on arm64).
-- `SPIKE_BIN_DIR` copies pre-built test binaries instead of compiling them.
-- `SPIKE_PROG` picks the program for `make linux-spike` (default `linuxhello`).
-- `SPIKE_ENV` sets the run environment (default `JOTUN_HZ=100`; preemption is on
+- `EXAMPLE_BIN_DIR` copies pre-built test binaries instead of compiling them.
+- `EXAMPLE_PROG` picks the program for `make linux-example` (default `linuxhello`).
+- `EXAMPLE_ENV` sets the run environment (default `JOTUN_HZ=100`; preemption is on
   by default, disable with `JOTUN_NO_PREEMPT`).
-- `SPIKE_SECS` caps each `linux-smoke` run when a `timeout` command is on PATH.
+- `EXAMPLE_SECS` caps each `linux-smoke` run when a `timeout` command is on PATH.
 - `BUNDLE_ARCHS` selects which arches go into a bundle.
 - `FUSE_LD` overrides the resolved linker flag for the clang ELF links.
 
-See `doc/linux-spike.md` for what the test programs exercise and
+See `doc/linux-compat-bringup.md` for what the test programs exercise and
 `guest/libos/linuxelf.c` for the Linux ABI the `bin` guest implements.

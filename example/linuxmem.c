@@ -1,10 +1,10 @@
-/* linuxmem.c : a static Linux test program for the M16.5 heap path.
+/* linuxmem.c : a static Linux example for the heap path.
  *
  * Exercises the guest's brk and anonymous mmap: it grows the break directly
  * with a raw brk syscall, then allocates through malloc (musl's mallocng gets
  * its memory from anonymous mmap), writing and reading back to confirm the
- * memory is real and zeroed. Built by `make linux-spike`; run with
- * `make linux-spike SPIKE_PROG=linuxmem`. An ordinary Linux binary. */
+ * memory is real and zeroed. Built by `make linux-example`; run with
+ * `make linux-example EXAMPLE_PROG=linuxmem`. An ordinary Linux binary. */
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>

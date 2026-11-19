@@ -4,7 +4,7 @@
  * anchored at the guest epoch, and that gettimeofday and time agree with it.
  *
  * Run with the host timer on, which drives the clock:
- *   JOTUN_HZ=1000 make linux-spike SPIKE_PROG=linuxtime
+ *   JOTUN_HZ=1000 make linux-example EXAMPLE_PROG=linuxtime
  * An ordinary Linux binary. */
 #include <stdint.h>
 #include <string.h>

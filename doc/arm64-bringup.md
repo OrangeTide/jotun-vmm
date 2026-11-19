@@ -39,10 +39,10 @@ reachable only after that switch, which is why the band carries the boot.
 
 - **linux/arm64 (KVM).** Build natively: a plain `make` on the arm64 box selects
   the aarch64 guest and builds `jotun` and `libos.elf` with the host gcc. For the
-  Linux-compat spikes you also need `aarch64-linux-musl-gcc` on `PATH`.
+  Linux-compat examples you also need `aarch64-linux-musl-gcc` on `PATH`.
 - **macos/arm64 (Hypervisor.framework).** `make` selects the HVF host and the
   aarch64 guest, built with `clang` and `lld` (`brew install lld`). A musl
-  cross-compiler for the spikes is usually not available here; use the
+  cross-compiler for the examples is usually not available here; use the
   pre-built-binary path (below) instead.
 
 The kernel can also be cross-built from an x86 box to inspect it without running:
@@ -97,11 +97,11 @@ These confirm the 128 MiB layout this milestone introduced on arm64 (it was a
 
 ## Phase C: Linux-compat, single process
 
-The static musl spikes in `example/linux*.c` are the acceptance set. Build and
+The static musl examples in `example/linux*.c` are the acceptance set. Build and
 run them with the harness:
 
 ```
-make linux-spike SPIKE_PROG=linuxhello    # needs aarch64-linux-musl-gcc
+make linux-example EXAMPLE_PROG=linuxhello    # needs aarch64-linux-musl-gcc
 ```
 
 Or, without a musl cross-compiler (typically macos/arm64), build the `linux*`
@@ -109,10 +109,10 @@ binaries elsewhere for aarch64 (static, non-PIE, ET_EXEC linked at `0x400000`),
 drop them in a directory, and point the harness at it:
 
 ```
-make linux-spike-prebuilt SPIKE_BIN_DIR=/path/to/prebuilt SPIKE_PROG=linuxhello
+make linux-example EXAMPLE_PROG=linuxhello EXAMPLE_BIN_DIR=/path/to/prebuilt
 ```
 
-Run the single-process spikes first, in rough order of surface area:
+Run the single-process examples first, in rough order of surface area:
 
 - `linuxhello`: entry, argv/auxv, write, exit. The smoke test.
 - `linuxargs`, `linuxwrite`, `linuxcat`: argv delivery and file reads.

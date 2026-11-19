@@ -4,7 +4,7 @@ This is a design sketch, not yet implemented. The goal is the one the whole
 Linux-compat line was built toward: run an unmodified host binary, which on a
 normal distribution is dynamically linked, position independent, and resolved
 at startup by `ld-linux-x86-64.so.2` against `libc.so.6`. Static linking (see
-`doc/linux-spike.md`) proved the ring-0 SYSCALL trap and the per-process
+`doc/linux-compat-bringup.md`) proved the ring-0 SYSCALL trap and the per-process
 address-space model. Dynamic linking is the real target, and the host's
 `/usr/bin/sed` is a good first subject: PIE, one `DT_NEEDED` on glibc.
 
@@ -259,7 +259,7 @@ New tag values: `AT_PHDR=3`, `AT_PHENT=4`, `AT_PHNUM=5`, `AT_BASE=7`,
 1. File-backed `mmap` and `pread64` first, proved in isolation with a static
    program that opens a bundle file, maps it `MAP_PRIVATE`, and reads the bytes
    back. No loader changes yet. This de-risks the core piece on its own.
-   **Done.** `example/linuxmmap.c` (run with `make linux-spike SPIKE_PROG=linuxmmap`)
+   **Done.** `example/linuxmmap.c` (run with `make linux-example EXAMPLE_PROG=linuxmmap`)
    checks a `MAP_PRIVATE` file mapping against a plain `read`, a `pread` at a
    nonzero offset, and a `MAP_FIXED` overlay onto a prior anonymous reservation,
    which is the exact move the dynamic linker makes. The committed musl tests
@@ -487,7 +487,7 @@ so a multi-word program goes in a file read with `gawk -f`, not inline.
 ## make, and posix_spawn
 
 The host's `make` running a real Makefile was the first tool that forks a child
-per recipe, and it exposed the one process primitive the spike had skipped:
+per recipe, and it exposed the one process primitive the examples had skipped:
 `posix_spawn`. glibc implements it with `clone3` (435) and the flags
 `CLONE_VM | CLONE_VFORK`, a sequence the earlier static musl make was rebuilt to
 avoid. The host binary cannot be rebuilt, so the primitive is now implemented.
@@ -1031,7 +1031,7 @@ times the band, then freeing and rewriting half of it, runs clean.
 The window never shrinks and its pages, once mapped, are never unmapped, so
 growth needs no cross-cpu TLB shootdown: the entries it writes were not present
 before, so no stale translation can be cached for them. x86 is exercised by the
-full spike set plus the 36 MiB overlay stress; the arm64 side is the usual
+full example set plus the 36 MiB overlay stress; the arm64 side is the usual
 compile-only parity, pending a runtime host.
 
 ## A guard band below the user stack
@@ -1083,7 +1083,7 @@ the privilege-separation section above), that fault is a user-mode fault the
 kernel cannot demand-page, so it terminates the process with SIGSEGV rather than
 dumping a fatal CPU exception and halting. The program being the only process,
 the guest then halts for want of anything to run, so it is kept out of the green
-set and launched on its own with `SPIKE_PROG=linuxstackov`. `linuxsegv` is the
+set and launched on its own with `EXAMPLE_PROG=linuxstackov`. `linuxsegv` is the
 positive companion: a child faults the same way while the parent survives and
 its `wait4` reports the signal, which is the containment the split buys.
 

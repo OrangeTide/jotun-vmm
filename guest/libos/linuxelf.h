@@ -1,4 +1,4 @@
-/* linuxelf.h : the M16.1 Linux binary-compat spike entry point.
+/* linuxelf.h : the Linux binary-compat entry point.
  *
  * linux_elf_run loads a static, non-PIE Linux x86-64 ELF from the bundle and
  * runs it under a SYSCALL trap, servicing the handful of syscalls a musl

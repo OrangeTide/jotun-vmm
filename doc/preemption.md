@@ -130,7 +130,7 @@ makes P4 correct. P4 is the keystone.
   preempted and checks its own results.
 - Nondeterminism: preemption surfaces any latent race. Linux-visible state is
   already serialized by the giant lock and the kernel stays non-preemptible, so
-  the exposure is small, but the spike suite should run repeatedly to shake out
+  the exposure is small, but the example suite should run repeatedly to shake out
   ordering assumptions.
 - A spinning child becomes killable, the exact gap from the signal work: a child
   in a no-syscall loop that the parent kills hangs today and should terminate
@@ -168,8 +168,8 @@ separated the clock from preemption:
   running Linux user loop (P4 made this safe for Linux threads: the vector is
   delivered only on a return to ring 3, never inside a kernel critical section).
 
-Proof: example/linuxtime.c, run as `JOTUN_HZ=1000 make linux-spike
-SPIKE_PROG=linuxtime`. All 16 spikes stay green, arm64 cross-compiles clean.
+Proof: example/linuxtime.c, run as `JOTUN_HZ=1000 make linux-example
+EXAMPLE_PROG=linuxtime`. All 16 examples stay green, arm64 cross-compiles clean.
 
 ## What P4 debugging surfaced (resolved)
 
@@ -210,7 +210,7 @@ land on the thread's own `rsp0` stack.
   `JOTUN_POWEROFF` store, since the in-kernel APIC keeps HLT from reaching the
   host. Validated: example/linuxpreempt.c (a user thread spinning on a flag that
   only another user thread can set) hangs without preemption and prints
-  "preempt ok" with it; the full spike suite is green with and without preemption
+  "preempt ok" with it; the full example suite is green with and without preemption
   at HZ up to 1000; the clock still passes; the spin demo now runs cooperatively;
   arm64 cross-compiles clean.
 - P5 (real sleeps and timers): blocking sleeps done; interval timers deferred.

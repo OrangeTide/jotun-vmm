@@ -1,6 +1,6 @@
-# Linux binary-compat spike: findings
+# Linux binary-compat bringup: findings
 
-This records an experimental spike, not a supported feature. The goal was the
+This records an experiment, not a supported feature. The goal was the
 cheapest possible proof that the libOS can run an unmodified static Linux
 binary: load a `musl-gcc -static -no-pie` hello, trap its syscalls, and reach
 `exit_group(0)` with output on the console. That proof now passes.
@@ -19,7 +19,7 @@ init: done
 
 The binary is an ordinary Linux program (`example/linuxhello.c`, just
 `printf("hello from musl\n")`). It was not recompiled against any Jotun header.
-Run it with `make linux-spike` on an x86-64 host with `musl-gcc` on PATH.
+Run it with `make linux-example` on an x86-64 host with `musl-gcc` on PATH.
 
 ## How it works
 
@@ -59,7 +59,7 @@ never called `KVM_SET_CPUID2` at all. `host/vmm_kvm.c` now copies
 `KVM_GET_SUPPORTED_CPUID` into the vcpu with `KVM_SET_CPUID2`. The normal libOS
 never executes the `CPUID` instruction, so this changes nothing for existing
 guests; it only unblocks the SYSCALL enable. This is the single surprise the
-spike turned up. Everything else lived in the experimental guest module.
+experiment turned up. Everything else lived in the experimental guest module.
 
 ## What this proves, and what it does not
 
@@ -88,7 +88,7 @@ Not yet addressed, and each is a known milestone, not a surprise:
 
 ## Go / no-go
 
-Go, with eyes open. The spike cost little and removed the central doubt: the
+Go, with eyes open. The experiment cost little and removed the central doubt: the
 ring-0 SYSCALL trap works and musl runs unmodified. The sensible next step is
 to broaden the VFS and process syscalls toward a static `busybox`, but it
 should open by adding the `#GP`/`#PF` diagnostic handler, because the next
@@ -115,7 +115,7 @@ programs rather than an external binary. New pieces:
   `pipe`/`pipe2`; and the universal startup syscalls `mprotect` (a no-op on the
   flat map), `clock_gettime`, `getrandom`, and `prlimit64`. Writes to the bundle
   return `-EROFS`.
-- Committed musl tests, run with `make linux-spike SPIKE_PROG=<name>`:
+- Committed musl tests, run with `make linux-example EXAMPLE_PROG=<name>`:
   `linuxcat` (open/read/fstat/stat), `linuxls` (getdents64), and `linuxpipe`
   (pipe/read/write). All run clean with no unhandled syscalls:
 
@@ -127,7 +127,7 @@ read back: data through a pipe
 
 ## A heap, and glibc busybox running
 
-The spike then grew a real heap for the foreign libc, and found a register-ABI
+The experiment then grew a real heap for the foreign libc, and found a register-ABI
 bug along the way.
 
 - A Linux-specific address space (`linuxelf.c`), independent of the shared
@@ -194,7 +194,7 @@ filesystem; it is the shortcut its name implies.
 
 ## AArch64 port (minimal PoC)
 
-The spike was ported to AArch64 so the concept can be checked on a non-Linux
+The experiment was ported to AArch64 so the concept can be checked on a non-Linux
 host (macos/arm64, HVF) with a Linux-like guest. The scope is one process: MMU
 enable, per-process TTBR0 paging with demand faults, the SVC trap, and the
 shared VFS and heap. fork, pipes, and threads are not part of this first cut.
@@ -225,19 +225,19 @@ shared unchanged:
   demand-mapped by `pf_handle`; anything else is reported by
   `arm64_fault_report` and halts.
 
-Run it with `make linux-spike` on macos/arm64 (HVF). It needs a static musl
+Run it with `make linux-example` on macos/arm64 (HVF). It needs a static musl
 AArch64 toolchain; the default is `aarch64-linux-musl-gcc`, overridable with
-`SPIKE_CC=`. `SPIKE_PROG` selects the program (default `linuxhello`).
+`EXAMPLE_CC=`. `EXAMPLE_PROG` selects the program (default `linuxhello`).
 
-### Prebuilt test binaries (SPIKE_BIN_DIR)
+### Prebuilt test binaries (EXAMPLE_BIN_DIR)
 
 macos has no static musl AArch64 cross-compiler, so the pattern rule that builds
 `build/linux*` cannot compile there. Instead of a toolchain, point
-`SPIKE_BIN_DIR` at a directory of prebuilt binaries and the build copies them in
+`EXAMPLE_BIN_DIR` at a directory of prebuilt binaries and the build copies them in
 rather than compiling:
 
 ```
-make linux-smoke SPIKE_BIN_DIR=a64bins
+make linux-smoke EXAMPLE_BIN_DIR=a64bins
 ```
 
 Each binary must be a static non-PIE `ET_EXEC` linked at `0x400000` for this
@@ -249,10 +249,10 @@ the musl cross-compiler, then copy it to the macos machine (it is untracked, so
 git does not carry it):
 
 ```
-make linux-prebuilts PREBUILT_DIR=a64bins SPIKE_CC=aarch64-linux-musl-gcc
+make linux-prebuilts PREBUILT_DIR=a64bins EXAMPLE_CC=aarch64-linux-musl-gcc
 ```
 
-`PREBUILT_DIR` is the output directory (default `prebuilts`) and `SPIKE_CC` is
+`PREBUILT_DIR` is the output directory (default `prebuilts`) and `EXAMPLE_CC` is
 the cross-compiler. The target builds every `example/linux*.c`, so re-run it
 whenever a new test lands to keep the directory in sync. A stale directory makes
 the copy step fail with `cp: <dir>/<name>: No such file or directory`.
@@ -260,7 +260,7 @@ the copy step fail with `cp: <dir>/<name>: No such file or directory`.
 `make linux-smoke` needs only the `SMOKE_PROGS` subset, so the prebuilt
 directory does not have to carry `linuxchurn` (the long-running stress
 reproducer) or `linuxtmp` (excluded; needs a writable host mount). `make
-linux-spike`, which can run and bundle any program including `linuxchurn`, does
+linux-example`, which can run and bundle any program including `linuxchurn`, does
 need the full set present.
 
 ## Real tools: busybox sed/awk and GNU make
@@ -315,7 +315,7 @@ found no children.
 
 The workaround used here is to build make with `posix_spawn` disabled
 (`ac_cv_func_posix_spawn=no ./configure ...`), which forces the plain
-`fork()` + `execve` path the spike already supports. This is a property of the
+`fork()` + `execve` path the experiment already supports. This is a property of the
 binary, not a loader limitation. Supporting `posix_spawn` directly is future
 work: it means handling `clone(CLONE_VM | CLONE_VFORK)` where the child shares
 the address space briefly, then `execve` replaces its image, with the parent

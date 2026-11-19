@@ -3,7 +3,7 @@
  * Creates a file with O_CREAT|O_WRONLY, writes two chunks, stats it to confirm
  * the size, then reopens it read-only and reads the contents back. The 9P
  * bundle is read-only, so this exercises the guest's writable ramfs overlay.
- * Run with `make linux-spike SPIKE_PROG=linuxwrite`. An ordinary Linux binary. */
+ * Run with `make linux-example EXAMPLE_PROG=linuxwrite`. An ordinary Linux binary. */
 #include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>

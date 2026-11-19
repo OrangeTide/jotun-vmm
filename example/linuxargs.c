@@ -1,7 +1,7 @@
 /* linuxargs.c : a static Linux test program that echoes its argv.
  *
  * Confirms the guest delivers argc/argv on the initial stack. Run with
- * `make linux-spike SPIKE_PROG="linuxargs one two three"`: the words after the
+ * `make linux-example EXAMPLE_PROG="linuxargs one two three"`: the words after the
  * program name become its arguments. An ordinary Linux binary. */
 #include <string.h>
 #include <unistd.h>

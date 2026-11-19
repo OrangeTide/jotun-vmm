@@ -11,7 +11,7 @@
  * the page exists but is off-limits to CPL 3) and the program never reaches its
  * "SURVIVED" print. A guest that still shares ring 0 would read the byte and
  * print SURVIVED. Like linuxstackov, this halts the guest by design, so it runs
- * on its own with SPIKE_PROG=linuxkmem, not as part of the green suite. */
+ * on its own with EXAMPLE_PROG=linuxkmem, not as part of the green suite. */
 #include <unistd.h>
 
 int

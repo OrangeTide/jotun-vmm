@@ -1,11 +1,11 @@
-/* linuxcat.c : a static Linux test program for the M16.2 VFS syscalls.
+/* linuxcat.c : a static Linux example for the VFS syscalls.
  *
  * Opens two bundle files, prints their size from fstat, and cats their
  * contents, then stats a path directly and checks that a missing path fails.
  * It uses the raw open/read/write/close/fstat/stat wrappers, which musl issues
  * as direct syscalls with no heap, so it exercises the file syscalls the libOS
- * services over the read-only 9P bundle. Built by `make linux-spike`; run with
- * `make linux-spike SPIKE_PROG=linuxcat`. Not a Jotun program: it is an
+ * services over the read-only 9P bundle. Built by `make linux-example`; run with
+ * `make linux-example EXAMPLE_PROG=linuxcat`. Not a Jotun program: it is an
  * ordinary Linux binary. */
 #include <fcntl.h>
 #include <string.h>

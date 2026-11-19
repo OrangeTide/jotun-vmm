@@ -218,7 +218,7 @@ Goal: multiple cores, preemptive scheduling, and threads.
 Acceptance: two CPU-bound tasks are preempted and balanced across two vcpus, and
 a thread test passes.
 
-Spike decision (made): to preempt a running, possibly spinning, guest, a host
+Design decision (made): to preempt a running, possibly spinning, guest, a host
 timer thread (opt-in, `JOTUN_HZ`) sets a per-vcpu pending flag and signals the
 vcpu thread (`SIGUSR1`) so `KVM_RUN` returns `EINTR`. On x86 KVM with no
 in-kernel irqchip, the backend then injects with `KVM_INTERRUPT` when

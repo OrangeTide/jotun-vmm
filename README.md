@@ -92,7 +92,7 @@ per-architecture toolchain setup, see `doc/sandbox-build.md`.
   unsigned, unentitled binary)
 - macOS has no musl cross-compiler, so the sandbox binaries must be built on a
   Linux arm64 host and copied over. By convention they live in an untracked
-  `a64bins/` directory, passed as `SPIKE_BIN_DIR=a64bins`.
+  `a64bins/` directory, passed as `EXAMPLE_BIN_DIR=a64bins`.
 
 ## Quick start
 
@@ -109,7 +109,7 @@ program bundle and run the test suite:
 
 ```sh
 make linux-smoke                          # linux/x86-64 and linux/arm64
-make linux-smoke SPIKE_BIN_DIR=a64bins    # macos/arm64 (uses pre-built arm64 binaries)
+make linux-smoke EXAMPLE_BIN_DIR=a64bins    # macos/arm64 (uses pre-built arm64 binaries)
 ```
 
 On Linux this needs `/dev/kvm` access (see KVM permissions below); macOS needs no
@@ -161,8 +161,8 @@ Linux compatibility:
 
 - [`doc/linux-syscalls.md`](doc/linux-syscalls.md) - the implemented syscall
   surface, with per-call status.
-- [`doc/linux-spike.md`](doc/linux-spike.md) - the first Linux binary-compat
-  spike: the ring-0 syscall trap and what the test programs exercise.
+- [`doc/linux-compat-bringup.md`](doc/linux-compat-bringup.md) - the first Linux
+  binary-compat bringup: the ring-0 syscall trap and what the examples exercise.
 - [`doc/dynamic-binaries.md`](doc/dynamic-binaries.md) - running dynamic glibc
   and musl programs (ld.so, PIE), and building real projects (gcc, Node, Redis).
 - [`doc/signals.md`](doc/signals.md) - signal delivery in the guest.

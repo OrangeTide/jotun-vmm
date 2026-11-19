@@ -5,8 +5,8 @@
  * splices it into an overlay file, and reads it back to confirm the bytes
  * survived. It then splices a second pipe's contents into /dev/null, which is
  * the idiom GNU grep uses to drain its input when the match result is all that
- * matters. Built by `make linux-spike`; run with
- * `make linux-spike SPIKE_PROG=linuxsplice`. An ordinary Linux binary. */
+ * matters. Built by `make linux-example`; run with
+ * `make linux-example EXAMPLE_PROG=linuxsplice`. An ordinary Linux binary. */
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <string.h>

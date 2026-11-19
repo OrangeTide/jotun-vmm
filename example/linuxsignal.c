@@ -8,7 +8,7 @@
  * The scheduler is cooperative, so a child must block (not spin) for the parent
  * to run and send the signal. Each child parks in read() on a "hold" pipe and
  * announces readiness through a "sync" pipe. Run with
- * `make linux-spike SPIKE_PROG=linuxsignal`. An ordinary Linux binary. */
+ * `make linux-example EXAMPLE_PROG=linuxsignal`. An ordinary Linux binary. */
 #include <errno.h>
 #include <signal.h>
 #include <stdlib.h>

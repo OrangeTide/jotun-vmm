@@ -4,7 +4,7 @@
  * overlay: make a directory, change into it, create a file by a relative name,
  * read it back by relative and absolute names, resolve "." and "..", and check
  * that chdir rejects a nonexistent path and a plain file. Run with
- * `make linux-spike SPIKE_PROG=linuxcwd`. An ordinary Linux binary. */
+ * `make linux-example EXAMPLE_PROG=linuxcwd`. An ordinary Linux binary. */
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>

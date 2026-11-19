@@ -332,84 +332,84 @@ bundle: castool jbundle $(BUNDLE_DEPS)
 ## These run unmodified static Linux binaries in the `bin` guest, exercising the
 ## VFS, heap, fork/exec, signals, threads, mmap, and preemption. They run
 ## natively, so on x86-64 (KVM) and on macos/arm64 (HVF). See
-## guest/libos/linuxelf.c and doc/linux-spike.md.
+## guest/libos/linuxelf.c and doc/linux-compat-bringup.md.
 ##
 ## Build with a static musl toolchain, picked by arch and overridable with
-## SPIKE_CC (x86-64: musl-gcc; aarch64: aarch64-linux-musl-gcc). A host with no
-## musl cross-compiler can instead point SPIKE_BIN_DIR at a directory of
+## EXAMPLE_CC (x86-64: musl-gcc; aarch64: aarch64-linux-musl-gcc). A host with no
+## musl cross-compiler can instead point EXAMPLE_BIN_DIR at a directory of
 ## pre-built binaries (static non-PIE ET_EXEC at 0x400000, matching this arch).
 ## linuxtmp is excluded from the wildcard suite: it needs a writable host mount
 ## supplied by a manifest ("mount tmp host:<dir> rw"), which the bin-guest smoke
 ## harness does not provide. It has its own target, linux-tmp-mount, below.
-LINUX_SPIKE_SRCS := $(filter-out example/linuxtmp.c,$(wildcard example/linux*.c))
-LINUX_SPIKE_BINS := $(patsubst example/%.c,build/%,$(LINUX_SPIKE_SRCS))
-LINUX_SPIKE_PROGS := $(patsubst build/%,%,$(LINUX_SPIKE_BINS))
+LINUX_EXAMPLE_SRCS := $(filter-out example/linuxtmp.c,$(wildcard example/linux*.c))
+LINUX_EXAMPLE_BINS := $(patsubst example/%.c,build/%,$(LINUX_EXAMPLE_SRCS))
+LINUX_EXAMPLE_PROGS := $(patsubst build/%,%,$(LINUX_EXAMPLE_BINS))
 ## linuxchurn is a long-running stress reproducer, not a unit test: the smoke
 ## suite neither builds, bundles, nor runs it (SMOKE_BINS drops it), so a
-## prebuilt SPIKE_BIN_DIR need not carry it. Run it explicitly with linux-spike,
-## which bundles the full LINUX_SPIKE_BINS set. SMOKE_PROGS is the run loop; it
+## prebuilt EXAMPLE_BIN_DIR need not carry it. Run it explicitly with linux-example,
+## which bundles the full LINUX_EXAMPLE_BINS set. SMOKE_PROGS is the run loop; it
 ## runs each program with no arguments.
-SMOKE_PROGS := $(filter-out linuxchurn,$(LINUX_SPIKE_PROGS))
+SMOKE_PROGS := $(filter-out linuxchurn,$(LINUX_EXAMPLE_PROGS))
 SMOKE_BINS  := $(patsubst %,build/%,$(SMOKE_PROGS))
-SPIKE_CC_x86_64  ?= musl-gcc
-SPIKE_CC_aarch64 ?= aarch64-linux-musl-gcc
-SPIKE_CC ?= $(SPIKE_CC_$(ARCH))
-SPIKE_BIN_DIR ?=
+EXAMPLE_CC_x86_64  ?= musl-gcc
+EXAMPLE_CC_aarch64 ?= aarch64-linux-musl-gcc
+EXAMPLE_CC ?= $(EXAMPLE_CC_$(ARCH))
+EXAMPLE_BIN_DIR ?=
 
 ## The guest preempts Linux user loops by default now, so the preemptible-loop
-## test makes progress and the rest tolerate the timer. SPIKE_SECS caps a run
+## test makes progress and the rest tolerate the timer. EXAMPLE_SECS caps a run
 ## through a timeout command when one is on PATH, so a regression that hangs
 ## still fails the suite. The cap holds for the slowest supported host: linuxbigmem
 ## demand-pages 2.5 GiB and takes low-20s seconds on a Raspberry Pi 4, so 20 was
 ## too tight there; 45 leaves margin while still catching a real hang.
-SPIKE_ENV  ?= JOTUN_HZ=100
-SPIKE_SECS ?= 45
+EXAMPLE_ENV  ?= JOTUN_HZ=100
+EXAMPLE_SECS ?= 45
 TIMEOUT    := $(shell command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null)
 
 ## Build one test program. A pattern rule, so editing one source rebuilds only
 ## that binary (the old rule rebuilt all of them on every run). With
-## SPIKE_BIN_DIR set, copy a pre-built binary instead of compiling.
+## EXAMPLE_BIN_DIR set, copy a pre-built binary instead of compiling.
 build/linux%: example/linux%.c | build
-	@if [ -n "$(SPIKE_BIN_DIR)" ]; then \
-	    cp "$(SPIKE_BIN_DIR)/$(@F)" "$@"; \
+	@if [ -n "$(EXAMPLE_BIN_DIR)" ]; then \
+	    cp "$(EXAMPLE_BIN_DIR)/$(@F)" "$@"; \
 	else \
-	    command -v $(SPIKE_CC) >/dev/null 2>&1 || \
-	        { echo "need a static musl compiler on PATH (SPIKE_CC=, default $(SPIKE_CC)), or set SPIKE_BIN_DIR="; exit 1; }; \
-	    $(SPIKE_CC) -static -no-pie -O2 -o "$@" "$<"; \
+	    command -v $(EXAMPLE_CC) >/dev/null 2>&1 || \
+	        { echo "need a static musl compiler on PATH (EXAMPLE_CC=, default $(EXAMPLE_CC)), or set EXAMPLE_BIN_DIR="; exit 1; }; \
+	    $(EXAMPLE_CC) -static -no-pie -O2 -o "$@" "$<"; \
 	fi
 
 ## Build every test program.
-linux-progs: $(LINUX_SPIKE_BINS)
+linux-progs: $(LINUX_EXAMPLE_BINS)
 
-## Populate a directory of prebuilt spike binaries for a toolchain-less host.
+## Populate a directory of prebuilt example binaries for a toolchain-less host.
 ## macos has no static musl AArch64 cross-compiler, so it cannot compile the
-## build/linux* programs; it copies them from SPIKE_BIN_DIR instead. Run this on
-## a Linux host that has SPIKE_CC, then copy PREBUILT_DIR to the target host and
-## pass it back as SPIKE_BIN_DIR:
-##   make linux-prebuilts PREBUILT_DIR=a64bins SPIKE_CC=aarch64-linux-musl-gcc
-##   # copy a64bins/ to the mac, then: make linux-smoke SPIKE_BIN_DIR=a64bins
+## build/linux* programs; it copies them from EXAMPLE_BIN_DIR instead. Run this on
+## a Linux host that has EXAMPLE_CC, then copy PREBUILT_DIR to the target host and
+## pass it back as EXAMPLE_BIN_DIR:
+##   make linux-prebuilts PREBUILT_DIR=a64bins EXAMPLE_CC=aarch64-linux-musl-gcc
+##   # copy a64bins/ to the mac, then: make linux-smoke EXAMPLE_BIN_DIR=a64bins
 ## It builds every example/linux*.c (including linuxtmp and linuxchurn) so
-## linux-spike, linux-tmp-mount, and linux-cmdline work from the prebuilts too.
+## linux-example, linux-tmp-mount, and linux-cmdline work from the prebuilts too.
 PREBUILT_DIR ?= prebuilts
 linux-prebuilts:
-	@command -v $(SPIKE_CC) >/dev/null 2>&1 || \
-	    { echo "need a static musl compiler on PATH (SPIKE_CC=, default $(SPIKE_CC))"; exit 1; }
+	@command -v $(EXAMPLE_CC) >/dev/null 2>&1 || \
+	    { echo "need a static musl compiler on PATH (EXAMPLE_CC=, default $(EXAMPLE_CC))"; exit 1; }
 	@mkdir -p "$(PREBUILT_DIR)"
 	@n=0; for c in $(wildcard example/linux*.c); do \
 	    p=`basename "$$c" .c`; \
-	    $(SPIKE_CC) -static -no-pie -O2 -o "$(PREBUILT_DIR)/$$p" "$$c" || exit 1; \
+	    $(EXAMPLE_CC) -static -no-pie -O2 -o "$(PREBUILT_DIR)/$$p" "$$c" || exit 1; \
 	    n=`expr $$n + 1`; \
 	done; \
 	echo "linux-prebuilts: $$n binaries in $(PREBUILT_DIR)"
 
 ## Run one test program in the bin guest (default linuxhello):
-##   make linux-spike SPIKE_PROG=linuxcat
+##   make linux-example EXAMPLE_PROG=linuxcat
 ## All programs are bundled, because some (linuxexec) run their peers.
-SPIKE_PROG ?= linuxhello
-linux-spike: $(TARGET) libos.elf $(LINUX_SPIKE_BINS)
-	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="$(LINUX_SPIKE_BINS)"
-	$(SPIKE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
-	    ./$(TARGET) libos.elf bin $(SPIKE_PROG)
+EXAMPLE_PROG ?= linuxhello
+linux-example: $(TARGET) libos.elf $(LINUX_EXAMPLE_BINS)
+	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="$(LINUX_EXAMPLE_BINS)"
+	$(EXAMPLE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
+	    ./$(TARGET) libos.elf bin $(EXAMPLE_PROG)
 
 ## Kernel-command-line test. A manifest sets "cmdline <string>"; linuxcmdline
 ## reads /proc/cmdline in the guest and prints it. The test passes only when the
@@ -423,7 +423,7 @@ linux-cmdline: $(TARGET) libos.elf build/linuxcmdline
 	printf 'bundle %s\nref root\nsubtree /\ninit bin linuxcmdline\ncmdline %s\n' \
 	    "$(BUNDLE_DEPOT)" "$$cl" > $$mf; \
 	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="build/linuxcmdline"; \
-	out=`$(SPIKE_ENV) $(if $(TIMEOUT),$(TIMEOUT) $(SPIKE_SECS)) \
+	out=`$(EXAMPLE_ENV) $(if $(TIMEOUT),$(TIMEOUT) $(EXAMPLE_SECS)) \
 	    ./$(TARGET) -m $$mf libos.elf 2>&1`; \
 	echo "$$out"; \
 	rm -f $$mf; \
@@ -443,7 +443,7 @@ linux-tmp-mount: $(TARGET) libos.elf build/linuxtmp
 	printf 'bundle %s\nref root\nsubtree /\ninit bin linuxtmp\nmount tmp host:%s rw\n' \
 	    "$(BUNDLE_DEPOT)" "$$hostdir" > $$mf; \
 	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="build/linuxtmp"; \
-	out=`$(SPIKE_ENV) $(if $(TIMEOUT),$(TIMEOUT) $(SPIKE_SECS)) \
+	out=`$(EXAMPLE_ENV) $(if $(TIMEOUT),$(TIMEOUT) $(EXAMPLE_SECS)) \
 	    ./$(TARGET) -m $$mf libos.elf 2>&1`; \
 	echo "$$out"; \
 	ok=1; \
@@ -462,8 +462,8 @@ linux-smoke: $(TARGET) libos.elf $(SMOKE_BINS)
 	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="$(SMOKE_BINS)"
 	@fail=0; \
 	for p in $(SMOKE_PROGS); do \
-	    out=`$(SPIKE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
-	        $(if $(TIMEOUT),$(TIMEOUT) $(SPIKE_SECS)) \
+	    out=`$(EXAMPLE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
+	        $(if $(TIMEOUT),$(TIMEOUT) $(EXAMPLE_SECS)) \
 	        ./$(TARGET) libos.elf bin $$p 2>&1`; \
 	    if echo "$$out" | grep -q 'libos halting' && \
 	       ! echo "$$out" | grep -Eq 'unhandled|EL1 fault|panic'; then \
@@ -486,7 +486,7 @@ linux-run: $(TARGET) libos.elf | build
 	@test -f "$(BIN)" || { echo "no such file: $(BIN)"; exit 1; }
 	@[ "$(BIN)" -ef "build/$(notdir $(BIN))" ] || cp "$(BIN)" "build/$(notdir $(BIN))"
 	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="build/$(notdir $(BIN))"
-	$(SPIKE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
+	$(EXAMPLE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
 	    ./$(TARGET) libos.elf bin $(notdir $(BIN)) $(ARGS)
 
 # macsyntax: syntax-check the macOS-only net path from a Linux dev box, so the
@@ -545,4 +545,4 @@ clean:
 	rm -f $(TARGET) libos.elf $(PROGS) castool jbundle
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean install uninstall bundle macsyntax fmt-test linux-progs linux-prebuilts linux-spike linux-smoke linux-tmp-mount linux-cmdline linux-run
+.PHONY: all clean install uninstall bundle macsyntax fmt-test linux-progs linux-prebuilts linux-example linux-smoke linux-tmp-mount linux-cmdline linux-run

@@ -3,7 +3,7 @@
  * Exercises the character devices the libOS emulates in-guest (no host round
  * trip): null, zero, full, random, urandom, tty/console, and the std* nodes.
  * Also checks that stat reports a character device and that /dev lists its
- * nodes. Run with `make linux-spike SPIKE_PROG=linuxdev`. An ordinary Linux
+ * nodes. Run with `make linux-example EXAMPLE_PROG=linuxdev`. An ordinary Linux
  * binary. */
 #include <dirent.h>
 #include <errno.h>

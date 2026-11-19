@@ -4,8 +4,8 @@
  * the kernel. This writes a payload to a file, sendfile()s it into a second
  * file (NULL offset, which advances the input position), reads it back, then
  * repeats with an explicit offset to confirm a partial copy and that the file
- * position is left untouched. Built by `make linux-spike`; run with
- * `make linux-spike SPIKE_PROG=linuxsendfile`. An ordinary Linux binary. */
+ * position is left untouched. Built by `make linux-example`; run with
+ * `make linux-example EXAMPLE_PROG=linuxsendfile`. An ordinary Linux binary. */
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <string.h>

@@ -3,8 +3,8 @@
  *
  * bind() records a name but creates no file behind it; the libOS still answers
  * stat on that name with S_IFSOCK (what `test -S` and a server-readiness poll
- * check) instead of ENOENT. Built by `make linux-spike`; run with
- * `make linux-spike SPIKE_PROG=linuxsockstat`. An ordinary Linux binary. */
+ * check) instead of ENOENT. Built by `make linux-example`; run with
+ * `make linux-example EXAMPLE_PROG=linuxsockstat`. An ordinary Linux binary. */
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
