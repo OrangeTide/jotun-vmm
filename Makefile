@@ -489,6 +489,41 @@ linux-run: $(TARGET) libos.elf | build
 	$(EXAMPLE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
 	    ./$(TARGET) libos.elf bin $(notdir $(BIN)) $(ARGS)
 
+## Demo: build a Linux kernel from source inside the guest. This is a
+## demonstration of the in-guest toolchain over a real project, not part of the
+## normal build or the regression suite. It serves a distro userland as the
+## guest root, runs example/kbuild-demo.sh as pid 1 (configure + build a minimal
+## kernel for this guest's arch), and writes the image to the writable KSRC
+## mount. See doc/kernel-build.md for the prerequisites and the full runbook.
+##
+##   make linux-kernel-demo KSRC=<writable linux source tree> [ROOTFS=<dir>]
+##
+## KSRC is a writable, unmodified Linux source tree; the build output lands in
+## it. ROOTFS is a Linux distro rootfs for this guest's arch carrying the
+## toolchain (gcc binutils make flex bison bc). On Linux it defaults to the
+## host's own "/"; on macOS it must be a Linux rootfs, because the Mac's own "/"
+## is Mach-O rather than Linux ELF. The timer is left off (JOTUN_HZ unset), which
+## macOS needs for the fork/exec-heavy build and which is harmless on Linux.
+KSRC ?=
+ifeq ($(OS),Darwin)
+ROOTFS ?=
+else
+ROOTFS ?= /
+endif
+linux-kernel-demo: $(TARGET) libos.elf | build
+	@test -n "$(KSRC)" || \
+	    { echo "set KSRC=<writable Linux source tree> (see doc/kernel-build.md)"; exit 1; }
+	@test -d "$(KSRC)" || { echo "no such directory: $(KSRC)"; exit 1; }
+	@test -n "$(ROOTFS)" || \
+	    { echo "macOS: set ROOTFS=<Linux $(GUEST_ARCH) distro rootfs with a toolchain> (see doc/kernel-build.md)"; exit 1; }
+	cp example/kbuild-demo.sh "$(KSRC)/kbuild-demo.sh"
+	chmod +x "$(KSRC)/kbuild-demo.sh"
+	@printf 'rootfs host:%s\nmount ksrc host:%s rw\ninit bin /bin/sh /ksrc/kbuild-demo.sh\n' \
+	    "$(ROOTFS)" "$(KSRC)" > build/kernel-demo.manifest
+	@echo "=== linux-kernel-demo (demo): building a $(GUEST_ARCH) kernel from $(KSRC) ==="
+	@echo "    output lands in $(KSRC); this is a long build (see doc/kernel-build.md)"
+	JOTUN_HZ= ./$(TARGET) -m build/kernel-demo.manifest libos.elf
+
 # macsyntax: syntax-check the macOS-only net path from a Linux dev box, so the
 # kqueue backend does not rot between real macOS builds. It compiles host/net.c
 # with the __APPLE__ branch selected against a minimal shim of the kqueue API
@@ -545,4 +580,4 @@ clean:
 	rm -f $(TARGET) libos.elf $(PROGS) castool jbundle
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
-.PHONY: all clean install uninstall bundle macsyntax fmt-test linux-progs linux-prebuilts linux-example linux-smoke linux-tmp-mount linux-cmdline linux-run
+.PHONY: all clean install uninstall bundle macsyntax fmt-test linux-progs linux-prebuilts linux-example linux-smoke linux-tmp-mount linux-cmdline linux-run linux-kernel-demo

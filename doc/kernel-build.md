@@ -295,6 +295,21 @@ building an aarch64 kernel. It produces `arch/arm64/boot/Image` from an
 unmodified Linux 6.12 tree. The commands assume the repo is checked out at
 `~/Vibe/vmm` and that paths like `~/kbuild` are writable. Adjust paths to taste.
 
+Steps 3 through 5 are automated by the `linux-kernel-demo` Make target, which
+copies `example/kbuild-demo.sh` into the source tree, writes the manifest, and
+runs the guest with the timer off:
+
+```
+# Linux:
+make linux-kernel-demo KSRC=~/ksrc/linux-6.12
+# macOS:
+make linux-kernel-demo KSRC=~/kbuild/linux-6.12 ROOTFS=~/debroot-arm64
+```
+
+Steps 1 and 2 (the distro rootfs and the source tree) still have to be prepared
+by hand. The manual steps below show what the target does and are worth reading
+once; after that the target is the short path.
+
 ### 0. Prerequisites
 
 - An Apple-silicon Mac (Hypervisor.framework). Build the host and guest once:

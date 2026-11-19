@@ -172,7 +172,8 @@ Linux compatibility:
 Worked builds:
 
 - [`doc/kernel-build.md`](doc/kernel-build.md) - building an unmodified Linux
-  kernel from source inside the sandbox, with a step-by-step macOS runbook.
+  kernel from source inside the sandbox, with a step-by-step macOS runbook. The
+  `make linux-kernel-demo KSRC=<tree>` target runs the demo on Linux and macOS.
 
 Formats:
 
