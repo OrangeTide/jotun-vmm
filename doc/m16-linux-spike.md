@@ -228,6 +228,44 @@ Run it with `make linux-spike` on macos/arm64 (HVF). It needs a static musl
 AArch64 toolchain; the default is `aarch64-linux-musl-gcc`, overridable with
 `SPIKE_CC=`. `SPIKE_PROG` selects the program (default `linuxhello`).
 
+### Prebuilt test binaries (SPIKE_BIN_DIR)
+
+macos has no static musl AArch64 cross-compiler, so the pattern rule that builds
+`build/linux*` cannot compile there. Instead of a toolchain, point
+`SPIKE_BIN_DIR` at a directory of prebuilt binaries and the build copies them in
+rather than compiling:
+
+```
+make linux-smoke SPIKE_BIN_DIR=a64bins
+```
+
+Each binary must be a static non-PIE `ET_EXEC` linked at `0x400000` for this
+guest arch (what `aarch64-linux-musl-gcc -static -no-pie -O2` produces). The
+directory name is arbitrary; `a64bins` is only a convention.
+
+Build the directory once on a Linux host that has the musl cross-compiler, then
+copy it to the macos machine (it is untracked, so git does not carry it). From
+the repo root:
+
+```
+mkdir -p a64bins
+for c in example/linux*.c; do
+    p=$(basename "$c" .c)
+    [ "$p" = linuxtmp ] && continue
+    aarch64-linux-musl-gcc -static -no-pie -O2 -o "a64bins/$p" "$c"
+done
+```
+
+Keep the directory in sync with `example/linux*.c`. When a new `linux*.c` test
+lands, rebuild the missing binary into the prebuilt directory, or the copy step
+fails with `cp: a64bins/<name>: No such file or directory`.
+
+`make linux-smoke` needs only the `SMOKE_PROGS` subset, so the prebuilt
+directory does not have to carry `linuxchurn` (the long-running stress
+reproducer) or `linuxtmp` (excluded; needs a writable host mount). `make
+linux-spike`, which can run and bundle any program including `linuxchurn`, does
+need the full set present.
+
 ## Real tools: busybox sed/awk and GNU make
 
 The committed tests are small musl programs. To check the trap against real

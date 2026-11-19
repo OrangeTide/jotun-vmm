@@ -344,10 +344,13 @@ bundle: castool jbundle $(BUNDLE_DEPS)
 LINUX_SPIKE_SRCS := $(filter-out example/linuxtmp.c,$(wildcard example/linux*.c))
 LINUX_SPIKE_BINS := $(patsubst example/%.c,build/%,$(LINUX_SPIKE_SRCS))
 LINUX_SPIKE_PROGS := $(patsubst build/%,%,$(LINUX_SPIKE_BINS))
-## linuxchurn is a long-running stress reproducer, not a unit test: it is built
-## and bundled like the others but kept out of the smoke loop, which runs each
-## program with no arguments. Run it explicitly with linux-spike.
+## linuxchurn is a long-running stress reproducer, not a unit test: the smoke
+## suite neither builds, bundles, nor runs it (SMOKE_BINS drops it), so a
+## prebuilt SPIKE_BIN_DIR need not carry it. Run it explicitly with linux-spike,
+## which bundles the full LINUX_SPIKE_BINS set. SMOKE_PROGS is the run loop; it
+## runs each program with no arguments.
 SMOKE_PROGS := $(filter-out linuxchurn,$(LINUX_SPIKE_PROGS))
+SMOKE_BINS  := $(patsubst %,build/%,$(SMOKE_PROGS))
 SPIKE_CC_x86_64  ?= musl-gcc
 SPIKE_CC_aarch64 ?= aarch64-linux-musl-gcc
 SPIKE_CC ?= $(SPIKE_CC_$(ARCH))
@@ -434,8 +437,8 @@ linux-tmp-mount: $(TARGET) libos.elf build/linuxtmp
 ## reaches a clean halt with no unhandled trap; a hang (caught by the timeout)
 ## or a guest fault fails. Exits nonzero if any program fails, so it works as a
 ## regression check.
-linux-smoke: $(TARGET) libos.elf $(LINUX_SPIKE_BINS)
-	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="$(LINUX_SPIKE_BINS)"
+linux-smoke: $(TARGET) libos.elf $(SMOKE_BINS)
+	$(MAKE) bundle BUNDLE_ARCHS=$(GUEST_ARCH) EXTRA_BUNDLE_FILES="$(SMOKE_BINS)"
 	@fail=0; \
 	for p in $(SMOKE_PROGS); do \
 	    out=`$(SPIKE_ENV) JOTUN_BUNDLE=$(BUNDLE_DEPOT) JOTUN_REF=root \
