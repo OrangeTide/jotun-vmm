@@ -330,4 +330,4 @@ Static linking was the stepping stone that proved the ring-0 SYSCALL trap and
 the address-space model. The project's goal is to run unmodified native Linux
 binaries, which on a normal distribution means dynamically linked, PIE, glibc
 programs loaded through `ld-linux-x86-64.so.2`. The design for that step lives
-in `doc/m16-dynamic.md`.
+in `doc/dynamic-binaries.md`.

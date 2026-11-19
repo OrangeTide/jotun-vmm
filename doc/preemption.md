@@ -11,7 +11,7 @@ cannot reach a running loop. Preemption lifts that one ceiling.
   Today a `while (1) {}` with no syscalls hangs the whole guest.
 - Asynchronous signals. This completes the signal work (stage F and the
   asynchronous half of C and D): a signal reaches a running loop, and
-  `SIGALRM`/`setitimer` become possible. See doc/m16-signals.md.
+  `SIGALRM`/`setitimer` become possible. See doc/signals.md.
 - Real time. A timer gives a measured time base, replacing the assumed 1 GHz
   cycle-counter approximation in `clock_gettime`, `time`, and `gettimeofday`, and
   enabling real `nanosleep` and `timerfd`.
@@ -230,4 +230,4 @@ land on the thread's own `rsp0` stack.
   stage D) has since landed, so `SIGALRM` can now reach a handler; what these
   still need is a per-process interval-timer source armed off the host tick and,
   for `timerfd`, the readable-fd/poll wiring. They are a separate increment (see
-  doc/m16-signals.md, stage F).
+  doc/signals.md, stage F).

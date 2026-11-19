@@ -36,7 +36,7 @@ projects did not:
 - It exercises the full binutils set (as, ld, ar, nm, objcopy, strip) and one
   very large final link (vmlinux).
 
-Everything underneath it is already proven: see `doc/m16-dynamic.md` for make,
+Everything underneath it is already proven: see `doc/dynamic-binaries.md` for make,
 bash, gcc compile-and-link, fork/exec/posix_spawn, exec from the writable
 overlay and from a host mount, dynamic glibc and musl, autotools on a host
 mount, and `doc/sandbox-build.md` for writable host mounts and running a distro

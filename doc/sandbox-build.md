@@ -330,5 +330,5 @@ run `jotun` directly, so prefix the whole command, for example
 - `BUNDLE_ARCHS` selects which arches go into a bundle.
 - `FUSE_LD` overrides the resolved linker flag for the clang ELF links.
 
-See `doc/m16-linux-spike.md` for what the test programs exercise and
+See `doc/linux-spike.md` for what the test programs exercise and
 `guest/libos/linuxelf.c` for the Linux ABI the `bin` guest implements.

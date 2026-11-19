@@ -151,7 +151,7 @@ default terminate action, so a process is killable (even while blocked in a
 syscall) and a fatal signal is reported as `WIFSIGNALED`. Invoking a
 user-installed handler, and returning `EINTR` to a caught syscall, are a later
 stage; a caught signal is recorded as pending but not yet delivered. See
-doc/m16-signals.md.
+doc/signals.md.
 
 | nr | name | status | notes |
 |----|------|--------|-------|
@@ -195,7 +195,7 @@ doc/m16-signals.md.
 | 96 | gettimeofday | partial | the guest epoch plus host-timer time (JOTUN_HZ), split into seconds and microseconds; cycle-counter fallback without a timer |
 | 98 | getrusage | stub | zeroed counters; no CPU-time accounting (gcc, as query it) |
 | 99 | sysinfo | stub | reports total RAM and a plausible free fraction; cc1 sizes its allocator from this |
-| 228 | clock_gettime | partial | realtime is the guest epoch plus host-timer monotonic time (JOTUN_HZ), monotonic is uptime from the same source; shares the epoch with file timestamps so a freshly built file is not in the future; cycle-counter fallback at an assumed 1 GHz when no timer runs. See doc/m16-preemption.md |
+| 228 | clock_gettime | partial | realtime is the guest epoch plus host-timer monotonic time (JOTUN_HZ), monotonic is uptime from the same source; shares the epoch with file timestamps so a freshly built file is not in the future; cycle-counter fallback at an assumed 1 GHz when no timer runs. See doc/preemption.md |
 | 63 | uname | full | fixed Linux/jotun/x86_64 fields |
 | 318 | getrandom | partial | cycle-counter PRNG, not cryptographic |
 | 302 | prlimit64 | partial | reports RLIMIT_NOFILE as the real fd cap (LINUX_NFD), RLIM_INFINITY for other resources; a new limit is ignored |
@@ -405,7 +405,7 @@ Whole subsystems. Each is a project; land only when a target workload needs it.
 - **Signals.** Stages A to C have landed: real disposition and mask state,
   generation (`kill`/`tkill`/`tgkill`), and the default terminate action, so a
   process is killable even while blocked in a syscall and a fatal signal reports
-  `WIFSIGNALED` (see doc/m16-signals.md). What remains is the harder half:
+  `WIFSIGNALED` (see doc/signals.md). What remains is the harder half:
   invoking a user-installed handler (stage D: build a frame on the user stack,
   divert the return, implement `rt_sigreturn`, honor `SA_RESTART`), catchable
   faults (stage E: save the user context in the fault stub so `SIGSEGV` can reach

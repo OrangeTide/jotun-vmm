@@ -75,7 +75,7 @@ Milestones, smallest first, each with its own acceptance test:
       and the auxv (`AT_PAGESZ`, `AT_RANDOM`). Trap `SYSCALL` into a dispatch
       table. Implement the startup syscalls a thin libc needs. Done: a
       `musl-gcc -no-pie -static` hello reaches `exit_group(0)` and prints to the
-      console. See `doc/m16-linux-spike.md`, `guest/libos/linuxelf.c`,
+      console. See `doc/linux-spike.md`, `guest/libos/linuxelf.c`,
       `guest/libos/arch/x86_64_linuxsys.S`, and `make linux-spike`. The one host
       change needed was advertising the SYSCALL CPUID feature (`KVM_SET_CPUID2`
       in `host/vmm_kvm.c`), without which KVM refuses the `EFER.SCE` write. This
@@ -88,7 +88,7 @@ Milestones, smallest first, each with its own acceptance test:
       clock_gettime/getrandom/prlimit64/getuid family/prctl; plus a
       CPU-exception diagnostic handler and a register-ABI fix in the SYSCALL
       trampoline. Committed musl tests cover it (example/linuxcat.c, linuxls.c,
-      linuxpipe.c, linuxmem.c; see doc/m16-linux-spike.md). The glibc static
+      linuxpipe.c, linuxmem.c; see doc/linux-spike.md). The glibc static
       busybox (manual probe, not committed) now runs to exit_group and prints
       its full banner with zero unhandled syscalls. argv delivery is in (a
       glibc busybox applet runs: `bin busybox echo hello world` prints it), and
@@ -142,7 +142,7 @@ from Stage C (127 objects) to a finished binary took: 9p deep-path Twalk chunkin
 V8's `pipeline.cc` (2d55f82), `FUTEX_WAIT_BITSET` + `pkey` so V8's `mksnapshot`
 runs in-guest (833b522), and `eventfd2` + `capget`/`clock_getres` so node's
 `node_mksnapshot` runs in-guest (f2bad85). The manifest, build environment, the
-gcc/python gotchas, and this whole push are written up in doc/m16-dynamic.md
+gcc/python gotchas, and this whole push are written up in doc/dynamic-binaries.md
 ("Compiling Node (Stage C)" and "Pushing the Node build through V8"). The items
 below are the gaps and bugs that surfaced getting there.
 
@@ -232,7 +232,7 @@ large build work. Roughly in dependency order:
       that keeps the device MMIO band below the x86 IOAPIC/APIC hole at
       0xfec00000 without splitting it; going past ~3.9 GiB needs that split (a
       later step). The per-process page tables now span four top-level slots on
-      both arches; see the per-arch vmspace headers and doc/m16-dynamic.md.
+      both arches; see the per-arch vmspace headers and doc/dynamic-binaries.md.
 - [x] A WRITABLE host-backed mount. A build's output tree (`out/`, object files,
       archives, the linked binary) now lands on the host filesystem instead of
       guest RAM. This was the key architectural piece: it removes the in-RAM

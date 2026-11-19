@@ -155,7 +155,7 @@ The end state x86 reached: run unmodified host arm64 binaries (a dynamic glibc
 needs an aarch64 host filesystem to mount and almost certainly uncovers more
 arm64 work (the dynamic linker path, `posix_spawn` via `clone3` with
 `CLONE_VM|CLONE_VFORK`, the per-process cwd across exec). Approach it the way the
-x86 path was built up in `doc/m16-dynamic.md`: a dynamic musl hello first, then a
+x86 path was built up in `doc/dynamic-binaries.md`: a dynamic musl hello first, then a
 single glibc tool, then a pipeline, then a build. Treat Phase E as the research
 frontier, not a checklist.
 

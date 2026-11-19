@@ -4,7 +4,7 @@ This is a design sketch, not yet implemented. The goal is the one the whole
 Linux-compat line was built toward: run an unmodified host binary, which on a
 normal distribution is dynamically linked, position independent, and resolved
 at startup by `ld-linux-x86-64.so.2` against `libc.so.6`. Static linking (see
-`doc/m16-linux-spike.md`) proved the ring-0 SYSCALL trap and the per-process
+`doc/linux-spike.md`) proved the ring-0 SYSCALL trap and the per-process
 address-space model. Dynamic linking is the real target, and the host's
 `/usr/bin/sed` is a good first subject: PIE, one `DT_NEEDED` on glibc.
 

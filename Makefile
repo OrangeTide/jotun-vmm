@@ -332,7 +332,7 @@ bundle: castool jbundle $(BUNDLE_DEPS)
 ## These run unmodified static Linux binaries in the `bin` guest, exercising the
 ## VFS, heap, fork/exec, signals, threads, mmap, and preemption. They run
 ## natively, so on x86-64 (KVM) and on macos/arm64 (HVF). See
-## guest/libos/linuxelf.c and doc/m16-linux-spike.md.
+## guest/libos/linuxelf.c and doc/linux-spike.md.
 ##
 ## Build with a static musl toolchain, picked by arch and overridable with
 ## SPIKE_CC (x86-64: musl-gcc; aarch64: aarch64-linux-musl-gcc). A host with no
