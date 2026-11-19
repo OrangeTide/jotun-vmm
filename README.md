@@ -8,6 +8,29 @@ is to build and cross-compile real projects inside the sandbox, using a host
 toolchain mounted into the guest. See `doc/unikernel-design.md` for the design
 and `doc/sandbox-build.md` for how to build and run it.
 
+## Built and run in the sandbox
+
+Real software, built from source by a host toolchain mounted into the guest,
+then run in the guest:
+
+- **Linux 6.12 kernel.** Built from its own source on all three host configs:
+  an x86-64 `bzImage`, and an arm64 `Image` on both Raspberry Pi 4 KVM (4 KiB
+  granule) and Apple Silicon Hypervisor.framework (16 KiB granule, the latter
+  with 1308 modules and 1191 device trees). A from-clean arm64 build compiles
+  several thousand objects under `make -j4` and produces a valid 82 MiB boot
+  `Image`.
+- **Node.js v26.13.0.** Compiles end to end, the full V8 pipeline included
+  (3745 objects, `mksnapshot` and all), then runs and executes JavaScript.
+- **Redis 7.4.1.** Builds from source, including jemalloc through its autotools
+  `./configure`, then serves live clients (`PING`/`SET`/`GET`/`INCR`) over an
+  in-guest AF_UNIX socket.
+
+Underneath those: the unmodified host GCC toolchain runs inside the guest and
+compiles and links C to valid executables, autotools `./configure` runs against
+host-mounted sources, and a full distro userland (Alpine busybox with 304
+applets, or a Debian arm64 rootfs) runs its `bash`, `make`, `sed`, and `gawk`
+from host mounts.
+
 ## Status
 
 Working today:
@@ -22,10 +45,9 @@ Working today:
   reads the host toolchain and writes build output to the host. The guest root
   can also be served from a host directory, so a minimal distro rootfs (Alpine,
   Debian, or an exported container) runs its userland in the sandbox.
-- Real builds in-guest from a host-mounted toolchain: Node.js v26.13.0 compiles
-  and runs; Redis 7.4.1 builds (including jemalloc through its autotools
-  `./configure`) and serves clients; autotools `./configure` works on
-  host-mounted sources.
+- Real builds in-guest from a host-mounted toolchain (see the gallery above):
+  the Linux kernel, Node.js, and Redis all build from source, and Node and Redis
+  run.
 - Multiple guests per process, single-file packaging, multi-arch bundles, a
   Plan 9 style network between guests, and a signed bundle pull.
 
