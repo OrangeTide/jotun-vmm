@@ -147,6 +147,37 @@ Running needs read/write on `/dev/kvm`. Add yourself to the `kvm` group once:
 sudo usermod -aG kvm "$USER"    # then log out and back in
 ```
 
+## Documentation
+
+Start here:
+
+- [`doc/unikernel-design.md`](doc/unikernel-design.md) - the design: the
+  hypervisor abstraction, the guest libOS, and how a Linux program runs in it.
+- [`doc/sandbox-build.md`](doc/sandbox-build.md) - per-platform build and run,
+  writable host mounts, and running a distro rootfs.
+- [`doc/roadmap.md`](doc/roadmap.md) - where the project is going.
+
+Linux compatibility:
+
+- [`doc/linux-syscalls.md`](doc/linux-syscalls.md) - the implemented syscall
+  surface, with per-call status.
+- [`doc/linux-spike.md`](doc/linux-spike.md) - the first Linux binary-compat
+  spike: the ring-0 syscall trap and what the test programs exercise.
+- [`doc/dynamic-binaries.md`](doc/dynamic-binaries.md) - running dynamic glibc
+  and musl programs (ld.so, PIE), and building real projects (gcc, Node, Redis).
+- [`doc/signals.md`](doc/signals.md) - signal delivery in the guest.
+- [`doc/preemption.md`](doc/preemption.md) - preempting Linux user threads.
+- [`doc/arm64-bringup.md`](doc/arm64-bringup.md) - bringing up the AArch64 guest.
+
+Worked builds:
+
+- [`doc/kernel-build.md`](doc/kernel-build.md) - building an unmodified Linux
+  kernel from source inside the sandbox, with a step-by-step macOS runbook.
+
+Formats:
+
+- [`doc/jimage-format.md`](doc/jimage-format.md) - the single-file image format.
+
 ## Layout
 
 - `host/` - the hypervisor and host services. `vmm_kvm.c` and `vmm_hvf.c` are the
@@ -161,5 +192,4 @@ sudo usermod -aG kvm "$USER"    # then log out and back in
 - `abi/` - headers shared by host and guest (the boot block, the 9P, network, and
   draw channels).
 - `example/` - the `linux*.c` test programs that run inside the sandbox.
-- `doc/` - `unikernel-design.md` (the design), `sandbox-build.md` (per-platform
-  build and run), and the `m16-*.md` notes on the Linux-compat work.
+- `doc/` - the design, build, and Linux-compat notes. See Documentation below.
