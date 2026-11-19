@@ -73,7 +73,6 @@ ifeq ($(OS), Darwin)
         host/p9smolvfs.c host/p9overlay.c host/p9graft.c host/p9hostdir.c host/manifest.c host/jimage.c host/net.c host/http.c host/bundlepull.c host/main.c $(SMOLVFS_SRC)
     CC = clang
     GUEST = libos.elf
-    GUEST_SRC = guest/test_guest_arm64.c
     LIBOS_ARCH = guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
         guest/libos/arch/arm64_boot.S guest/libos/arch/arm64_linuxsys.S \
         guest/libos/arch/arm64_vmspace.c
@@ -94,7 +93,6 @@ else
     ifeq ($(ARCH), x86_64)
         # linux/x86-64: KVM, 64-bit long-mode x86 guest at 1 MiB.
         GUEST = libos.elf
-        GUEST_SRC = guest/test_guest_x86.c
         LIBOS_ARCH = guest/libos/arch/x86_64.c guest/libos/arch/x86_64_ctx.S \
             guest/libos/arch/x86_64_isr.S guest/libos/arch/x86_64_boot.S \
             guest/libos/arch/x86_64_linuxsys.S guest/libos/arch/x86_64_fault.S \
@@ -105,7 +103,6 @@ else
     ifeq ($(ARCH), aarch64)
         # linux/arm64: KVM, arm64 guest.
         GUEST = libos.elf
-        GUEST_SRC = guest/test_guest_arm64.c
         LIBOS_ARCH = guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
             guest/libos/arch/arm64_boot.S guest/libos/arch/arm64_linuxsys.S \
             guest/libos/arch/arm64_vmspace.c
@@ -129,14 +126,7 @@ else
 GUEST_ARCH := aarch64
 endif
 
-# Bundled programs are standalone ELFs whose image lies within the program
-# region that begins at JOTUN_PROG_BASE (0x400000, abi/jotun_svc.h). The linker
-# puts the ELF headers one page below -Ttext, so text goes at base + one page,
-# which lands the headers exactly at the region base. Same on both arches.
-PROG_TEXT = 0x401000
-PROGS = hello.elf
-
-all: $(TARGET) $(GUEST) $(PROGS)
+all: $(TARGET) $(GUEST)
 
 $(TARGET): $(SRC) build/version.h
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
@@ -186,45 +176,6 @@ build/fmtfloat.o: guest/libos/fmtfloat.c guest/libos/fmtfloat.h | build
 libos.elf: $(LIBOS_SRC) $(LIBOS_FP_OBJ)
 	$(GUEST_CC) $(GUEST_CFLAGS) -Iguest/libos -Wl,-Ttext=$(GUEST_TEXT) -o $@ $(LIBOS_SRC) $(LIBOS_FP_OBJ)
 
-# The program C library (jlibc): the formatter and string primitives shared
-# with the libOS, plus program-side printf and numeric parsing, compiled to
-# objects and linked into each bundle program. Kept as plain objects rather than
-# an ar archive, for cross-toolchain portability (no ranlib step); building each
-# function into its own section and linking with --gc-sections drops whatever a
-# given program does not use, so unused library code costs it nothing.
-PROG_INC = -Iguest/prog/libc -Iguest/prog -Iguest/libos -Iabi
-PROG_LIBC_OBJS = build/libc_fmt.o build/libc_fmtfloat.o build/libc_string.o \
-    build/libc_io.o build/libc_stdlib.o build/libc_malloc.o build/libc_sbrk.o
-GUEST_COBJ_CFLAGS = $(filter-out -Wl%,$(GUEST_CFLAGS)) \
-    -ffunction-sections -fdata-sections
-# The float unit needs the FPU, so it drops -mgeneral-regs-only like triton.o.
-GUEST_COBJ_FP_CFLAGS = $(filter-out -mgeneral-regs-only,$(GUEST_COBJ_CFLAGS))
-
-build/libc_fmt.o: guest/libos/fmt.c | build
-	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
-build/libc_fmtfloat.o: guest/libos/fmtfloat.c | build
-	$(GUEST_CC) $(GUEST_COBJ_FP_CFLAGS) $(PROG_INC) -c -o $@ $<
-build/libc_string.o: guest/libos/string.c | build
-	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
-build/libc_io.o: guest/prog/libc/progio.c | build
-	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
-build/libc_stdlib.o: guest/prog/libc/progstdlib.c | build
-	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
-build/libc_malloc.o: guest/prog/libc/jmalloc.c | build
-	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
-build/libc_sbrk.o: guest/prog/libc/jsbrk.c | build
-	$(GUEST_CC) $(GUEST_COBJ_CFLAGS) $(PROG_INC) -c -o $@ $<
-
-# Standalone programs, linked at the program base and loaded from the bundle,
-# with the program C library and dead-code elimination of its unused parts.
-hello.elf: guest/prog/hello.c $(PROG_LIBC_OBJS)
-	$(GUEST_CC) $(GUEST_CFLAGS) -Wl,--gc-sections $(PROG_INC) \
-	    -Wl,-Ttext=$(PROG_TEXT) -o $@ guest/prog/hello.c $(PROG_LIBC_OBJS)
-
-build/malloctest: guest/prog/malloctest.c $(PROG_LIBC_OBJS) | build
-	$(GUEST_CC) $(GUEST_CFLAGS) -Wl,--gc-sections $(PROG_INC) \
-	    -Wl,-Ttext=$(PROG_TEXT) -o $@ guest/prog/malloctest.c $(PROG_LIBC_OBJS)
-
 # Build a test bundle depot from example/bundle/ using castool, then run with
 # JOTUN_BUNDLE=bundle-depot ./jotun libos.elf. castool is built from the
 # vendored smolvfs sources (no external checkout). Signing is not enabled here;
@@ -243,12 +194,12 @@ castool: $(CASTOOL_SRC)
 jbundle: host/jbundle.c $(SMOLVFS_SRC)
 	$(CC) $(CFLAGS) -o $@ $^
 
-# Multi-arch image build. The native arch reuses the tested libos.elf/hello.elf;
-# every other arch is cross-built with clang + lld to a freestanding ELF. The
-# per-arch guest flags are self-contained here, independent of the native
-# single-arch GUEST_CFLAGS above. BUNDLE_ARCHS selects which arches go into the
-# image; the default is all supported arches, so a plain `make bundle` produces
-# a multi-arch image (which needs clang + lld for the non-native arch; set
+# Multi-arch image build. The native arch reuses the tested libos.elf; every
+# other arch is cross-built with clang + lld to a freestanding ELF. The per-arch
+# guest flags are self-contained here, independent of the native single-arch
+# GUEST_CFLAGS above. BUNDLE_ARCHS selects which arches go into the image; the
+# default is all supported arches, so a plain `make bundle` produces a
+# multi-arch image (which needs clang + lld for the non-native arch; set
 # BUNDLE_ARCHS to this host's arch to build a single-arch image with no cross
 # toolchain).
 BUNDLE_ARCHS ?= x86_64 aarch64
@@ -257,9 +208,6 @@ GUEST_BASE = -ffreestanding -fno-pic -fno-pie -nostdlib -fno-builtin -Iabi \
     -fno-asynchronous-unwind-tables -mgeneral-regs-only \
     -Wl,-e_start -Wl,--build-id=none
 GUEST_BASE_FP = $(filter-out -mgeneral-regs-only,$(GUEST_BASE))
-GUEST_BASE_OBJ = $(filter-out -Wl%,$(GUEST_BASE)) -ffunction-sections \
-    -fdata-sections
-GUEST_BASE_OBJ_FP = $(filter-out -mgeneral-regs-only,$(GUEST_BASE_OBJ))
 
 CROSSCC_x86_64  ?= clang --target=x86_64-unknown-none-elf $(FUSE_LD)
 CROSSCC_aarch64 ?= clang --target=aarch64-unknown-none-elf $(FUSE_LD)
@@ -275,8 +223,8 @@ ASRC_aarch64 := guest/libos/arch/arm64.c guest/libos/arch/arm64_ctx.S \
     guest/libos/arch/arm64_boot.S guest/libos/arch/arm64_linuxsys.S \
     guest/libos/arch/arm64_vmspace.c
 
-# Generate the cross-build rules for one arch: the kernel (libos) and the hello
-# program, under build/img/<arch>/. Used only for arches other than this host's.
+# Generate the cross-build rule for one arch: the kernel (libos) under
+# build/img/<arch>/. Used only for arches other than this host's.
 define IMG_ARCH_template
 build/img/$(1):
 	mkdir -p build/img/$(1)
@@ -285,43 +233,19 @@ build/img/$(1)/fmtfloat.o: guest/libos/fmtfloat.c guest/libos/fmtfloat.h | build
 build/img/$(1)/kernel: $$(LIBOS_SRC_COMMON) $(5) build/img/$(1)/fmtfloat.o | build/img/$(1)
 	$(2) $$(GUEST_BASE) $(4) -Iguest/libos -Wl,-Ttext=$(3) -o $$@ \
 	    $$(LIBOS_SRC_COMMON) $(5) build/img/$(1)/fmtfloat.o
-build/img/$(1)/libc_fmt.o: guest/libos/fmt.c | build/img/$(1)
-	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
-build/img/$(1)/libc_fmtfloat.o: guest/libos/fmtfloat.c | build/img/$(1)
-	$(2) $$(GUEST_BASE_OBJ_FP) $(4) $$(PROG_INC) -c -o $$@ $$<
-build/img/$(1)/libc_string.o: guest/libos/string.c | build/img/$(1)
-	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
-build/img/$(1)/libc_io.o: guest/prog/libc/progio.c | build/img/$(1)
-	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
-build/img/$(1)/libc_stdlib.o: guest/prog/libc/progstdlib.c | build/img/$(1)
-	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
-build/img/$(1)/libc_malloc.o: guest/prog/libc/jmalloc.c | build/img/$(1)
-	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
-build/img/$(1)/libc_sbrk.o: guest/prog/libc/jsbrk.c | build/img/$(1)
-	$(2) $$(GUEST_BASE_OBJ) $(4) $$(PROG_INC) -c -o $$@ $$<
-build/img/$(1)/hello: guest/prog/hello.c build/img/$(1)/libc_fmt.o \
-    build/img/$(1)/libc_fmtfloat.o build/img/$(1)/libc_string.o \
-    build/img/$(1)/libc_io.o build/img/$(1)/libc_stdlib.o \
-    build/img/$(1)/libc_malloc.o build/img/$(1)/libc_sbrk.o | build/img/$(1)
-	$(2) $$(GUEST_BASE) $(4) -Wl,--gc-sections $$(PROG_INC) \
-	    -Wl,-Ttext=$$(PROG_TEXT) -o $$@ guest/prog/hello.c \
-	    build/img/$(1)/libc_fmt.o build/img/$(1)/libc_fmtfloat.o \
-	    build/img/$(1)/libc_string.o \
-	    build/img/$(1)/libc_io.o build/img/$(1)/libc_stdlib.o \
-	    build/img/$(1)/libc_malloc.o build/img/$(1)/libc_sbrk.o
 endef
 
 NONNATIVE_ARCHS := $(filter-out $(GUEST_ARCH),x86_64 aarch64)
 $(foreach a,$(NONNATIVE_ARCHS),$(eval $(call IMG_ARCH_template,$(a),$(CROSSCC_$(a)),$(TEXT_$(a)),$(AFLAGS_$(a)),$(ASRC_$(a)))))
 
-# The kernel and program for one arch: the native arch reuses the top-level
-# build, every other arch comes from its cross-build directory.
+# The kernel for one arch: the native arch reuses the top-level build, every
+# other arch comes from its cross-build directory.
 img_kernel = $(if $(filter $(1),$(GUEST_ARCH)),libos.elf,build/img/$(1)/kernel)
-img_prog   = $(if $(filter $(1),$(GUEST_ARCH)),hello.elf,build/img/$(1)/hello)
-BUNDLE_DEPS = $(foreach a,$(BUNDLE_ARCHS),$(call img_kernel,$(a)) $(call img_prog,$(a)))
+BUNDLE_DEPS = $(foreach a,$(BUNDLE_ARCHS),$(call img_kernel,$(a)))
 
-# Assemble a per-arch staging tree (the shared files plus boot/kernel and the
-# program for that arch) and build one multi-arch image from it with jbundle.
+# Assemble a per-arch staging tree (the shared root files plus boot/kernel) and
+# build one multi-arch image from it with jbundle. Guest programs are Linux
+# binaries added through EXTRA_BUNDLE_FILES (see linux-example and linux-smoke).
 bundle: castool jbundle $(BUNDLE_DEPS)
 	rm -rf $(BUNDLE_DEPOT) bundle-staging
 	@args=""; \
@@ -331,12 +255,11 @@ bundle: castool jbundle $(BUNDLE_DEPS)
 	    cp example/bundle/* $$d/; \
 	    [ -z "$(EXTRA_BUNDLE_FILES)" ] || cp $(EXTRA_BUNDLE_FILES) $$d/; \
 	    if [ "$$a" = "$(GUEST_ARCH)" ]; then \
-	        k=libos.elf; p=hello.elf; \
+	        k=libos.elf; \
 	    else \
-	        k=build/img/$$a/kernel; p=build/img/$$a/hello; \
+	        k=build/img/$$a/kernel; \
 	    fi; \
 	    cp $$k $$d/boot/kernel; \
-	    cp $$p $$d/hello; \
 	    args="$$args --arch $$a=$$d"; \
 	    echo "bundle: staged $$a from $$k"; \
 	done; \
@@ -592,7 +515,7 @@ uninstall:
 	-rmdir $(DESTDIR)$(libexecdir) 2>/dev/null
 
 clean:
-	rm -f $(TARGET) libos.elf $(PROGS) castool jbundle
+	rm -f $(TARGET) libos.elf castool jbundle
 	rm -rf $(BUNDLE_DEPOT) image-depot bundle-staging build
 
 .PHONY: all clean install uninstall bundle macsyntax fmt-test linux-progs linux-prebuilts linux-example linux-smoke linux-tmp-mount linux-cmdline linux-run linux-kernel-demo

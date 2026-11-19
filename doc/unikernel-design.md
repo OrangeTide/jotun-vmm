@@ -156,8 +156,7 @@ the sole authority.
 Services appear in the guest namespace, Plan 9 style:
 
 - filesystem: the host's 9P server, rooted at the granted subtree,
-- networking: a `/net` tree (section 8),
-- display: a `/dev/draw` endpoint the guest writes a command stream to.
+- networking: a `/net` tree (section 8).
 
 ### 7.1 Guest parameters and the filesystem bundle
 
@@ -338,6 +337,9 @@ flat trust model; external binding stays separately opt-in and default-deny.
 Rate limits are not yet implemented.
 
 ## 9. Display subsystem
+
+Note: the display subsystem described in this section was removed in 0.34.0.
+Jotun hosts Linux-like guests only; this section is kept as design history.
 
 The target workloads are non-realtime and remote-friendly: visualizations,
 interactive diagrams, and schematics. The design is therefore vector-first.

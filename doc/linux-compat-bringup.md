@@ -161,14 +161,6 @@ that the model scales past the musl hello. The musl path stays the committed
 one; busybox applets proper still want argv delivery and a broader VFS, but the
 heap wall is down.
 
-## jlibc malloc (separate, native programs)
-
-Independently, vmm's native bundle programs gained an allocator: skjegg's
-boundary-tag malloc and its static-region sbrk, lifted into
-`guest/prog/libc/jmalloc.c` and `jsbrk.c` (CC0). This is unrelated to the Linux
-path, which serves the foreign binary's own malloc; it just fills a gap in the
-native `jlibc`. See `make malloc-test`.
-
 ## argv delivery and a writable ramfs
 
 Two more pieces let a multi-call binary actually do something.

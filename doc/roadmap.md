@@ -453,7 +453,7 @@ Steps:
   or corrupt the single server thread. Limits added: a 16 KiB max inbound frame,
   a 200/sec event rate window, and receive and send timeouts. TLS is documented
   as a loopback-only host behind a TLS-terminating reverse proxy
-  (`doc/draw-vocabulary.md`). The interaction vocabulary is wired end to end:
+  (the draw-vocabulary notes, since removed). The interaction vocabulary is wired end to end:
   guest `draw_drag`/`draw_xy` emit DI_DRAG/DI_XY, the client reports drag and xy
   gestures, and the host re-encodes their fractional values into the binary norm
   form the guest ABI defines (verified: a 0.5 scroll decodes to norm 32768 in
@@ -480,7 +480,7 @@ Steps:
   count; applying an op is O(1). The node ceiling (4096 per guest, matching the
   browser SVG DOM limit) is enforced. A benchmark hook (JOTUN_DRAW_BENCH) times
   apply and serialize per SUBMIT, driven by a `bench` guest demo that builds a
-  grid of N rects. Numbers and method are in `doc/draw-vocabulary.md`. The
+  grid of N rects. Numbers and method were in the draw-vocabulary notes (since removed). The
   guest-to-host op-rate question is resolved: synchronous submission is its own
   backpressure, so no explicit limit is needed. The remaining lever for very
   large scenes under steady mutation is incremental (changed-node) updates
@@ -793,7 +793,7 @@ Locked decisions (interview, 2026-10-06):
   offset by a per-guest origin the host assigns; guests keep their own internal
   coordinates. Simplest compositor and minimal client change.
 - Auth: the host stays loopback-only and single-browser; a reverse proxy owns
-  TLS and authentication off-box, per `doc/draw-vocabulary.md`. The host gains no
+  TLS and authentication off-box, per the draw-vocabulary notes (since removed). The host gains no
   auth code.
 
 Sub-milestones:
@@ -865,7 +865,7 @@ Sub-milestones:
   (accept_conn closes the old connection before taking the new one) after
   multiplexing, demonstrated by a second browser dropping the first live. One
   session fronts all guests, not one browser per guest. Documented the boundary
-  in `doc/draw-vocabulary.md`: several simultaneous viewers and in-host session
+  in the draw-vocabulary notes (since removed): several simultaneous viewers and in-host session
   authentication are deliberately not implemented; a deployment that needs them
   puts them in the reverse proxy in front.
 - M10.4 (done): shared read-only filesystem mount between guests. Two guests

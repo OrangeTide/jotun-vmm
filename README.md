@@ -97,15 +97,15 @@ per-architecture toolchain setup, see `doc/sandbox-build.md`.
 ## Quick start
 
 Install the prerequisites for your platform (above), then build the hypervisor
-and run the native test guest, which prints a line and stops:
+and the guest kernel:
 
 ```sh
 make
-./jotun
+./jotun --help    # usage, options, and environment variables
 ```
 
-To run unmodified Linux binaries inside the sandbox, build the guest kernel and a
-program bundle and run the test suite:
+To run unmodified Linux binaries inside the sandbox, build a program bundle and
+run the test suite:
 
 ```sh
 make linux-smoke                          # linux/x86-64 and linux/arm64
@@ -188,9 +188,7 @@ Formats:
 - `guest/libos/` - the freestanding guest kernel: the Linux-compat layer
   (`linuxelf.c`), per-process paging, the scheduler, and the 9P client. Builds to
   `libos.elf`.
-- `guest/` - the sample native guests (`test_guest_x86.c`, `test_guest_arm64.c`)
-  that `make` builds and `./jotun` runs.
-- `abi/` - headers shared by host and guest (the boot block, the 9P, network, and
-  draw channels).
-- `example/` - the `linux*.c` test programs that run inside the sandbox.
+- `abi/` - headers shared by host and guest (the boot block, the 9P, and network
+  channels).
+- `example/` - the `linux*.c` example programs that run inside the sandbox.
 - `doc/` - the design, build, and Linux-compat notes. See Documentation below.

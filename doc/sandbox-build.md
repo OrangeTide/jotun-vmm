@@ -16,8 +16,8 @@ The pieces a full sandbox run uses are:
 - a bundle (a content-addressed store under `bundle-depot/`) that holds the
   guest programs. The `bin` guest reads its programs from the bundle over 9P.
 
-`make` builds `jotun` and the native test guest. The sandbox targets below build
-`libos.elf` and a bundle as needed.
+`make` builds `jotun` and the guest kernel `libos.elf`. The sandbox targets below
+build a bundle as needed.
 
 ## Toolchains
 
@@ -61,7 +61,7 @@ and LLVM clang, so the same setting works everywhere. Override it with
 ### Build and run
 
 ```sh
-make                           # jotun + native test guest
+make                           # jotun + libos.elf (the guest kernel)
 make linux-smoke               # build libos.elf, bundle the tests, run all of them
 make linux-example EXAMPLE_PROG=linuxcat   # run one test program
 ```
