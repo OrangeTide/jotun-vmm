@@ -1,4 +1,8 @@
 # Makefile
+# The version is kept in version.mk (a single tracked line) and stamped into the
+# binary through the generated build/version.h. Bump version.mk to change it.
+include version.mk
+
 # smolvfs provides the bundle store the host 9P server reads from. Its sources
 # are vendored in-tree under third_party/smolvfs (no external checkout); the
 # host compiles them directly. The read path backs the 9P server; the sign path
@@ -21,7 +25,7 @@ SMOLVFS_DEFS = -DCAS_WITH_MONOCYPHER -DCAS_WITH_MINIZ -DMINIZ_NO_STDIO
 # _DEFAULT_SOURCE is defined empty to match cas.c's own definition (no warning).
 HOST_DEFS = -D_DARWIN_C_SOURCE -D_DEFAULT_SOURCE=
 
-CFLAGS = -Wall -Wextra -std=c11 -pthread -Iabi -I$(SMOLVFS_DIR) \
+CFLAGS = -Wall -Wextra -std=c11 -pthread -Iabi -Ibuild -I$(SMOLVFS_DIR) \
     $(SMOLVFS_DEFS) $(HOST_DEFS)
 LDFLAGS =
 ifeq ($(OS),)
@@ -134,11 +138,22 @@ PROGS = hello.elf
 
 all: $(TARGET) $(GUEST) $(PROGS)
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+$(TARGET): $(SRC) build/version.h
+	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
 ifeq ($(OS), Darwin)
 	codesign --force --entitlements entitlements.plist --sign - $@
 endif
+
+# Stamp the version into a generated header, so only a version change triggers a
+# rebuild. FORCE reruns the recipe every build to track version.mk; the cmp
+# guard leaves the header's mtime alone when the string is unchanged. The header
+# is build output: it lives under build/ (gitignored) and is never committed.
+build/version.h: version.mk FORCE | build
+	@printf '#ifndef JOTUN_VERSION\n#define JOTUN_VERSION "%s"\n#endif\n' \
+	    '$(JOTUN_VERSION)' > $@.tmp
+	@cmp -s $@.tmp $@ || mv $@.tmp $@
+	@rm -f $@.tmp
+FORCE:
 
 # The library OS is multiple translation units: the portable core plus the
 # selected arch file. It needs its own include path and links all objects. The

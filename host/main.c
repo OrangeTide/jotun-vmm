@@ -26,6 +26,7 @@
 #include "manifest.h"
 #include "bundlepull.h"
 #include "net.h"
+#include "version.h"
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -979,9 +980,69 @@ guest_bringup(struct guest *gp, int gid, const char *kernel,
     return 0;
 }
 
+/* Print the version banner, one line, to the given stream. */
+static void
+print_version(FILE *out)
+{
+    fprintf(out, "jotun %s (%s)\n", JOTUN_VERSION, JOTUN_ARCH);
+}
+
+/* Print full usage. Goes to stdout for an explicit --help (exit 0) and to
+ * stderr for a usage error (exit 2). */
+static void
+usage(FILE *out, const char *prog)
+{
+    print_version(out);
+    fprintf(out,
+"\n"
+"A hypervisor-hosted sandbox that runs a freestanding guest kernel (libOS),\n"
+"which runs unmodified native Linux binaries. See README.md and doc/.\n"
+"\n"
+"Usage:\n"
+"  %s [-m <manifest>]... [<kernel>] [init-arg...]\n"
+"  %s --version | --help\n"
+"\n"
+"Arguments:\n"
+"  -m <manifest>   Add one guest from a manifest file. Repeatable, up to %d\n"
+"                  guests run side by side, each with its own root and args.\n"
+"  <kernel>        The guest kernel (libOS) image to run. Optional: with none,\n"
+"                  jotun lifts '%s' from the bundle, or finds libos.elf\n"
+"                  beside the binary or in ../libexec/jotun.\n"
+"  init-arg...     For a lone guest with no -m manifest, the init program and\n"
+"                  its arguments (argv[0] is the init program in the bundle).\n"
+"\n"
+"Options:\n"
+"  -h, --help      Show this help and exit.\n"
+"  -V, --version   Show the version and exit.\n"
+"\n"
+"A -m manifest configures a guest declaratively (root, mounts, init, network,\n"
+"command line, pull origin). Without any -m, one guest is configured from the\n"
+"environment variables below, which a manifest overrides per guest.\n"
+"\n"
+"Environment:\n"
+"  JOTUN_MANIFEST  Manifest path for the lone guest (same as a single -m).\n"
+"  JOTUN_BUNDLE    Bundle depot the guest root is served from.\n"
+"  JOTUN_REF       Ref name to resolve in the bundle (default 'root').\n"
+"  JOTUN_KERNEL    Guest kernel image path, overriding auto-detection.\n"
+"  JOTUN_VCPUS     Number of vCPUs, 1 to %d (default 1).\n"
+"  JOTUN_HZ        Preemption-timer rate in ticks/sec. Unset or 0 runs fully\n"
+"                  cooperatively with no timer.\n"
+"  JOTUN_NO_PREEMPT  Set to disable preemption even when a timer runs.\n"
+"  JOTUN_MAX_EXITS   Cap the vCPU exit count (0, the default, is unlimited).\n"
+"  JOTUN_NAME      Network name the guest registers for inter-guest links.\n"
+"  JOTUN_ORIGIN    Signed-pull origin URL to fetch the bundle from.\n"
+"  JOTUN_KEY       Trusted publisher key that a pulled ref must verify against.\n"
+"  JOTUN_CACHE     Local cache directory for a pull.\n"
+"  JOTUN_LABEL     Ref label to resolve for a pull.\n"
+"  JOTUN_DEBUG     Set for verbose vCPU exit tracing.\n",
+            prog, prog, MAX_GUESTS, JOTUN_KERNEL_PATH, MAX_VCPUS);
+}
+
 int
 main(int argc, char **argv)
 {
+    const char *prog = (argc > 0 && argv[0]) ? argv[0] : "jotun";
+
     /* Each -m names one guest's manifest; the first bare argument is the kernel
      * image shared by all guests, and any trailing arguments are the init args
      * for the lone no-manifest guest. With no -m, one guest runs from the
@@ -993,12 +1054,23 @@ main(int argc, char **argv)
     char *targv[MANIFEST_MAXARG];
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(stdout, prog);
+            return 0;
+        } else if (strcmp(argv[i], "-V") == 0 ||
+                   strcmp(argv[i], "--version") == 0) {
+            print_version(stdout);
+            return 0;
+        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             if (nmanifests >= MAX_GUESTS) {
                 fprintf(stderr, "too many -m manifests (max %d)\n", MAX_GUESTS);
                 return 1;
             }
             manifests[nmanifests++] = argv[++i];
+        } else if (strcmp(argv[i], "-m") == 0) {
+            fprintf(stderr, "%s: -m needs a manifest path\n", prog);
+            usage(stderr, prog);
+            return 2;
         } else if (!kernel) {
             kernel = argv[i];
         } else if (targc < MANIFEST_MAXARG) {
