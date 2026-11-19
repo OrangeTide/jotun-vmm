@@ -167,7 +167,7 @@ Scope: one global namespace (per-process namespaces are later), and the bundle
 is flat, since castool's import builds a single directory level; nested
 subtrees need the smolvfs library API and are deferred. bind and mount are the
 same operation over the single filesystem; real additional mounts arrive with
-networking (M5) and display (M6).
+networking (M5).
 
 Transition from M2: M2's `exec` resolves a function directly and the guest has
 no loader. M3 adds the loader and makes `exec` resolve a program by name, read
@@ -197,7 +197,7 @@ device table, held back from M2, land.
 - Guest namespace `bind` and `mount`.
 - Per-guest manifest, read by the host at launch: it names the bundle, the
   subtree the guest may see, the init program and its parameters, and the
-  coarse rights that grow through M5 and M6. It is the full description of a
+  coarse rights that grow through M5. It is the full description of a
   guest domain.
 
 Acceptance: a bundle holding `jsh` and a couple of small programs boots; the
@@ -358,233 +358,11 @@ Steps:
   and without rules, and `cat /net/conn/0` against a live connection, with
   bundle delegation and policy enforcement intact.
 
-## M6: display, the 2D vector path (done)
+## M6-M7: display (removed)
 
-Goal: the primary use case, interactive diagrams and schematics in a browser.
-
-Acceptance: a guest app draws an interactive diagram in a browser window and
-receives a click or other semantic event back.
-
-Investigation (done): the design reuses the Quaoar research
-(Quaoar): a guest line protocol, a C
-bridge that multiplexes apps onto one WebSocket, and a browser client that
-renders SVG. The bridge is a single-threaded `poll` relay with inline
-SHA-1/base64 WebSocket handshake and framing, no dependencies; its protocol
-logic (framing, routing, per-app id) is transport-agnostic and its I/O layer
-(~300-500 LOC) is the only socket-coupled part. The guest emitter `libquaoar`
-is built on `snprintf`/`vsnprintf`/`malloc`/sockets, none of which the
-freestanding libOS has. Quaoar is a proof of concept (Approach A, SVG
-streaming) and its author documents the untested parts: a 5-10k SVG-node
-ceiling, localhost-only latency, no auth or session management, and no pixel
-path (that is M7).
-
-The decisive risk is the threat-model inversion. Quaoar is a display server
-for cooperative apps; its client `DOMParser`s application-supplied SVG into one
-shared page with no sanitization. Jotun's guest is attacker-controlled, so
-forwarding guest markup verbatim would let one guest inject script that reaches
-other guests' surfaces and the socket.
-
-Decisions (made):
-
-- Restrict the vocabulary. The guest never emits markup. It emits a small set
-  of structured draw ops (surface, group/transform, rect, circle, line, path
-  with validated commands, text, a style allowlist, and declarative hover/
-  press/drag annotations). The host validates every op and field and is the
-  sole author of the SVG sent to the browser, so no guest bytes are ever
-  DOM-parsed by the client. This makes the host-side validation genuinely cheap
-  (a known vocabulary, not arbitrary SVG) and closes the injection risk by
-  construction rather than by sanitizing a hostile parser's input.
-- Mechanism first, then harden. The restricted vocabulary is light enough that
-  it is part of the mechanism, not a later phase, so there is no insecure
-  intermediate state. What defers to M6.5+ is the WebSocket frame parser audit,
-  transport hardening, vocabulary breadth, and scale/latency work.
-
-Steps:
-
-- M6.1 (done): the `/dev/draw` channel ABI (`abi/jotun_draw.h`) and the guest
-  draw client (`guest/libos/draw.{c,h}`). A structured-op emitter encodes ops
-  little-endian into the channel buffer with no markup and no libc formatting,
-  auto-flushing between whole ops when a chunk fills, so a scene larger than one
-  slot chunks rather than assuming one message. Backpressure reuses the M5.1
-  block/wake primitive: a full outbound queue returns DRAW_EAGAIN and the task
-  parks instead of stalling the vcpu. Input events return through a POLL op and
-  a scheduler event hook (the net hook became an array so net and draw can both
-  register). The host sink (`host/draw.{c,h}`) is mechanism only for now: it
-  walks and bounds-checks the op stream, rejecting a malformed stream whole, and
-  discards the payload since no SVG is authored yet. A self-test event source
-  (JOTUN_DRAW_TEST) feeds a synthetic click back on a clickable node, so the
-  submit/park/poll loop runs end to end with no front end. The `draw` demo in
-  the libos exercises it; verified on x86-64 KVM and cross-linked for arm64.
-- M6.2 (done): the host draw subsystem (`host/draw.c`). The sink now retains a
-  per-guest scene tree and applies each SUBMIT op as a validated mutation:
-  create under a parent, set text, annotate interaction, listen, remove. It
-  validates id uniqueness (id 0 reserved), that a parent exists and is a surface
-  or group, the color/enum/width ranges, and the node, surface, and string caps.
-  From the tree it authors the canonical SVG, reconstructing every attribute
-  from a validated number or an XML-escaped string, so no guest bytes are
-  forwarded and there is nowhere to inject markup. Hover and press fills become
-  SMIL `<set>` children; drag, xy, click, and close become `data-qu-*`
-  attributes the M6.3 client reads. JOTUN_DRAW_SVG dumps the authored document
-  per SUBMIT for inspection; verified well-formed with the draw demo (surface,
-  rect with hover, text, nested group and circle). Not yet shipped anywhere:
-  that is the WebSocket front end in M6.3. SET, POLYLINE, and PATH apply/emit
-  land with their guest wrappers; full op-stream rollback against a hostile
-  guest and a node index for scale are M6.5/M6.6.
-- M6.3 (done): the host WebSocket front end (`host/drawws.c`) and the embedded
-  browser client. The SHA-1, base64, and WebSocket framing are lifted from
-  `quaoar-server` (the SHA-1 is Jon Mayo's public-domain sha1tiny). A single
-  server thread, bound to localhost, serves the client page over HTTP and
-  upgrades a WebSocket on the same port; all socket work stays on that thread,
-  with a self-pipe nudge for pushes from the vcpu thread, so there are no fd
-  races. On each SUBMIT the draw subsystem serializes the scene and pushes the
-  whole SVG document; the client (a small page, not Quaoar's command protocol,
-  since the host sends authored documents) renders it with DOMParser and wires
-  `data-qu-listen` click and close back as events. An inbound event is queued
-  under a lock and rouses the guest through the same evt-plus-wake path as the
-  self-test source. Meets the acceptance test, verified end to end with a test
-  WebSocket client: the guest draws the scene, the host pushes a 918-byte
-  authored SVG, a click on the rect returns DEV_CLICK to the guest, which
-  unblocks and finishes. JOTUN_DRAW_PORT selects the port (0 disables).
-- M6.5 (done): hardening and interaction breadth. The hand-rolled WebSocket
-  frame reader was replaced with a non-blocking incremental parser that
-  validates every field before touching a payload byte (reserved bits clear,
-  client frames masked, control frames final and <= 125 bytes, length within
-  the cap and fully present), so a malformed or slow-loris browser cannot wedge
-  or corrupt the single server thread. Limits added: a 16 KiB max inbound frame,
-  a 200/sec event rate window, and receive and send timeouts. TLS is documented
-  as a loopback-only host behind a TLS-terminating reverse proxy
-  (the draw-vocabulary notes, since removed). The interaction vocabulary is wired end to end:
-  guest `draw_drag`/`draw_xy` emit DI_DRAG/DI_XY, the client reports drag and xy
-  gestures, and the host re-encodes their fractional values into the binary norm
-  form the guest ABI defines (verified: a 0.5 scroll decodes to norm 32768 in
-  the guest).
-- M6.5 vocabulary breadth (done): the specified-but-stubbed ops now have guest
-  wrappers, host validation and apply, and SVG emission. SET mutates one
-  attribute of an existing node (geometry attributes apply only to the node
-  kinds that have the field, style attributes and VISIBLE to any node); POLYLINE
-  emits a polyline or, when closed, a polygon; PATH re-emits a path string from
-  a closed command set (M L H V C Q Z) with host-checked argument counts, so no
-  path text crosses from the guest. Points and segments are capped per node and
-  freed with the node. Verified end to end via the draw demo (a SET moves a
-  circle, a closed polyline renders as a polygon, a path renders) and the SVG is
-  well-formed and renders. A build fix came with this: the guest is now compiled
-  -mgeneral-regs-only, since a larger aggregate initializer made the compiler
-  emit SSE the guest never enabled, which faulted the vcpu. Text and paste input
-  stay deferred since they need a text-input primitive the restricted vocabulary
-  excludes (no foreignObject).
-- M6.6 (done): scale and latency. The host scene tree gained an id-to-slot hash
-  index (O(1) lookup), a free-slot stack (O(1) allocation), and creation-order
-  sibling links, so the whole scene serializes in one O(n) walk. This replaced
-  the first cut's linear scans. Full-scene serialize at the 4096-node ceiling
-  dropped from about 111 ms to about 2.6 ms (42x), and is now linear in node
-  count; applying an op is O(1). The node ceiling (4096 per guest, matching the
-  browser SVG DOM limit) is enforced. A benchmark hook (JOTUN_DRAW_BENCH) times
-  apply and serialize per SUBMIT, driven by a `bench` guest demo that builds a
-  grid of N rects. Numbers and method were in the draw-vocabulary notes (since removed). The
-  guest-to-host op-rate question is resolved: synchronous submission is its own
-  backpressure, so no explicit limit is needed. The remaining lever for very
-  large scenes under steady mutation is incremental (changed-node) updates
-  instead of full re-render, noted for later.
-
-## M7: display, the pixel path (done)
-
-Goal: raster content where vector does not fit.
-
-- M7.1 (done): the framebuffer node. The pixel surface is a framebuffer in
-  guest RAM, surfaced as a `DOP_IMAGE` node in the existing draw scene, so it
-  composites through the same channel, scene tree, SVG, and WebSocket as the 2D
-  path, no new channel. The guest declares the node with the framebuffer's
-  guest-physical address, geometry, format (RGBA8888), and stride; the host
-  validates the geometry, reads the pixels from guest RAM through a bounds-
-  checked address translator, encodes them as a PNG (a small dependency-free
-  encoder, `host/png.c`, with real fixed-Huffman LZ77 DEFLATE: the wireframe
-  frame compresses about 68x, 263 KB to 3.9 KB), and emits an `<image>` data URI
-  under the chrome. No
-  pixel command stream crosses into the host, only a declared buffer, which is
-  the security point of §9.2. The `pixel` guest demo software-renders a
-  wireframe cube (integer Bresenham, no FP) into the framebuffer and shows it
-  under a window; verified by rendering the authored SVG. Acceptance met.
-- M7.2 (done): incremental changed-node transmit. Instead of re-sending the
-  whole document on every SUBMIT, the host tracks per-node change state while
-  applying the op stream (added, modified, removed) and, after the browser has
-  a full-document baseline, sends a small delta that names only what changed.
-  The delta is a line-oriented text message: a `!<cw> <ch>` header carrying the
-  canvas size, then one record per change, `R <id>` to remove a node,
-  `N <parent> <fragment>` to add one, and `U <fragment>` to replace one in
-  place. The browser applies records against the live DOM by element id. When a
-  delta cannot be delivered in order (the browser has no baseline yet, a prior
-  delta is still queued, or the change set overflows the per-submit cap), the
-  host falls back to the full document, so the browser never drifts. A DOP_IMAGE
-  node re-encodes its PNG only when its pixels are marked dirty. Measured on the
-  2D demo, a single-attribute SET goes out as a 226 byte delta in place of the
-  1144 byte full document. This is the changed-node path M6.6 noted as the lever
-  for large scenes under steady mutation.
-- M7.3 (done): dirty-rectangle partial updates for the pixel path. The guest
-  reports a changed sub-region of an image with a new op (DOP_IMAGE_DAMAGE)
-  after re-rendering into the framebuffer. The host crops that region, encodes
-  only it as a small PNG, and sends it as an overlay `<image>` patch positioned
-  over the base through the M7.2 delta path (an `N` record appending the patch
-  under the image's group). Patches accumulate until a cap (16 per image) or
-  until the patched area would reach a full frame, at which point the host
-  re-bases: one full re-encode replaces the group and clears the overlays, so
-  the DOM stays bounded. Re-submitting DOP_IMAGE for the same id also re-bases.
-  The host crops without copying by pointing the encoder at the region's offset
-  with the framebuffer's own stride. Measured on the pixel demo, stamping a
-  32x32 square into a 256x192 frame goes out as a 242 byte patch delta rather
-  than the 3911 byte full frame, and five stamps cost 1211 bytes against about
-  19.5 KB of full frames. The pixels still never cross the channel, only the
-  declared buffer and a declared damage rect, so the §9.2 boundary is unchanged.
-- M7.4 (done): the guest software rasterizer, a minimal 3D core. `guest/libos/
-  triton.c` rasterizes gouraud-shaded, z-buffered triangles into an RGBA
-  framebuffer in guest RAM, through a small Glide-flavored immediate-mode API
-  (`tr_clear`, `tr_triangle`). It renders entirely in the guest; the host still
-  only receives pixels through the pixel path, so the section 9.2 boundary holds.
-  The `triton` guest demo spins a shaded cube (incremental rotation with no
-  sin/cos routine, re-based through the pixel path each frame). The fuller
-  subset named in the design doc landed on top of this core, in two steps.
-  First: per-vertex texture coordinates with point sampling, the Glide-style
-  color-combine modes (iterated, texture/decal, modulate, add), and source-over
-  alpha blending (a blended triangle depth-tests but does not write depth).
-  Then: perspective-correct texturing (the vertex carries its clip-space w and
-  the rasterizer interpolates u/w, v/w and 1/w and divides per pixel, reducing
-  exactly to affine at w = 1), bilinear filtering, and mip-mapped textures with
-  trilinear sampling. The mip level is picked per pixel from the screen-space
-  derivatives of the texture coordinates, formed from the barycentric gradients
-  (constant per triangle) by the quotient rule; `log2` for the level and `floor`
-  are small freestanding approximations, since the guest has no libm. Last:
-  anisotropic filtering. At a grazing angle the per-pixel texel footprint is
-  elongated, so a single trilinear tap at the long axis blurs the texture; the
-  core instead takes several trilinear taps spread along the long axis, each at a
-  mip level matched to the short axis, and averages them. The tap count is the
-  footprint's long/short axis ratio, rounded and clamped to a per-target maximum,
-  which reduces to one tap (plain trilinear) wherever the footprint is round.
-  `sqrt` is another small freestanding approximation. Finally a vertex transform
-  and clip stage in front of the rasterizer: it multiplies object-space vertices
-  by a 4x4 matrix (there are builders for translate, the three axis rotations
-  that take cos and sin directly so no sin/cos routine is needed, and a
-  perspective projection), clips the triangle against the near and far planes
-  with Sutherland-Hodgman interpolating every attribute, divides by w, and maps
-  to the viewport. The near clip is what lets geometry cross behind the camera
-  safely, instead of the old hand projection's rule that every vertex stay in
-  front of it. The demo now builds the cube's matrix from the running rotation
-  and draws it checker-textured, gouraud-modulated, bilinear, mipped and
-  anisotropic, over a ground plane that runs from behind the camera out past the
-  far plane so both clip planes trim it each frame, behind a translucent
-  screen-space panel. Every path runs each frame.
-  Enabling it meant turning on the guest FPU, since the rasterizer uses floating
-  point. The FPU is enabled per cpu at boot (`arch_fpu_init`: CR0/CR4 for SSE on
-  x86-64, CPACR_EL1 for FP/SIMD on arm64). The rest of the guest stays
-  integer-only (`-mgeneral-regs-only`); only `triton.c` is built with the FPU on,
-  as its own object. FP state is preserved across task switches: on x86-64 the
-  interrupt path saves it with FXSAVE/FXRSTOR around the handler (preemption must
-  be transparent to a task mid-computation), and on arm64 the cooperative switch
-  saves the callee-saved vector registers d8-d15 (arm64 has no preemption yet).
-  The earlier M6.5 reason for `-mgeneral-regs-only` stands for the kernel; this
-  only carves out the one FP translation unit.
-- Real PNG compression is done (fixed-Huffman LZ77 DEFLATE in `host/png.c`).
-
-Acceptance: a guest software-renders a wireframe into a framebuffer node
-composited under the 2D chrome. Met, and extended to a shaded, z-buffered cube.
+The 2D vector and pixel display paths were built here (a `/dev/draw` channel, a
+host WebSocket front end, and a browser client). They were removed in v0.34.0
+when jotun became Linux-only. The detailed history is dropped; see CHANGELOG.md.
 
 ## M8: image distribution, signed pull from a URL (done)
 
@@ -677,7 +455,7 @@ endorsement to the active key and boots, while an untrusted key is refused.
 
 Goal: a small freestanding library for the guest, so the libOS stops
 open-coding the same primitives and bundle programs become writable. Not a
-full libc. It is cross-cutting and independent of the display and distribution
+full libc. It is cross-cutting and independent of the distribution
 work, so it lands opportunistically rather than in sequence.
 
 Scope: `string.h` (mem{cpy,set,move,cmp}, str{len,cmp,ncmp}, a bounded
@@ -755,62 +533,50 @@ yield, and tss_* thread-specific storage is not provided.
 
 ## After M8: the forward milestones
 
-The seven-step plan in the design doc (section 10) is now implemented end to
-end: the transport ABI, 9P and the bundle, the shell, preemption and SMP,
-networking, the 2D vector display, and the pixel path, with signed distribution
-on top. What remains are the forward milestones below, drawn from the display
-design's multi-guest front end (section 9.4), the cross-cutting concerns, and
-the deferrals accumulated along the way. They are largely independent, so they
-land as wanted rather than in a strict sequence. M9 (above) stays opportunistic.
+The core plan in the design doc is now implemented end to end: the transport
+ABI, 9P and the bundle, the shell, preemption and SMP, and networking, with
+signed distribution on top. (The display paths built here were removed in
+v0.34.0; see M6-M7.) What remains are the forward milestones below, the
+cross-cutting concerns, and the deferrals accumulated along the way. They are
+largely independent, so they land as wanted rather than in a strict sequence.
+M9 (above) stays opportunistic.
 
-## M10: multi-guest multiplexing and the browser session
+## M10: multi-guest multiplexing (done)
 
-Goal: one browser session fronting several guests at once, which the display
-design (section 9.4) calls for but the current front end does not do (one guest
-to one browser, replace-on-connect). The host runs several isolated guests in
-one process and composites their scenes into a single client document.
+Goal: run several isolated guests in one host process, each with its own VM,
+RAM, and device channels.
 
-The current host is strictly one guest: one process is one VM, and the N vcpus
-are SMP cpus of that one guest, sharing one RAM and one set of device channels
-(net, draw, p9) at fixed GPAs resolved against a single backing buffer. The
-display layer already reserved the seam for this work: DOM ids are
-`qu-<guest>-<node>` with the guest field pinned to a constant 0, and the client
-JS already parses then discards it.
+The host was strictly one guest: one process was one VM, and the N vcpus were
+SMP cpus of that one guest, sharing one RAM and one set of device channels (net,
+p9) at fixed GPAs resolved against a single backing buffer.
 
 Locked decisions (interview, 2026-10-06):
 
 - Process model: several VMs in one host process, each its own guest with
-  private RAM and its own draw/net/p9 devices. Guests are isolated by default
+  private RAM and its own net/p9 devices. Guests are isolated by default
   (separate VMs and address spaces), so the fixed channel GPAs do not collide.
   The host is the only thing that can bridge two guests, which keeps the trust
-  model intact. Chosen over a process-per-guest front-end aggregator, since that
-  would need an inter-host IPC bus for the same result.
+  model intact. Chosen over a process-per-guest aggregator, since that would
+  need an inter-host IPC bus for the same result.
 - Launch: one guest per manifest, named with repeated `-m <manifest>` arguments
   (`jotun -m web.manifest -m db.manifest libos.elf`). The existing manifest
   (bundle, net policy, init params) is unchanged and each guest is specified
   independently.
-- Compositing layout: each guest is a top-level group `<g id="qu-<guest>">`
-  offset by a per-guest origin the host assigns; guests keep their own internal
-  coordinates. Simplest compositor and minimal client change.
-- Auth: the host stays loopback-only and single-browser; a reverse proxy owns
-  TLS and authentication off-box, per the draw-vocabulary notes (since removed). The host gains no
-  auth code.
 
 Sub-milestones:
 
 - M10.0: run N guests in one host process. Collapse the file-scope singletons
-  (vm, backing RAM, vcpu table, netdev, drawdev, p9srv, manifest) into a
-  per-guest struct, launch one VM per manifest, and carry a `struct guest *` on
-  each vcpu thread so the doorbell demux and the net/draw/p9/ring service calls
-  target that guest's devices. The SMP wake and event-vector injection become
-  per-guest. Independent of the browser and the bulk of the work; it can ship
-  with the front end still showing guest 0 only. This is the schedule risk in
-  M10, so it is done in small steps that each keep the build and the existing
-  single-guest tests green, with N held at 1 until the last:
+  (vm, backing RAM, vcpu table, netdev, p9srv, manifest) into a per-guest
+  struct, launch one VM per manifest, and carry a `struct guest *` on each vcpu
+  thread so the doorbell demux and the net/p9/ring service calls target that
+  guest's devices. The SMP wake and event-vector injection become per-guest.
+  This is the schedule risk in M10, so it is done in small steps that each keep
+  the build and the existing single-guest tests green, with N held at 1 until
+  the last:
   - M10.0a: introduce `struct guest` and group the file-scope singletons into
     one instance of it. Pure data-grouping, no behavior change.
   - M10.0b: thread `struct guest *` through run_vcpu, the doorbell demux, and
-    the net/draw/p9/ring service calls, replacing the global reaches. Still one
+    the net/p9/ring service calls, replacing the global reaches. Still one
     guest, identical behavior.
   - M10.0c: make the wake and event path per-guest (rouse_vcpus, the SIGUSR1
     wake, event-vector injection target one guest's vcpu set, not the global
@@ -821,53 +587,14 @@ Sub-milestones:
   - M10.0e (done): flip to N guests. `jotun [-m <manifest>]... <kernel> [args]`
     runs one guest per `-m` (each its own VM, RAM, net/9p devices, and manifest
     config), with no `-m` keeping the single env/CLI guest exactly as before.
-    guest_bringup resolves config, brings a guest up, and spawns its vcpus; the
-    front end attaches to guest 0 only, so the rest run headless. The preemption
-    timer and the join and shutdown loops span all guests. Known limitation: all
-    guests share the one serial console, so their output interleaves per
-    character; per-guest console tagging is a separate concern, not part of M10.
-- M10.1: per-guest id namespacing and host-side compositing. Split, since the
-  namespacing is a small threading change but the compositing reworks the
-  draw/front-end boundary:
-  - M10.1a (done): per-drawdev guest id. drawdev carries a gid (passed to
-    draw_init from the owning guest), and every `qu-<guest>-<node>` emit site
-    uses it in place of the old constant 0. No behavior change yet, since only
-    guest 0 has a sink; it removes the hardcoded id and threads the real one.
-  - M10.1b (done): invert the draw / front-end ownership. draw_init used to
-    start its own WebSocket server, so each guest would collide on the port. A
-    new session object, struct drawfe, owns the one drawws transport and a sink
-    registry; drawfe_start/stop are called by main, draw_init attaches a sink to
-    it instead of starting a server, and a guest's scene is pushed through
-    drawfe_publish. Still guest 0 only, so the forwarded document is byte-
-    identical to before; the drawws transport stays a dumb one-scene buffer
-    (compositing is SVG authoring, which belongs in draw.c). Inbound events go
-    to the first registered sink for now; per-guest routing is M10.2.
-  - M10.1c (done): compositing. Every guest attaches a sink to the shared front
-    end. A lone guest keeps the pass-through fast path (plain `<svg>` plus
-    deltas, byte-identical to before). With more than one guest, drawfe
-    composites: each guest's content is serialized as a bare fragment
-    (serialize_inner), wrapped in a `<g id="qu-<guest>" transform="translate(x,0)">`
-    group at a host-assigned origin (guests laid left to right, each as wide as
-    its own canvas), and the groups are combined into one `<svg>` sized to hold
-    them all. A multi-guest change restates the whole document (sent full, no
-    delta yet); per-guest deltas are a later optimization. The per-guest id
-    prefix keeps node ids distinct across guests. Inbound events still reach the
-    first registered sink; per-guest routing is M10.2.
-- M10.2 (done): the session layer for inbound events. The client now reads the
-  guest field of the DOM id (guestId) alongside the node and sends it, so the
-  browser-to-host wire is `<guest> <node> <type>` with the optional value line.
-  dispatch_event parses the guest, the drawws event callback carries it, and the
-  front end routes the event to that guest's sink (fe->sinks[guest]); an event
-  for an unattached guest is dropped. A click on one guest's content now reaches
-  that guest and no other.
-- M10.3 (done): auth is a no-op in the host by the decision above. Confirmed the
-  front end is still loopback-only (binds INADDR_LOOPBACK) and single-browser
-  (accept_conn closes the old connection before taking the new one) after
-  multiplexing, demonstrated by a second browser dropping the first live. One
-  session fronts all guests, not one browser per guest. Documented the boundary
-  in the draw-vocabulary notes (since removed): several simultaneous viewers and in-host session
-  authentication are deliberately not implemented; a deployment that needs them
-  puts them in the reverse proxy in front.
+    guest_bringup resolves config, brings a guest up, and spawns its vcpus. The
+    preemption timer and the join and shutdown loops span all guests. Known
+    limitation: all guests share the one serial console, so their output
+    interleaves per character; per-guest console tagging is a separate concern,
+    not part of M10.
+- M10.1-M10.3: per-guest id namespacing, host-side compositing, the browser
+  session layer, and its auth boundary. These were display work (the removed
+  draw front end), done then removed in v0.34.0. See CHANGELOG.md.
 - M10.4 (done): shared read-only filesystem mount between guests. Two guests
   point their 9P subtree at the same bundle depot, one side owning ref commits
   and the other reading. This already worked for a live ref (the depot is a
@@ -886,8 +613,7 @@ Sub-milestones:
   a net listen/accept or rendezvous primitive that does not exist yet (design
   section 8), so it is tracked under opportunistic work, not M10.
 
-Suggested order: M10.0 first (unblocks the rest), then M10.1 and M10.2 together
-(shared id plumbing), then M10.3 and M10.4.
+Suggested order: M10.0 first (unblocks the rest), then M10.4.
 
 ## M11: single-file packaging (done)
 
@@ -940,12 +666,12 @@ relitigated later):
 
 - Cooperative checkpoint, not host-forced capture. The guest reaches a
   quiescent point and writes a new snapshot doorbell (the same MMIO doorbell
-  mechanism the ring, 9P, net, and draw channels already use). The guest handles
+  mechanism the ring, 9P, and net channels already use). The guest handles
   its own register context, which its task switcher already saves and restores
   (`guest/libos/task.c` and `arch/*_ctx.S`). The host captures guest RAM plus a
   small resume vector, and on restore reloads RAM and re-enters a guest resume
-  trampoline; the guest re-initialises its devices (reconnect sockets, redraw,
-  remount 9P). This was chosen because two facts make a host-forced capture
+  trampoline; the guest re-initialises its devices (reconnect sockets, remount
+  9P). This was chosen because two facts make a host-forced capture
   costly and low-value here: the VMM abstraction cannot read back a vcpu's full
   architectural register state today (it only sets PC/SP/ARG at creation, so a
   forced capture needs a large new get/set-all-registers surface in both
@@ -986,18 +712,9 @@ the wrapper) left until a need appears.
 
 Independent of the milestones above, tracked so they are not lost:
 
-- Guest rasterizer (M7.4): texturing (perspective-correct), the Glide combine
-  units, alpha blend, bilinear filtering, mip-mapped trilinear sampling,
-  anisotropic filtering, and a vertex transform and near/far clip stage all
-  landed on the minimal 3D core (see M7.4). It now has the full planned feature
-  set; back-face culling and a scene/mesh layer above the per-triangle API are
-  possible future additions, not currently needed.
 - Pull transport (M8): the pack byte-range transport and key rotation landed
   (see M8). Still open: pack-aware resume granularity and a published multi-pack
   layout for very large origins.
-- Display input: text and paste landed (see M15's keyboard-input note).
-  `DEV_TEXT` and `DEV_PASTE` carry keydown and paste from the client to the
-  guest, consumed by the `webterm` terminal.
 - libc-lite (M9): the `<threads.h>` shim landed (see M9). Still open: the timed
   variants (`mtx_timedlock`, `cnd_timedwait`) and precise `thrd_sleep`, which
   need a guest clock, and `tss_*` thread-specific storage. M9.1 through M9.4 are
@@ -1061,208 +778,19 @@ What landed:
 
 Deferred: rate limits.
 
-## M15: web hosting (in progress)
+## M15: web hosting (removed)
 
-Goal: let a user reach a guest from a browser over the public internet, not just
-the loopback display on the developer's own machine.
-
-Most of what this sounds like already exists. The display path is a web stack,
-not a raw pixel channel: M6.3 built the host WebSocket front end
-(`host/drawws.c`) with an embedded JavaScript client, and M7/M10 added the pixel
-path and compositing. So the browser client, the live SVG-plus-delta streaming,
-the PNG pixel transport, and the click/close/scroll/xy input return path are all
-done. M15 is not a client project; it is the hosting layer around that server.
-
-What already exists (do not rebuild):
-- The embedded client page and the HTTP-then-WebSocket server on
-  `JOTUN_DRAW_PORT` (default 9230), including the WebSocket handshake and
-  framing, hand-rolled in `host/drawws.c`.
-- Host-authored SVG with a line-oriented delta language, pixels carried as
-  base64 PNG inside `<image>`, and the per-process left-to-right compositing of
-  up to eight guests (M10).
-- The inbound event path: browser events to a per-guest ring to the guest's
-  `draw_next_event`, rate-limited and guest-namespaced.
-
-This confirms, rather than revisits, the auth decision already locked in M10:
-the host stays loopback-only and single-browser, and a reverse proxy owns TLS
-and authentication off-box, so the host gains no auth code. M15 is the off-box
-layer that decision points to.
-
-What is needed:
-- M15.1 (done): TLS and public reachability. The listener binds `127.0.0.1`
-  only and speaks plain HTTP, while a browser over the internet needs `wss:`.
-  There is no TLS library in tree (the vendored monocypher does signing, not
-  TLS), so TLS terminates at a reverse proxy that forwards to the loopback port,
-  as M10 already decided, with no new host code. The committed recipe is
-  `example/web/Caddyfile` (Caddy with `tls internal` locally, a real domain in
-  production), a `make web` target, and `doc/web-hosting.md`. On its own it puts
-  a single shared session on the web; the single-browser behaviour (a new
-  connection replaces the old) is acceptable for one user. `make caddy-smoke`
-  checks the TLS chain end to end with `openssl s_client`.
-- M15.2 (step one done): a session broker, split into host mechanism and a
-  broker guest (design decided 2026-10-07). Today one host process is one front
-  end serving one browser; independent users need one guest per session, spawned
-  on demand.
-  Rather than write the broker as trusted host C, keep the host to mechanism and
-  put the policy in a guest, so the trusted base stays small and the broker's own
-  logic is sandboxed and restartable. This is the mechanism/policy split applied
-  to session management.
-  - Host mechanism (trusted, minimal). Two new primitives. First, runtime guest
-    spawn and destroy: today guests are static, named by `-m` at boot, so this
-    adds creating a VM at run time from a bundle with resource limits and reaping
-    it. Second, token-keyed display routing: binding a browser's draw connection
-    to one session guest. Routing must stay host-side, because draw frames are
-    read out of the session guest's RAM, which no other guest may touch. Both
-    reach a guest through a new broker control channel, the same
-    doorbell-plus-shared-buffer pattern as the net, draw, and 9P devices, granted
-    only to a guest marked `broker` in its manifest: spawn(bundle, params,
-    limits) returns a handle, destroy(handle), bind(token, handle), and events
-    connected / disconnected / guest_exited. The host enforces quotas on all of
-    it (max session guests, total RAM, spawn rate), so a buggy or hostile broker
-    is at worst bounded denial of service, never a sandbox escape or a read of
-    another guest.
-  - Broker guest (policy, sandboxed). Admission (who gets a session, rate
-    limits), which bundle to run, the limit values, session bookkeeping, and the
-    landing and auth UX. It already has what it needs: external listen and accept
-    (M14), the task model, and jsh.
-  - Control plane in the guest, data plane in the host. Caddy routes `/` to the
-    broker guest's own HTTP socket and `/ws` to the host draw server. A browser
-    hits `/`; the broker runs policy, asks the host to spawn a session guest,
-    gets a handle, issues a token bound to it, and returns a page whose WebSocket
-    URL carries the token. The browser opens `/ws` with the token; the host
-    validates it against the spawn the broker registered and routes that draw
-    stream to the bound guest. The broker never touches pixels.
-  - Trust model. This moves from M14's flat, host-mediated peers to one
-    bounded-privilege guest holding a capability, a deliberate quota-shaped grant
-    rather than a hole. Caveat: dynamic spawn and draw routing are trusted host
-    code either way; the gain is that policy leaves the trusted base and the
-    broker is sandboxed, not that the hardest mechanism disappears.
-  - Incremental path. Build the host mechanism first with trivial inline policy
-    (a fixed bundle per connection), which already gives working multi-user
-    hosting, then lift policy into the broker guest over the control channel.
-    Designing the channel up front makes the second step additive, not a rewrite.
-  - Host mechanism, step one (done 2026-10-07). Shipped as a process-per-session
-    supervisor, `host/brokerd.c` (new binary `brokerd`), chosen over the in-process
-    spawn/bind primitives above because in-process add and remove would need
-    trusted-core surgery the proven single-guest stack does not: no forced vcpu
-    stop, a dangling `fe->sinks[gid]` after `draw_shutdown`, no vswitch deregister,
-    no 9P chain free, and a single-browser `drawws`. Process-per-session sidesteps
-    all of it. Each browser session is a separate `jotun` child (the ordinary
-    single-guest stack with its own loopback draw port); brokerd proxies the
-    browser's bytes to the child's draw port rather than reading its RAM, so the
-    isolation is at the address-space level and teardown is kill-and-reap. A
-    `jsess` cookie ties a browser's page GET and its `/ws` to one child (302
-    Set-Cookie on a cookieless GET, then a transparent splice). The policy is
-    trivial and inline, a fixed bundle and guest per session, configured by
-    environment. Quotas are a hard `max` (503 when full), per-child `setrlimit`
-    (address space, CPU, open files), and an idle sweep; `SIGCHLD` reaping frees
-    slots, and `SIGINT`/`SIGTERM` kills every child so a shutdown orphans nothing.
-    `jotun` itself is unchanged. One enabler was required in the storage layer:
-    the depot lock was always exclusive, so a second concurrent `jotun` reading
-    the same bundle blocked forever. Serving is read-only, so `cas_new_ro` now
-    takes a shared lock (several readers serve one depot at once) while writers
-    keep the exclusive lock. Run with `make web-multi`, front it with the same
-    Caddy recipe, and check it headless with `make broker-smoke` (two independent
-    sessions, each sees only its own token, no cross-leak, then teardown). The
-    broker-guest control channel (step two) is still to come; it will drive
-    fork and kill in place of the inline policy.
-- M15.3 (step one done): admission and auth. Authentication stays off the box in
-  the reverse proxy, as M10 decided; the host contributes only the admission
-  mechanism. This fits the section 9.2 split: the host stays trusted and minimal,
-  the session guests stay sandboxed, and the authenticating front is explicit.
-  - Step one (done 2026-10-07, proxy auth + host admission): a bearer-token gate
-    in front of brokerd, with no token ever reaching the host. `authd` is a small
-    loopback validator Caddy delegates to with `forward_auth`; it maps a token to
-    a user and a per-user cap from a `token user [cap]` store (minted by
-    `jmint`), and returns `X-Jotun-Auth: <secret> <user> <cap>` which Caddy copies
-    onto the request. brokerd (when `JOTUN_BROKER_AUTH_SECRET` is set) trusts only
-    the line carrying that shared secret, so the identity cannot be forged; it
-    enforces the per-user session cap, refuses an unidentified request (403), and
-    binds a `jsess` cookie to its owning user so one user's cookie cannot attach
-    to another's session. A client sends the token as an `Authorization: Bearer`
-    header or, for a browser (whose WebSocket takes no custom header), as the
-    `jauth` cookie obtained once from `/login?token=`. Run with
-    `make web-auth JOTUN_BROKER_AUTH_SECRET=<secret>` behind
-    `example/web/Caddyfile-auth`; `make auth-smoke` checks it headless. With the
-    secret unset brokerd is unchanged, so `make web-multi` still runs open.
-  - Still to come: when the broker guest (M15.2 step two) exists, the admission
-    policy can move into it over the control channel, with the host keeping the
-    per-request quota and the token binding. Per-user bundle selection is M15.4.
-- M15.4: per-session bundle delivery. The broker guest names the bundle in its
-  spawn request and the host resolves it through the signed pull (M8), so a
-  session's image is pinned per request rather than baked in.
-
-Intermediate steps that smooth the path (all done 2026-10-07):
-
-- A one-command authenticated demo (done). `make web-auth-demo` brings up
-  brokerd, authd, and Caddy together with `example/web/Caddyfile-auth` (storage
-  under `build/`, torn down together), generating an ephemeral secret and minting
-  a `demo` token on first run, so the whole authenticated chain is one command.
-  `make web-auth` stays as the no-Caddy pair.
-- An end-to-end auth check through Caddy (done). `make caddy-auth-smoke`
-  (`tools/cauthsmoke.c`) drives the real `forward_auth` chain with `curl` (no
-  token 401, bearer 302, `/login` sets the cookie, cookie 302, bad token 401),
-  guarding the Caddyfile wiring that `auth-smoke` only simulates.
-- Token store management (done). `jmint -l` lists the stored tokens (masked) and
-  `jmint -r <user>` revokes a user's tokens (atomic rewrite, comments and other
-  users preserved); authd reloads on change, so a revoke needs no restart.
-- Session introspection (done). `SIGUSR1` makes brokerd dump its live session
-  table (user, pid, port, idle age) to stderr, with no network surface to gate.
-- The broker control-channel ABI, defined ahead of step two (done).
-  `abi/jotun_broker.h` specifies spawn/destroy/bind and the
-  connected/disconnected/exited events in the doorbell-plus-shared-buffer shape;
-  `host/brokerctl.c` is a host-side mock of it and `make brokerctl-test` drives
-  the protocol. Nothing is wired into the trusted core yet, so step two stays
-  additive: the mock bodies become real spawn/route/reap behind the same ABI.
-
-Cross-cutting decisions, independent of the tiers above:
-- Keyboard and text input (done). `DEV_TEXT` and `DEV_PASTE` are now wired end
-  to end. The host-to-guest path was already variable-length, so the only new
-  pieces were a document-level keydown and paste handler in the client (paste
-  split into short UTF-8 chunks under the 63-byte event-value cap) and a guest
-  that consumes the text. That guest is `webterm` (`guest/libos/webterm.c`): the
-  jsh shell rendered as a monospace text screen over the draw channel, a usable
-  web terminal. It needed a console-output seam (a portable `con_putc` over the
-  arch `con_raw_putc`, with `con_set_sink` to mirror output on screen) and an
-  interactive `jsh_exec_line`. This is the showcase of a hosted, keyboard-driven
-  session on the single-session recipe above.
-- Frame efficiency. The draw path was exercised end to end for the first time
-  (beyond the SVG-dump): a live guest on `JOTUN_DRAW_PORT` reached over a real
-  WebSocket, framed and input-driven, and the same path through a Caddy TLS
-  reverse proxy over `wss:`, with no host code change. That run showed frames
-  were the cost, so `host/png.c` gained adaptive PNG row filtering (it already
-  had hash-chain LZ77 with fixed Huffman, despite an old comment to the
-  contrary): each row picks the None/Sub/Up/Average/Paeth filter with the
-  smallest residual, which cut a rasterizer frame about 2.5x (a 256x192 frame
-  from roughly 51 KB to 21 KB), losslessly and with no protocol change. The
-  fixed Huffman was then replaced with a dynamic one (per-frame code trees
-  length-limited to 15 bits), another 13% (to about 18 KB), for 2.8x below the
-  original encoder overall, and verified lossless against a strict libpng
-  decoder over adversarial inputs (solid color, a single rare literal, noise,
-  1px stripes, 1x1). The partial-update path was found already wired end to end:
-  a guest that sends `DOP_IMAGE_DAMAGE` makes the host encode and send only the
-  damaged sub-rectangle (confirmed with the drawpixel demo: a 32x32 patch is a
-  234-byte delta, not a full frame). The triton demo cannot use it because the
-  whole frame changes as the cube spins, but any guest that updates a region
-  gets the saving for free. Remaining lever if a smooth high-rate pixel stream
-  ever needs it: a binary tile-delta in place of PNG-in-SVG.
-
-Status: authenticated multi-user hosting works. M15.1 (the hosting recipe),
-keyboard and text input, and the webterm jsh terminal shipped the single-session
-MVP; the M15.2 host mechanism ships as the `brokerd` process-per-session
-supervisor, where independent browsers each get their own sandboxed `jotun`
-child, spawned on demand and torn down on exit or idle; and M15.3 step one adds
-bearer-token admission in front (`authd` behind Caddy `forward_auth`, per-user
-session caps in brokerd), with no token reaching the host. Remaining: lifting
-policy into a sandboxed broker guest over a control channel (M15.2 step two,
-which M15.3's admission can then move into), and per-session bundle delivery
-(M15.4). Both are additive on top of what ships.
+This milestone remoted the display to a browser over the internet: a host
+WebSocket front end, a session broker, and per-session `jotun` children routing
+draw frames to browsers. It was display work and was dropped with the display
+subsystem in v0.34.0. See CHANGELOG.md. Serving Linux guests over the network is
+unscoped.
 
 ## Cross-cutting concerns
 
 - The per-guest manifest is the sandbox's control surface. It appears at M3,
   naming the filesystem bundle and the init parameters, and grows through M5 for
-  networking, M6 for display, and M8 for the pull origin and trusted key.
+  networking and M8 for the pull origin and trusted key.
 - Validation of every guest-to-host message is a standing requirement, not a
   phase.
 - Host portability to macos/arm64 is a standing concern. As of the M8 work the
