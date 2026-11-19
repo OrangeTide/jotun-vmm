@@ -1,4 +1,4 @@
-# M16.1 Linux binary-compat spike: findings
+# Linux binary-compat spike: findings
 
 This records an experimental spike, not a supported feature. The goal was the
 cheapest possible proof that the libOS can run an unmodified static Linux
@@ -98,7 +98,7 @@ static-PIE relocation) are all still ahead and unchanged by this result; none of
 them block the busybox step. The experimental module can stay as the seed of the
 real loader, or be rewritten once the shape of M16.2 is clear.
 
-## M16.2: VFS and process syscalls
+## VFS and process syscalls
 
 Follow-on work broadened the syscall surface, driven by self-contained musl test
 programs rather than an external binary. New pieces:
@@ -124,7 +124,7 @@ entries in /: boot/ hello hello.txt ... motd rc net/
 read back: data through a pipe
 ```
 
-## M16.5: a heap, and glibc busybox running
+## A heap, and glibc busybox running
 
 The spike then grew a real heap for the foreign libc, and found a register-ABI
 bug along the way.
@@ -191,7 +191,7 @@ not service. Applets that fork/exec (a shell pipeline) need `clone`/`execve`
 (M16.4 and beyond). The ramfs is per-run and single trust domain, not a real
 filesystem; it is the shortcut its name implies.
 
-## AArch64 port (M16.6, minimal PoC)
+## AArch64 port (minimal PoC)
 
 The spike was ported to AArch64 so the concept can be checked on a non-Linux
 host (macos/arm64, HVF) with a Linux-like guest. The scope is one process: MMU

@@ -1,4 +1,4 @@
-# Linux syscall support (M16 binary-compat guest)
+# Linux syscall support (the binary-compat guest)
 
 This is the inventory of Linux x86-64 syscalls for the `bin` guest, which runs
 unmodified static Linux x86-64 binaries under the libOS SYSCALL trap

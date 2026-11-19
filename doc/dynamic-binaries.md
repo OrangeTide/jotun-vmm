@@ -1,4 +1,4 @@
-# M16.7 design: dynamic binaries (ld.so, PIE, glibc)
+# Dynamic binaries: ld.so, PIE, and glibc
 
 This is a design sketch, not yet implemented. The goal is the one the whole
 Linux-compat line was built toward: run an unmodified host binary, which on a
