@@ -437,11 +437,14 @@ linux-run: $(TARGET) libos.elf | build
 ##   make linux-kernel-demo KSRC=<writable linux source tree> [ROOTFS=<dir>]
 ##
 ## KSRC is a writable, unmodified Linux source tree; the build output lands in
-## it. ROOTFS is a Linux distro rootfs for this guest's arch carrying the
-## toolchain (gcc binutils make flex bison bc). On Linux it defaults to the
-## host's own "/"; on macOS it must be a Linux rootfs, because the Mac's own "/"
-## is Mach-O rather than Linux ELF. The timer is left off (JOTUN_HZ unset), which
-## macOS needs for the fork/exec-heavy build and which is harmless on Linux.
+## it. Download and unpack one from kernel.org, for example:
+##   curl -LO https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz
+##   tar xf linux-6.12.tar.xz        # then KSRC=$PWD/linux-6.12
+## ROOTFS is a Linux distro rootfs for this guest's arch carrying the toolchain
+## (gcc binutils make flex bison bc). On Linux it defaults to the host's own "/";
+## on macOS it must be a Linux rootfs, because the Mac's own "/" is Mach-O rather
+## than Linux ELF. The timer is left off (JOTUN_HZ unset), which macOS needs for
+## the fork/exec-heavy build and which is harmless on Linux.
 KSRC ?=
 ifeq ($(OS),Darwin)
 ROOTFS ?=
@@ -449,8 +452,11 @@ else
 ROOTFS ?= /
 endif
 linux-kernel-demo: $(TARGET) libos.elf | build
-	@test -n "$(KSRC)" || \
-	    { echo "set KSRC=<writable Linux source tree> (see doc/kernel-build.md)"; exit 1; }
+	@test -n "$(KSRC)" || { \
+	    echo "set KSRC=<writable Linux source tree>. Download and unpack one, e.g.:"; \
+	    echo "  curl -LO https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz"; \
+	    echo "  tar xf linux-6.12.tar.xz   # then KSRC=\$$PWD/linux-6.12"; \
+	    echo "See doc/kernel-build.md for the full runbook."; exit 1; }
 	@test -d "$(KSRC)" || { echo "no such directory: $(KSRC)"; exit 1; }
 	@test -n "$(ROOTFS)" || \
 	    { echo "macOS: set ROOTFS=<Linux $(GUEST_ARCH) distro rootfs with a toolchain> (see doc/kernel-build.md)"; exit 1; }

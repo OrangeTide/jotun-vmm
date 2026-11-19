@@ -341,13 +341,18 @@ now avoids a second pass. Copy the tree to the Mac, for example to
 ### 2. Stage the kernel source (writable)
 
 The output tree is several GB and must sit on a writable host mount. The
-simplest layout keeps source and output together in one writable directory. On
-the Mac:
+simplest layout keeps source and output together in one writable directory.
+Download an unmodified source tree from kernel.org and unpack it there:
 
 ```
-mkdir -p ~/kbuild
-# copy or extract an unmodified linux-6.12 tree into ~/kbuild/linux-6.12
+mkdir -p ~/kbuild && cd ~/kbuild
+curl -LO https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz
+tar xf linux-6.12.tar.xz        # yields ~/kbuild/linux-6.12
 ```
+
+Pick a different version by changing the file name (and the `v6.x` directory
+for other major series). The `linux-kernel-demo` target prints the same hint if
+`KSRC` is unset.
 
 A read-only source plus a separate `mount out host:<dir> rw` output tree also
 works (`make O=<out>`), but a single writable tree is fewer moving parts for a
