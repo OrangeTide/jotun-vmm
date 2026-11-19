@@ -288,6 +288,169 @@ yet root-caused or fixed; the candidates are the physical-frame allocator, the
 per-process page-table teardown, and the kernel heap under sustained process
 turnover.
 
+## Runbook: aarch64 kernel on macOS/HVF, step by step
+
+This is the concrete recipe for the headline case, an aarch64 guest on macOS
+building an aarch64 kernel. It produces `arch/arm64/boot/Image` from an
+unmodified Linux 6.12 tree. The commands assume the repo is checked out at
+`~/Vibe/vmm` and that paths like `~/kbuild` are writable. Adjust paths to taste.
+
+### 0. Prerequisites
+
+- An Apple-silicon Mac (Hypervisor.framework). Build the host and guest once:
+  `cd ~/Vibe/vmm && make` produces `jotun` and `libos.elf`.
+- About 15 GB of free disk: a few GB for the Debian rootfs and up to ~10 GB for
+  the kernel output tree.
+- A Linux aarch64 distro rootfs (step 1) and the kernel source (step 2). Neither
+  can be produced on the Mac directly, so build them on a Linux host (or a Linux
+  container) and copy the trees over.
+
+### 1. Build the Debian aarch64 rootfs (on a Linux host)
+
+macOS binaries are Mach-O, so the guest root cannot be the Mac's own `/`. Serve
+a Linux aarch64 userland instead. On any Linux box with `debootstrap` and
+`qemu-user-static` for arm64 emulation:
+
+```
+sudo debootstrap --arch=arm64 --include=build-essential,flex,bison,bc,perl,\
+dwarves,libelf-dev,libssl-dev,kmod bookworm ~/debroot-arm64 \
+    http://deb.debian.org/debian
+```
+
+`build-essential` pulls gcc, binutils, and make. `dwarves` supplies `pahole`,
+which `init/Kconfig` probes even when BTF is off. `libelf-dev` and `libssl-dev`
+are only needed once modules and signing are enabled (S3), but installing them
+now avoids a second pass. Copy the tree to the Mac, for example to
+`~/debroot-arm64`. Preserve ownership and symlinks (`rsync -aH` or a tarball).
+
+### 2. Stage the kernel source (writable)
+
+The output tree is several GB and must sit on a writable host mount. The
+simplest layout keeps source and output together in one writable directory. On
+the Mac:
+
+```
+mkdir -p ~/kbuild
+# copy or extract an unmodified linux-6.12 tree into ~/kbuild/linux-6.12
+```
+
+A read-only source plus a separate `mount out host:<dir> rw` output tree also
+works (`make O=<out>`), but a single writable tree is fewer moving parts for a
+first run.
+
+### 3. Write the build wrapper
+
+The guest `init` runs one program. Use a shell wrapper inside the source tree so
+the whole config-and-build sequence runs unattended and its exit code is
+reported. Save this as `~/kbuild/linux-6.12/kbuild.sh`:
+
+```sh
+#!/bin/sh
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export HOME=/root
+cd /ksrc || { echo "no /ksrc"; exit 1; }
+
+echo "=== S0: make ARCH=arm64 defconfig ==="
+make ARCH=arm64 defconfig || { echo "defconfig failed"; exit 1; }
+
+echo "=== minimal config (no MODULES/debug/BTF/gdb/msm) ==="
+sed -i \
+    -e 's/^CONFIG_MODULES=y/# CONFIG_MODULES is not set/' \
+    -e 's/^CONFIG_GDB_SCRIPTS=y/# CONFIG_GDB_SCRIPTS is not set/' \
+    -e 's/^CONFIG_DRM_MSM=[ym]/# CONFIG_DRM_MSM is not set/' \
+    .config
+sed -i \
+    -e '/^CONFIG_DEBUG_INFO_DWARF.*=y/d' \
+    -e '/^CONFIG_DEBUG_INFO_BTF.*=y/d' \
+    -e 's/^CONFIG_DEBUG_INFO=y/# CONFIG_DEBUG_INFO is not set/' \
+    .config
+echo 'CONFIG_DEBUG_INFO_NONE=y' >> .config
+make ARCH=arm64 olddefconfig || { echo "olddefconfig failed"; exit 1; }
+
+echo "=== S2: make ARCH=arm64 -j4 Image ==="
+make ARCH=arm64 -j4 Image
+rc=$?
+if [ $rc -ne 0 ]; then
+    echo "=== parallel stopped (rc=$rc); finishing serially ==="
+    make ARCH=arm64 Image; rc=$?
+fi
+
+ls -l vmlinux arch/arm64/boot/Image 2>/dev/null
+echo "=== BUILD END rc=$rc ==="
+exit $rc
+```
+
+`DRM_MSM` is disabled because it generates register headers with `$(PYTHON3)`
+and the Debian rootfs has no Python. `-j4` is matched to the libOS process
+budget; do not let make auto-detect, which guesses high. The serial fallback
+finishes any target a parallel race dropped.
+
+### 4. Write the manifest
+
+Save this as `~/Vibe/vmm/kbuild.manifest`:
+
+```
+rootfs host:/Users/<you>/debroot-arm64
+mount ksrc host:/Users/<you>/kbuild/linux-6.12 rw
+init bin /bin/sh /ksrc/kbuild.sh
+```
+
+`rootfs host:<path>` serves that directory as the guest root read-only, so the
+toolchain resolves at `/usr` and `/bin`. `mount ksrc ... rw` grafts the writable
+source-and-output tree at `/ksrc` in the guest. `init` runs `/bin/sh` on the
+wrapper. The `bin` token is the mount the init program is resolved against; with
+a `rootfs` root it resolves `/bin/sh` from the distro tree.
+
+### 5. Run it
+
+From the repo root, with the preemption timer off (`JOTUN_HZ` unset):
+
+```
+cd ~/Vibe/vmm
+./jotun -m kbuild.manifest libos.elf
+```
+
+Leave `JOTUN_HZ` unset for the whole build. The HVF preemption bug corrupts a
+process when an async interrupt lands during fork/exec/reap, and a kernel build
+is almost entirely fork/exec. With the timer off the build takes no async
+interrupts. Expect a long wall clock under the single-vCPU cooperative
+scheduler; a full image build runs for a long stretch. The writable mount keeps
+partial output, so a stopped run resumes where it left off on the next launch.
+
+### 6. Verify on the host
+
+When the run prints `=== BUILD END rc=0 ===`, check the artifact from the Mac:
+
+```
+file ~/kbuild/linux-6.12/arch/arm64/boot/Image
+file ~/kbuild/linux-6.12/vmlinux
+```
+
+`Image` should report an aarch64 Linux boot executable (the `ARM\x64` magic at
+offset 0x38), and `vmlinux` an aarch64 ELF. That is the S2 headline success.
+
+### Extending to modules and dtbs (S3)
+
+Re-enable `CONFIG_MODULES` and build `Image modules dtbs` instead of `Image`.
+Drop the `CONFIG_MODULES` disable from the wrapper's first `sed` and change the
+build line to `make ARCH=arm64 -j4 Image modules dtbs`. This needs `libelf-dev`
+(modpost BTF and `.ko` linking) and the in-tree `dtc` (flex and bison), both
+already in the step 1 package list. Enabling modules rewrites `autoconf.h`, so
+it is a near-full recompile; clear the stale `vmlinux` and archives first for a
+consistent base.
+
+### Gotchas
+
+- macOS `ar` and `file` cannot read GNU thin archives (`!<thin>`) and misreport
+  a valid archive as corrupt. Check thin-archive membership with
+  `strings <archive> | grep <member>.o`, not `ar t`.
+- A benign "Clock skew detected" warning comes from the mount's synthetic file
+  timestamps against the wall clock. It does not affect the result.
+- If a long-lived build process starts producing `cc1` internal compiler errors
+  after many thousands of objects, stop and relaunch. A fresh process clears the
+  state (see the S4 pumpkin note in Status); the artifact and partial progress
+  survive on the writable mount.
+
 ## Open risks
 
 - `flock` and `select` gaps may each need a small syscall addition.
