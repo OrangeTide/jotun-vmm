@@ -236,7 +236,7 @@ New tag values: `AT_PHDR=3`, `AT_PHENT=4`, `AT_PHNUM=5`, `AT_BASE=7`,
   - Copy the host files into the bundle staging directory (the quick path, like
     the `EXTRA_BUNDLE_FILES` hook used for the busybox and make probes).
   - Graft a runtime as a read-only mount. The repo already has the mechanism:
-    the manifest `mount` entry served by the `p9graft` backend (M13) grafts a
+    the manifest `mount` entry served by the `p9graft` backend grafts a
     shared read-only tree at a path. A bundled runtime, or the host's own
     `/lib64` and `/usr/lib`, can be grafted in rather than copied file by file.
     This is the design to aim for, since it lets the guest pick up either an

@@ -212,12 +212,12 @@ object bytes. What it does not establish is which root hash is authentic; that
 is the ref, and ref authenticity is the trust anchor. smolvfs signs refs with
 `cas-sign`: the publisher signs a ref, and the client verifies the signature
 against a trusted public key before using the root. Signing lands with the
-pull-from-URL stage (roadmap M8), where a bundle first arrives from an origin
+pull-from-URL stage, where a bundle first arrives from an origin
 that is not already trusted; a local bundle until then carries a ref trusted
 directly. Multi-arch stays out of scope.
 
 Because the store is immutable and content addressed, several guests in one host
-process can read the same depot at once without copying it (roadmap M10.4). The
+process can read the same depot at once without copying it. The
 depot's write lock is taken only when a ref is committed, never on a read, so
 concurrent readers never block each other. A manifest ref is resolved as either
 a ref name or a fixed 64-hex root tree hash. A ref name tracks whatever root its
@@ -230,7 +230,7 @@ refuses the mount otherwise. This shares a whole tree as a guest's root. A guest
 can instead graft a shared tree at a top-level name inside its own tree, so it
 sees both at once: the manifest line `mount <name> <bundle> <ref> [subtree]`
 wraps the guest's backend so the shared tree appears as `/<name>`, with the two
-trees' qids kept disjoint (roadmap M13). The shared `ref` resolves the same way,
+trees' qids kept disjoint. The shared `ref` resolves the same way,
 so a pinned hash gives a stable shared tree.
 
 Per-object compression is available (smolvfs ships a DEFLATE codec); the first
@@ -274,7 +274,7 @@ manifest: which ports may be bound or dialed, NAT, and rate limits. The guest
 cannot name anything outside what `/net` exposes, so there is no path to the
 real network except through the host's mediation.
 
-As built (M5), the data path is a socket-like client over a dedicated net
+As built, the data path is a socket-like client over a dedicated net
 channel (`net_dial`/`net_read`/`net_write`/`net_close`, plus UDP
 `net_sendto`/`net_recvfrom`); the host opens the real sockets, which is the
 NAT. A would-block parks the calling task, not the vcpu, and an event-driven

@@ -72,31 +72,32 @@ threads, no signals, no relocation). No unhandled syscall appeared in the run.
 Not yet addressed, and each is a known milestone, not a surprise:
 
 - Static non-PIE only. A static-PIE binary (Alpine's default) needs
-  `R_*_RELATIVE` self-relocation (M16.3). `elf_load_fid` loads at the fixed
+  `R_*_RELATIVE` self-relocation. `elf_load_fid` loads at the fixed
   `p_vaddr`, with the `0x400000..0x600000` window as its only bound.
 - `mmap`/`brk` are stubbed. The guest has a flat heap and an 8 MiB RAM identity
   map, no demand paging. Anything that reserves large sparse arenas (Go) needs
-  real address-space management (M16.5).
+  real address-space management.
 - No exception handlers. Only the timer IDT vector exists. A bad guest
   instruction triple-faults to a bare "unknown exit" with no diagnostics, which
   made bring-up slower than it needed to be. A `#GP`/`#PF` handler that prints
-  the faulting RIP is worth adding before M16.2.
+  the faulting RIP is worth adding before broadening the syscall surface.
 - Interrupts are off for the whole run, so this cannot host anything that blocks
   or waits. That is fine for a batch hello and nothing more.
-- One fixed program stack, single task. Threads (`clone`/`futex`) are M16.4.
+- One fixed program stack, single task. Threads (`clone`/`futex`) come later.
 - x86-64 only. The arm64 SVC path is unwritten; `linux_elf_run` is a stub there.
 
 ## Go / no-go
 
 Go, with eyes open. The spike cost little and removed the central doubt: the
 ring-0 SYSCALL trap works and musl runs unmodified. The sensible next step is
-M16.2 (broaden the VFS and process syscalls toward a static `busybox`), but it
+to broaden the VFS and process syscalls toward a static `busybox`, but it
 should open by adding the `#GP`/`#PF` diagnostic handler, because the next
 binaries will fault in ways the hello never did and the current failure mode is
 a silent triple fault. The larger risks (`mmap` with lazy commit, `futex`,
 static-PIE relocation) are all still ahead and unchanged by this result; none of
 them block the busybox step. The experimental module can stay as the seed of the
-real loader, or be rewritten once the shape of M16.2 is clear.
+real loader, or be rewritten once the shape of the VFS and syscall work is
+clear.
 
 ## VFS and process syscalls
 
@@ -157,8 +158,8 @@ manual probe (not committed, since its make target would need an external path),
 unhandled syscalls** on a guest that previously could not get it past startup.
 That it executes at all, RELRO and TLS and heap and all, is the real evidence
 that the model scales past the musl hello. The musl path stays the committed
-one; busybox applets proper still want argv delivery and a broader VFS (M16.2
-onward), but the heap wall (M16.5) is down.
+one; busybox applets proper still want argv delivery and a broader VFS, but the
+heap wall is down.
 
 ## jlibc malloc (separate, native programs)
 
@@ -187,8 +188,8 @@ Two more pieces let a multi-call binary actually do something.
   creates `/tmp/scratch.txt`, writes to it, stats it, and reads it back.
 
 Not yet: `busybox ls /` wants `statx` (332), the glibc stat variant, which we do
-not service. Applets that fork/exec (a shell pipeline) need `clone`/`execve`
-(M16.4 and beyond). The ramfs is per-run and single trust domain, not a real
+not service. Applets that fork/exec (a shell pipeline) need `clone`/`execve`,
+which come later. The ramfs is per-run and single trust domain, not a real
 filesystem; it is the shortcut its name implies.
 
 ## AArch64 port (minimal PoC)

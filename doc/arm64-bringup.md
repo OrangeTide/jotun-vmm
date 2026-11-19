@@ -1,8 +1,8 @@
 # Bringing up the AArch64 guest: a runtime test plan
 
 The guest's arm64 backend is written and cross-compiles clean, but it has never
-run. Every result in the M16 work (the native libOS demos, the Linux-compat
-path, dynamic glibc, the toolchain, autotools) was produced on linux/x86-64
+run. Every result so far (the native libOS demos, the Linux-compat path,
+dynamic glibc, the toolchain, autotools) was produced on linux/x86-64
 under KVM. The arm64 side has only ever been compiled, not executed.
 
 This is the plan to change that: a staged bring-up that starts at "does it
