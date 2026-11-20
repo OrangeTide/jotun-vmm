@@ -337,7 +337,7 @@ Rate limits are not yet implemented.
 5. Add `/net` with container-style policy.
 
 (A display subsystem, `/dev/draw` and a browser front end, was built after this
-and removed in 0.34.0; jotun hosts Linux-like guests only.)
+and removed in v0.34.0; jotun hosts Linux-like guests only.)
 
 ## 10. Open decisions
 
