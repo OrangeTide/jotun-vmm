@@ -3,6 +3,16 @@
 Notable changes to Jotun. The version is the single line in `version.mk`; each
 release is tagged `v<version>`.
 
+## 0.34.1
+
+### Changed
+
+- Docs only. Pruned the removed display subsystem from the roadmap and the
+  design doc: roadmap M6/M7 and M15 are reduced to removal stubs, M10 is
+  refocused on multi-guest multiplexing, and `doc/unikernel-design.md` Section 9
+  is removed with its sections renumbered. Release-version prose references were
+  made uniform (`v0.34.0`). No code change.
+
 ## 0.34.0
 
 ### Removed
